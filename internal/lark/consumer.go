@@ -56,6 +56,9 @@ func (c Consumer) Consume(ctx context.Context, handle func(EventEnvelope) error)
 	registerSDKEventHandler(handler, "message", legacyMessageHandler{handle: func(event *legacyMessageEvent) error {
 		return handleEvent(projectLegacyMessageEvent(event))
 	}})
+	for _, eventType := range ignoredRealtimeEventTypes {
+		registerSDKEventHandler(handler, eventType, ignoredEventHandler{})
+	}
 	options := []ws.ClientOption{ws.WithEventHandler(handler)}
 	if c.BaseURL != "" {
 		options = append(options, ws.WithDomain(c.BaseURL))
@@ -133,6 +136,24 @@ func (h legacyMessageHandler) Event() any {
 
 func (h legacyMessageHandler) Handle(_ context.Context, event any) error {
 	return h.handle(event.(*legacyMessageEvent))
+}
+
+var ignoredRealtimeEventTypes = []string{
+	"message_read",
+	"im.message.message_read_v1",
+	"im.message.reaction.created_v1",
+	"im.message.reaction.deleted_v1",
+	"im.chat.access_event.bot_p2p_chat_entered_v1",
+}
+
+type ignoredEventHandler struct{}
+
+func (ignoredEventHandler) Event() any {
+	return &map[string]any{}
+}
+
+func (ignoredEventHandler) Handle(context.Context, any) error {
+	return nil
 }
 
 // registerSDKEventHandler bridges legacy event keys that the public SDK can

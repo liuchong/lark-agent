@@ -1,6 +1,7 @@
 package lark
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -112,6 +113,29 @@ func TestRealtimeReceiveTimeFillsMissingLegacyCreateTime(t *testing.T) {
 	})
 	if !got.CreatedAt.Equal(realtimeNow()) {
 		t.Fatalf("created_at=%s", got.CreatedAt)
+	}
+}
+
+func TestIgnoredRealtimeEventHandlerCoversKnownNonMessageEvents(t *testing.T) {
+	want := map[string]bool{
+		"message_read":                                 false,
+		"im.message.message_read_v1":                   false,
+		"im.chat.access_event.bot_p2p_chat_entered_v1": false,
+		"im.message.reaction.created_v1":               false,
+		"im.message.reaction.deleted_v1":               false,
+	}
+	for _, eventType := range ignoredRealtimeEventTypes {
+		if _, ok := want[eventType]; ok {
+			want[eventType] = true
+		}
+	}
+	for eventType, found := range want {
+		if !found {
+			t.Fatalf("ignored event type %q is not registered", eventType)
+		}
+	}
+	if err := (ignoredEventHandler{}).Handle(context.Background(), map[string]any{"event": "read"}); err != nil {
+		t.Fatalf("ignored handler returned error: %v", err)
 	}
 }
 
