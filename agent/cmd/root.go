@@ -121,7 +121,8 @@ func newAuthCommand(in io.Reader, out io.Writer, configPath *string) *cobra.Comm
 		Short: "Read Lark credentials as JSON from stdin and store them in Keychain",
 		Long: "Read JSON from stdin with app_secret, optional user_access_token, and optional " +
 			"refresh_token, then store those values in macOS Keychain accounts named by config. " +
-			"Secrets are never accepted as command arguments or written to stdout.",
+			"If app_secret is already stored, stdin may omit it when only adding or replacing " +
+			"user tokens. Secrets are never accepted as command arguments or written to stdout.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if in == nil {
 				return errs.NewValidationError(errs.SubtypeInvalidArgument, "stdin is required").WithParam("stdin")
@@ -130,22 +131,16 @@ func newAuthCommand(in io.Reader, out io.Writer, configPath *string) *cobra.Comm
 			if err != nil {
 				return err
 			}
-			var input struct {
-				AppSecret       string `json:"app_secret"`
-				UserAccessToken string `json:"user_access_token"`
-				RefreshToken    string `json:"refresh_token"`
-			}
+			var input authLoginInput
 			if err := json.NewDecoder(in).Decode(&input); err != nil {
 				return errs.NewValidationError(errs.SubtypeInvalidArgument, "decode auth login JSON from stdin").WithCause(err)
 			}
-			if strings.TrimSpace(input.AppSecret) == "" {
-				return errs.NewValidationError(errs.SubtypeInvalidArgument, "app_secret is required")
+			existing, _ := serviceim.LoadCredentials(cmd.Context(), credentialRefs(cfg))
+			credentials, err := mergeAuthLoginInput(existing, input)
+			if err != nil {
+				return err
 			}
-			if err := serviceim.StoreCredentials(cmd.Context(), credentialRefs(cfg), serviceim.Credentials{
-				AppSecret:       strings.TrimSpace(input.AppSecret),
-				UserAccessToken: strings.TrimSpace(input.UserAccessToken),
-				RefreshToken:    strings.TrimSpace(input.RefreshToken),
-			}); err != nil {
+			if err := serviceim.StoreCredentials(cmd.Context(), credentialRefs(cfg), credentials); err != nil {
 				return err
 			}
 			return writeData(out, map[string]any{
@@ -193,6 +188,35 @@ func newAuthCommand(in io.Reader, out io.Writer, configPath *string) *cobra.Comm
 		},
 	})
 	return cmd
+}
+
+type authLoginInput struct {
+	AppSecret       string `json:"app_secret"`
+	UserAccessToken string `json:"user_access_token"`
+	RefreshToken    string `json:"refresh_token"`
+}
+
+func mergeAuthLoginInput(existing serviceim.Credentials, input authLoginInput) (serviceim.Credentials, error) {
+	appSecret := strings.TrimSpace(input.AppSecret)
+	if appSecret == "" {
+		appSecret = strings.TrimSpace(existing.AppSecret)
+	}
+	if appSecret == "" {
+		return serviceim.Credentials{}, errs.NewValidationError(errs.SubtypeInvalidArgument, "app_secret is required")
+	}
+	userToken := strings.TrimSpace(input.UserAccessToken)
+	if userToken == "" {
+		userToken = strings.TrimSpace(existing.UserAccessToken)
+	}
+	refreshToken := strings.TrimSpace(input.RefreshToken)
+	if refreshToken == "" {
+		refreshToken = strings.TrimSpace(existing.RefreshToken)
+	}
+	return serviceim.Credentials{
+		AppSecret:       appSecret,
+		UserAccessToken: userToken,
+		RefreshToken:    refreshToken,
+	}, nil
 }
 
 func newInitCommand(out io.Writer, configPath *string) *cobra.Command {

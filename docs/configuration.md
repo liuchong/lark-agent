@@ -13,7 +13,8 @@ lark-agent config show
 
 `auth login` 从标准输入读取 JSON，字段为 `app_secret`、可选的 `user_access_token`
 和可选的 `refresh_token`。这些值只写入 macOS Keychain，不会写入配置文件、stdout
-或 plist。
+或 plist。首次登录必须提供 `app_secret`；如果 Keychain 里已经有 `app_secret`，
+后续可以只提供 `user_access_token` 和可选的 `refresh_token` 来补齐用户身份能力。
 
 ## 关键字段
 

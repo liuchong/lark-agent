@@ -56,6 +56,32 @@ func TestAuthStatusReportsMissingUserTokenSeparately(t *testing.T) {
 	}
 }
 
+func TestMergeAuthLoginInputAllowsAddingUserTokenToExistingAppSecret(t *testing.T) {
+	merged, err := mergeAuthLoginInput(serviceim.Credentials{
+		AppSecret: "existing-app-secret",
+	}, authLoginInput{
+		UserAccessToken: " user-token ",
+		RefreshToken:    " refresh-token ",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.AppSecret != "existing-app-secret" ||
+		merged.UserAccessToken != "user-token" ||
+		merged.RefreshToken != "refresh-token" {
+		t.Fatalf("merged=%+v", merged)
+	}
+}
+
+func TestMergeAuthLoginInputStillRequiresAppSecretWithoutExistingSecret(t *testing.T) {
+	_, err := mergeAuthLoginInput(serviceim.Credentials{}, authLoginInput{
+		UserAccessToken: "user-token",
+	})
+	if err == nil || !strings.Contains(err.Error(), "app_secret is required") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestApprovalCommandsListAndApproveExactAction(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.db")
 	store, err := storage.Open(statePath)
