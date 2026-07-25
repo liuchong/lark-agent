@@ -167,10 +167,13 @@ func newAuthCommand(in io.Reader, out io.Writer, configPath *string) *cobra.Comm
 			if err != nil {
 				return err
 			}
-			_, err = serviceim.LoadCredentials(cmd.Context(), credentialRefs(cfg))
+			credentials, err := serviceim.LoadCredentials(cmd.Context(), credentialRefs(cfg))
 			return writeData(out, map[string]any{
 				"keychain_service": cfg.Lark.KeychainService,
-				"configured":       err == nil,
+				"app_secret":       err == nil && credentials.AppSecret != "",
+				"user_token":       credentials.UserAccessToken != "",
+				"refresh_token":    credentials.RefreshToken != "",
+				"configured":       err == nil && credentials.AppSecret != "",
 				"error":            errorString(err),
 			})
 		},
@@ -813,6 +816,7 @@ func buildLiveOptions(
 	if err != nil {
 		return nil, nil, nil, info, err
 	}
+	userContextEnabled := credentials.UserAccessToken != ""
 	builder := &conversationBuilder{
 		svc: imSvc,
 		base: agentcontext.Builder{
@@ -823,9 +827,11 @@ func buildLiveOptions(
 				OpenID: cfg.Owner.OpenID,
 			},
 		},
+		includeLarkContext: userContextEnabled,
 	}
 	options := []app.Option{app.WithContextBuilder(builder)}
-	if credentials.UserAccessToken != "" {
+	info["user_context"] = userContextEnabled
+	if userContextEnabled {
 		livePoller := newConfiguredLivePoller(imSvc, store, agentRouter, cfg, chatQuery, includePrivate)
 		options = append(options, app.WithPoller(livePoller))
 		info["user_polling"] = true
@@ -844,7 +850,9 @@ func buildLiveOptions(
 		}
 		definitions := append([]agenttools.Definition{}, agenttools.CodeIndexDefinitions(scope, nil)...)
 		definitions = append(definitions, agenttools.WorkspaceDefinitions(scope)...)
-		definitions = append(definitions, agenttools.LarkContextDefinitions(larkToolContext{svc: imSvc})...)
+		if userContextEnabled {
+			definitions = append(definitions, agenttools.LarkContextDefinitions(larkToolContext{svc: imSvc})...)
+		}
 		definitions = append(definitions,
 			agenttools.ShellDefinition(scope, agenttools.ShellOptions{
 				ApprovalRequired:     cfg.Agent.ShellApproval,
@@ -890,6 +898,10 @@ func buildLiveOptions(
 		info["runtime_fingerprint"] = modelFingerprint + ":" + configFingerprint
 	}
 	if !dryRun {
+		threadState := liveThreadState{}
+		if userContextEnabled {
+			threadState.svc = imSvc
+		}
 		gate := policy.NewReplyGate(policy.Config{
 			Mode:               cfg.Policy.Mode,
 			ReplyConfidenceMin: cfg.Policy.ReplyConfidenceMin,
@@ -897,7 +909,7 @@ func buildLiveOptions(
 			BlockChats:         cfg.Policy.BlockChats,
 			BlockUsers:         cfg.Policy.BlockUsers,
 			RequireTestScope:   chatQuery != "",
-		}, liveThreadState{svc: imSvc})
+		}, threadState)
 		options = append(options,
 			app.WithReplyHandler(reply.NewController(gate, imSvc, store)),
 			app.WithNotificationHandler(liveOwnerNotifier{messenger: imSvc}),
@@ -1045,8 +1057,9 @@ func agentConfigFingerprintForContract(cfg config.Config, contract agentOperatin
 }
 
 type conversationBuilder struct {
-	svc  *serviceim.Service
-	base agentcontext.Builder
+	svc                *serviceim.Service
+	includeLarkContext bool
+	base               agentcontext.Builder
 }
 
 type larkToolContext struct {
@@ -1151,7 +1164,7 @@ func normalizeServiceMessageTime(raw string) time.Time {
 
 func (b *conversationBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, error) {
 	builder := b.base
-	if b.svc != nil && item.Event.ChatID != "" {
+	if b.includeLarkContext && b.svc != nil && item.Event.ChatID != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		messageContext, err := b.svc.GetMessageContext(ctx, serviceim.MessageContextRequest{

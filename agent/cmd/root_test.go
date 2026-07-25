@@ -23,6 +23,39 @@ func TestRootDoesNotExposeCopiedInternalEventBus(t *testing.T) {
 	}
 }
 
+func TestAuthStatusReportsMissingUserTokenSeparately(t *testing.T) {
+	t.Setenv("LARK_AGENT_APP_SECRET", "super-secret-value")
+	cfg := config.Default()
+	cfg.Lark.AppID = "cli_a"
+	cfg.Owner.OpenID = "ou_owner"
+	cfg.Assistant.OpenIDs = []string{"ou_bot"}
+	cfg.Workspace.Root = t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := Execute(strings.NewReader(""), &out, &errOut, []string{
+		"--config", configPath,
+		"auth", "status",
+	}); code != 0 {
+		t.Fatalf("status code=%d stderr=%s", code, errOut.String())
+	}
+	output := out.String()
+	for _, want := range []string{
+		`"app_secret":true`,
+		`"user_token":false`,
+		`"configured":true`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("auth status missing %q: %s", want, output)
+		}
+	}
+	if strings.Contains(output, "super-secret-value") {
+		t.Fatalf("auth status leaked secret: %s", output)
+	}
+}
+
 func TestApprovalCommandsListAndApproveExactAction(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.db")
 	store, err := storage.Open(statePath)
@@ -119,6 +152,48 @@ func TestConfiguredLivePollerPersistsRouterPriority(t *testing.T) {
 		items[0].WorkKind != domain.WorkKindFastPath ||
 		items[0].Priority != domain.PriorityFastPath {
 		t.Fatalf("items=%+v", items)
+	}
+}
+
+func TestLiveOptionsWithoutUserTokenDoNotExposeUserContextTools(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_MODEL", "test-model")
+	t.Setenv("LARK_AGENT_APP_SECRET", "secret")
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close() //nolint:errcheck
+	cfg := config.Default()
+	cfg.Workspace.Root = t.TempDir()
+	cfg.Lark.AppID = "cli_a"
+	cfg.Owner.OpenID = "ou_owner"
+	cfg.Assistant.OpenIDs = []string{"ou_bot"}
+	cfg.Assistant.Names = []string{"Assistant Bot"}
+	options, realtimeRunner, _, info, err := buildLiveOptions(
+		context.Background(),
+		cfg,
+		store,
+		newAgentRouter(cfg, store),
+		true,
+		false,
+		"Example Group",
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if realtimeRunner == nil {
+		t.Fatal("realtime owner-request source should still be configured")
+	}
+	if info["user_polling"] != false || info["user_context"] != false || info["user_token"] != "missing" {
+		t.Fatalf("info=%+v", info)
+	}
+	if info["agent_tools"] != 12 {
+		t.Fatalf("agent tool count=%v; user-token-only context tools leaked", info["agent_tools"])
+	}
+	if len(options) == 0 {
+		t.Fatal("expected daemon options")
 	}
 }
 
