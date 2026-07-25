@@ -163,7 +163,7 @@ func (s *Store) RecordIntake(
 	ctx context.Context,
 	event domain.NormalizedEvent,
 ) (domain.IntakeReceipt, error) {
-	return s.recordIntake(ctx, domain.NewWorkItem(event))
+	return s.recordIntake(ctx, domain.NewWorkItem(event), false)
 }
 
 // RecordWorkIntake atomically records one receipt and its classified
@@ -172,6 +172,21 @@ func (s *Store) RecordWorkIntake(
 	ctx context.Context,
 	item domain.WorkItem,
 ) (domain.IntakeReceipt, error) {
+	item = normalizeIntakeWorkItem(item)
+	return s.recordIntake(ctx, item, false)
+}
+
+// RecordBackfillWorkIntake admits one explicitly backfilled work item even when
+// its event predates the current online session.
+func (s *Store) RecordBackfillWorkIntake(
+	ctx context.Context,
+	item domain.WorkItem,
+) (domain.IntakeReceipt, error) {
+	item = normalizeIntakeWorkItem(item)
+	return s.recordIntake(ctx, item, true)
+}
+
+func normalizeIntakeWorkItem(item domain.WorkItem) domain.WorkItem {
 	if item.DedupKey == "" {
 		item.DedupKey = domain.DedupKey(item.Event)
 	}
@@ -181,12 +196,13 @@ func (s *Store) RecordWorkIntake(
 	if item.WorkKind == "" {
 		item.WorkKind = domain.WorkKindGeneric
 	}
-	return s.recordIntake(ctx, item)
+	return item
 }
 
 func (s *Store) recordIntake(
 	ctx context.Context,
 	item domain.WorkItem,
+	admitHistorical bool,
 ) (domain.IntakeReceipt, error) {
 	event := item.Event
 	if event.MessageID == "" && event.EventID == "" {
@@ -198,6 +214,11 @@ func (s *Store) recordIntake(
 	if receipt, ok, err := s.findIntakeReceipt(ctx, event.MessageID, event.EventID); err != nil {
 		return domain.IntakeReceipt{}, err
 	} else if ok {
+		if admitHistorical &&
+			receipt.Disposition == domain.IntakeOfflineBacklog &&
+			receipt.WorkItemID == 0 {
+			return s.admitBackfillReceipt(ctx, receipt, item)
+		}
 		return s.recordDuplicateIntake(ctx, event, receipt)
 	}
 	eventJSON, err := json.Marshal(event)
@@ -222,7 +243,7 @@ func (s *Store) recordIntake(
 	// Compare against the session floor at that same precision so a message
 	// created during the startup second is not misclassified as old backlog.
 	sessionFloor := s.session.StartedAt.Truncate(time.Second)
-	if event.CreatedAt.IsZero() || event.CreatedAt.Before(sessionFloor) {
+	if !admitHistorical && (event.CreatedAt.IsZero() || event.CreatedAt.Before(sessionFloor)) {
 		receipt.Disposition = domain.IntakeOfflineBacklog
 		receipt.Reason = "event predates the current online session or lacks trusted creation time"
 	}
@@ -295,6 +316,81 @@ func (s *Store) recordIntake(
 			"commit intake receipt",
 		).WithCause(err)
 	}
+	return receipt, nil
+}
+
+func (s *Store) admitBackfillReceipt(
+	ctx context.Context,
+	receipt domain.IntakeReceipt,
+	item domain.WorkItem,
+) (domain.IntakeReceipt, error) {
+	eventJSON, err := json.Marshal(item.Event)
+	if err != nil {
+		return domain.IntakeReceipt{}, errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"encode backfill intake event",
+		).WithCause(err)
+	}
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.IntakeReceipt{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin backfill intake",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	result, err := tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO work_items(
+			dedup_key, status, work_kind, priority, session_id, event_json,
+			created_at, updated_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		item.DedupKey, item.Status, item.WorkKind, item.Priority, s.session.ID,
+		string(eventJSON), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	if err != nil {
+		return domain.IntakeReceipt{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"admit backfilled intake work",
+		).WithCause(err)
+	}
+	var workID int64
+	if affected, _ := result.RowsAffected(); affected == 1 {
+		workID, err = lastInsertID(result)
+		if err != nil {
+			return domain.IntakeReceipt{}, err
+		}
+	} else if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM work_items WHERE dedup_key = ?`, item.DedupKey).
+		Scan(&workID); err != nil {
+		return domain.IntakeReceipt{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"locate backfilled intake work",
+		).WithCause(err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE intake_receipts
+		    SET disposition = ?, reason = ?, work_item_id = ?, session_id = ?,
+		        event_json = ?, observed_at = ?
+		  WHERE id = ?`,
+		domain.IntakeAdmitted, "explicitly backfilled by owner", workID,
+		s.session.ID, string(eventJSON), now.Format(time.RFC3339Nano), receipt.ID); err != nil {
+		return domain.IntakeReceipt{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"link backfilled intake receipt",
+		).WithCause(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.IntakeReceipt{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit backfill intake",
+		).WithCause(err)
+	}
+	receipt.Disposition = domain.IntakeAdmitted
+	receipt.Reason = "explicitly backfilled by owner"
+	receipt.WorkItemID = workID
+	receipt.SessionID = s.session.ID
+	receipt.EventJSON = string(eventJSON)
+	receipt.ObservedAt = now
 	return receipt, nil
 }
 

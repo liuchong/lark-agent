@@ -91,6 +91,13 @@ func (s *scopedFakeStore) RecordWorkIntake(
 	return domain.IntakeReceipt{Disposition: domain.IntakeAdmitted}, nil
 }
 
+func (s *scopedFakeStore) RecordBackfillWorkIntake(
+	ctx context.Context,
+	item domain.WorkItem,
+) (domain.IntakeReceipt, error) {
+	return s.RecordWorkIntake(ctx, item)
+}
+
 type delayedPrivateIM struct {
 	generalCalls int
 	message      serviceim.Message
@@ -136,6 +143,13 @@ func (f *fakeStore) RecordWorkIntake(
 	f.items = append(f.items, item)
 	f.events = append(f.events, item.Event)
 	return domain.IntakeReceipt{Disposition: domain.IntakeAdmitted}, nil
+}
+
+func (f *fakeStore) RecordBackfillWorkIntake(
+	ctx context.Context,
+	item domain.WorkItem,
+) (domain.IntakeReceipt, error) {
+	return f.RecordWorkIntake(ctx, item)
 }
 
 func (f *fakeStore) GetPollCursor(string) (time.Time, bool, error) {

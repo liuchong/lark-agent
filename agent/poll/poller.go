@@ -43,6 +43,7 @@ type Store interface {
 	GetPollCursor(scope string) (time.Time, bool, error)
 	SetPollCursor(scope string, cursor time.Time) error
 	RecordWorkIntake(context.Context, domain.WorkItem) (domain.IntakeReceipt, error)
+	RecordBackfillWorkIntake(context.Context, domain.WorkItem) (domain.IntakeReceipt, error)
 }
 
 // Config controls user-message polling.
@@ -202,7 +203,7 @@ func (p *Poller) Backfill(ctx context.Context, req BackfillRequest) (BackfillRes
 			item.WorkKind = decision.WorkKind
 			item.Priority = decision.Priority
 		}
-		receipt, err := p.store.RecordWorkIntake(ctx, item)
+		receipt, err := p.store.RecordBackfillWorkIntake(ctx, item)
 		if err != nil {
 			return result, err
 		}
