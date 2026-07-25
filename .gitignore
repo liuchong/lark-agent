@@ -1,0 +1,12 @@
+/lark-agent
+/lark-agent-daemon
+/LarkAgentStatus
+/.local/
+/.profile/
+/.idea/
+/.vscode/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.DS_Store

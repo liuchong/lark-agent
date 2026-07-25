@@ -1,0 +1,221 @@
+================================================================================
+                            1号公共许可证 (1PL)
+                        One Public License
+                              Version 1.0, March 2026
+================================================================================
+
+本许可证适用于任何包含或引用了本许可证声明的软件及相关文档（以下简称
+"本软件"）。通过使用、复制、修改或分发本软件，您表示接受本许可证的所有
+条款和条件。
+
+
+第 1 条 定义
+--------------------------------------------------------------------------------
+
+1.1 "源代码"指修改本软件的首选形式，包括但不限于所有模块的源代码、相关
+    接口定义文件、用于控制编译和安装的脚本等。
+
+1.2 "衍生作品"指基于本软件或从本软件派生的任何作品，无论是全部还是部分
+    包含本软件的源代码，或经编译、转换后的形式。
+
+1.3 "分发"指以任何方式向第三方提供本软件或其衍生作品的副本，包括但不限于
+    销售、出租、出借、赠送、网络传输等行为。
+
+1.4 "您"指获得本软件授权的个人或组织。
+
+
+第 2 条 授权许可
+--------------------------------------------------------------------------------
+
+2.1 在遵守本许可证所有条款的前提下，每位接收者获得以下权利：
+
+    (a) 以任何目的使用本软件；
+    (b) 复制、修改本软件；
+    (c) 分发本软件及其衍生作品；
+    (d) 再许可本软件，但再许可的条款必须与本许可证一致。
+
+2.2 上述授权是全球性的、免费的、非独占的、永久的和不可撤销的，仅限于本
+    软件的版权期限内。
+
+
+第 3 条 源代码要求（Copyleft 条款）
+--------------------------------------------------------------------------------
+
+3.1 如果您分发本软件的可执行形式或目标代码形式，您必须：
+
+    (a) 同时提供完整的源代码，或
+    (b) 提供书面的源代码获取方式，确保任何第三方都能以不超过分发成本的
+        费用获得源代码，且有效期不少于分发后三年。
+
+3.2 如果您分发本软件的衍生作品，该衍生作品必须：
+
+    (a) 采用本许可证（ONE PUBLIC LICENSE Version 1.0）进行许可；
+    (b) 包含本许可证的完整副本；
+    (c) 在显著位置声明该作品是基于本软件的衍生作品。
+
+3.3 【Copyleft】任何包含本软件或基于本软件的部分、修改、翻译的更大作品，
+    整体必须采用本许可证进行许可。此要求确保自由的传递不被中断。
+
+
+第 4 条 专利授权
+--------------------------------------------------------------------------------
+
+4.1 每位贡献者特此授予您永久的、全球性的、非独占的、免费的、不可撤销的
+    （除本节规定外）专利许可，以制造、委托制造、使用、许诺销售、销售、
+    进口和以其他方式转让本软件。
+
+4.2 如果您对任何人提起专利侵权诉讼，指控本软件或其衍生作品构成直接或
+    间接侵权，则本许可证授予您的所有权利立即终止。
+
+
+第 5 条 免责声明
+--------------------------------------------------------------------------------
+
+5.1 除非适用法律要求或书面同意，本软件按"原样"提供，不做任何明示或暗示
+    的担保，包括但不限于对适销性、特定用途适用性和非侵权性的担保。
+
+5.2 在任何情况下，作者、版权持有人或贡献者均不对因使用本软件而产生的
+    任何直接、间接、偶然、特殊、惩罚性或后果性损害负责，无论该等责任是
+    基于合同、严格责任还是侵权（包括过失或其他）。
+
+
+第 6 条 许可证的终止
+--------------------------------------------------------------------------------
+
+6.1 如果您违反本许可证的任何条款，您使用本软件的授权将自动终止。但是，
+    如果您从违反状态恢复合规，本许可证可由版权持有人恢复。
+
+6.2 本许可证的终止不影响您根据本许可证已合法分发的副本的效力。
+
+
+第 7 条 其他条款
+--------------------------------------------------------------------------------
+
+7.1 您在分发本软件时不得修改本许可证的条款。
+
+7.2 如果本许可证的任何条款被认定为不可执行，该条款应被修改至最小必要
+    程度以使其可执行，其余条款仍完全有效。
+
+7.3 本许可证构成您与版权持有人之间关于本软件的完整协议。
+
+
+================================================================================
+                            ONE PUBLIC LICENSE
+                              Version 1.0, March 2026
+================================================================================
+
+This license applies to any software and associated documentation (the
+"Software") that contains a notice placed by the copyright holder stating that
+it is subject to the terms of this License. By using, copying, modifying, or
+distributing the Software, you accept and agree to be bound by all terms and
+conditions of this License.
+
+
+Article 1 - Definitions
+--------------------------------------------------------------------------------
+
+1.1 "Source Code" means the preferred form for making modifications to the
+    Software, including but not limited to source code for all modules, related
+    interface definition files, and scripts used to control compilation and
+    installation.
+
+1.2 "Derivative Works" means any work based upon or derived from the Software,
+    whether in whole or in part, including the Software's Source Code in its
+    original or modified form, or compiled or transformed versions thereof.
+
+1.3 "Distribution" means providing copies of the Software or Derivative Works
+    to third parties by any means, including but not limited to selling,
+    renting, lending, gifting, or network transmission.
+
+1.4 "You" means an individual or organization exercising rights under this
+    License.
+
+
+Article 2 - Grant of Rights
+--------------------------------------------------------------------------------
+
+2.1 Subject to the terms and conditions of this License, each recipient is
+    hereby granted the following rights:
+
+    (a) to use the Software for any purpose;
+    (b) to copy and modify the Software;
+    (c) to distribute the Software and Derivative Works;
+    (d) to sublicense the Software, provided that sublicensing terms are
+        identical to this License.
+
+2.2 The above rights are worldwide, royalty-free, non-exclusive, perpetual,
+    and irrevocable for the duration of the copyright in the Software.
+
+
+Article 3 - Source Code Requirements (Copyleft)
+--------------------------------------------------------------------------------
+
+3.1 If You distribute the Software in executable or object code form, You must:
+
+    (a) also provide the complete Source Code, or
+    (b) provide a written offer for Source Code access, ensuring that any third
+        party can obtain the Source Code at a cost no greater than the cost of
+        distribution, and valid for at least three years from distribution.
+
+3.2 If You distribute a Derivative Work, such work must:
+
+    (a) be licensed under this License (ONE PUBLIC LICENSE Version 1.0);
+    (b) include a complete copy of this License;
+    (c) prominently state that the work is based on or derived from the
+        Software.
+
+3.3 [Copyleft] Any larger work that includes or is based on any portion of
+    this Software, whether modified or translated, must as a whole be licensed
+    under this License. This requirement ensures that freedom is passed on
+    without interruption.
+
+
+Article 4 - Patent License
+--------------------------------------------------------------------------------
+
+4.1 Each contributor hereby grants You a perpetual, worldwide, non-exclusive,
+    royalty-free, irrevocable (except as stated in this section) patent license
+to make, have made, use, offer to sell, sell, import, and otherwise transfer
+the Software.
+
+4.2 If You institute patent litigation against anyone alleging that the Software
+or Derivative Works constitute direct or contributory patent infringement,
+all rights granted to You under this License shall terminate immediately.
+
+
+Article 5 - Disclaimer of Warranty
+--------------------------------------------------------------------------------
+
+5.1 Unless required by applicable law or agreed to in writing, the Software is
+provided "as is", without warranty of any kind, express or implied, including
+but not limited to the warranties of merchantability, fitness for a particular
+purpose and noninfringement.
+
+5.2 In no event shall the authors, copyright holders, or contributors be liable
+for any claim, damages or other liability, whether in an action of contract,
+tort or otherwise, arising from, out of or in connection with the Software or
+the use or other dealings in the Software.
+
+
+Article 6 - Termination
+--------------------------------------------------------------------------------
+
+6.1 If You violate any term of this License, Your rights under this License
+shall terminate automatically. However, if You resume compliance, this License
+may be reinstated by the copyright holder.
+
+6.2 Termination of this License does not affect the validity of copies
+lawfully distributed by You prior to termination.
+
+
+Article 7 - Miscellaneous
+--------------------------------------------------------------------------------
+
+7.1 You may not modify the terms of this License when distributing the Software.
+
+7.2 If any provision of this License is held to be unenforceable, such provision
+shall be reformed only to the extent necessary to make it enforceable, and the
+remaining provisions shall remain in full force and effect.
+
+7.3 This License constitutes the entire agreement between You and the copyright
+holder concerning the Software.

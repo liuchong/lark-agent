@@ -1,0 +1,7 @@
+{
+  "anchor": {"message_id":"om_anchor","chat_id":"oc_allowed"},
+  "messages": [
+    {"message_id":"om_before","chat_id":"oc_allowed","content":"same chat"},
+    {"message_id":"om_forbidden","chat_id":"oc_other","content":"must never enter context"}
+  ]
+}

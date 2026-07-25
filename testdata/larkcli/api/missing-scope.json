@@ -1,0 +1,13 @@
+{
+  "ok": false,
+  "identity": "bot",
+  "error": {
+    "type": "authorization",
+    "subtype": "missing_scope",
+    "code": 99991679,
+    "message": "missing required test scope",
+    "hint": "enable the test scope",
+    "log_id": "log_fixture",
+    "missing_scopes": ["im:message"]
+  }
+}

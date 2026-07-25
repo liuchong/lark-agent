@@ -1,0 +1,98 @@
+# 运行、恢复与故障处理
+
+## 服务状态
+
+```bash
+lark-agent daemon status
+lark-agent daemon start
+lark-agent daemon stop
+lark-agent daemon restart
+```
+
+LaunchAgent label 是 `com.liuchong.lark-agent`。日志位于
+`~/Library/Logs/lark-agent/`。
+
+正常启动会先完成 SDK/Keychain、配置、状态库、接收入口和调度器初始化，再把在线会话
+标记为 ready，并由机器人私聊 Owner 上线通知。正常停止会先暂停当前未完成工作，
+发送离线通知，再结束在线会话。异常崩溃不会伪造离线通知。
+
+实时消息由官方 Go SDK 的 WebSocket 长连接接收，用户身份轮询作为兜底。日志若持续
+出现 `lark SDK websocket event consumer exited`，说明实时入口没有保持连接，应检查
+app id、Keychain 凭据、事件订阅和权限；不能只用轮询回复成功代替实时验收。
+
+## 队列检查
+
+```bash
+lark-agent queue summary
+lark-agent queue list
+lark-agent queue inspect --work-id 123
+lark-agent queue inspect --message-id om_xxx
+```
+
+inspect 会显示接收回执、工作项、最近模型步骤、最近外部动作和中断快照，用于判断
+消息是离线积压、重复、排队、处理中、中断、已回复还是终态。
+
+## 显式恢复
+
+跨重启任务不会自动回放。只恢复一条明确消息：
+
+```bash
+lark-agent queue resume --work-id 123
+lark-agent queue resume --message-id om_xxx
+```
+
+恢复已完成、已忽略、已取消或死信工作时还必须明确：
+
+```bash
+lark-agent queue resume --work-id 123 --force-terminal
+```
+
+中断时正在执行的 shell、回复、Owner 通知或生命周期通知属于结果不确定的外部
+动作。系统不会自动重发；Owner 必须先根据飞书和本地审计证据确认实际结果。
+
+`queue retry` 只用于加速当前在线会话中处于 `retry_wait` 的普通瞬时失败，并且
+该工作不能有关联的执行中或结果不确定外部动作。它不能恢复处理中、中断、终态
+或其他会话的工作；这些情况必须先 inspect，再按上面的精确 resume 流程处理。
+
+## 审批
+
+```bash
+lark-agent approval list
+lark-agent approval status
+lark-agent approval approve ACTION_ID
+lark-agent approval reject ACTION_ID
+```
+
+批准和拒绝只作用于指定 action ID，不会重新运行模型改写草稿。
+
+## 诊断
+
+只检查 SDK 配置和 Keychain 凭据：
+
+```bash
+lark-agent doctor --lark-only
+```
+
+检查 SDK/Keychain、配置、Workspace、SQLite 和调度状态：
+
+```bash
+lark-agent doctor
+```
+
+缺少 app id、Keychain 凭据、配置无效、Workspace 越界或状态库不可读都会返回非零
+退出码和结构化错误。需要检查远端应用发布态和实时事件权限时，设置
+`LARK_AGENT_REMOTE_DOCTOR=1` 后再运行 doctor。
+
+守护进程内的 worker 共用一个串行 SQLite 连接，避免并发写入彼此返回
+`database is locked`。如果 `queue inspect`、`queue resume` 等另一进程短暂占用写锁，
+守护进程最多等待 5 秒；超时仍会明确记录存储错误，不会把未持久化的状态当成成功。
+
+## 故障回退
+
+- 安装失败：不要加载新服务；保留当前独立状态和安装备份，修复原因后重新 check。
+- 新服务未 ready：安装控制器会卸载新 label；检查 stderr 日志和 doctor。
+- live 行为异常：停止新服务，恢复安装备份，只加载已知可运行的旧版本。
+- 外部动作不确定：保持工作暂停，不要用 `queue retry` 或重启来猜测性重发。
+
+真实验收只允许在“Test Group”和“Assistant Bot”私聊进行，不在 Example Group 群发送测试
+消息。

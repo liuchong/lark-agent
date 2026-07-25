@@ -1,0 +1,145 @@
+// Package policy gates side-effecting actions proposed by the agent.
+package policy
+
+import (
+	"context"
+	"math"
+	"time"
+
+	"github.com/liuchong/lark-agent/agent/domain"
+)
+
+// ThreadState checks live message state before an owner reply is sent.
+type ThreadState interface {
+	OwnerAlreadyReplied(context.Context, domain.WorkItem) (bool, error)
+	MessageWithdrawn(context.Context, domain.WorkItem) (bool, error)
+}
+
+// Config controls reply gates.
+type Config struct {
+	Mode               domain.Mode
+	ReplyConfidenceMin float64
+	OwnerWait          time.Duration
+	BlockChats         []string
+	BlockUsers         []string
+	RequireTestScope   bool
+	Sleeper            func(context.Context, time.Duration) error
+}
+
+// ReplyGate prepares a reply action or blocks/cancels it.
+type ReplyGate struct {
+	cfg   Config
+	state ThreadState
+}
+
+// NewReplyGate creates a gate for reply actions.
+func NewReplyGate(cfg Config, state ThreadState) *ReplyGate {
+	if cfg.Mode == "" {
+		cfg.Mode = domain.ModeAuto
+	}
+	if cfg.ReplyConfidenceMin == 0 {
+		cfg.ReplyConfidenceMin = 0.85
+	}
+	return &ReplyGate{cfg: cfg, state: state}
+}
+
+// Prepare applies hard policy gates before sending.
+func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision domain.Decision) (domain.Action, error) {
+	action := domain.Action{Kind: "reply_message", Status: domain.ActionReady}
+	if decision.Kind != domain.DecisionReply {
+		action.Status = domain.ActionCancelled
+		action.CancelReason = "not_reply_decision"
+		return action, nil
+	}
+	if g.cfg.Mode == domain.ModePaused {
+		action.Status = domain.ActionCancelled
+		action.CancelReason = "agent_paused"
+		return action, nil
+	}
+	if decision.Risk == domain.RiskForbidden {
+		action.Status = domain.ActionBlocked
+		action.CancelReason = "forbidden_risk"
+		return action, nil
+	}
+	if decision.Confidence < g.replyConfidenceMin(decision) {
+		action.Status = domain.ActionAwaitingApproval
+		action.CancelReason = "low_confidence"
+		return action, nil
+	}
+	if contains(g.cfg.BlockChats, item.Event.ChatID) || contains(g.cfg.BlockUsers, item.Event.SenderID) {
+		action.Status = domain.ActionBlocked
+		action.CancelReason = "blocked_target"
+		return action, nil
+	}
+	if g.cfg.RequireTestScope && !item.Event.InTestScope && decision.Relevance != domain.RelevanceOwnerRequest {
+		action.Status = domain.ActionBlocked
+		action.CancelReason = "outside_test_scope"
+		return action, nil
+	}
+	if g.cfg.OwnerWait > 0 &&
+		decision.WorkKind != domain.WorkKindFastPath &&
+		decision.Relevance != domain.RelevanceOwnerRequest {
+		sleep := g.cfg.Sleeper
+		if sleep == nil {
+			sleep = func(ctx context.Context, d time.Duration) error {
+				timer := time.NewTimer(d)
+				defer timer.Stop()
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-timer.C:
+					return nil
+				}
+			}
+		}
+		if err := sleep(ctx, g.cfg.OwnerWait); err != nil {
+			return action, err
+		}
+	}
+	if g.state != nil {
+		withdrawn, err := g.state.MessageWithdrawn(ctx, item)
+		if err != nil {
+			return action, err
+		}
+		if withdrawn {
+			action.Status = domain.ActionCancelled
+			action.CancelReason = "message_withdrawn"
+			return action, nil
+		}
+		if decision.Relevance != domain.RelevanceOwnerRequest {
+			replied, err := g.state.OwnerAlreadyReplied(ctx, item)
+			if err != nil {
+				return action, err
+			}
+			if replied {
+				action.Status = domain.ActionCancelled
+				action.CancelReason = "owner_already_replied"
+				return action, nil
+			}
+		}
+	}
+	if g.cfg.Mode == domain.ModeApproval {
+		action.Status = domain.ActionAwaitingApproval
+		return action, nil
+	}
+	action.Status = domain.ActionReady
+	action.Idempotency = domain.DedupKey(item.Event) + ":reply"
+	return action, nil
+}
+
+func (g *ReplyGate) replyConfidenceMin(decision domain.Decision) float64 {
+	minimum := g.cfg.ReplyConfidenceMin
+	if (decision.Relevance == domain.RelevanceDirectMention || decision.Relevance == domain.RelevanceOwnerRequest) && decision.Risk == domain.RiskLow {
+		minimum = math.Min(minimum, 0.6)
+	}
+	return minimum
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
