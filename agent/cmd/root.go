@@ -961,7 +961,7 @@ func newAgentRouter(cfg config.Config, store *storage.Store) *router.Router {
 		Sensitivity:       cfg.Policy.Sensitivity,
 		DisableFastPath:   !cfg.FastPath.Enabled,
 		DisableCodingGoal: !cfg.Goal.Enabled,
-		StatusText:        func() string { return "lark-agent 正在运行，调度器可用。" },
+		StatusText:        func() string { return "lark-agent 正在运行，调度器可用。" + queueText() },
 		DoctorText:        func() string { return "基础诊断正常。" + queueText() },
 		QueueSummaryText:  queueText,
 	})

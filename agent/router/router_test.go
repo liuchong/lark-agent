@@ -159,6 +159,33 @@ func TestOwnerFastPathCoversDateStatusDoctorQueueAndHelp(t *testing.T) {
 	}
 }
 
+func TestOwnerFastPathCoversResponseStatusQuestions(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID: "owner", AssistantOpenIDs: []string{"bot"}, AssistantNames: []string{"Agent"},
+		StatusText: func() string { return "lark-agent 正在运行，队列可检查。" },
+	})
+	for _, content := range []string{
+		"为什么不说话？",
+		"为什么不回答我的问题？",
+		"@Agent 怎么不回答",
+	} {
+		decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+			ChatType:      "p2p",
+			ChatPartnerID: "bot",
+			SenderID:      "owner",
+			Content:       content,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision.Kind != domain.DecisionReply ||
+			decision.WorkKind != domain.WorkKindFastPath ||
+			!strings.Contains(decision.ReplyText, "队列可检查") {
+			t.Fatalf("content=%q decision=%+v", content, decision)
+		}
+	}
+}
+
 func TestFastPathCanBeDisabledAndCodingGoalIsClassified(t *testing.T) {
 	r := New(Config{OwnerOpenID: "owner", AssistantNames: []string{"Agent"}, DisableFastPath: true})
 	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{

@@ -152,6 +152,13 @@ func (r *Router) fastPathDecision(event domain.NormalizedEvent, base domain.Deci
 	if content == "ping" {
 		return fastPathReply(base, "pong", "fast_path_ping"), true
 	}
+	if isResponseStatusQuestion(content) {
+		text := "lark-agent 正在运行。"
+		if r.cfg.StatusText != nil {
+			text = r.cfg.StatusText()
+		}
+		return fastPathReply(base, text, "fast_path_response_status"), true
+	}
 	switch content {
 	case "状态", "状态如何", "status":
 		text := "lark-agent 正在运行。"
@@ -179,6 +186,15 @@ func (r *Router) fastPathDecision(event domain.NormalizedEvent, base domain.Deci
 		return fastPathReply(base, text, "fast_path_help"), true
 	}
 	return domain.Decision{}, false
+}
+
+func isResponseStatusQuestion(content string) bool {
+	for _, keyword := range []string{"为什么不说话", "为什么不回答", "为什么没回答", "为什么不回应", "怎么不说话", "怎么不回答"} {
+		if strings.Contains(content, keyword) {
+			return true
+		}
+	}
+	return false
 }
 
 func oneOf(value string, candidates ...string) bool {
