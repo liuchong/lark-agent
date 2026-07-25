@@ -27,6 +27,7 @@ func TestAuthStatusReportsMissingUserTokenSeparately(t *testing.T) {
 	t.Setenv("LARK_AGENT_APP_SECRET", "super-secret-value")
 	cfg := config.Default()
 	cfg.Lark.AppID = "cli_a"
+	cfg.Lark.KeychainService = "lark-agent-test-" + strings.ReplaceAll(t.Name(), "/", "-")
 	cfg.Owner.OpenID = "ou_owner"
 	cfg.Assistant.OpenIDs = []string{"ou_bot"}
 	cfg.Workspace.Root = t.TempDir()
@@ -193,6 +194,7 @@ func TestLiveOptionsWithoutUserTokenDoNotExposeUserContextTools(t *testing.T) {
 	cfg := config.Default()
 	cfg.Workspace.Root = t.TempDir()
 	cfg.Lark.AppID = "cli_a"
+	cfg.Lark.KeychainService = "lark-agent-test-" + strings.ReplaceAll(t.Name(), "/", "-")
 	cfg.Owner.OpenID = "ou_owner"
 	cfg.Assistant.OpenIDs = []string{"ou_bot"}
 	cfg.Assistant.Names = []string{"Assistant Bot"}
@@ -276,7 +278,7 @@ func TestQueueSummaryCommandReportsFastPathLane(t *testing.T) {
 
 func TestQueueExposesExplicitInspectAndResumeCommands(t *testing.T) {
 	root := NewRootCommand(strings.NewReader(""), &bytes.Buffer{})
-	for _, path := range [][]string{{"queue", "inspect"}, {"queue", "resume"}} {
+	for _, path := range [][]string{{"queue", "inspect"}, {"queue", "resume"}, {"queue", "backfill"}} {
 		command, _, err := root.Find(path)
 		if err != nil {
 			t.Fatalf("find %v: %v", path, err)

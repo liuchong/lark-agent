@@ -164,6 +164,58 @@ func TestPollerColdStartOnlySetsCursor(t *testing.T) {
 	}
 }
 
+func TestBackfillAdmitsOwnerMentionsWithoutAdvancingPollCursor(t *testing.T) {
+	start := time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC)
+	end := start.Add(2 * time.Hour)
+	cursor := end.Add(30 * time.Minute)
+	store := &fakeStore{cursorSet: true, cursor: cursor}
+	im := &fakeIM{
+		chatResults: map[string]serviceim.SearchChatsResult{
+			"Example Group": {Items: []serviceim.Chat{{ChatID: "oc_rd", Name: "Example Group", ChatMode: "group"}}},
+		},
+		atMessages: serviceim.SearchMessagesResult{Items: []serviceim.Message{{
+			MessageID:    "om_owner_mention",
+			ChatID:       "oc_rd",
+			SenderOpenID: "ou_teammate",
+			SenderType:   "user",
+			Content:      "@_user_1 请看下数据库迁移问题",
+			Mentions:     []domain.Mention{{Key: "@_user_1", OpenID: "ou_owner"}},
+			CreateTime:   start.Add(time.Hour).Format(time.RFC3339),
+		}}},
+	}
+	poller := New(im, store, Config{OwnerOpenID: "ou_owner"})
+	result, err := poller.Backfill(context.Background(), BackfillRequest{
+		ChatQuery: "Example Group",
+		Start:     start,
+		End:       end,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Seen != 1 || result.Inserted != 1 || len(store.items) != 1 {
+		t.Fatalf("result=%+v items=%d", result, len(store.items))
+	}
+	if !store.cursor.Equal(cursor) {
+		t.Fatalf("backfill advanced poll cursor: %s", store.cursor)
+	}
+	call := im.searchCalls[0]
+	if !call.IncludeAtMe ||
+		call.Query != "" ||
+		call.StartISO != start.Format(time.RFC3339) ||
+		call.EndISO != end.Format(time.RFC3339) ||
+		len(call.ChatIDs) != 1 || call.ChatIDs[0] != "oc_rd" ||
+		len(call.AtChatterIDs) != 1 || call.AtChatterIDs[0] != "ou_owner" {
+		t.Fatalf("search call=%+v", call)
+	}
+	event := store.items[0].Event
+	if event.MessageID != "om_owner_mention" ||
+		event.ChatName != "Example Group" ||
+		!event.MentionsUser("ou_owner") ||
+		!event.InTestScope {
+		t.Fatalf("event=%+v", event)
+	}
+}
+
 func TestPollerOverlapRecoversLateIndexedPrivateMessageAfterColdStart(t *testing.T) {
 	start := time.Date(2026, 7, 24, 5, 35, 0, 0, time.UTC)
 	now := start

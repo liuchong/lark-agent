@@ -52,6 +52,10 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 			want: []string{"--work-id", "--message-id", "--force-terminal", "never replayed", "不会自动回放"},
 		},
 		{
+			args: []string{"queue", "backfill", "--help"},
+			want: []string{"--chat-query", "--since", "--until", "@Owner", "never advances the normal poll cursor"},
+		},
+		{
 			args: []string{"daemon", "install-app", "--help"},
 			want: []string{"--write", "--load", "--program", "--poll-interval"},
 		},

@@ -395,6 +395,15 @@ ingested. Message-ID deduplication makes the overlap safe. Every new online
 session advances the intake floor to its own start boundary, so polling cannot
 turn offline backlog into an unsolicited reply after restart.
 
+If user-token polling was unavailable, messages from that outage were never
+observed by the local intake layer and therefore cannot be recovered with
+`queue resume`. The owner may explicitly run `queue backfill` with a chat query
+or exact chat ID and a bounded time range. Backfill only searches owner-mention
+messages visible to the user token, records matching messages through the same
+intake, routing, deduplication, and audit path as polling, and never advances
+the normal poll cursor. It is an operator recovery action, not automatic history
+replay.
+
 ## Conversation Context
 
 Every normalized message preserves Lark's direct-parent, root-message, and
@@ -476,6 +485,9 @@ completed, including the exact last durable stage and any uncertain external
 action. `queue resume` is the only normal path that makes interrupted or
 offline-backlog work claimable in a later session. Replaying an already terminal
 item requires an additional explicit force flag.
+Messages that were never observed because user-token polling was not configured
+have no queue receipt; for those, operators use `queue backfill --chat-query
+<query> --since <time> --until <time>` to create bounded intake records first.
 `queue retry` has a narrower purpose: it may only accelerate ordinary
 `retry_wait` work owned by the currently active session and having no executing
 or blocked external action. It must never make prior-session, processing,
@@ -829,6 +841,10 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given the owner explicitly resumes one interrupted or offline-backlog
   message, when the current session claims it, then a new run uses current
   evidence while preserving the prior audit timeline.
+- Given user-token polling was unavailable and the owner later authorizes it,
+  when the owner runs `queue backfill` with a bounded chat and time range, then
+  only matching @Owner messages are recorded through normal intake and the
+  normal poll cursor is not advanced.
 - Given a reply send was in flight when the process stopped, when recovery
   cannot prove whether Lark accepted it, then the action remains uncertain and
   no reply or owner notice is resent automatically.

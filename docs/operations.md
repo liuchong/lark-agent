@@ -50,6 +50,19 @@ lark-agent queue resume --work-id 123 --force-terminal
 中断时正在执行的 shell、回复、Owner 通知或生命周期通知属于结果不确定的外部
 动作。系统不会自动重发；Owner 必须先根据飞书和本地审计证据确认实际结果。
 
+## 授权缺失后的显式补录
+
+如果 user token 曾经缺失，用户身份轮询无法读取群里 @Owner 的消息，这些消息没有
+本地队列回执，不能用 `queue resume` 恢复。授权补齐后，只补录一个明确群和时间范围：
+
+```bash
+lark-agent queue backfill --chat-query "Test Group" --since 8h --until 0s
+lark-agent queue backfill --chat-id oc_xxx --since 2026-07-25T08:00:00+08:00 --until 2026-07-25T15:30:00+08:00
+```
+
+`queue backfill` 只搜索 @Owner 消息，使用正常入队、路由和去重逻辑，且不会推进常规
+轮询 cursor。补录后用 `queue summary` 查看新增工作，再由常驻 daemon 按当前策略处理。
+
 `queue retry` 只用于加速当前在线会话中处于 `retry_wait` 的普通瞬时失败，并且
 该工作不能有关联的执行中或结果不确定外部动作。它不能恢复处理中、中断、终态
 或其他会话的工作；这些情况必须先 inspect，再按上面的精确 resume 流程处理。

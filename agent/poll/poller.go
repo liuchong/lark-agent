@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -63,6 +65,25 @@ type Result struct {
 	TestChatIDs []string `json:"test_chat_ids,omitempty" yaml:"test_chat_ids,omitempty"`
 }
 
+// BackfillRequest explicitly recovers owner mentions that were never captured
+// by the normal online polling window.
+type BackfillRequest struct {
+	ChatQuery string
+	ChatIDs   []string
+	Start     time.Time
+	End       time.Time
+	PageSize  int
+}
+
+// BackfillResult summarizes an explicit historical intake operation.
+type BackfillResult struct {
+	Seen     int      `json:"seen" yaml:"seen"`
+	Inserted int      `json:"inserted" yaml:"inserted"`
+	ChatIDs  []string `json:"chat_ids" yaml:"chat_ids"`
+	StartISO string   `json:"start" yaml:"start"`
+	EndISO   string   `json:"end" yaml:"end"`
+}
+
 // Poller discovers visible conversations and ingests new messages.
 type Poller struct {
 	im            IMClient
@@ -103,6 +124,160 @@ func New(im IMClient, store Store, cfg Config) *Poller {
 		indexLookback: indexLookback,
 		currentTime:   now,
 	}
+}
+
+// Backfill explicitly searches a bounded time range for owner mentions and
+// records matching messages without advancing the normal poll cursor.
+func (p *Poller) Backfill(ctx context.Context, req BackfillRequest) (BackfillResult, error) {
+	if err := ctx.Err(); err != nil {
+		return BackfillResult{}, err
+	}
+	if strings.TrimSpace(p.cfg.OwnerOpenID) == "" {
+		return BackfillResult{}, fmt.Errorf("owner open_id is required")
+	}
+	start := req.Start.UTC()
+	end := req.End.UTC()
+	if start.IsZero() || end.IsZero() {
+		return BackfillResult{}, fmt.Errorf("backfill requires --since and --until")
+	}
+	if !end.After(start) {
+		return BackfillResult{}, fmt.Errorf("backfill --until must be after --since")
+	}
+	chatIDs, err := p.backfillChatTargets(ctx, req)
+	if err != nil {
+		return BackfillResult{}, err
+	}
+	result := BackfillResult{
+		ChatIDs:  chatIDs,
+		StartISO: start.Format(time.RFC3339),
+		EndISO:   end.Format(time.RFC3339),
+	}
+	if len(chatIDs) == 0 {
+		return result, nil
+	}
+	pageSize := req.PageSize
+	if pageSize <= 0 {
+		pageSize = p.pageSize
+	}
+	if pageSize > 50 {
+		pageSize = 50
+	}
+	atMe, err := p.searchAllMessages(ctx, serviceim.SearchMessagesRequest{
+		ChatIDs:        chatIDs,
+		StartISO:       result.StartISO,
+		EndISO:         result.EndISO,
+		PageSize:       pageSize,
+		IncludeAtMe:    true,
+		AtChatterIDs:   []string{p.cfg.OwnerOpenID},
+		ExcludeBotSend: true,
+		ChatType:       p.chatTypeFilter(),
+	})
+	if err != nil {
+		return result, err
+	}
+	seen := map[string]serviceim.Message{}
+	for _, msg := range atMe.Items {
+		if msg.MessageID != "" {
+			seen[msg.MessageID] = msg
+		}
+	}
+	if err := p.hydrateExactMessageDetails(ctx, seen); err != nil {
+		return result, err
+	}
+	if err := p.hydrateChatMetadata(ctx, seen); err != nil {
+		return result, err
+	}
+	if err := p.hydrateEmptyMessages(ctx, seen); err != nil {
+		return result, err
+	}
+	result.Seen = len(seen)
+	for _, msg := range seen {
+		event := p.eventFromMessage(msg, true)
+		item := domain.NewWorkItem(event)
+		if p.cfg.Classify != nil {
+			decision, err := p.cfg.Classify(ctx, item)
+			if err != nil {
+				return result, err
+			}
+			item.WorkKind = decision.WorkKind
+			item.Priority = decision.Priority
+		}
+		receipt, err := p.store.RecordWorkIntake(ctx, item)
+		if err != nil {
+			return result, err
+		}
+		if receipt.Disposition == domain.IntakeAdmitted {
+			result.Inserted++
+		}
+	}
+	return result, nil
+}
+
+func (p *Poller) backfillChatTargets(ctx context.Context, req BackfillRequest) ([]string, error) {
+	ids := uniqueNonEmpty(req.ChatIDs)
+	if len(ids) > 0 {
+		for _, id := range ids {
+			p.testChats[id] = serviceim.Chat{ChatID: id}
+		}
+		if err := p.hydrateKnownChats(ctx, ids); err != nil {
+			return nil, err
+		}
+		sort.Strings(ids)
+		return ids, nil
+	}
+	query := strings.TrimSpace(req.ChatQuery)
+	if query == "" {
+		query = strings.TrimSpace(p.cfg.ChatQuery)
+	}
+	if query == "" {
+		return nil, fmt.Errorf("backfill requires --chat-query or --chat-id")
+	}
+	var out []string
+	pageToken := ""
+	for {
+		result, err := p.im.SearchChats(ctx, serviceim.SearchChatsRequest{
+			Query:     query,
+			PageSize:  50,
+			PageToken: pageToken,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, chat := range result.Items {
+			if chat.ChatID == "" {
+				continue
+			}
+			p.testChats[chat.ChatID] = chat
+			out = append(out, chat.ChatID)
+		}
+		if !result.HasMore || result.PageToken == "" {
+			break
+		}
+		pageToken = result.PageToken
+	}
+	out = uniqueNonEmpty(out)
+	sort.Strings(out)
+	return out, nil
+}
+
+func (p *Poller) hydrateKnownChats(ctx context.Context, chatIDs []string) error {
+	getter, ok := p.im.(chatBatchGetter)
+	if !ok || len(chatIDs) == 0 {
+		return nil
+	}
+	details, err := getter.BatchGetChats(ctx, chatIDs)
+	if err != nil {
+		return err
+	}
+	for _, id := range chatIDs {
+		chat := details[id]
+		if chat.ChatID == "" {
+			chat.ChatID = id
+		}
+		p.chatDetails[id] = chat
+		p.testChats[id] = chat
+	}
+	return nil
 }
 
 // Poll ingests messages newer than the last cursor. On first run it only sets

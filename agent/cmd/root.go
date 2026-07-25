@@ -104,7 +104,7 @@ Modes:
 		newModelCommand(in, out, &configPath),
 		newDaemonCommand(out, &configPath, &statePath),
 		newModeCommand(out, &configPath),
-		newQueueCommand(out, &statePath),
+		newQueueCommand(out, &configPath, &statePath),
 		newSubscriptionCommand(out, &statePath),
 		newApprovalCommand(out, &statePath),
 		newMemoryCommand(out),
@@ -1270,7 +1270,7 @@ func newModeCommand(out io.Writer, configPath *string) *cobra.Command {
 	return cmd
 }
 
-func newQueueCommand(out io.Writer, statePath *string) *cobra.Command {
+func newQueueCommand(out io.Writer, configPath, statePath *string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "queue",
 		Short: "Inspect or repair the durable queue",
@@ -1311,6 +1311,7 @@ func newQueueCommand(out io.Writer, statePath *string) *cobra.Command {
 	})
 	cmd.AddCommand(newQueueInspectCommand(out, statePath))
 	cmd.AddCommand(newQueueResumeCommand(out, statePath))
+	cmd.AddCommand(newQueueBackfillCommand(out, configPath, statePath))
 	cmd.AddCommand(newQueueRetryCommand(out, statePath))
 	cmd.AddCommand(newQueueExportCommand(out, statePath))
 	cmd.AddCommand(&cobra.Command{
@@ -1384,6 +1385,131 @@ func newQueueResumeCommand(out io.Writer, statePath *string) *cobra.Command {
 	cmd.Flags().StringVar(&messageID, "message-id", "", "exact Lark message id")
 	cmd.Flags().BoolVar(&forceTerminal, "force-terminal", false, "allow explicit replay of terminal work")
 	return cmd
+}
+
+func newQueueBackfillCommand(out io.Writer, configPath, statePath *string) *cobra.Command {
+	var chatQuery string
+	var chatIDs []string
+	var since string
+	var until string
+	var includePrivate bool
+	var pageSize int
+	cmd := &cobra.Command{
+		Use:   "backfill --chat-query QUERY --since TIME [--until TIME]",
+		Short: "Explicitly backfill missed @Owner messages",
+		Long: "Explicitly search a bounded Lark time range for messages that @Owner, " +
+			"then record matching messages into the durable queue. This recovers messages " +
+			"that were never captured while user-token polling was unavailable. It never " +
+			"advances the normal poll cursor and never scans history without --since.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if strings.TrimSpace(since) == "" {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "queue backfill requires --since").
+					WithParam("--since")
+			}
+			if strings.TrimSpace(chatQuery) == "" && len(chatIDs) == 0 {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "queue backfill requires --chat-query or --chat-id").
+					WithParam("--chat-query")
+			}
+			now := time.Now()
+			start, err := parseBackfillTime(since, now)
+			if err != nil {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid --since: %s", since).
+					WithParam("--since").
+					WithCause(err)
+			}
+			end := now.UTC()
+			if strings.TrimSpace(until) != "" {
+				end, err = parseBackfillTime(until, now)
+				if err != nil {
+					return errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid --until: %s", until).
+						WithParam("--until").
+						WithCause(err)
+				}
+			}
+			if pageSize <= 0 {
+				pageSize = 20
+			}
+			if pageSize > 50 {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "--page-size must be at most 50").
+					WithParam("--page-size")
+			}
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			credentials, err := serviceim.LoadCredentials(cmd.Context(), credentialRefs(cfg))
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(credentials.UserAccessToken) == "" {
+				return errs.NewConfigError(errs.SubtypeNotConfigured, "lark user access token is not configured").
+					WithHint("run `lark-agent auth login` before queue backfill")
+			}
+			client, err := serviceim.NewClient(serviceim.ClientConfig{
+				AppID:           cfg.Lark.AppID,
+				AppSecret:       credentials.AppSecret,
+				UserAccessToken: credentials.UserAccessToken,
+				BaseURL:         cfg.Lark.BaseURL,
+				Timeout:         30 * time.Second,
+			})
+			if err != nil {
+				return err
+			}
+			store, err := storage.OpenInspection(resolveStatePath(*statePath))
+			if err != nil {
+				return err
+			}
+			defer store.Close() //nolint:errcheck // bounded queue repair command
+			agentRouter := newAgentRouter(cfg, store)
+			poller := newConfiguredLivePoller(
+				serviceim.NewService(client, cfg.Owner.OpenID),
+				store,
+				agentRouter,
+				cfg,
+				chatQuery,
+				includePrivate,
+			)
+			result, err := poller.Backfill(cmd.Context(), poll.BackfillRequest{
+				ChatQuery: chatQuery,
+				ChatIDs:   chatIDs,
+				Start:     start,
+				End:       end,
+				PageSize:  pageSize,
+			})
+			if err != nil {
+				return err
+			}
+			return writeData(out, result)
+		},
+	}
+	cmd.Flags().StringVar(&chatQuery, "chat-query", "", "visible chat search keyword, for example Example Group")
+	cmd.Flags().StringArrayVar(&chatIDs, "chat-id", nil, "exact Lark chat id; may be passed more than once")
+	cmd.Flags().StringVar(&since, "since", "", "required start time, RFC3339 or lookback duration such as 8h")
+	cmd.Flags().StringVar(&until, "until", "", "optional end time, RFC3339 or lookback duration; defaults to now")
+	cmd.Flags().BoolVar(&includePrivate, "include-private", false, "also allow private chats when searching")
+	cmd.Flags().IntVar(&pageSize, "page-size", 20, "Lark message search page size, max 50")
+	return cmd
+}
+
+func parseBackfillTime(raw string, now time.Time) (time.Time, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return time.Time{}, fmt.Errorf("time value is required")
+	}
+	if duration, err := time.ParseDuration(value); err == nil {
+		if duration < 0 {
+			return time.Time{}, fmt.Errorf("duration must be positive")
+		}
+		return now.Add(-duration).UTC(), nil
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed.UTC(), nil
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return parsed.UTC(), nil
 }
 
 func newQueueExportCommand(out io.Writer, statePath *string) *cobra.Command {
