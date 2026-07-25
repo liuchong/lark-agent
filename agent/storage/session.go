@@ -215,7 +215,6 @@ func (s *Store) recordIntake(
 		return domain.IntakeReceipt{}, err
 	} else if ok {
 		if admitHistorical &&
-			receipt.Disposition == domain.IntakeOfflineBacklog &&
 			receipt.WorkItemID == 0 {
 			return s.admitBackfillReceipt(ctx, receipt, item)
 		}

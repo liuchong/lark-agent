@@ -88,6 +88,14 @@ func TestBackfillAdmitsExistingOfflineBacklogReceiptWithCurrentClassification(t 
 	if backlog.Disposition != domain.IntakeOfflineBacklog {
 		t.Fatalf("backlog=%+v", backlog)
 	}
+	duplicateWithoutWork, err := store.RecordIntake(context.Background(), event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicateWithoutWork.Disposition != domain.IntakeDuplicate ||
+		duplicateWithoutWork.WorkItemID != 0 {
+		t.Fatalf("duplicateWithoutWork=%+v", duplicateWithoutWork)
+	}
 	item := domain.NewWorkItem(event)
 	item.WorkKind = domain.WorkKindDirectMention
 	item.Priority = domain.PriorityDirectMention
@@ -95,10 +103,10 @@ func TestBackfillAdmitsExistingOfflineBacklogReceiptWithCurrentClassification(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if receipt.ID != backlog.ID ||
+	if receipt.ID != duplicateWithoutWork.ID ||
 		receipt.Disposition != domain.IntakeAdmitted ||
 		receipt.WorkItemID == 0 {
-		t.Fatalf("receipt=%+v backlog=%+v", receipt, backlog)
+		t.Fatalf("receipt=%+v backlog=%+v duplicateWithoutWork=%+v", receipt, backlog, duplicateWithoutWork)
 	}
 	claimed, ok, err := store.ClaimNext("worker")
 	if err != nil || !ok {
