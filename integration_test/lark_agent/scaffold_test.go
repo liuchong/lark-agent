@@ -350,6 +350,59 @@ func (privateReplyThreadState) MessageWithdrawn(context.Context, domain.WorkItem
 	return false, nil
 }
 
+func TestDelegatedReplyScopeControlsOutsideGroupReply(t *testing.T) {
+	tests := []struct {
+		name        string
+		scope       domain.ReplyScope
+		wantStatus  domain.ActionStatus
+		wantReplies int
+	}{
+		{
+			name:        "default all groups sends",
+			scope:       config.Default().Policy.ReplyScope,
+			wantStatus:  domain.ActionCompleted,
+			wantReplies: 1,
+		},
+		{
+			name:        "configured groups blocks outside group",
+			scope:       domain.ReplyScopeConfiguredGroups,
+			wantStatus:  domain.ActionBlocked,
+			wantReplies: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			messenger := &privateReplyMessenger{}
+			controller := reply.NewController(
+				policy.NewReplyGate(policy.Config{
+					Mode:       domain.ModeAuto,
+					ReplyScope: tt.scope,
+				}, privateReplyThreadState{}),
+				messenger,
+			)
+			result, err := controller.Handle(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+				MessageID:   "om_outside_group",
+				ChatID:      "oc_other_group",
+				ChatType:    "group",
+				SenderID:    "ou_other",
+				InTestScope: false,
+			}), domain.Decision{
+				Kind:       domain.DecisionReply,
+				Relevance:  domain.RelevanceDirectMention,
+				Confidence: 0.99,
+				Risk:       domain.RiskLow,
+				ReplyText:  "收到，我先确认。",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Action.Status != tt.wantStatus || messenger.userReplies != tt.wantReplies {
+				t.Fatalf("result=%+v messenger=%+v", result, messenger)
+			}
+		})
+	}
+}
+
 func TestPrivateOwnerRequestUsesBotReplyPath(t *testing.T) {
 	messenger := &privateReplyMessenger{}
 	controller := reply.NewController(
@@ -933,6 +986,84 @@ func TestOwnerAssistantInvocationRoutesOnlyOwner(t *testing.T) {
 	}
 }
 
+func TestInvalidReplyScopeFailsAtConfigLoad(t *testing.T) {
+	bin := buildAgentBinary(t)
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "agent.yaml")
+	workspace := filepath.Join(dir, "workspace")
+	if err := os.Mkdir(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	code, _, stderr := runAgent(t, bin,
+		"--config", configPath,
+		"init",
+		"--workspace", workspace,
+		"--app-id", "cli_test",
+		"--owner-open-id", "ou_owner",
+	)
+	if code != 0 {
+		t.Fatalf("init exit=%d stderr=%s", code, stderr)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := bytes.Replace(data, []byte("reply_scope: all_groups"), []byte("reply_scope: test_chat"), 1)
+	if bytes.Equal(invalid, data) {
+		t.Fatalf("initialized config missing explicit reply_scope:\n%s", data)
+	}
+	if err := os.WriteFile(configPath, invalid, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, _, stderr = runAgent(t, bin, "--config", configPath, "config", "show")
+	if code == 0 ||
+		!strings.Contains(stderr, "policy.reply_scope") ||
+		!strings.Contains(stderr, "test_chat") {
+		t.Fatalf("config show exit=%d stderr=%s", code, stderr)
+	}
+}
+
+func TestConfiguredGroupsScopeWithoutChatQueryFailsLiveStartup(t *testing.T) {
+	bin := buildAgentBinary(t)
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "agent.yaml")
+	statePath := filepath.Join(dir, "state.db")
+	workspace := filepath.Join(dir, "workspace")
+	if err := os.Mkdir(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	code, _, stderr := runAgent(t, bin,
+		"--config", configPath,
+		"init",
+		"--workspace", workspace,
+		"--app-id", "cli_test",
+		"--owner-open-id", "ou_owner",
+	)
+	if code != 0 {
+		t.Fatalf("init exit=%d stderr=%s", code, stderr)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Policy.ReplyScope = domain.ReplyScopeConfiguredGroups
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	code, _, stderr = runAgentWithEnv(t, []string{"LARK_AGENT_OFFLINE_LIVE_TEST=1"}, bin,
+		"--config", configPath,
+		"--state", statePath,
+		"daemon", "run",
+		"--live",
+		"--once",
+	)
+	if code == 0 ||
+		!strings.Contains(stderr, "policy.reply_scope") ||
+		!strings.Contains(stderr, "--chat-query") {
+		t.Fatalf("daemon run exit=%d stderr=%s", code, stderr)
+	}
+}
+
 func TestDoctorReportsAssistantOwnerDirect(t *testing.T) {
 	bin := buildAgentBinary(t)
 	dir := t.TempDir()
@@ -963,7 +1094,9 @@ func TestDoctorReportsAssistantOwnerDirect(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("doctor exit=%d stderr=%s", code, stderr)
 	}
-	if !strings.Contains(stdout, `"assistant"`) || !strings.Contains(stdout, `"owner_direct_enabled":false`) {
+	if !strings.Contains(stdout, `"assistant"`) ||
+		!strings.Contains(stdout, `"owner_direct_enabled":false`) ||
+		!strings.Contains(stdout, `"reply_scope":"all_groups"`) {
 		t.Fatalf("doctor missing assistant owner direct state:\n%s", stdout)
 	}
 }

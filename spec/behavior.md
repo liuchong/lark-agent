@@ -591,10 +591,27 @@ acknowledgement fallback. `notify` performs a real owner notification,
 auditable trajectory, and ignore/reply outcomes preserve the actual action
 status rather than treating blocked or awaiting actions as completed.
 
+Delegated group replies have an explicit `policy.reply_scope`:
+
+- `all_groups` allows a direct owner mention from every user-visible group to
+  pass the reply-scope gate;
+- `configured_groups` allows delegated replies only in groups discovered by
+  the daemon's `--chat-query`, and startup fails if that query is empty.
+
+`all_groups` is the default. `--chat-query` still discovers and marks the
+primary validation group, but it does not restrict delegated replies while
+`reply_scope` is `all_groups`. Reply scope does not bypass blocked chats or
+users, model relevance and risk checks, confidence and approval policy, the
+owner wait window, withdrawn-message and owner-already-replied checks, or
+idempotent sending. Changing reply scope never replays completed, ignored, or
+interrupted historical work; operators must inspect and explicitly resume an
+individual work item.
+
 `--dry-run` uses the same intake, context, and model decision path but does not
 execute the reply tool. Initial live validation should run dry-run across
-visible conversations, then allow one bounded configured test-chat reply. The
-current live acceptance chat is `Test Group`; Example Group is excluded from live testing.
+visible conversations, then allow one bounded authorized chat reply. Live
+validation targets are operational constraints and are independent from the
+configured reply scope.
 
 The model is not given tools for payments, contracts, personnel decisions,
 permission grants, permanent external deletion, subjective commitments,
@@ -642,6 +659,19 @@ The multi-step loop is accepted by these executable BDD scenarios:
   after a terminal outcome, without a timer controlling removal.
 - Given another sender mentions the owner, when the agent evaluates or replies
   as the owner's delegate, then it never adds the assistant working reaction.
+- Given `policy.reply_scope` is `all_groups` and another sender directly
+  mentions the owner in a group that does not match `--chat-query`, when the
+  reply passes all other policy checks, then the agent may reply as the owner
+  and the query is not used as a final reply gate.
+- Given `policy.reply_scope` is `configured_groups` and another sender directly
+  mentions the owner outside the groups discovered by `--chat-query`, when the
+  final reply gate runs, then the reply is blocked as outside the configured
+  scope.
+- Given `policy.reply_scope` is `configured_groups` but the daemon has no
+  `--chat-query`, when live options are built, then startup fails with a
+  configuration error instead of silently blocking every delegated reply.
+- Given `policy.reply_scope` contains an unsupported value, when configuration
+  is loaded, then validation fails and names the `policy.reply_scope` field.
 - Given an owner request is visible through `im.message.receive_v1`, when the
   real-time adapter receives it, then it is classified and persisted immediately,
   without waiting for the next user-token poll.

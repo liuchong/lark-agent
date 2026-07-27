@@ -45,7 +45,9 @@ go build -o ./lark-agent ./cmd/lark-agent
 安装脚本支持以下环境变量：
 
 - `CONFIG_PATH`、`STATE_PATH`：覆盖独立目标路径。
-- `CHAT_QUERY`：限制初始验收群关键词，默认“Test Group”。
+- `CHAT_QUERY`：发现并标记配置群和验收群的关键词，默认“Test Group”。默认
+  `policy.reply_scope: all_groups` 时不会据此限制其他群；仅
+  `configured_groups` 模式把它作为代回复范围。
 - `POLL_INTERVAL`：轮询间隔，默认 `10s`。
 - `INSTALL_LOAD=0`：只安装，不加载，供隔离验证使用。
 - `OPEN_STATUS_APP=0`：安装后不打开状态栏，供隔离验证使用。

@@ -31,6 +31,9 @@ lark-agent config show
 - `workspace.root`：唯一 Workspace，必须是绝对路径。
 - `workspace.excludes`：不可读写的秘密或构建目录模式。
 - `policy.mode`：`auto`、`approval` 或 `paused`。
+- `policy.reply_scope`：群内代回复范围。`all_groups` 是默认值，允许任意可见群里的
+  直接 `@Owner` 进入其余回复门禁；`configured_groups` 只允许 daemon
+  `--chat-query` 发现的群，并要求启动参数提供非空群关键词。
 - `policy.allow_chats`、`block_chats`、`block_users`：确定性的会话和用户边界。
 - `scheduler.*`：不同工作通道的 lease 和 worker 数量。
 - `agent.*`、`tool_policy.*`、`goal.*`：模型轮次、工具输出、无进展和长任务上限。
@@ -52,6 +55,29 @@ lark-agent mode paused
 - `paused`：停止领取新工作和未发送副作用；已完成审计记录保留。
 
 模式变化不会扩大 Workspace、身份、会话或飞书权限边界。
+
+## 群回复范围
+
+当前实际安装建议明确配置：
+
+```yaml
+policy:
+  reply_scope: all_groups
+```
+
+这只放开“群范围”这一道门。黑名单、模型相关性与风险判断、置信度和审批模式、
+Owner 等待时间、撤回检查、Owner 已回复检查与幂等发送仍然生效。
+
+需要重新限制到验收群时改为：
+
+```yaml
+policy:
+  reply_scope: configured_groups
+```
+
+此模式必须同时为 daemon 提供 `--chat-query`。`--chat-query` 负责发现并标记允许群；
+在 `all_groups` 模式下，它只保留群发现和验收用途，不会限制其他群里的正常
+`@Owner` 处理。切换范围不会自动重放历史终态或中断工作。
 
 ## Workspace
 

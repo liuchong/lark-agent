@@ -553,7 +553,7 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 	runCmd.Flags().BoolVar(&once, "once", false, "process at most one queued item and exit")
 	runCmd.Flags().BoolVar(&live, "live", false, "consume owner bot events in real time and poll user-visible Lark conversations as fallback")
 	runCmd.Flags().BoolVar(&dryRun, "dry-run", false, "run live intake and model decisions without sending replies")
-	runCmd.Flags().StringVar(&chatQuery, "chat-query", "", "chat keyword used to mark the primary test chat, for example Test Group")
+	runCmd.Flags().StringVar(&chatQuery, "chat-query", "", "chat keyword used to mark configured and validation groups")
 	runCmd.Flags().BoolVar(&includePrivate, "include-private", true, "include private chats in live user-visible polling")
 	runCmd.Flags().DurationVar(&pollInterval, "poll-interval", 30*time.Second, "live polling interval")
 	cmd.AddCommand(runCmd)
@@ -677,7 +677,7 @@ func newDaemonInstallAppCommand(out io.Writer, configPath, statePath *string) *c
 	cmd.Flags().BoolVar(&load, "load", false, "load and start the LaunchAgent after writing")
 	cmd.Flags().StringVar(&program, "program", "", "lark-agent binary path (default: current executable)")
 	cmd.Flags().BoolVar(&live, "live", true, "run daemon with live Lark polling")
-	cmd.Flags().StringVar(&chatQuery, "chat-query", "Test Group", "test chat query used by live daemon")
+	cmd.Flags().StringVar(&chatQuery, "chat-query", "Test Group", "chat keyword used to mark configured and validation groups")
 	cmd.Flags().DurationVar(&pollInterval, "poll-interval", 10*time.Second, "daemon live polling interval")
 	return cmd
 }
@@ -791,11 +791,15 @@ func buildLiveOptions(
 		"dry_run":                 dryRun,
 		"model_configured":        false,
 		"chat_query":              chatQuery,
+		"reply_scope":             cfg.Policy.ReplyScope,
 		"include_private":         includePrivate,
 		"realtime_owner_requests": false,
 	}
 	if !live {
 		return nil, nil, nil, info, nil
+	}
+	if err := validateLiveReplyScope(cfg.Policy.ReplyScope, chatQuery); err != nil {
+		return nil, nil, nil, info, err
 	}
 	if os.Getenv("LARK_AGENT_OFFLINE_LIVE_TEST") == "1" {
 		info["offline_live_test"] = true
@@ -930,11 +934,11 @@ func buildLiveOptions(
 		}
 		gate := policy.NewReplyGate(policy.Config{
 			Mode:               cfg.Policy.Mode,
+			ReplyScope:         cfg.Policy.ReplyScope,
 			ReplyConfidenceMin: cfg.Policy.ReplyConfidenceMin,
 			OwnerWait:          cfg.Policy.OwnerWait,
 			BlockChats:         cfg.Policy.BlockChats,
 			BlockUsers:         cfg.Policy.BlockUsers,
-			RequireTestScope:   chatQuery != "",
 		}, threadState)
 		options = append(options,
 			app.WithReplyHandler(reply.NewController(gate, imSvc, store)),
@@ -943,6 +947,17 @@ func buildLiveOptions(
 		)
 	}
 	return options, realtimeSource, imSvc, info, nil
+}
+
+func validateLiveReplyScope(scope domain.ReplyScope, chatQuery string) error {
+	if scope == domain.ReplyScopeConfiguredGroups && strings.TrimSpace(chatQuery) == "" {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"policy.reply_scope configured_groups requires --chat-query",
+		).WithField("policy.reply_scope").
+			WithHint("set policy.reply_scope to all_groups or provide --chat-query")
+	}
+	return nil
 }
 
 func newConfiguredLivePoller(
@@ -1882,10 +1897,11 @@ func newDoctorCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 				return err
 			}
 			return writeData(out, map[string]any{
-				"ok":        true,
-				"lark":      larkStatus,
-				"workspace": scope.Snapshot(),
-				"mode":      cfg.Policy.Mode,
+				"ok":          true,
+				"lark":        larkStatus,
+				"workspace":   scope.Snapshot(),
+				"mode":        cfg.Policy.Mode,
+				"reply_scope": cfg.Policy.ReplyScope,
 				"scheduler": map[string]any{
 					"fast_path_enabled":     cfg.FastPath.Enabled,
 					"foreground_workers":    cfg.Scheduler.ForegroundWorkers,

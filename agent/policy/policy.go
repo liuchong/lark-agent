@@ -18,11 +18,11 @@ type ThreadState interface {
 // Config controls reply gates.
 type Config struct {
 	Mode               domain.Mode
+	ReplyScope         domain.ReplyScope
 	ReplyConfidenceMin float64
 	OwnerWait          time.Duration
 	BlockChats         []string
 	BlockUsers         []string
-	RequireTestScope   bool
 	Sleeper            func(context.Context, time.Duration) error
 }
 
@@ -36,6 +36,9 @@ type ReplyGate struct {
 func NewReplyGate(cfg Config, state ThreadState) *ReplyGate {
 	if cfg.Mode == "" {
 		cfg.Mode = domain.ModeAuto
+	}
+	if cfg.ReplyScope == "" {
+		cfg.ReplyScope = domain.ReplyScopeAllGroups
 	}
 	if cfg.ReplyConfidenceMin == 0 {
 		cfg.ReplyConfidenceMin = 0.85
@@ -71,9 +74,11 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 		action.CancelReason = "blocked_target"
 		return action, nil
 	}
-	if g.cfg.RequireTestScope && !item.Event.InTestScope && decision.Relevance != domain.RelevanceOwnerRequest {
+	if g.cfg.ReplyScope == domain.ReplyScopeConfiguredGroups &&
+		!item.Event.InTestScope &&
+		decision.Relevance != domain.RelevanceOwnerRequest {
 		action.Status = domain.ActionBlocked
-		action.CancelReason = "outside_test_scope"
+		action.CancelReason = "outside_reply_scope"
 		return action, nil
 	}
 	if g.cfg.OwnerWait > 0 &&

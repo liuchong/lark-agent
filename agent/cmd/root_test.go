@@ -255,6 +255,20 @@ func TestLiveOptionsWithoutUserTokenDoNotExposeUserContextTools(t *testing.T) {
 	}
 }
 
+func TestConfiguredGroupsReplyScopeRequiresChatQuery(t *testing.T) {
+	if err := validateLiveReplyScope(domain.ReplyScopeConfiguredGroups, ""); err == nil ||
+		!strings.Contains(err.Error(), "policy.reply_scope") ||
+		!strings.Contains(err.Error(), "--chat-query") {
+		t.Fatalf("missing configured-groups validation: %v", err)
+	}
+	if err := validateLiveReplyScope(domain.ReplyScopeConfiguredGroups, "龙虾群"); err != nil {
+		t.Fatalf("configured groups with query rejected: %v", err)
+	}
+	if err := validateLiveReplyScope(domain.ReplyScopeAllGroups, ""); err != nil {
+		t.Fatalf("all groups without query rejected: %v", err)
+	}
+}
+
 func TestAgentConfigFingerprintIncludesDecisionToolContract(t *testing.T) {
 	cfg := config.Default()
 	contract, err := currentAgentOperatingContract()

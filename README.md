@@ -9,8 +9,9 @@
 
 - Owner 在“Assistant Bot”私聊机器人，或在群里直接 @机器人时，机器人回答
   Owner；处理期间添加键盘工作表情，结束后删除。
-- 他人在群里直接 @Owner 时，Agent 可按策略用 Owner 身份回复；回复成功后再由
-  机器人私聊 Owner 说明已经回复以及仍需处理的事项。
+- 他人在任意用户可见群里直接 @Owner 时，Agent 默认可按策略用 Owner 身份回复；
+  回复成功后再由机器人私聊 Owner 说明已经回复以及仍需处理的事项。可以通过
+  `policy.reply_scope` 改回仅允许配置群。
 - 没有显式引用时使用同一会话内的邻近消息；有引用或 thread 时沿引用关系读取，
   不会把其他群或私聊的内容混入上下文。
 - 编程问题可在配置的 Workspace 内使用有边界的代码搜索、文件读取和 shell
@@ -60,8 +61,9 @@ export OPENAI_MODEL='model-name'
 `com.liuchong.lark-agent`。新进程没有进入 ready 状态时会立即卸载。安装器不读取
 旧目录，也不迁移历史数据。
 
-首次 live 验收只在“Test Group”和“Assistant Bot”私聊进行，不在 Example Group 群发送测试
-消息。
+`CHAT_QUERY` 只用于发现和标记验收群，不会在默认的 `all_groups` 回复范围下限制
+其他群的正常 `@Owner` 处理。真实 live 验收仍只在本次明确授权的群和机器人私聊中
+发送测试消息。
 
 ## 常用操作
 

@@ -100,6 +100,11 @@ Owner 私聊 Assistant Bot 发送“在吗”或简单问候时走本地快速�
 会话历史。其他问题在构建上下文时，会把飞书会话历史作为可选增强；历史读取暂时失败
 不会中断当前消息处理。
 
+群内其他人直接 `@Owner` 由用户身份轮询接收，再经过模型判断和代回复策略。
+`policy.reply_scope: all_groups` 允许所有可见群进入其余门禁；改为
+`configured_groups` 后只允许 daemon `--chat-query` 发现的群。运行
+`lark-agent doctor` 可在 `reply_scope` 字段确认实际值。范围变化不会自动重放旧消息。
+
 用户身份接口若发现进程缓存的 `user_access_token` 已过期，会先重读 Keychain；
 如果没有更新的凭据，再通过官方 SDK 使用 `refresh_token` 刷新，并把轮换后的两个
 token 写回 Keychain 后重放原请求一次。若刷新凭据也过期，运行

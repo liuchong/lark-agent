@@ -27,6 +27,24 @@ func ParseMode(raw string) (Mode, error) {
 	}
 }
 
+// ReplyScope controls which groups permit delegated owner replies.
+type ReplyScope string
+
+const (
+	ReplyScopeAllGroups        ReplyScope = "all_groups"
+	ReplyScopeConfiguredGroups ReplyScope = "configured_groups"
+)
+
+// ParseReplyScope validates a user-visible delegated reply scope.
+func ParseReplyScope(raw string) (ReplyScope, error) {
+	switch ReplyScope(raw) {
+	case ReplyScopeAllGroups, ReplyScopeConfiguredGroups:
+		return ReplyScope(raw), nil
+	default:
+		return "", fmt.Errorf("unsupported reply scope %q", raw)
+	}
+}
+
 // Sensitivity controls how eagerly non-mention messages are considered.
 type Sensitivity string
 

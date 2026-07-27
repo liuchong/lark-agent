@@ -59,6 +59,10 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 			args: []string{"daemon", "install-app", "--help"},
 			want: []string{"--write", "--load", "--program", "--poll-interval"},
 		},
+		{
+			args: []string{"daemon", "run", "--help"},
+			want: []string{"--chat-query", "configured and validation groups"},
+		},
 	}
 	for _, testCase := range cases {
 		code, stdout, stderr := runAgent(t, bin, testCase.args...)
@@ -99,8 +103,8 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"official Go SDK",
 		"com.liuchong.lark-agent",
 		"跨重启工作不会自动回放",
-		"Test Group",
-		"Assistant Bot",
+		"policy.reply_scope",
+		"all_groups",
 	} {
 		if !strings.Contains(string(readme), want) {
 			t.Fatalf("README missing %q", want)

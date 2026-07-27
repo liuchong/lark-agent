@@ -170,6 +170,7 @@ type ModelConfig struct {
 // PolicyConfig controls routing and reply behavior.
 type PolicyConfig struct {
 	Mode               domain.Mode        `json:"mode" yaml:"mode"`
+	ReplyScope         domain.ReplyScope  `json:"reply_scope" yaml:"reply_scope"`
 	Sensitivity        domain.Sensitivity `json:"sensitivity" yaml:"sensitivity"`
 	OwnerWait          time.Duration      `json:"owner_wait" yaml:"owner_wait"`
 	MentionPoll        time.Duration      `json:"mention_poll" yaml:"mention_poll"`
@@ -256,6 +257,7 @@ func Default() Config {
 		State: StateConfig{AllowReset: false},
 		Policy: PolicyConfig{
 			Mode:               domain.ModeAuto,
+			ReplyScope:         domain.ReplyScopeAllGroups,
 			Sensitivity:        domain.SensitivityNormal,
 			OwnerWait:          60 * time.Second,
 			MentionPoll:        30 * time.Second,
@@ -325,6 +327,11 @@ func (c Config) Validate() error {
 	if _, err := domain.ParseMode(string(c.Policy.Mode)); err != nil {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "invalid policy.mode: %s", c.Policy.Mode).
 			WithField("policy.mode").
+			WithCause(err)
+	}
+	if _, err := domain.ParseReplyScope(string(c.Policy.ReplyScope)); err != nil {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "invalid policy.reply_scope: %s", c.Policy.ReplyScope).
+			WithField("policy.reply_scope").
 			WithCause(err)
 	}
 	if c.Policy.OwnerWait <= 0 {

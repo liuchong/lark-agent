@@ -2,6 +2,7 @@ package config
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -97,6 +98,22 @@ func TestDefaultAssistantConfigAllowsOwnerInvocations(t *testing.T) {
 	}
 }
 
+func TestDefaultReplyScopeAllowsAllGroups(t *testing.T) {
+	cfg := validConfigForTest(t)
+	if cfg.Policy.ReplyScope != domain.ReplyScopeAllGroups {
+		t.Fatalf("default reply scope=%q, want %q", cfg.Policy.ReplyScope, domain.ReplyScopeAllGroups)
+	}
+}
+
+func TestValidateRejectsUnsupportedReplyScope(t *testing.T) {
+	cfg := validConfigForTest(t)
+	cfg.Policy.ReplyScope = domain.ReplyScope("test_chat")
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "policy.reply_scope") {
+		t.Fatalf("Validate error=%v", err)
+	}
+}
+
 func TestConfigRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	cfg := validConfigForTest(t)
@@ -106,6 +123,7 @@ func TestConfigRoundTrip(t *testing.T) {
 	cfg.Model.BaseURL = "https://example.test/v1"
 	cfg.Model.Name = "test-model"
 	cfg.Policy.Mode = domain.ModeAuto
+	cfg.Policy.ReplyScope = domain.ReplyScopeConfiguredGroups
 
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := Save(path, cfg); err != nil {
@@ -115,7 +133,9 @@ func TestConfigRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Workspace.Root != root || got.Policy.Mode != domain.ModeAuto {
+	if got.Workspace.Root != root ||
+		got.Policy.Mode != domain.ModeAuto ||
+		got.Policy.ReplyScope != domain.ReplyScopeConfiguredGroups {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
 }

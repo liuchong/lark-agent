@@ -133,8 +133,8 @@ func TestBlockedUserBlocksAtFinalGate(t *testing.T) {
 	}
 }
 
-func TestOutsideTestScopeBlocksAtFinalGate(t *testing.T) {
-	gate := NewReplyGate(Config{Mode: domain.ModeAuto, RequireTestScope: true}, fakeThreadState{})
+func TestConfiguredGroupsScopeBlocksOutsideConfiguredGroup(t *testing.T) {
+	gate := NewReplyGate(Config{Mode: domain.ModeAuto, ReplyScope: domain.ReplyScopeConfiguredGroups}, fakeThreadState{})
 	action, err := gate.Prepare(context.Background(), domain.WorkItem{
 		Event: domain.NormalizedEvent{MessageID: "om_1", InTestScope: false},
 	}, domain.Decision{
@@ -146,13 +146,32 @@ func TestOutsideTestScopeBlocksAtFinalGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if action.Status != domain.ActionBlocked || action.CancelReason != "outside_test_scope" {
+	if action.Status != domain.ActionBlocked || action.CancelReason != "outside_reply_scope" {
 		t.Fatalf("action=%+v", action)
 	}
 }
 
-func TestOwnerRequestBypassesTestScopeReplyLimit(t *testing.T) {
-	gate := NewReplyGate(Config{Mode: domain.ModeAuto, RequireTestScope: true}, fakeThreadState{})
+func TestAllGroupsScopeAllowsOutsideConfiguredGroup(t *testing.T) {
+	gate := NewReplyGate(Config{Mode: domain.ModeAuto, ReplyScope: domain.ReplyScopeAllGroups}, fakeThreadState{})
+	action, err := gate.Prepare(context.Background(), domain.WorkItem{
+		Event: domain.NormalizedEvent{MessageID: "om_all_groups", InTestScope: false},
+	}, domain.Decision{
+		Kind:       domain.DecisionReply,
+		Relevance:  domain.RelevanceDirectMention,
+		Confidence: 0.99,
+		Risk:       domain.RiskLow,
+		ReplyText:  "ok",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Status != domain.ActionReady {
+		t.Fatalf("action=%+v", action)
+	}
+}
+
+func TestOwnerRequestBypassesConfiguredGroupsReplyLimit(t *testing.T) {
+	gate := NewReplyGate(Config{Mode: domain.ModeAuto, ReplyScope: domain.ReplyScopeConfiguredGroups}, fakeThreadState{})
 	action, err := gate.Prepare(context.Background(), domain.WorkItem{
 		Event: domain.NormalizedEvent{MessageID: "om_owner_request", InTestScope: false},
 	}, domain.Decision{
