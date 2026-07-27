@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/liuchong/lark-agent/agent/config"
+	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
 	"github.com/liuchong/lark-agent/agent/storage"
 	serviceim "github.com/liuchong/lark-agent/internal/lark"
@@ -144,6 +146,34 @@ func (f configuredPollerIM) SearchMessages(_ context.Context, req serviceim.Sear
 		return serviceim.SearchMessagesResult{}, nil
 	}
 	return serviceim.SearchMessagesResult{Items: []serviceim.Message{f.message}}, nil
+}
+
+type failingMessageContextCaller struct{}
+
+func (failingMessageContextCaller) CallAPI(context.Context, serviceim.APIRequest) (any, error) {
+	return nil, errors.New("Authentication token expired. Please request a new one.")
+}
+
+func TestConversationBuilderContinuesWhenLarkHistoryIsUnavailable(t *testing.T) {
+	builder := &conversationBuilder{
+		svc:                serviceim.NewService(failingMessageContextCaller{}, "ou_owner"),
+		includeLarkContext: true,
+		base:               agentcontext.Builder{},
+	}
+	bundle, err := builder.Build(domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_context_unavailable",
+		ChatID:    "oc_private",
+		Content:   "请继续处理这个问题",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bundle.ContextSelection.Incomplete ||
+		bundle.ContextSelection.AnchorMessageID != "om_context_unavailable" ||
+		bundle.ContextSelection.Reason != "lark_context_unavailable" ||
+		len(bundle.Conversation) != 0 {
+		t.Fatalf("bundle=%+v", bundle)
+	}
 }
 
 func TestConfiguredLivePollerPersistsRouterPriority(t *testing.T) {

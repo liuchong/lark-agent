@@ -80,6 +80,34 @@ func TestOwnerFastPathTimeRoutesAsReplyWithoutModel(t *testing.T) {
 	}
 }
 
+func TestOwnerAvailabilityQuestionRoutesAsFastPathReplyWithoutModel(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:      "ou_owner",
+		AssistantOpenIDs: []string{"ou_bot"},
+		AssistantNames:   []string{"Assistant Bot"},
+		Mode:             domain.ModeAuto,
+	})
+	for _, content := range []string{"在吗？", "你好", "@Assistant Bot 在吗"} {
+		decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID:     "om_availability",
+			ChatID:        "oc_private",
+			ChatType:      "p2p",
+			ChatPartnerID: "ou_bot",
+			SenderID:      "ou_owner",
+			Content:       content,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision.Kind != domain.DecisionReply ||
+			decision.WorkKind != domain.WorkKindFastPath ||
+			decision.Relevance != domain.RelevanceOwnerRequest ||
+			decision.ReplyText != "在的。" {
+			t.Fatalf("content=%q decision=%+v", content, decision)
+		}
+	}
+}
+
 func TestOwnerPrivateAssistantPartnerRoutesWithoutChatName(t *testing.T) {
 	now := time.Date(2026, 7, 24, 5, 40, 0, 0, time.FixedZone("CST", 8*60*60))
 	r := New(Config{

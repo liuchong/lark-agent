@@ -96,6 +96,15 @@ lark-agent doctor
 退出码和结构化错误。需要检查远端应用发布态和实时事件权限时，设置
 `LARK_AGENT_REMOTE_DOCTOR=1` 后再运行 doctor。
 
+Owner 私聊 Assistant Bot 发送“在吗”或简单问候时走本地快速回复，不依赖模型和
+会话历史。其他问题在构建上下文时，会把飞书会话历史作为可选增强；历史读取暂时失败
+不会中断当前消息处理。
+
+用户身份接口若发现进程缓存的 `user_access_token` 已过期，会先重读 Keychain；
+如果没有更新的凭据，再通过官方 SDK 使用 `refresh_token` 刷新，并把轮换后的两个
+token 写回 Keychain 后重放原请求一次。若刷新凭据也过期，运行
+`lark-agent auth login` 重新授权，再执行 `lark-agent doctor --lark-only`。
+
 守护进程内的 worker 共用一个串行 SQLite 连接，避免并发写入彼此返回
 `database is locked`。如果 `queue inspect`、`queue resume` 等另一进程短暂占用写锁，
 守护进程最多等待 5 秒；超时仍会明确记录存储错误，不会把未持久化的状态当成成功。
@@ -107,5 +116,5 @@ lark-agent doctor
 - live 行为异常：停止新服务，恢复安装备份，只加载已知可运行的旧版本。
 - 外部动作不确定：保持工作暂停，不要用 `queue retry` 或重启来猜测性重发。
 
-真实验收只允许在“Test Group”和“Assistant Bot”私聊进行，不在 Example Group 群发送测试
-消息。
+真实验收只允许在用户本次明确授权的会话进行。当前验收目标是“龙虾群🦞”和
+“测试负责人的智能助手”私聊；不得向名称相近的会话或 Example Group 群发送测试消息。

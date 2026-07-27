@@ -135,6 +135,9 @@ func (r *Router) fastPathDecision(event domain.NormalizedEvent, base domain.Deci
 		content = strings.TrimSpace(strings.TrimPrefix(content, fields[0]))
 	}
 	content = strings.TrimSpace(strings.TrimRight(content, "?？。！!"))
+	if oneOf(content, "在吗", "你好", "您好", "hi", "hello") {
+		return fastPathReply(base, "在的。", "fast_path_availability"), true
+	}
 	if oneOf(content, "几点了", "现在几点", "现在几点了", "现在时间", "time") {
 		now := r.cfg.Now()
 		base.Kind = domain.DecisionReply

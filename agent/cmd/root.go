@@ -810,6 +810,8 @@ func buildLiveOptions(
 		AppID:           cfg.Lark.AppID,
 		AppSecret:       credentials.AppSecret,
 		UserAccessToken: credentials.UserAccessToken,
+		RefreshToken:    credentials.RefreshToken,
+		UserTokenStore:  serviceim.NewKeychainUserTokenStore(credentialRefs(cfg)),
 		BaseURL:         cfg.Lark.BaseURL,
 		Timeout:         30 * time.Second,
 	})
@@ -1201,7 +1203,15 @@ func (b *conversationBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, 
 			Limit:            30,
 		})
 		if err != nil {
-			return agentcontext.Bundle{}, err
+			builder.ContextSelection = domain.ContextSelection{
+				Mode:             domain.ContextModeAdjacent,
+				AnchorMessageID:  item.Event.MessageID,
+				RootMessageID:    item.Event.RootMessageID,
+				ReplyToMessageID: item.Event.ReplyToMessageID,
+				Incomplete:       true,
+				Reason:           "lark_context_unavailable",
+			}
+			return builder.Build(item)
 		}
 		builder.Conversation = append(builder.Conversation, normalizeToolMessages(messageContext.Messages)...)
 		builder.ContextSelection = messageContext.Selection
@@ -1449,6 +1459,8 @@ func newQueueBackfillCommand(out io.Writer, configPath, statePath *string) *cobr
 				AppID:           cfg.Lark.AppID,
 				AppSecret:       credentials.AppSecret,
 				UserAccessToken: credentials.UserAccessToken,
+				RefreshToken:    credentials.RefreshToken,
+				UserTokenStore:  serviceim.NewKeychainUserTokenStore(credentialRefs(cfg)),
 				BaseURL:         cfg.Lark.BaseURL,
 				Timeout:         30 * time.Second,
 			})
@@ -1913,6 +1925,8 @@ func checkLarkSDK(ctx context.Context, cfg config.Config) (map[string]any, error
 		AppID:           cfg.Lark.AppID,
 		AppSecret:       credentials.AppSecret,
 		UserAccessToken: credentials.UserAccessToken,
+		RefreshToken:    credentials.RefreshToken,
+		UserTokenStore:  serviceim.NewKeychainUserTokenStore(credentialRefs(cfg)),
 		BaseURL:         cfg.Lark.BaseURL,
 		Timeout:         15 * time.Second,
 	})

@@ -371,6 +371,101 @@ func TestPrivateOwnerRequestUsesBotReplyPath(t *testing.T) {
 	}
 }
 
+func TestPrivateOwnerAvailabilityReplyCompletesWithoutModel(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := store.EnqueueWorkItem(domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:     "om_private_availability",
+		ChatID:        "oc_private",
+		ChatType:      "p2p",
+		ChatPartnerID: "ou_bot",
+		SenderID:      "ou_owner",
+		Content:       "在吗？",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	messenger := &privateReplyMessenger{}
+	daemon := app.NewDaemon(
+		store,
+		router.New(router.Config{
+			OwnerOpenID:      "ou_owner",
+			AssistantOpenIDs: []string{"ou_bot"},
+		}),
+		app.WithReplyHandler(reply.NewController(
+			policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, privateReplyThreadState{}),
+			messenger,
+			store,
+		)),
+		app.WithOwnerActivityHandler(feedback.NewController(messenger, store)),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed ||
+		result.Decision.Kind != domain.DecisionReply ||
+		result.Decision.WorkKind != domain.WorkKindFastPath ||
+		result.Decision.ReplyText != "在的。" {
+		t.Fatalf("result=%+v", result)
+	}
+	if strings.Join(messenger.events, ",") != "working_reaction_on,reply,working_reaction_off" ||
+		messenger.botReplies != 1 ||
+		messenger.userReplies != 0 {
+		t.Fatalf("events=%v messenger=%+v", messenger.events, messenger)
+	}
+}
+
+func TestGroupOwnerAvailabilityMentionCompletesWithoutModel(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := store.EnqueueWorkItem(domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_group_availability",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_owner",
+		Mentions:  []domain.Mention{{Key: "@_user_1", OpenID: "ou_bot", Name: "Lark Agent"}},
+		Content:   "@_user_1 在吗？",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	messenger := &privateReplyMessenger{}
+	daemon := app.NewDaemon(
+		store,
+		router.New(router.Config{
+			OwnerOpenID:      "ou_owner",
+			AssistantOpenIDs: []string{"ou_bot"},
+			AssistantNames:   []string{"Lark Agent"},
+		}),
+		app.WithReplyHandler(reply.NewController(
+			policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, privateReplyThreadState{}),
+			messenger,
+			store,
+		)),
+		app.WithOwnerActivityHandler(feedback.NewController(messenger, store)),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed ||
+		result.Decision.Kind != domain.DecisionReply ||
+		result.Decision.WorkKind != domain.WorkKindFastPath ||
+		result.Decision.ReplyText != "在的。" {
+		t.Fatalf("result=%+v", result)
+	}
+	if strings.Join(messenger.events, ",") != "working_reaction_on,reply,working_reaction_off" ||
+		messenger.botReplies != 1 ||
+		messenger.userReplies != 0 {
+		t.Fatalf("events=%v messenger=%+v", messenger.events, messenger)
+	}
+}
+
 func TestOwnerPrivateFeedbackAndReplyAreAudited(t *testing.T) {
 	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

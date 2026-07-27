@@ -160,6 +160,24 @@ owner's approval. Shell output may locate evidence but is not itself a citable
 source; before replying from a shell-discovered file, the model reads that file
 through `read_workspace` to obtain a digest-backed source reference.
 
+Availability checks and simple greetings from the configured owner to the
+assistant bot, including "在吗", are fast-path work. The bot replies immediately
+with bot identity without requiring Lark conversation history or a model call.
+
+Lark conversation history is optional enrichment for an already-received work
+item. If that bounded history cannot be loaded, the context bundle records an
+incomplete selection with a non-secret reason and continues with the current
+message. A history lookup failure must not make the working reaction disappear
+and leave the owner request silently waiting for retry.
+
+User-identity Lark calls use the current Keychain credentials. If a cached
+user_access_token is rejected as expired, the client serializes recovery,
+reloads any newer Keychain token, and otherwise uses the current refresh_token
+through the official SDK. A successful refresh rotates both tokens in Keychain
+before replaying the original request exactly once. Refresh failure remains a
+typed authorization error; the client never loops indefinitely or logs token
+values.
+
 ## User-Visible Modes
 
 - `auto`: the default mode. The agent may autonomously ignore, record, notify,
@@ -741,6 +759,21 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given the configured owner privately messages the assistant chat, when the
   message is polled, then it enters the model as an owner-request work item and
   the assistant replies with bot identity without a redundant owner notice.
+- Given the configured owner privately asks the assistant "在吗", when the item
+  is processed, then the bot replies "在的。" as fast-path work and removes the
+  working reaction without loading conversation history or calling a model.
+- Given the configured owner mentions the assistant in a group and asks "在吗",
+  when the item is processed, then the bot replies "在的。" through the same
+  fast path without loading conversation history or calling a model.
+- Given a non-fast-path owner request has already been received and bounded Lark
+  history loading fails, when context is built, then the current message still
+  reaches the model and the bundle marks its context selection incomplete.
+- Given a user-identity Lark request rejects the cached access token as expired
+  and Keychain contains a newer token, when the request recovers, then it reloads
+  and replays once without consuming the refresh token.
+- Given no newer access token exists but a refresh token is available, when the
+  request recovers, then the official SDK rotates both tokens, persists them,
+  and replays the original request once.
 - Given the configured owner mentions the assistant bot in any conversation,
   when the message is polled, then it enters the model as an owner-request work
   item even when the owner did not mention themselves, and a reply uses bot
