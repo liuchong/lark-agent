@@ -56,7 +56,7 @@ type CodingConfig struct {
 	ToolPermission      map[string]string `json:"tool_permission,omitempty" yaml:"tool_permission,omitempty"`
 }
 
-// FastPathConfig controls deterministic owner-only local answers.
+// FastPathConfig controls deterministic local answers for direct requests.
 type FastPathConfig struct {
 	Enabled        bool `json:"enabled" yaml:"enabled"`
 	SimpleMaxTurns int  `json:"simple_max_turns" yaml:"simple_max_turns"`
@@ -147,10 +147,11 @@ type OwnerConfig struct {
 	OpenID string `json:"open_id" yaml:"open_id"`
 }
 
-// AssistantConfig identifies bot-facing owner request entry points.
+// AssistantConfig identifies bot-facing request entry points.
 type AssistantConfig struct {
 	OpenIDs     []string                 `json:"open_ids,omitempty" yaml:"open_ids,omitempty"`
 	Names       []string                 `json:"names,omitempty" yaml:"names,omitempty"`
+	ReplyScope  domain.ReplyScope        `json:"reply_scope" yaml:"reply_scope"`
 	OwnerDirect OwnerDirectRequestConfig `json:"owner_direct" yaml:"owner_direct"`
 }
 
@@ -205,6 +206,7 @@ func Default() Config {
 		},
 		Assistant: AssistantConfig{
 			Names:       []string{"Lark Agent", "lark-agent", "机器人", "Agent"},
+			ReplyScope:  domain.ReplyScopeAllGroups,
 			OwnerDirect: OwnerDirectRequestConfig{Enabled: true},
 		},
 		Model: ModelConfig{
@@ -332,6 +334,11 @@ func (c Config) Validate() error {
 	if _, err := domain.ParseReplyScope(string(c.Policy.ReplyScope)); err != nil {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "invalid policy.reply_scope: %s", c.Policy.ReplyScope).
 			WithField("policy.reply_scope").
+			WithCause(err)
+	}
+	if _, err := domain.ParseReplyScope(string(c.Assistant.ReplyScope)); err != nil {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "invalid assistant.reply_scope: %s", c.Assistant.ReplyScope).
+			WithField("assistant.reply_scope").
 			WithCause(err)
 	}
 	if c.Policy.OwnerWait <= 0 {

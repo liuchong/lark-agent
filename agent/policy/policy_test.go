@@ -170,6 +170,78 @@ func TestAllGroupsScopeAllowsOutsideConfiguredGroup(t *testing.T) {
 	}
 }
 
+func TestConfiguredAssistantScopeBlocksOutsideConfiguredGroup(t *testing.T) {
+	gate := NewReplyGate(Config{
+		Mode:                domain.ModeAuto,
+		AssistantReplyScope: domain.ReplyScopeConfiguredGroups,
+	}, fakeThreadState{})
+	action, err := gate.Prepare(context.Background(), domain.WorkItem{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_assistant", ChatType: "group",
+			InTestScope: true, InAssistantScope: false,
+		},
+	}, domain.Decision{
+		Kind:       domain.DecisionReply,
+		Relevance:  domain.RelevanceAssistantRequest,
+		Confidence: 0.99,
+		Risk:       domain.RiskLow,
+		ReplyText:  "ok",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Status != domain.ActionBlocked || action.CancelReason != "outside_assistant_reply_scope" {
+		t.Fatalf("action=%+v", action)
+	}
+}
+
+func TestConfiguredAssistantScopeAllowsBotResolvedGroup(t *testing.T) {
+	gate := NewReplyGate(Config{
+		Mode:                domain.ModeAuto,
+		AssistantReplyScope: domain.ReplyScopeConfiguredGroups,
+	}, fakeThreadState{})
+	action, err := gate.Prepare(context.Background(), domain.WorkItem{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_assistant", ChatType: "group",
+			InTestScope: false, InAssistantScope: true,
+		},
+	}, domain.Decision{
+		Kind:       domain.DecisionReply,
+		Relevance:  domain.RelevanceAssistantRequest,
+		Confidence: 0.99,
+		Risk:       domain.RiskLow,
+		ReplyText:  "ok",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Status != domain.ActionReady {
+		t.Fatalf("action=%+v", action)
+	}
+}
+
+func TestAllGroupsAssistantScopeAllowsOutsideConfiguredGroup(t *testing.T) {
+	gate := NewReplyGate(Config{
+		Mode:                domain.ModeAuto,
+		AssistantReplyScope: domain.ReplyScopeAllGroups,
+	}, fakeThreadState{ownerReplied: true})
+	action, err := gate.Prepare(context.Background(), domain.WorkItem{
+		Event: domain.NormalizedEvent{MessageID: "om_assistant", ChatType: "group", InTestScope: false},
+	}, domain.Decision{
+		Kind:       domain.DecisionReply,
+		Relevance:  domain.RelevanceAssistantRequest,
+		Confidence: 0.99,
+		Risk:       domain.RiskLow,
+		ReplyText:  "ok",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Status != domain.ActionReady {
+		t.Fatalf("action=%+v", action)
+	}
+}
+
 func TestOwnerRequestBypassesConfiguredGroupsReplyLimit(t *testing.T) {
 	gate := NewReplyGate(Config{Mode: domain.ModeAuto, ReplyScope: domain.ReplyScopeConfiguredGroups}, fakeThreadState{})
 	action, err := gate.Prepare(context.Background(), domain.WorkItem{

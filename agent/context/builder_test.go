@@ -212,13 +212,16 @@ func TestAgentUserPromptRemainsValidJSONWhenContextIsLarge(t *testing.T) {
 	}
 }
 
-func TestAgentSystemPromptActsForOwnerNotContextBotPersona(t *testing.T) {
+func TestAgentSystemPromptDefinesAssistantAndDelegatedOwnerRoles(t *testing.T) {
 	prompt := AgentSystemPrompt()
 	for _, want := range []string{
-		"act on behalf of the configured human owner",
+		"two explicit Lark roles",
+		"assistant_request",
+		"answer that sender as the assistant bot",
 		"directly mentions the owner",
+		"act on behalf of that owner",
 		"owner_request",
-		"owner-only entry point",
+		"Do not require the sender to be the configured owner",
 		"quoted reply or thread context is authoritative",
 		"never import messages from another chat",
 		"context selection is marked incomplete",
@@ -230,12 +233,14 @@ func TestAgentSystemPromptActsForOwnerNotContextBotPersona(t *testing.T) {
 		"question, status update, handoff, or coordination request",
 		"Remaining owner work is not by itself a reason",
 		"without inventing a completion promise or personal commitment",
-		"reply sends the sender-facing response first and then privately notifies the owner",
+		"delegated direct_mention work",
+		"assistant_request and owner_request replies do not create that owner notice",
 		"put a concise concrete private task in owner_action",
 		"never use an internal label such as direct_mention",
 		"incomplete facts are not enough reason to choose notify",
 		"read_workspace",
 		"owner-relevant messages that do not directly mention the owner",
+		"runtime chooses bot identity for assistant_request and owner_request",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("system prompt missing %q:\n%s", want, prompt)

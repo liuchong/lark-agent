@@ -28,11 +28,12 @@ type Service struct {
 	ownerOpenID string
 }
 
-// SearchChatsRequest searches chats visible to the current user.
+// SearchChatsRequest searches chats visible to the requested identity.
 type SearchChatsRequest struct {
 	Query     string
 	PageSize  int
 	PageToken string
+	As        Identity
 }
 
 // SearchChatsResult is a single page of visible chats.
@@ -142,7 +143,7 @@ func NewService(caller Caller, ownerOpenID string) *Service {
 	return &Service{caller: caller, ownerOpenID: ownerOpenID}
 }
 
-// SearchChats searches chats visible to the user identity.
+// SearchChats searches chats visible to the requested identity.
 func (s *Service) SearchChats(ctx context.Context, req SearchChatsRequest) (SearchChatsResult, error) {
 	if s.caller == nil {
 		return SearchChatsResult{}, errs.NewInternalError(errs.SubtypeUnknown, "IM API caller is not configured")
@@ -156,12 +157,16 @@ func (s *Service) SearchChats(ctx context.Context, req SearchChatsRequest) (Sear
 	if req.Query != "" {
 		body["query"] = req.Query
 	}
+	identity := req.As
+	if identity == "" {
+		identity = IdentityUser
+	}
 	result, err := s.caller.CallAPI(ctx, APIRequest{
 		Method: http.MethodPost,
 		Path:   "/open-apis/im/v2/chats/search",
 		Params: params,
 		Data:   body,
-		As:     IdentityUser,
+		As:     identity,
 	})
 	if err != nil {
 		return SearchChatsResult{}, err

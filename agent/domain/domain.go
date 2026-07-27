@@ -27,7 +27,7 @@ func ParseMode(raw string) (Mode, error) {
 	}
 }
 
-// ReplyScope controls which groups permit delegated owner replies.
+// ReplyScope controls which groups permit one configured reply entry point.
 type ReplyScope string
 
 const (
@@ -35,7 +35,7 @@ const (
 	ReplyScopeConfiguredGroups ReplyScope = "configured_groups"
 )
 
-// ParseReplyScope validates a user-visible delegated reply scope.
+// ParseReplyScope validates a user-visible reply scope.
 func ParseReplyScope(raw string) (ReplyScope, error) {
 	switch ReplyScope(raw) {
 	case ReplyScopeAllGroups, ReplyScopeConfiguredGroups:
@@ -91,6 +91,7 @@ type NormalizedEvent struct {
 	RawDigest        string      `json:"raw_digest,omitempty" yaml:"raw_digest,omitempty"`
 	WorkspaceID      string      `json:"workspace_id,omitempty" yaml:"workspace_id,omitempty"`
 	InTestScope      bool        `json:"in_test_scope,omitempty" yaml:"in_test_scope,omitempty"`
+	InAssistantScope bool        `json:"in_assistant_scope,omitempty" yaml:"in_assistant_scope,omitempty"`
 }
 
 // ContextMode describes how same-chat messages were selected around a target.
@@ -395,10 +396,11 @@ const (
 type Relevance string
 
 const (
-	RelevanceNone          Relevance = "none"
-	RelevanceDirectMention Relevance = "direct_mention"
-	RelevanceInferred      Relevance = "inferred"
-	RelevanceOwnerRequest  Relevance = "owner_request"
+	RelevanceNone             Relevance = "none"
+	RelevanceDirectMention    Relevance = "direct_mention"
+	RelevanceInferred         Relevance = "inferred"
+	RelevanceOwnerRequest     Relevance = "owner_request"
+	RelevanceAssistantRequest Relevance = "assistant_request"
 )
 
 // Risk is a policy classification for proposed side effects.

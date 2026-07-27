@@ -678,6 +678,37 @@ func TestDaemonDoesNotSendPostReplyNoticeForOwnerRequest(t *testing.T) {
 	}
 }
 
+func TestDaemonDoesNotSendPostReplyNoticeForAssistantRequest(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_group_assistant", ChatID: "oc_group", ChatType: "group",
+		SenderID: "ou_other",
+		Mentions: []domain.Mention{{OpenID: "ou_bot", Name: "Assistant Bot"}},
+	})}
+	replier := &fakeReplyHandler{}
+	notifier := &fakeNotifier{}
+	daemon := NewDaemon(q, router.New(router.Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantReplyScope: domain.ReplyScopeAllGroups,
+		Mode:                domain.ModeAuto,
+	}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(&fakeDecider{decision: domain.Decision{
+			Kind: domain.DecisionReply, Relevance: domain.RelevanceAssistantRequest,
+			Confidence: 0.99, Risk: domain.RiskLow, ReplyText: "可以。",
+		}}),
+		WithReplyHandler(replier),
+		WithNotificationHandler(notifier),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || !replier.called || notifier.called || q.completed.Kind != domain.DecisionReply {
+		t.Fatalf("result=%+v replier=%+v notifier=%+v completed=%+v", result, replier, notifier, q.completed)
+	}
+}
+
 type fakePostReplyQueue struct {
 	*fakeQueue
 	pending       domain.Decision

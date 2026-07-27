@@ -48,14 +48,15 @@ type Store interface {
 
 // Config controls user-message polling.
 type Config struct {
-	OwnerOpenID    string
-	ChatQuery      string
-	AssistantNames []string
-	IncludePrivate bool
-	PageSize       int
-	IndexLookback  time.Duration
-	Now            func() time.Time
-	Classify       func(context.Context, domain.WorkItem) (domain.Decision, error)
+	OwnerOpenID                string
+	ChatQuery                  string
+	AssistantNames             []string
+	ConfiguredAssistantChatIDs []string
+	IncludePrivate             bool
+	PageSize                   int
+	IndexLookback              time.Duration
+	Now                        func() time.Time
+	Classify                   func(context.Context, domain.WorkItem) (domain.Decision, error)
 }
 
 // Result summarizes a poll cycle.
@@ -87,15 +88,16 @@ type BackfillResult struct {
 
 // Poller discovers visible conversations and ingests new messages.
 type Poller struct {
-	im            IMClient
-	store         Store
-	cfg           Config
-	testChats     map[string]serviceim.Chat
-	chatDetails   map[string]serviceim.Chat
-	discovered    bool
-	pageSize      int
-	indexLookback time.Duration
-	currentTime   func() time.Time
+	im               IMClient
+	store            Store
+	cfg              Config
+	testChats        map[string]serviceim.Chat
+	assistantChatIDs map[string]bool
+	chatDetails      map[string]serviceim.Chat
+	discovered       bool
+	pageSize         int
+	indexLookback    time.Duration
+	currentTime      func() time.Time
 }
 
 // New creates a user-message poller.
@@ -115,15 +117,22 @@ func New(im IMClient, store Store, cfg Config) *Poller {
 	if indexLookback <= 0 {
 		indexLookback = 2 * time.Minute
 	}
+	assistantChatIDs := make(map[string]bool, len(cfg.ConfiguredAssistantChatIDs))
+	for _, chatID := range cfg.ConfiguredAssistantChatIDs {
+		if chatID = strings.TrimSpace(chatID); chatID != "" {
+			assistantChatIDs[chatID] = true
+		}
+	}
 	return &Poller{
-		im:            im,
-		store:         store,
-		cfg:           cfg,
-		testChats:     map[string]serviceim.Chat{},
-		chatDetails:   map[string]serviceim.Chat{},
-		pageSize:      pageSize,
-		indexLookback: indexLookback,
-		currentTime:   now,
+		im:               im,
+		store:            store,
+		cfg:              cfg,
+		testChats:        map[string]serviceim.Chat{},
+		assistantChatIDs: assistantChatIDs,
+		chatDetails:      map[string]serviceim.Chat{},
+		pageSize:         pageSize,
+		indexLookback:    indexLookback,
+		currentTime:      now,
 	}
 }
 
@@ -659,6 +668,7 @@ func (p *Poller) eventFromMessage(msg serviceim.Message, mentionedOwner bool) do
 		CreatedAt:        parseMessageTime(msg.CreateTime),
 		RawDigest:        digestMessage(msg),
 		InTestScope:      chat.ChatID != "",
+		InAssistantScope: p.assistantChatIDs[msg.ChatID],
 	}
 }
 

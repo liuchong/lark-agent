@@ -17,13 +17,14 @@ type ThreadState interface {
 
 // Config controls reply gates.
 type Config struct {
-	Mode               domain.Mode
-	ReplyScope         domain.ReplyScope
-	ReplyConfidenceMin float64
-	OwnerWait          time.Duration
-	BlockChats         []string
-	BlockUsers         []string
-	Sleeper            func(context.Context, time.Duration) error
+	Mode                domain.Mode
+	ReplyScope          domain.ReplyScope
+	AssistantReplyScope domain.ReplyScope
+	ReplyConfidenceMin  float64
+	OwnerWait           time.Duration
+	BlockChats          []string
+	BlockUsers          []string
+	Sleeper             func(context.Context, time.Duration) error
 }
 
 // ReplyGate prepares a reply action or blocks/cancels it.
@@ -39,6 +40,9 @@ func NewReplyGate(cfg Config, state ThreadState) *ReplyGate {
 	}
 	if cfg.ReplyScope == "" {
 		cfg.ReplyScope = domain.ReplyScopeAllGroups
+	}
+	if cfg.AssistantReplyScope == "" {
+		cfg.AssistantReplyScope = domain.ReplyScopeAllGroups
 	}
 	if cfg.ReplyConfidenceMin == 0 {
 		cfg.ReplyConfidenceMin = 0.85
@@ -76,14 +80,22 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 	}
 	if g.cfg.ReplyScope == domain.ReplyScopeConfiguredGroups &&
 		!item.Event.InTestScope &&
-		decision.Relevance != domain.RelevanceOwnerRequest {
+		decision.Relevance != domain.RelevanceOwnerRequest &&
+		decision.Relevance != domain.RelevanceAssistantRequest {
 		action.Status = domain.ActionBlocked
 		action.CancelReason = "outside_reply_scope"
 		return action, nil
 	}
+	if g.cfg.AssistantReplyScope == domain.ReplyScopeConfiguredGroups &&
+		!item.Event.InAssistantScope &&
+		decision.Relevance == domain.RelevanceAssistantRequest {
+		action.Status = domain.ActionBlocked
+		action.CancelReason = "outside_assistant_reply_scope"
+		return action, nil
+	}
 	if g.cfg.OwnerWait > 0 &&
 		decision.WorkKind != domain.WorkKindFastPath &&
-		decision.Relevance != domain.RelevanceOwnerRequest {
+		!isAssistantFacingRequest(decision.Relevance) {
 		sleep := g.cfg.Sleeper
 		if sleep == nil {
 			sleep = func(ctx context.Context, d time.Duration) error {
@@ -111,7 +123,7 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 			action.CancelReason = "message_withdrawn"
 			return action, nil
 		}
-		if decision.Relevance != domain.RelevanceOwnerRequest {
+		if !isAssistantFacingRequest(decision.Relevance) {
 			replied, err := g.state.OwnerAlreadyReplied(ctx, item)
 			if err != nil {
 				return action, err
@@ -134,10 +146,15 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 
 func (g *ReplyGate) replyConfidenceMin(decision domain.Decision) float64 {
 	minimum := g.cfg.ReplyConfidenceMin
-	if (decision.Relevance == domain.RelevanceDirectMention || decision.Relevance == domain.RelevanceOwnerRequest) && decision.Risk == domain.RiskLow {
+	if (decision.Relevance == domain.RelevanceDirectMention || isAssistantFacingRequest(decision.Relevance)) && decision.Risk == domain.RiskLow {
 		minimum = math.Min(minimum, 0.6)
 	}
 	return minimum
+}
+
+func isAssistantFacingRequest(relevance domain.Relevance) bool {
+	return relevance == domain.RelevanceOwnerRequest ||
+		relevance == domain.RelevanceAssistantRequest
 }
 
 func contains(values []string, target string) bool {

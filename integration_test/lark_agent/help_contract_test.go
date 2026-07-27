@@ -103,6 +103,7 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"official Go SDK",
 		"com.liuchong.lark-agent",
 		"跨重启工作不会自动回放",
+		"assistant.reply_scope",
 		"policy.reply_scope",
 		"all_groups",
 	} {

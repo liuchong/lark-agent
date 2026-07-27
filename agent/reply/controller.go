@@ -184,7 +184,8 @@ func (c *Controller) Handle(ctx context.Context, item domain.WorkItem, decision 
 }
 
 func shouldReplyAsBot(decision domain.Decision) bool {
-	return decision.Relevance == domain.RelevanceOwnerRequest
+	return decision.Relevance == domain.RelevanceOwnerRequest ||
+		decision.Relevance == domain.RelevanceAssistantRequest
 }
 
 var larkMentionPlaceholderPattern = regexp.MustCompile(`@_user_\d+`)

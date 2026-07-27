@@ -11,22 +11,24 @@ import (
 
 // Config controls deterministic routing.
 type Config struct {
-	OwnerOpenID       string
-	AssistantOpenIDs  []string
-	AssistantNames    []string
-	OwnerDirect       bool
-	Mode              domain.Mode
-	AllowChats        []string
-	BlockChats        []string
-	BlockUsers        []string
-	Sensitivity       domain.Sensitivity
-	Now               func() time.Time
-	DisableFastPath   bool
-	DisableCodingGoal bool
-	StatusText        func() string
-	DoctorText        func() string
-	QueueSummaryText  func() string
-	HelpText          string
+	OwnerOpenID         string
+	AssistantOpenIDs    []string
+	AssistantNames      []string
+	AssistantReplyScope domain.ReplyScope
+	OwnerDirect         bool
+	Mode                domain.Mode
+	ReplyScope          domain.ReplyScope
+	AllowChats          []string
+	BlockChats          []string
+	BlockUsers          []string
+	Sensitivity         domain.Sensitivity
+	Now                 func() time.Time
+	DisableFastPath     bool
+	DisableCodingGoal   bool
+	StatusText          func() string
+	DoctorText          func() string
+	QueueSummaryText    func() string
+	HelpText            string
 }
 
 // Router decides whether a work item should enter the agent loop.
@@ -38,6 +40,12 @@ type Router struct {
 func New(cfg Config) *Router {
 	if cfg.Mode == "" {
 		cfg.Mode = domain.ModeAuto
+	}
+	if cfg.AssistantReplyScope == "" {
+		cfg.AssistantReplyScope = domain.ReplyScopeAllGroups
+	}
+	if cfg.ReplyScope == "" {
+		cfg.ReplyScope = domain.ReplyScopeAllGroups
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -69,6 +77,31 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 	}
 	if len(r.cfg.AllowChats) > 0 && !contains(r.cfg.AllowChats, item.Event.ChatID) {
 		decision.Reason = "chat_not_allowed"
+		return decision, nil
+	}
+	if r.assistantMentioned(item.Event) && item.Event.ChatType != "p2p" {
+		if !assistantGroupScopeAllows(r.cfg.AssistantReplyScope, item.Event) {
+			decision.Reason = "outside_assistant_reply_scope"
+			return decision, nil
+		}
+		decision.Kind = domain.DecisionNotify
+		decision.Relevance = domain.RelevanceAssistantRequest
+		decision.WorkKind = domain.WorkKindSimpleQuestion
+		decision.Priority = domain.PrioritySimpleQuestion
+		decision.Confidence = 1
+		decision.Reason = "assistant_mention"
+		if !r.cfg.DisableFastPath {
+			if fast, ok := r.fastPathDecision(item.Event, decision); ok {
+				return fast, nil
+			}
+		}
+		if !r.cfg.DisableCodingGoal && isCodingGoal(item.Event.Content) {
+			decision.WorkKind = domain.WorkKindCodingGoal
+			decision.Priority = domain.PriorityBackground
+		} else if isCodingQuestion(item.Event.Content) {
+			decision.WorkKind = domain.WorkKindCodingQuestion
+			decision.Priority = domain.PriorityCodingQuestion
+		}
 		return decision, nil
 	}
 	if r.assistantMentioned(item.Event) || r.assistantPrivateChat(item.Event) || r.assistantTextMentioned(item.Event) {
@@ -103,6 +136,10 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 		return decision, nil
 	}
 	if item.Event.MentionsUser(r.cfg.OwnerOpenID) {
+		if !groupScopeAllows(r.cfg.ReplyScope, item.Event) {
+			decision.Reason = "outside_reply_scope"
+			return decision, nil
+		}
 		decision.Kind = domain.DecisionNotify
 		decision.Relevance = domain.RelevanceDirectMention
 		decision.WorkKind = domain.WorkKindDirectMention
@@ -121,6 +158,18 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 		return decision, nil
 	}
 	return decision, nil
+}
+
+func groupScopeAllows(scope domain.ReplyScope, event domain.NormalizedEvent) bool {
+	return event.ChatType == "p2p" ||
+		scope != domain.ReplyScopeConfiguredGroups ||
+		event.InTestScope
+}
+
+func assistantGroupScopeAllows(scope domain.ReplyScope, event domain.NormalizedEvent) bool {
+	return event.ChatType == "p2p" ||
+		scope != domain.ReplyScopeConfiguredGroups ||
+		event.InAssistantScope
 }
 
 func (r *Router) fastPathDecision(event domain.NormalizedEvent, base domain.Decision) (domain.Decision, bool) {

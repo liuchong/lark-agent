@@ -267,7 +267,112 @@ func TestSourceDropsNonOwnerMessagesBeforeQueue(t *testing.T) {
 	}
 }
 
-func TestSourceOnlyAcceptsOwnerGroupMessageThatMentionsAssistant(t *testing.T) {
+func TestSourceAcceptsNonOwnerGroupMessageThatMentionsAssistant(t *testing.T) {
+	store := &fakeStore{}
+	payload := `{
+	  "type":"im.message.receive_v1",
+	  "event_id":"evt_group_mention",
+	  "message_id":"om_group_mention",
+	  "create_time":"1784853999000",
+	  "chat_id":"oc_group",
+	  "chat_type":"group",
+	  "sender_id":"ou_other",
+	  "sender_type":"user",
+	  "content":"@_user_1 帮我查这个接口",
+	  "mentions":[{"key":"@_user_1","open_id":"ou_bot","name":"Assistant Bot"}]
+	}`
+	source := NewSource(fakeConsumer{payload: payload}, store, Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantReplyScope: domain.ReplyScopeAllGroups,
+		Classify: func(_ context.Context, _ domain.WorkItem) (domain.Decision, error) {
+			return domain.Decision{
+				Relevance: domain.RelevanceAssistantRequest,
+				WorkKind:  domain.WorkKindSimpleQuestion,
+				Priority:  domain.PrioritySimpleQuestion,
+			}, nil
+		},
+	})
+
+	if err := source.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.items) != 1 ||
+		store.items[0].Event.SenderID != "ou_other" ||
+		store.items[0].WorkKind == "" {
+		t.Fatalf("assistant mention items=%+v", store.items)
+	}
+}
+
+func TestSourceConfiguredAssistantScopeDropsOutsideGroupBeforeQueue(t *testing.T) {
+	store := &fakeStore{}
+	payload := `{
+	  "type":"im.message.receive_v1",
+	  "event_id":"evt_group_outside",
+	  "message_id":"om_group_outside",
+	  "create_time":"1784853999000",
+	  "chat_id":"oc_outside",
+	  "chat_type":"group",
+	  "sender_id":"ou_other",
+	  "sender_type":"user",
+	  "content":"@_user_1 帮我查这个接口",
+	  "mentions":[{"key":"@_user_1","open_id":"ou_bot","name":"Assistant Bot"}]
+	}`
+	source := NewSource(fakeConsumer{payload: payload}, store, Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantReplyScope: domain.ReplyScopeConfiguredGroups,
+		ConfiguredChatIDs:   []string{"oc_configured"},
+	})
+
+	if err := source.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.items) != 0 {
+		t.Fatalf("outside assistant scope items=%+v", store.items)
+	}
+}
+
+func TestSourceConfiguredAssistantScopeMarksBotResolvedGroup(t *testing.T) {
+	store := &fakeStore{}
+	payload := `{
+	  "type":"im.message.receive_v1",
+	  "event_id":"evt_group_configured",
+	  "message_id":"om_group_configured",
+	  "create_time":"1784853999000",
+	  "chat_id":"oc_configured",
+	  "chat_type":"group",
+	  "sender_id":"ou_other",
+	  "sender_type":"user",
+	  "content":"@_user_1 帮我查这个接口",
+	  "mentions":[{"key":"@_user_1","open_id":"ou_bot","name":"Assistant Bot"}]
+	}`
+	source := NewSource(fakeConsumer{payload: payload}, store, Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantReplyScope: domain.ReplyScopeConfiguredGroups,
+		ConfiguredChatIDs:   []string{"oc_configured"},
+		Classify: func(_ context.Context, item domain.WorkItem) (domain.Decision, error) {
+			if !item.Event.InAssistantScope || item.Event.InTestScope {
+				t.Fatalf("event scope=%+v", item.Event)
+			}
+			return domain.Decision{
+				Relevance: domain.RelevanceAssistantRequest,
+				WorkKind:  domain.WorkKindSimpleQuestion,
+				Priority:  domain.PrioritySimpleQuestion,
+			}, nil
+		},
+	})
+
+	if err := source.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.items) != 1 || !store.items[0].Event.InAssistantScope {
+		t.Fatalf("configured assistant scope items=%+v", store.items)
+	}
+}
+
+func TestSourceOnlyAcceptsGroupMessageThatMentionsAssistant(t *testing.T) {
 	store := &fakeStore{}
 	payload := `{
 	  "type":"im.message.receive_v1",

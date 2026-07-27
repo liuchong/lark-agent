@@ -261,6 +261,22 @@ func TestSearchChatsUsesUserIdentity(t *testing.T) {
 	}
 }
 
+func TestSearchChatsUsesRequestedBotIdentity(t *testing.T) {
+	caller := &fakeCaller{response: map[string]any{
+		"data": map[string]any{"items": []any{}},
+	}}
+	svc := NewService(caller, "ou_owner")
+	if _, err := svc.SearchChats(context.Background(), SearchChatsRequest{
+		Query: "龙虾群",
+		As:    IdentityBot,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if caller.req.As != IdentityBot {
+		t.Fatalf("identity=%q", caller.req.As)
+	}
+}
+
 func TestSearchMessagesUsesUserIdentity(t *testing.T) {
 	caller := &fakeCaller{
 		response: map[string]any{

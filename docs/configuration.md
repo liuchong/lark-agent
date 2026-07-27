@@ -28,6 +28,9 @@ lark-agent config show
 - `owner.open_id`：唯一 Owner 的 open ID。
 - `assistant.open_ids`、`assistant.names`：Owner 私聊和群 @机器人的识别身份。
 - `assistant.owner_direct.enabled`：是否接受 Owner 直接发给机器人的请求。
+- `assistant.reply_scope`：群内 @机器人范围。`all_groups` 是默认值，允许任意真人在
+  任意机器人可见群里原生 `@机器人`；`configured_groups` 只允许 daemon
+  `--chat-query` 发现的群，并要求启动时查询至少匹配一个机器人可见群。
 - `workspace.root`：唯一 Workspace，必须是绝对路径。
 - `workspace.excludes`：不可读写的秘密或构建目录模式。
 - `policy.mode`：`auto`、`approval` 或 `paused`。
@@ -61,23 +64,38 @@ lark-agent mode paused
 当前实际安装建议明确配置：
 
 ```yaml
+assistant:
+  reply_scope: all_groups
+
 policy:
   reply_scope: all_groups
 ```
 
-这只放开“群范围”这一道门。黑名单、模型相关性与风险判断、置信度和审批模式、
-Owner 等待时间、撤回检查、Owner 已回复检查与幂等发送仍然生效。
+这两个字段相互独立：
+
+- `assistant.reply_scope` 控制任意真人在群里 `@机器人` 后，机器人是否接收并用
+  机器人身份回答。
+- `policy.reply_scope` 控制任意真人在群里 `@Owner` 后，Agent 是否可以用 Owner
+  身份代回复。
+
+它们只放开“群范围”这一道门。黑名单、模型相关性与风险判断、置信度和审批模式、
+撤回检查与幂等发送仍然生效。Owner 等待和“Owner 已回复”检查只适用于代回复，
+不适用于直接发给机器人的问题。
 
 需要重新限制到验收群时改为：
 
 ```yaml
+assistant:
+  reply_scope: configured_groups
+
 policy:
   reply_scope: configured_groups
 ```
 
 此模式必须同时为 daemon 提供 `--chat-query`。`--chat-query` 负责发现并标记允许群；
-在 `all_groups` 模式下，它只保留群发现和验收用途，不会限制其他群里的正常
-`@Owner` 处理。切换范围不会自动重放历史终态或中断工作。
+机器人范围在启动时用机器人身份把查询解析成具体群 ID；查询不到任何机器人可见群时
+启动会明确失败。在 `all_groups` 模式下，查询只保留群发现和验收用途，不会限制其他
+群里的正常 `@机器人` 或 `@Owner`。切换范围不会自动重放历史终态或中断工作。
 
 ## Workspace
 

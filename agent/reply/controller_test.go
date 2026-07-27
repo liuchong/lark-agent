@@ -160,14 +160,14 @@ func TestControllerAuditsNormalBotReplyBeforeCompleting(t *testing.T) {
 	}
 }
 
-func TestControllerUsesBotIdentityForOwnerAssistantGroupReply(t *testing.T) {
+func TestControllerUsesBotIdentityForGroupAssistantRequest(t *testing.T) {
 	m := &fakeMessenger{}
 	controller := NewController(policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, threadState{}), m)
 	result, err := controller.Handle(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID: "om_group", ChatID: "oc_group", ChatType: "group",
 		Mentions: []domain.Mention{{OpenID: "ou_bot", Name: "Assistant Bot"}},
 	}), domain.Decision{
-		Kind: domain.DecisionReply, Relevance: domain.RelevanceOwnerRequest,
+		Kind: domain.DecisionReply, Relevance: domain.RelevanceAssistantRequest,
 		Confidence: 0.99, Risk: domain.RiskLow, ReplyText: "现在是 05:40。",
 	})
 	if err != nil {

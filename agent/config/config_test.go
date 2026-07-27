@@ -100,8 +100,11 @@ func TestDefaultAssistantConfigAllowsOwnerInvocations(t *testing.T) {
 
 func TestDefaultReplyScopeAllowsAllGroups(t *testing.T) {
 	cfg := validConfigForTest(t)
+	if cfg.Assistant.ReplyScope != domain.ReplyScopeAllGroups {
+		t.Fatalf("default assistant reply scope=%q, want %q", cfg.Assistant.ReplyScope, domain.ReplyScopeAllGroups)
+	}
 	if cfg.Policy.ReplyScope != domain.ReplyScopeAllGroups {
-		t.Fatalf("default reply scope=%q, want %q", cfg.Policy.ReplyScope, domain.ReplyScopeAllGroups)
+		t.Fatalf("default delegated reply scope=%q, want %q", cfg.Policy.ReplyScope, domain.ReplyScopeAllGroups)
 	}
 }
 
@@ -111,6 +114,12 @@ func TestValidateRejectsUnsupportedReplyScope(t *testing.T) {
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "policy.reply_scope") {
 		t.Fatalf("Validate error=%v", err)
+	}
+	cfg = validConfigForTest(t)
+	cfg.Assistant.ReplyScope = domain.ReplyScope("test_chat")
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "assistant.reply_scope") {
+		t.Fatalf("Validate assistant reply scope error=%v", err)
 	}
 }
 
@@ -123,6 +132,7 @@ func TestConfigRoundTrip(t *testing.T) {
 	cfg.Model.BaseURL = "https://example.test/v1"
 	cfg.Model.Name = "test-model"
 	cfg.Policy.Mode = domain.ModeAuto
+	cfg.Assistant.ReplyScope = domain.ReplyScopeConfiguredGroups
 	cfg.Policy.ReplyScope = domain.ReplyScopeConfiguredGroups
 
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -135,6 +145,7 @@ func TestConfigRoundTrip(t *testing.T) {
 	}
 	if got.Workspace.Root != root ||
 		got.Policy.Mode != domain.ModeAuto ||
+		got.Assistant.ReplyScope != domain.ReplyScopeConfiguredGroups ||
 		got.Policy.ReplyScope != domain.ReplyScopeConfiguredGroups {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}

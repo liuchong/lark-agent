@@ -7,8 +7,9 @@
 
 ## 能做什么
 
-- Owner 在“Assistant Bot”私聊机器人，或在群里直接 @机器人时，机器人回答
-  Owner；处理期间添加键盘工作表情，结束后删除。
+- Owner 可以私聊“Assistant Bot”；任意真人都可以在允许的群里直接 @机器人提问或
+  要求执行操作，机器人用机器人身份回答。可以通过 `assistant.reply_scope` 选择所有
+  群或仅配置群；处理期间添加键盘工作表情，结束后删除。
 - 他人在任意用户可见群里直接 @Owner 时，Agent 默认可按策略用 Owner 身份回复；
   回复成功后再由机器人私聊 Owner 说明已经回复以及仍需处理的事项。可以通过
   `policy.reply_scope` 改回仅允许配置群。
@@ -61,9 +62,10 @@ export OPENAI_MODEL='model-name'
 `com.liuchong.lark-agent`。新进程没有进入 ready 状态时会立即卸载。安装器不读取
 旧目录，也不迁移历史数据。
 
-`CHAT_QUERY` 只用于发现和标记验收群，不会在默认的 `all_groups` 回复范围下限制
-其他群的正常 `@Owner` 处理。真实 live 验收仍只在本次明确授权的群和机器人私聊中
-发送测试消息。
+`CHAT_QUERY` 只用于发现和标记配置群与验收群。默认
+`assistant.reply_scope: all_groups` 和 `policy.reply_scope: all_groups` 时，它不会
+限制其他群正常 `@机器人` 或 `@Owner`。真实 live 验收仍只在本次明确授权的群和
+机器人私聊中发送测试消息。
 
 ## 常用操作
 

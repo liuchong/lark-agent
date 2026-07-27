@@ -21,6 +21,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/feedback"
 	"github.com/liuchong/lark-agent/agent/ingest"
 	"github.com/liuchong/lark-agent/agent/policy"
+	"github.com/liuchong/lark-agent/agent/poll"
 	"github.com/liuchong/lark-agent/agent/realtime"
 	"github.com/liuchong/lark-agent/agent/reply"
 	"github.com/liuchong/lark-agent/agent/router"
@@ -29,6 +30,42 @@ import (
 	"github.com/liuchong/lark-agent/agent/tools"
 	serviceim "github.com/liuchong/lark-agent/internal/lark"
 )
+
+type configuredAssistantPollIM struct {
+	now time.Time
+}
+
+func (f configuredAssistantPollIM) SearchChats(
+	context.Context,
+	serviceim.SearchChatsRequest,
+) (serviceim.SearchChatsResult, error) {
+	return serviceim.SearchChatsResult{Items: []serviceim.Chat{{
+		ChatID: "oc_user_scope", Name: "Configured Group", ChatMode: "group",
+	}}}, nil
+}
+
+func (f configuredAssistantPollIM) SearchMessages(
+	_ context.Context,
+	req serviceim.SearchMessagesRequest,
+) (serviceim.SearchMessagesResult, error) {
+	if req.IncludeAtMe {
+		return serviceim.SearchMessagesResult{}, nil
+	}
+	return serviceim.SearchMessagesResult{Items: []serviceim.Message{
+		{
+			MessageID: "om_bot_scope", ChatID: "oc_bot_scope", ChatType: "group",
+			SenderOpenID: "ou_other", SenderType: "user", Content: "@_user_1 在吗",
+			Mentions:   []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
+			CreateTime: f.now.Format(time.RFC3339),
+		},
+		{
+			MessageID: "om_user_scope", ChatID: "oc_user_scope", ChatType: "group",
+			SenderOpenID: "ou_other", SenderType: "user", Content: "@_user_1 在吗",
+			Mentions:   []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
+			CreateTime: f.now.Format(time.RFC3339),
+		},
+	}}, nil
+}
 
 func buildAgentBinary(t *testing.T) string {
 	t.Helper()
@@ -46,6 +83,87 @@ func buildAgentBinary(t *testing.T) string {
 		t.Fatalf("go build ./cmd/lark-agent failed: %v\n%s", err, out)
 	}
 	return bin
+}
+
+func TestPolledAssistantScopeUsesBotResolvedGroupsEndToEnd(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	now := time.Now().UTC()
+	start := now.Add(-30 * time.Second)
+	if err := store.SetPollCursor("messages:all", start); err != nil {
+		t.Fatal(err)
+	}
+	r := router.New(router.Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantNames:      []string{"Lark Agent"},
+		AssistantReplyScope: domain.ReplyScopeConfiguredGroups,
+		Mode:                domain.ModeAuto,
+	})
+	poller := poll.New(configuredAssistantPollIM{now: now}, store, poll.Config{
+		OwnerOpenID:                "ou_owner",
+		ChatQuery:                  "Configured Group",
+		AssistantNames:             []string{"Lark Agent"},
+		ConfiguredAssistantChatIDs: []string{"oc_bot_scope"},
+		Now:                        func() time.Time { return now },
+		Classify:                   r.Route,
+	})
+	if _, err := poller.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	items, err := store.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items=%+v", items)
+	}
+	byMessageID := map[string]domain.WorkItem{}
+	for _, item := range items {
+		byMessageID[item.Event.MessageID] = item
+	}
+	botScoped := byMessageID["om_bot_scope"]
+	if !botScoped.Event.InAssistantScope || botScoped.Event.InTestScope {
+		t.Fatalf("bot-scoped item=%+v", botScoped)
+	}
+	accepted, err := r.Route(context.Background(), botScoped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted.Relevance != domain.RelevanceAssistantRequest {
+		t.Fatalf("accepted decision=%+v", accepted)
+	}
+	gate := policy.NewReplyGate(policy.Config{
+		Mode:                domain.ModeAuto,
+		AssistantReplyScope: domain.ReplyScopeConfiguredGroups,
+	}, privateReplyThreadState{})
+	action, err := gate.Prepare(context.Background(), botScoped, domain.Decision{
+		Kind:       domain.DecisionReply,
+		Relevance:  domain.RelevanceAssistantRequest,
+		Confidence: 0.99,
+		Risk:       domain.RiskLow,
+		ReplyText:  "在的。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Status != domain.ActionReady {
+		t.Fatalf("bot-scoped action=%+v", action)
+	}
+	userScoped := byMessageID["om_user_scope"]
+	if userScoped.Event.InAssistantScope || !userScoped.Event.InTestScope {
+		t.Fatalf("user-scoped item=%+v", userScoped)
+	}
+	rejected, err := r.Route(context.Background(), userScoped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejected.Kind != domain.DecisionIgnore || rejected.Reason != "outside_assistant_reply_scope" {
+		t.Fatalf("rejected decision=%+v", rejected)
+	}
 }
 
 func repoRoot(t *testing.T) string {
@@ -616,8 +734,9 @@ func TestHelpContract(t *testing.T) {
 		"workspace",
 		"mode",
 		"model",
-		"owner-request",
+		"Any human can mention the assistant bot",
 		"assistant bot",
+		"independent all-groups or configured-groups scopes",
 		"keyboard working reaction",
 		"coding investigation",
 		"fast path",
@@ -913,11 +1032,13 @@ func TestOwnerAssistantContractIsSharedByPromptAndDecisionTool(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"configured human owner",
+		"two explicit Lark roles",
+		"assistant_request",
+		"answer that sender as the assistant bot",
 		"directly mentions the owner",
 		"owner_request",
-		"owner-only entry point",
-		"not a group bot persona",
+		"act on behalf of that owner",
+		"Do not require the sender to be the configured owner",
 		"prefer reply",
 		"read_workspace",
 		"coding question",
@@ -929,16 +1050,17 @@ func TestOwnerAssistantContractIsSharedByPromptAndDecisionTool(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"owner-irrelevant",
+		"ignore only irrelevant content",
 		"status update, handoff, or coordination request",
+		"assistant_request",
 		"owner_request",
-		"safe useful owner response",
-		"remaining owner work",
-		"privately notifies the owner",
-		"direct owner mentions cannot finish as notify only",
-		"incomplete facts should be stated as unknowns in reply_text",
+		"safe useful response",
+		"owner work remains",
+		"assistant_request and owner_request replies do not",
+		"direct owner mentions, assistant_request, and owner_request messages cannot finish as notify only",
+		"explicitly state unknowns",
 		"Lark mention placeholders",
-		"runtime renders known mention placeholders",
+		"The runtime renders known mention placeholders",
 		"coding replies",
 		"结论、依据、未知/下一步",
 		"source_refs",
@@ -951,12 +1073,13 @@ func TestOwnerAssistantContractIsSharedByPromptAndDecisionTool(t *testing.T) {
 	}
 }
 
-func TestOwnerAssistantInvocationRoutesOnlyOwner(t *testing.T) {
+func TestGroupAssistantInvocationRoutesAnyHumanSender(t *testing.T) {
 	r := router.New(router.Config{
-		OwnerOpenID:      "ou_owner",
-		AssistantOpenIDs: []string{"ou_bot"},
-		AssistantNames:   []string{"Lark Agent"},
-		Mode:             domain.ModeAuto,
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantNames:      []string{"Lark Agent"},
+		AssistantReplyScope: domain.ReplyScopeAllGroups,
+		Mode:                domain.ModeAuto,
 	})
 	owner, err := r.Route(context.Background(), domain.WorkItem{Event: domain.NormalizedEvent{
 		MessageID: "om_owner_bot",
@@ -968,7 +1091,7 @@ func TestOwnerAssistantInvocationRoutesOnlyOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if owner.Kind != domain.DecisionNotify || owner.Relevance != domain.RelevanceOwnerRequest {
+	if owner.Kind != domain.DecisionNotify || owner.Relevance != domain.RelevanceAssistantRequest {
 		t.Fatalf("owner decision=%+v", owner)
 	}
 	other, err := r.Route(context.Background(), domain.WorkItem{Event: domain.NormalizedEvent{
@@ -981,12 +1104,12 @@ func TestOwnerAssistantInvocationRoutesOnlyOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if other.Kind != domain.DecisionIgnore || other.Reason != "assistant_request_from_non_owner" {
+	if other.Kind != domain.DecisionNotify || other.Relevance != domain.RelevanceAssistantRequest {
 		t.Fatalf("other decision=%+v", other)
 	}
 }
 
-func TestInvalidReplyScopeFailsAtConfigLoad(t *testing.T) {
+func TestInvalidAssistantReplyScopeFailsAtConfigLoad(t *testing.T) {
 	bin := buildAgentBinary(t)
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "agent.yaml")
@@ -1012,6 +1135,47 @@ func TestInvalidReplyScopeFailsAtConfigLoad(t *testing.T) {
 	if bytes.Equal(invalid, data) {
 		t.Fatalf("initialized config missing explicit reply_scope:\n%s", data)
 	}
+	if err := os.WriteFile(configPath, invalid, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, _, stderr = runAgent(t, bin, "--config", configPath, "config", "show")
+	if code == 0 ||
+		!strings.Contains(stderr, "assistant.reply_scope") ||
+		!strings.Contains(stderr, "test_chat") {
+		t.Fatalf("config show exit=%d stderr=%s", code, stderr)
+	}
+}
+
+func TestInvalidDelegatedReplyScopeFailsAtConfigLoad(t *testing.T) {
+	bin := buildAgentBinary(t)
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "agent.yaml")
+	workspace := filepath.Join(dir, "workspace")
+	if err := os.Mkdir(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	code, _, stderr := runAgent(t, bin,
+		"--config", configPath,
+		"init",
+		"--workspace", workspace,
+		"--app-id", "cli_test",
+		"--owner-open-id", "ou_owner",
+	)
+	if code != 0 {
+		t.Fatalf("init exit=%d stderr=%s", code, stderr)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := []byte("reply_scope: all_groups")
+	index := bytes.LastIndex(data, old)
+	if index < 0 {
+		t.Fatalf("initialized config missing delegated reply_scope:\n%s", data)
+	}
+	invalid := append([]byte(nil), data[:index]...)
+	invalid = append(invalid, []byte("reply_scope: test_chat")...)
+	invalid = append(invalid, data[index+len(old):]...)
 	if err := os.WriteFile(configPath, invalid, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1064,6 +1228,47 @@ func TestConfiguredGroupsScopeWithoutChatQueryFailsLiveStartup(t *testing.T) {
 	}
 }
 
+func TestConfiguredAssistantScopeWithoutChatQueryFailsLiveStartup(t *testing.T) {
+	bin := buildAgentBinary(t)
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "agent.yaml")
+	statePath := filepath.Join(dir, "state.db")
+	workspace := filepath.Join(dir, "workspace")
+	if err := os.Mkdir(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	code, _, stderr := runAgent(t, bin,
+		"--config", configPath,
+		"init",
+		"--workspace", workspace,
+		"--app-id", "cli_test",
+		"--owner-open-id", "ou_owner",
+	)
+	if code != 0 {
+		t.Fatalf("init exit=%d stderr=%s", code, stderr)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Assistant.ReplyScope = domain.ReplyScopeConfiguredGroups
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	code, _, stderr = runAgentWithEnv(t, []string{"LARK_AGENT_OFFLINE_LIVE_TEST=1"}, bin,
+		"--config", configPath,
+		"--state", statePath,
+		"daemon", "run",
+		"--live",
+		"--once",
+	)
+	if code == 0 ||
+		!strings.Contains(stderr, "assistant.reply_scope") ||
+		!strings.Contains(stderr, "--chat-query") {
+		t.Fatalf("daemon run exit=%d stderr=%s", code, stderr)
+	}
+}
+
 func TestDoctorReportsAssistantOwnerDirect(t *testing.T) {
 	bin := buildAgentBinary(t)
 	dir := t.TempDir()
@@ -1096,6 +1301,8 @@ func TestDoctorReportsAssistantOwnerDirect(t *testing.T) {
 	}
 	if !strings.Contains(stdout, `"assistant"`) ||
 		!strings.Contains(stdout, `"owner_direct_enabled":false`) ||
+		!strings.Contains(stdout, `"assistant_mentions":"all_groups"`) ||
+		!strings.Contains(stdout, `"owner_mentions":"all_groups"`) ||
 		!strings.Contains(stdout, `"reply_scope":"all_groups"`) {
 		t.Fatalf("doctor missing assistant owner direct state:\n%s", stdout)
 	}

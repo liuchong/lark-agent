@@ -34,12 +34,14 @@ type Store interface {
 	RecordWorkIntake(context.Context, domain.WorkItem) (domain.IntakeReceipt, error)
 }
 
-// Config defines the owner-only real-time intake boundary.
+// Config defines the bot-visible real-time intake boundary.
 type Config struct {
-	OwnerOpenID      string
-	AssistantOpenIDs []string
-	AssistantNames   []string
-	Classify         func(context.Context, domain.WorkItem) (domain.Decision, error)
+	OwnerOpenID         string
+	AssistantOpenIDs    []string
+	AssistantNames      []string
+	AssistantReplyScope domain.ReplyScope
+	ConfiguredChatIDs   []string
+	Classify            func(context.Context, domain.WorkItem) (domain.Decision, error)
 }
 
 // Source converts bot events to the same durable work shape as polling.
@@ -51,6 +53,9 @@ type Source struct {
 
 // NewSource constructs one real-time source.
 func NewSource(consumer Consumer, store Store, cfg Config) *Source {
+	if cfg.AssistantReplyScope == "" {
+		cfg.AssistantReplyScope = domain.ReplyScopeAllGroups
+	}
 	return &Source{consumer: consumer, store: store, cfg: cfg}
 }
 
@@ -136,6 +141,7 @@ func (s *Source) Run(ctx context.Context) error {
 			<-consumeErr
 			return err
 		}
+		event.InAssistantScope = event.InAssistantScope || contains(s.cfg.ConfiguredChatIDs, event.ChatID)
 		if !s.accept(event) {
 			continue
 		}
@@ -178,13 +184,16 @@ func (s *Source) Run(ctx context.Context) error {
 
 func (s *Source) accept(event domain.NormalizedEvent) bool {
 	if event.MessageID == "" ||
-		event.SenderID != s.cfg.OwnerOpenID ||
 		(event.SenderType != "" && event.SenderType != "user") {
 		return false
 	}
 	if event.ChatType == "p2p" {
-		return firstAssistantOpenID(s.cfg.AssistantOpenIDs) != "" ||
-			firstNonEmpty(s.cfg.AssistantNames) != ""
+		return event.SenderID == s.cfg.OwnerOpenID &&
+			(firstAssistantOpenID(s.cfg.AssistantOpenIDs) != "" ||
+				firstNonEmpty(s.cfg.AssistantNames) != "")
+	}
+	if s.cfg.AssistantReplyScope == domain.ReplyScopeConfiguredGroups && !event.InAssistantScope {
+		return false
 	}
 	for _, assistantOpenID := range s.cfg.AssistantOpenIDs {
 		if event.MentionsUser(assistantOpenID) {
@@ -196,6 +205,15 @@ func (s *Source) accept(event domain.NormalizedEvent) bool {
 			if strings.EqualFold(strings.TrimSpace(mention.Name), strings.TrimSpace(assistantName)) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
 		}
 	}
 	return false

@@ -65,11 +65,12 @@ func NewRootCommand(in io.Reader, out io.Writer) *cobra.Command {
 
 It monitors Lark messages, applies workspace-bounded rules, routes relevant
 work to an Eino-based agent loop, and can reply as the owner in auto mode.
-The configured owner can also privately message the assistant chat or mention
-the assistant bot anywhere to initiate a question or coding investigation; this
-owner-request path uses bot real-time events, ignores all non-owner senders, and
-adds a keyboard working reaction before work starts, removing it when work
-finishes.
+Any human can mention the assistant bot in an allowed group to ask a question
+or request an operation; that path replies with bot identity. The configured
+owner can also privately message the assistant. Assistant mentions and owner
+mentions have independent all-groups or configured-groups scopes. Direct
+assistant requests add a keyboard working reaction before work starts and
+remove it when work finishes.
 Programming questions use a bounded coding investigation path with planning,
 code search fallback, source-backed verify, and replay transcript export.
 Simple questions use at most 2 model turns; coding questions use 20 turns,
@@ -791,14 +792,16 @@ func buildLiveOptions(
 		"dry_run":                 dryRun,
 		"model_configured":        false,
 		"chat_query":              chatQuery,
+		"assistant_reply_scope":   cfg.Assistant.ReplyScope,
 		"reply_scope":             cfg.Policy.ReplyScope,
 		"include_private":         includePrivate,
 		"realtime_owner_requests": false,
+		"realtime_requests":       false,
 	}
 	if !live {
 		return nil, nil, nil, info, nil
 	}
-	if err := validateLiveReplyScope(cfg.Policy.ReplyScope, chatQuery); err != nil {
+	if err := validateLiveReplyScopes(cfg.Assistant.ReplyScope, cfg.Policy.ReplyScope, chatQuery); err != nil {
 		return nil, nil, nil, info, err
 	}
 	if os.Getenv("LARK_AGENT_OFFLINE_LIVE_TEST") == "1" {
@@ -824,19 +827,30 @@ func buildLiveOptions(
 	}
 	imSvc := serviceim.NewService(apiClient, cfg.Owner.OpenID)
 	var realtimeSource realtime.Runner
-	if cfg.Assistant.OwnerDirect.Enabled {
+	var configuredAssistantChatIDs []string
+	if cfg.Assistant.ReplyScope == domain.ReplyScopeConfiguredGroups {
+		configuredAssistantChatIDs, err = discoverConfiguredAssistantChats(ctx, imSvc, chatQuery)
+		if err != nil {
+			return nil, nil, nil, info, err
+		}
+		info["configured_assistant_chat_ids"] = configuredAssistantChatIDs
+	}
+	if cfg.Assistant.OwnerDirect.Enabled || len(cfg.Assistant.OpenIDs) > 0 || len(cfg.Assistant.Names) > 0 {
 		consumer := realtime.NewLarkConsumer(apiClient, realtime.LarkConsumerConfig{
 			AppID:     cfg.Lark.AppID,
 			AppSecret: credentials.AppSecret,
 			BaseURL:   cfg.Lark.BaseURL,
 		})
 		realtimeSource = realtime.NewSource(consumer, store, realtime.Config{
-			OwnerOpenID:      cfg.Owner.OpenID,
-			AssistantOpenIDs: cfg.Assistant.OpenIDs,
-			AssistantNames:   cfg.Assistant.Names,
-			Classify:         agentRouter.Route,
+			OwnerOpenID:         cfg.Owner.OpenID,
+			AssistantOpenIDs:    cfg.Assistant.OpenIDs,
+			AssistantNames:      cfg.Assistant.Names,
+			AssistantReplyScope: cfg.Assistant.ReplyScope,
+			ConfiguredChatIDs:   configuredAssistantChatIDs,
+			Classify:            agentRouter.Route,
 		})
 		info["realtime_owner_requests"] = true
+		info["realtime_requests"] = true
 	}
 	scope, err := workspace.NewScopeWithExcludes(cfg.Workspace.Root, cfg.Workspace.Excludes)
 	if err != nil {
@@ -862,7 +876,15 @@ func buildLiveOptions(
 	options := []app.Option{app.WithContextBuilder(builder)}
 	info["user_context"] = userContextEnabled
 	if userContextEnabled {
-		livePoller := newConfiguredLivePoller(imSvc, store, agentRouter, cfg, chatQuery, includePrivate)
+		livePoller := newConfiguredLivePoller(
+			imSvc,
+			store,
+			agentRouter,
+			cfg,
+			chatQuery,
+			configuredAssistantChatIDs,
+			includePrivate,
+		)
 		options = append(options, app.WithPoller(livePoller))
 		info["user_polling"] = true
 	} else {
@@ -933,12 +955,13 @@ func buildLiveOptions(
 			threadState.svc = imSvc
 		}
 		gate := policy.NewReplyGate(policy.Config{
-			Mode:               cfg.Policy.Mode,
-			ReplyScope:         cfg.Policy.ReplyScope,
-			ReplyConfidenceMin: cfg.Policy.ReplyConfidenceMin,
-			OwnerWait:          cfg.Policy.OwnerWait,
-			BlockChats:         cfg.Policy.BlockChats,
-			BlockUsers:         cfg.Policy.BlockUsers,
+			Mode:                cfg.Policy.Mode,
+			ReplyScope:          cfg.Policy.ReplyScope,
+			AssistantReplyScope: cfg.Assistant.ReplyScope,
+			ReplyConfidenceMin:  cfg.Policy.ReplyConfidenceMin,
+			OwnerWait:           cfg.Policy.OwnerWait,
+			BlockChats:          cfg.Policy.BlockChats,
+			BlockUsers:          cfg.Policy.BlockUsers,
 		}, threadState)
 		options = append(options,
 			app.WithReplyHandler(reply.NewController(gate, imSvc, store)),
@@ -960,22 +983,74 @@ func validateLiveReplyScope(scope domain.ReplyScope, chatQuery string) error {
 	return nil
 }
 
+func validateLiveReplyScopes(assistantScope, delegatedScope domain.ReplyScope, chatQuery string) error {
+	if assistantScope == domain.ReplyScopeConfiguredGroups && strings.TrimSpace(chatQuery) == "" {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"assistant.reply_scope configured_groups requires --chat-query",
+		).WithField("assistant.reply_scope").
+			WithHint("set assistant.reply_scope to all_groups or provide --chat-query")
+	}
+	return validateLiveReplyScope(delegatedScope, chatQuery)
+}
+
+func discoverConfiguredAssistantChats(
+	ctx context.Context,
+	imSvc *serviceim.Service,
+	chatQuery string,
+) ([]string, error) {
+	var chatIDs []string
+	seen := map[string]bool{}
+	pageToken := ""
+	for {
+		result, err := imSvc.SearchChats(ctx, serviceim.SearchChatsRequest{
+			Query:     strings.TrimSpace(chatQuery),
+			PageSize:  100,
+			PageToken: pageToken,
+			As:        serviceim.IdentityBot,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, chat := range result.Items {
+			if chat.ChatID != "" && !seen[chat.ChatID] {
+				seen[chat.ChatID] = true
+				chatIDs = append(chatIDs, chat.ChatID)
+			}
+		}
+		if !result.HasMore || result.PageToken == "" {
+			break
+		}
+		pageToken = result.PageToken
+	}
+	if len(chatIDs) == 0 {
+		return nil, errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"assistant.reply_scope configured_groups query matched no bot-visible group",
+		).WithField("assistant.reply_scope").
+			WithHint("adjust --chat-query or set assistant.reply_scope to all_groups")
+	}
+	return chatIDs, nil
+}
+
 func newConfiguredLivePoller(
 	im poll.IMClient,
 	store poll.Store,
 	agentRouter *router.Router,
 	cfg config.Config,
 	chatQuery string,
+	configuredAssistantChatIDs []string,
 	includePrivate bool,
 ) *poll.Poller {
 	return poll.New(im, store, poll.Config{
-		OwnerOpenID:    cfg.Owner.OpenID,
-		ChatQuery:      chatQuery,
-		AssistantNames: cfg.Assistant.Names,
-		IncludePrivate: includePrivate,
-		PageSize:       20,
-		IndexLookback:  cfg.Scheduler.PollIndexLookback,
-		Classify:       agentRouter.Route,
+		OwnerOpenID:                cfg.Owner.OpenID,
+		ChatQuery:                  chatQuery,
+		AssistantNames:             cfg.Assistant.Names,
+		ConfiguredAssistantChatIDs: configuredAssistantChatIDs,
+		IncludePrivate:             includePrivate,
+		PageSize:                   20,
+		IndexLookback:              cfg.Scheduler.PollIndexLookback,
+		Classify:                   agentRouter.Route,
 	})
 }
 
@@ -991,20 +1066,22 @@ func newAgentRouter(cfg config.Config, store *storage.Store) *router.Router {
 		)
 	}
 	return router.New(router.Config{
-		OwnerOpenID:       cfg.Owner.OpenID,
-		AssistantOpenIDs:  cfg.Assistant.OpenIDs,
-		AssistantNames:    cfg.Assistant.Names,
-		OwnerDirect:       cfg.Assistant.OwnerDirect.Enabled,
-		Mode:              cfg.Policy.Mode,
-		AllowChats:        cfg.Policy.AllowChats,
-		BlockChats:        cfg.Policy.BlockChats,
-		BlockUsers:        cfg.Policy.BlockUsers,
-		Sensitivity:       cfg.Policy.Sensitivity,
-		DisableFastPath:   !cfg.FastPath.Enabled,
-		DisableCodingGoal: !cfg.Goal.Enabled,
-		StatusText:        func() string { return "lark-agent 正在运行，调度器可用。" + queueText() },
-		DoctorText:        func() string { return "基础诊断正常。" + queueText() },
-		QueueSummaryText:  queueText,
+		OwnerOpenID:         cfg.Owner.OpenID,
+		AssistantOpenIDs:    cfg.Assistant.OpenIDs,
+		AssistantNames:      cfg.Assistant.Names,
+		AssistantReplyScope: cfg.Assistant.ReplyScope,
+		OwnerDirect:         cfg.Assistant.OwnerDirect.Enabled,
+		Mode:                cfg.Policy.Mode,
+		ReplyScope:          cfg.Policy.ReplyScope,
+		AllowChats:          cfg.Policy.AllowChats,
+		BlockChats:          cfg.Policy.BlockChats,
+		BlockUsers:          cfg.Policy.BlockUsers,
+		Sensitivity:         cfg.Policy.Sensitivity,
+		DisableFastPath:     !cfg.FastPath.Enabled,
+		DisableCodingGoal:   !cfg.Goal.Enabled,
+		StatusText:          func() string { return "lark-agent 正在运行，调度器可用。" + queueText() },
+		DoctorText:          func() string { return "基础诊断正常。" + queueText() },
+		QueueSummaryText:    queueText,
 	})
 }
 
@@ -1494,6 +1571,7 @@ func newQueueBackfillCommand(out io.Writer, configPath, statePath *string) *cobr
 				agentRouter,
 				cfg,
 				chatQuery,
+				nil,
 				includePrivate,
 			)
 			result, err := poller.Backfill(cmd.Context(), poll.BackfillRequest{
@@ -1897,10 +1975,14 @@ func newDoctorCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 				return err
 			}
 			return writeData(out, map[string]any{
-				"ok":          true,
-				"lark":        larkStatus,
-				"workspace":   scope.Snapshot(),
-				"mode":        cfg.Policy.Mode,
+				"ok":        true,
+				"lark":      larkStatus,
+				"workspace": scope.Snapshot(),
+				"mode":      cfg.Policy.Mode,
+				"reply_scopes": map[string]any{
+					"assistant_mentions": cfg.Assistant.ReplyScope,
+					"owner_mentions":     cfg.Policy.ReplyScope,
+				},
 				"reply_scope": cfg.Policy.ReplyScope,
 				"scheduler": map[string]any{
 					"fast_path_enabled":     cfg.FastPath.Enabled,
