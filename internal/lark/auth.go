@@ -2,7 +2,6 @@ package lark
 
 import (
 	"context"
-	"os"
 	"strings"
 )
 
@@ -99,8 +98,4 @@ func DeleteCredentials(ctx context.Context, refs CredentialRefs) error {
 		}
 	}
 	return nil
-}
-
-func envSecret(name string) string {
-	return os.Getenv(name)
 }

@@ -4,6 +4,8 @@ package domain
 
 import (
 	"fmt"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -173,6 +175,96 @@ type ResourceSubscription struct {
 	LastError            string                     `json:"last_error,omitempty" yaml:"last_error,omitempty"`
 	CreatedAt            time.Time                  `json:"created_at" yaml:"created_at"`
 	UpdatedAt            time.Time                  `json:"updated_at" yaml:"updated_at"`
+}
+
+// GitHubReferenceKind identifies the trusted external object behind one Lark
+// notification.
+type GitHubReferenceKind string
+
+const (
+	GitHubReferenceWorkflowRun GitHubReferenceKind = "workflow_run"
+	GitHubReferencePullRequest GitHubReferenceKind = "pull_request"
+)
+
+// GitHubReference is trusted only after the Lark relation and app sender are
+// verified outside the model.
+type GitHubReference struct {
+	SchemaVersion      int                 `json:"schema_version" yaml:"schema_version"`
+	Repository         string              `json:"repository" yaml:"repository"`
+	Kind               GitHubReferenceKind `json:"kind" yaml:"kind"`
+	WorkflowRunID      int64               `json:"workflow_run_id,omitempty" yaml:"workflow_run_id,omitempty"`
+	WorkflowRunAttempt int                 `json:"workflow_run_attempt,omitempty" yaml:"workflow_run_attempt,omitempty"`
+	PullRequestNumber  int                 `json:"pull_request_number,omitempty" yaml:"pull_request_number,omitempty"`
+	HeadSHA            string              `json:"head_sha,omitempty" yaml:"head_sha,omitempty"`
+	HTMLURL            string              `json:"html_url,omitempty" yaml:"html_url,omitempty"`
+}
+
+var (
+	gitHubRepositoryPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+	gitHubSHAPattern        = regexp.MustCompile(`^[a-fA-F0-9]{40}([a-fA-F0-9]{24})?$`)
+)
+
+func (r GitHubReference) Validate() error {
+	if r.SchemaVersion != 1 {
+		return fmt.Errorf("unsupported github reference schema version %d", r.SchemaVersion)
+	}
+	if !gitHubRepositoryPattern.MatchString(r.Repository) {
+		return fmt.Errorf("invalid github repository %q", r.Repository)
+	}
+	switch r.Kind {
+	case GitHubReferenceWorkflowRun:
+		if r.WorkflowRunID <= 0 {
+			return fmt.Errorf("github workflow_run_id must be positive")
+		}
+		if r.WorkflowRunAttempt < 0 {
+			return fmt.Errorf("github workflow_run_attempt cannot be negative")
+		}
+	case GitHubReferencePullRequest:
+		if r.PullRequestNumber <= 0 {
+			return fmt.Errorf("github pull_request_number must be positive")
+		}
+	default:
+		return fmt.Errorf("unsupported github reference kind %q", r.Kind)
+	}
+	if r.PullRequestNumber < 0 {
+		return fmt.Errorf("github pull_request_number cannot be negative")
+	}
+	if r.HeadSHA != "" && !gitHubSHAPattern.MatchString(r.HeadSHA) {
+		return fmt.Errorf("invalid github head_sha")
+	}
+	if r.HTMLURL != "" {
+		parsed, err := url.Parse(r.HTMLURL)
+		if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+			return fmt.Errorf("invalid github html_url")
+		}
+	}
+	return nil
+}
+
+func (r GitHubReference) ExternalKey() string {
+	switch r.Kind {
+	case GitHubReferenceWorkflowRun:
+		return fmt.Sprintf("%s:workflow_run:%d:%d", r.Repository, r.WorkflowRunID, r.WorkflowRunAttempt)
+	case GitHubReferencePullRequest:
+		return fmt.Sprintf("%s:pull_request:%d", r.Repository, r.PullRequestNumber)
+	default:
+		return ""
+	}
+}
+
+// ExternalReference is one verified Lark-message-to-external-object binding.
+type ExternalReference struct {
+	ID              int64           `json:"id" yaml:"id"`
+	Provider        string          `json:"provider" yaml:"provider"`
+	Kind            string          `json:"kind" yaml:"kind"`
+	ExternalKey     string          `json:"external_key" yaml:"external_key"`
+	LarkMessageID   string          `json:"lark_message_id" yaml:"lark_message_id"`
+	ChatID          string          `json:"chat_id" yaml:"chat_id"`
+	SenderAppID     string          `json:"sender_app_id" yaml:"sender_app_id"`
+	Reference       GitHubReference `json:"reference" yaml:"reference"`
+	ReferenceDigest string          `json:"reference_digest" yaml:"reference_digest"`
+	VerifiedAt      time.Time       `json:"verified_at" yaml:"verified_at"`
+	UpdatedAt       time.Time       `json:"updated_at" yaml:"updated_at"`
 }
 
 // IntakeDisposition records whether an observed event entered the work queue.

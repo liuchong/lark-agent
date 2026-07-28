@@ -337,6 +337,24 @@ func (s *Store) migrate() error {
 			`CREATE INDEX IF NOT EXISTS idx_resource_subscriptions_resource
 			 ON resource_subscriptions(resource_type, file_token, app_token, table_id)`,
 		}},
+		{version: 9, statements: []string{
+			`CREATE TABLE IF NOT EXISTS external_references (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				provider TEXT NOT NULL,
+				kind TEXT NOT NULL,
+				external_key TEXT NOT NULL,
+				lark_message_id TEXT NOT NULL,
+				chat_id TEXT NOT NULL,
+				sender_app_id TEXT NOT NULL,
+				reference_json TEXT NOT NULL,
+				reference_digest TEXT NOT NULL,
+				verified_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				UNIQUE(provider, lark_message_id)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_external_references_key
+			 ON external_references(provider, external_key)`,
+		}},
 	}
 	for _, migration := range migrations {
 		if version >= migration.version {
@@ -367,6 +385,183 @@ func (s *Store) migrate() error {
 		version = migration.version
 	}
 	return nil
+}
+
+// UpsertExternalReference persists an identical verified reference
+// idempotently and rejects any attempt to reuse the Lark message for a
+// different external object.
+func (s *Store) UpsertExternalReference(
+	ctx context.Context,
+	ref domain.ExternalReference,
+) (domain.ExternalReference, error) {
+	if strings.TrimSpace(ref.Provider) == "" ||
+		strings.TrimSpace(ref.Kind) == "" ||
+		strings.TrimSpace(ref.ExternalKey) == "" ||
+		strings.TrimSpace(ref.LarkMessageID) == "" ||
+		strings.TrimSpace(ref.ChatID) == "" ||
+		strings.TrimSpace(ref.SenderAppID) == "" {
+		return domain.ExternalReference{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"external reference identity fields are required",
+		)
+	}
+	if err := ref.Reference.Validate(); err != nil {
+		return domain.ExternalReference{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"invalid external reference",
+		).WithCause(err)
+	}
+	referenceJSON, err := json.Marshal(ref.Reference)
+	if err != nil {
+		return domain.ExternalReference{}, errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"encode external reference",
+		).WithCause(err)
+	}
+	sum := sha256.Sum256(referenceJSON)
+	digest := fmt.Sprintf("sha256:%x", sum[:])
+	now := time.Now().UTC()
+	if ref.VerifiedAt.IsZero() {
+		ref.VerifiedAt = now
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.ExternalReference{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin external reference transaction",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	existing, found, err := queryExternalReference(
+		tx.QueryRowContext(ctx, externalReferenceSelect+` WHERE provider = ? AND lark_message_id = ?`,
+			ref.Provider, ref.LarkMessageID),
+	)
+	if err != nil {
+		return domain.ExternalReference{}, err
+	}
+	if found {
+		if existing.ReferenceDigest != digest ||
+			existing.ExternalKey != ref.ExternalKey ||
+			existing.ChatID != ref.ChatID ||
+			existing.SenderAppID != ref.SenderAppID {
+			return domain.ExternalReference{}, errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"conflicting external reference for Lark message %s",
+				ref.LarkMessageID,
+			)
+		}
+		return existing, nil
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO external_references(
+			provider, kind, external_key, lark_message_id, chat_id, sender_app_id,
+			reference_json, reference_digest, verified_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ref.Provider,
+		ref.Kind,
+		ref.ExternalKey,
+		ref.LarkMessageID,
+		ref.ChatID,
+		ref.SenderAppID,
+		string(referenceJSON),
+		digest,
+		ref.VerifiedAt.UTC().Format(time.RFC3339Nano),
+		now.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return domain.ExternalReference{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"insert external reference",
+		).WithCause(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return domain.ExternalReference{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read external reference id",
+		).WithCause(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.ExternalReference{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit external reference",
+		).WithCause(err)
+	}
+	ref.ID = id
+	ref.ReferenceDigest = digest
+	ref.UpdatedAt = now
+	return ref, nil
+}
+
+const externalReferenceSelect = `SELECT id, provider, kind, external_key,
+	lark_message_id, chat_id, sender_app_id, reference_json, reference_digest,
+	verified_at, updated_at FROM external_references`
+
+// GetExternalReference reads one verified reference without changing work
+// admission or replay state.
+func (s *Store) GetExternalReference(
+	ctx context.Context,
+	provider string,
+	larkMessageID string,
+) (domain.ExternalReference, bool, error) {
+	return queryExternalReference(s.db.QueryRowContext(
+		ctx,
+		externalReferenceSelect+` WHERE provider = ? AND lark_message_id = ?`,
+		provider,
+		larkMessageID,
+	))
+}
+
+type externalReferenceRowScanner interface {
+	Scan(...any) error
+}
+
+func queryExternalReference(row externalReferenceRowScanner) (domain.ExternalReference, bool, error) {
+	var ref domain.ExternalReference
+	var referenceJSON, verifiedAt, updatedAt string
+	err := row.Scan(
+		&ref.ID,
+		&ref.Provider,
+		&ref.Kind,
+		&ref.ExternalKey,
+		&ref.LarkMessageID,
+		&ref.ChatID,
+		&ref.SenderAppID,
+		&referenceJSON,
+		&ref.ReferenceDigest,
+		&verifiedAt,
+		&updatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.ExternalReference{}, false, nil
+	}
+	if err != nil {
+		return domain.ExternalReference{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read external reference",
+		).WithCause(err)
+	}
+	if err := json.Unmarshal([]byte(referenceJSON), &ref.Reference); err != nil {
+		return domain.ExternalReference{}, false, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"decode stored external reference",
+		).WithCause(err)
+	}
+	ref.VerifiedAt, err = time.Parse(time.RFC3339Nano, verifiedAt)
+	if err != nil {
+		return domain.ExternalReference{}, false, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"parse external reference verified_at",
+		).WithCause(err)
+	}
+	ref.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt)
+	if err != nil {
+		return domain.ExternalReference{}, false, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"parse external reference updated_at",
+		).WithCause(err)
+	}
+	return ref, true, nil
 }
 
 // GetPollCursor returns the stored polling cursor for a scope.

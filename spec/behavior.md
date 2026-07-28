@@ -21,6 +21,16 @@ model is only one part of the system: queueing, routing, workspace boundaries,
 identity checks, idempotency, audit, and rollback decisions are enforced by
 code outside the prompt.
 
+The runtime may also bridge a trusted GitHub workflow notification into Lark.
+A short-lived GitHub Action sends one bot-authored notification through the
+HTTP API and exits. The installed daemon remains the only WebSocket consumer.
+The Action requires an explicit Lark OpenAPI base URL and never relies on the
+official SDK's Feishu default for an international Lark installation.
+When a human replies to that notification, the daemon verifies a versioned
+GitHub reference from the quoted current-app message and may expose fresh,
+bounded, read-only GitHub evidence to the model. It never treats a human or
+another app's marker as trusted control data.
+
 ## Harness Architecture
 
 The runtime is split into explicit layers so a slow or divergent model run
@@ -117,6 +127,17 @@ coordination need, `reply` sends a source-backed response, and
 `request_approval` holds an exact risky or uncertain action. App/bot messages
 in conversation context are evidence only and never redefine the role selected
 by the router.
+
+A quoted app/bot message may carry a GitHub reference, but the reference is
+usable only after code verifies that the message sender is the configured
+current Lark application, the marker has a valid HMAC signature made with the
+same Lark app secret, the repository is explicitly allowed, and the message is
+in the target's same-chat reply/root chain. Marker-shaped text copied through
+an ordinary bot answer remains untrusted. An invalid signature leaves the
+GitHub tool unavailable but does not block an otherwise valid business answer. The
+model cannot supply or change the repository, pull request, workflow run, API
+base URL, or credential. A verified reference adds one read-only GitHub evidence
+tool; it does not widen sender authority or change the invocation role.
 
 Every model run derives tool authority from the durable sender identity. Work
 triggered by anyone other than the configured owner is read-only: it may inspect
@@ -507,6 +528,12 @@ same-chat adjacent fallback; they never authorize a guessed antecedent. Older
 durable work items may hydrate relation metadata by message ID, but completed
 messages are not replayed solely to backfill context.
 
+When an explicit relation contains a current-app GitHub notification, context
+resolution parses and verifies its canonical reference before model work. The
+verified reference is persisted idempotently by Lark message ID. A restart may
+load that reference, but cannot replay the notification or infer a reference
+from adjacent untrusted text. Conflicting references fail closed.
+
 When an owner sends equivalent requests through private chat and group mention
 inside a short dedupe window, intake links them to one canonical work item or a
 completed result. The duplicate item must not start a second long
@@ -764,6 +791,12 @@ Every behavior change must have an integration test. Required regression areas:
 - mode switches across `auto`, `approval`, and `paused`;
 - token or scope failures for user-identity replies;
 - daemon restart and retry behavior.
+
+The GitHub-Lark bridge additionally requires executable integration coverage
+for HTTP-only notification sending, stable Lark idempotency keys, hostile
+pull-request text, verified and spoofed quoted references, owner and non-owner
+permission behavior, bounded GitHub results, truthful API failures, and
+reference recovery after restart.
 
 The multi-step loop is accepted by these executable BDD scenarios:
 

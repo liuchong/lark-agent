@@ -54,14 +54,15 @@ type ToolReceipt struct {
 
 // Definition binds a model-visible schema to its controlled implementation.
 type Definition struct {
-	Info             *schema.ToolInfo
-	Permission       ToolPermission
-	Risk             ToolRisk
-	SideEffect       bool
-	OwnerOnly        bool
-	NonOwnerReadOnly bool
-	SameChatArgument string
-	Execute          func(context.Context, json.RawMessage) (Execution, error)
+	Info                    *schema.ToolInfo
+	Permission              ToolPermission
+	Risk                    ToolRisk
+	SideEffect              bool
+	OwnerOnly               bool
+	NonOwnerReadOnly        bool
+	SameChatArgument        string
+	RequiresGitHubReference bool
+	Execute                 func(context.Context, json.RawMessage) (Execution, error)
 }
 
 // Registry is the sole model-callable tool catalog.
@@ -74,9 +75,10 @@ type invocationScopeContextKey struct{}
 
 // InvocationScope is derived from durable sender identity and source chat.
 type InvocationScope struct {
-	Owner    bool
-	ReadOnly bool
-	ChatID   string
+	Owner           bool
+	ReadOnly        bool
+	ChatID          string
+	GitHubReference *domain.GitHubReference
 }
 
 // WithWorkItemDedup makes the current durable work identity available to tools.
@@ -169,6 +171,13 @@ func (r *Registry) Execute(ctx context.Context, name string, arguments json.RawM
 				name,
 			)
 		}
+		if definition.RequiresGitHubReference && scope.GitHubReference == nil {
+			return Execution{}, errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"tool requires a verified GitHub reference: %s",
+				name,
+			)
+		}
 		if !scope.Owner && definition.SameChatArgument != "" {
 			var argumentsObject map[string]json.RawMessage
 			if err := json.Unmarshal(arguments, &argumentsObject); err != nil {
@@ -207,6 +216,9 @@ func (r *Registry) Execute(ctx context.Context, name string, arguments json.RawM
 }
 
 func toolAllowedForScope(definition Definition, scope InvocationScope) bool {
+	if definition.RequiresGitHubReference && scope.GitHubReference == nil {
+		return false
+	}
 	if scope.Owner {
 		return true
 	}

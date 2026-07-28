@@ -108,9 +108,10 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		l.ToolChoice = schema.ToolChoiceForced
 	}
 	invocationScope := agenttools.InvocationScope{
-		Owner:    bundle.User.OpenID != "" && bundle.Event.SenderID == bundle.User.OpenID,
-		ReadOnly: bundle.User.OpenID == "" || bundle.Event.SenderID != bundle.User.OpenID,
-		ChatID:   bundle.Event.ChatID,
+		Owner:           bundle.User.OpenID != "" && bundle.Event.SenderID == bundle.User.OpenID,
+		ReadOnly:        bundle.User.OpenID == "" || bundle.Event.SenderID != bundle.User.OpenID,
+		ChatID:          bundle.Event.ChatID,
+		GitHubReference: bundle.GitHubReference,
 	}
 	visibleToolInfos := l.Tools.InfosFor(invocationScope)
 	bundle = filterBundleTools(bundle, visibleToolInfos, invocationScope)
@@ -869,6 +870,7 @@ func isRelevantEvidenceTool(name string) bool {
 	switch name {
 	case "get_lark_context",
 		"search_lark_messages",
+		"get_github_context",
 		"explore_workspace",
 		"search_workspace",
 		"read_workspace",

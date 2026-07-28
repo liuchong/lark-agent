@@ -120,6 +120,39 @@ Owner 私聊 Assistant Bot 发送“在吗”或简单问候时走本地快速�
 `reply_scopes.owner_mentions` 分别确认实际值。两个范围相互独立，范围变化不会自动
 重放旧消息。
 
+## GitHub 通知与追问
+
+本地令牌状态：
+
+```bash
+lark-agent github auth status
+lark-agent doctor
+```
+
+`doctor.github` 会显示是否启用、精确仓库 allowlist、令牌是否可读、`read_only` 和
+`single_lark_listener`。令牌缺失只会禁用 GitHub 增强，不会阻止普通 Lark 消息链路。
+
+GitHub Action 是一次性 HTTP 发送者。它可以与已安装 daemon 使用同一个 Lark app
+ID 和 app secret，但不会启动 WebSocket；已安装 daemon 始终是唯一实时事件监听者。
+Action 消息带有机器可验证的引用标记。用户在 Lark 中回复或引用该消息后，daemon
+只在以下条件全部成立时开放 `get_github_context`：
+
+- 引用根消息由当前 Lark 应用发送；
+- 根消息和当前问题属于同一 chat；
+- 引用标记结构及 HMAC 签名有效，且与持久化记录不冲突；
+- 仓库位于 `github.allowed_repositories`；
+- 本地只读 GitHub 令牌可用。
+
+模型只能选择读取摘要、检查、文件或审查；仓库、PR 和 run 身份来自已验证引用。
+GitHub API 不可用、限流、拒绝或返回不一致对象时，回复必须标明证据不完整，不能
+根据通知标题补写不存在的原因。
+
+生产工作流使用受保护的 GitHub Environment `lark-production`。其中
+`LARK_APP_SECRET` 是 secret，`LARK_APP_ID`、`LARK_CHAT_ID` 和 `LARK_BASE_URL`
+是部署变量。`LARK_BASE_URL` 必须显式设置，国际版使用
+`https://open.larksuite.com`。仓库工作流只检出默认分支的 Action 实现，不检出触发
+run 的 PR 头，不下载 artifacts，不执行外部贡献代码。
+
 非 Owner 只有群内直接 `@Owner` 的代回复请求会进入运行，并且只按只读权限执行：
 只能读取来源群的有界上下文和配置 Workspace 内的业务代码，不能执行 shell、搜索
 其他群、修改、删除、提交或部署。
@@ -167,5 +200,5 @@ token 写回 Keychain 后重放原请求一次。若刷新凭据也过期，运�
 - live 行为异常：停止新服务，恢复安装备份，只加载已知可运行的旧版本。
 - 外部动作不确定：保持工作暂停，不要用 `queue retry` 或重启来猜测性重发。
 
-真实验收只允许在用户本次明确授权的会话进行。当前验收目标是“龙虾群🦞”和
-“测试负责人的智能助手”私聊；不得向名称相近的会话或 Example Group 群发送测试消息。
+真实验收只允许在用户本次明确授权的精确 chat ID 进行。具体机器人名、群名和 chat
+ID 属于本机安装与部署配置，不写入项目通用代码或仓库文档；不得按相似名称猜测目标。

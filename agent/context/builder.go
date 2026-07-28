@@ -211,6 +211,7 @@ type Bundle struct {
 	WorkspaceHits    []workspace.SearchResult `json:"workspace_hits" yaml:"workspace_hits"`
 	Conversation     []domain.NormalizedEvent `json:"conversation,omitempty" yaml:"conversation,omitempty"`
 	ContextSelection domain.ContextSelection  `json:"context_selection,omitempty" yaml:"context_selection,omitempty"`
+	GitHubReference  *domain.GitHubReference  `json:"github_reference,omitempty" yaml:"github_reference,omitempty"`
 	Sources          []domain.SourceRef       `json:"sources" yaml:"sources"`
 }
 
@@ -223,6 +224,7 @@ type Builder struct {
 	User             UserProfile
 	Conversation     []domain.NormalizedEvent
 	ContextSelection domain.ContextSelection
+	GitHubReference  *domain.GitHubReference
 }
 
 // Build creates a bounded context bundle for item.
@@ -245,6 +247,7 @@ func (b Builder) Build(item domain.WorkItem) (Bundle, error) {
 		Rules:            b.Rules,
 		Memories:         memories,
 		ContextSelection: b.ContextSelection,
+		GitHubReference:  b.GitHubReference,
 		Conversation:     b.Conversation,
 		Sources:          collectSources(b.Rules, memories, nil),
 	}
@@ -323,6 +326,7 @@ func defaultToolSpecs() []ToolSpec {
 		{Name: "list_skills", Description: "List workspace-local skills", Available: true},
 		{Name: "load_skill", Description: "Load one workspace-local skill", Available: true},
 		{Name: "get_lark_context", Description: "Read bounded same-chat nearby, quoted reply, or thread context", Available: true},
+		{Name: "get_github_context", Description: "Read bounded facts from a verified quoted GitHub notification", Available: true},
 		{Name: "search_lark_messages", Description: "Search owner-visible Lark messages", Available: true},
 		{Name: "shell", Description: "Run a command in the enforced workspace sandbox", SideEffect: true, Available: runtime.GOOS == "darwin" && sandboxErr == nil},
 		{Name: "submit_investigation_plan", Description: "Submit a bounded read-only plan before broad coding search", Available: true},

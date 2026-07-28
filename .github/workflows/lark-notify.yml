@@ -1,0 +1,33 @@
+name: Notify Lark after CI
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+
+permissions:
+  actions: read
+  checks: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    environment: lark-production
+    steps:
+      - name: Check out trusted default branch action
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Send trusted workflow facts to Lark
+        uses: ./
+        with:
+          lark_app_id: ${{ vars.LARK_APP_ID }}
+          lark_app_secret: ${{ secrets.LARK_APP_SECRET }}
+          lark_chat_id: ${{ vars.LARK_CHAT_ID }}
+          lark_base_url: ${{ vars.LARK_BASE_URL }}
+          github_token: ${{ github.token }}

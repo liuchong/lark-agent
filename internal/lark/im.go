@@ -28,6 +28,19 @@ type Service struct {
 	ownerOpenID string
 }
 
+// SendMessageRequest sends one fully encoded Lark message to an exact chat.
+type SendMessageRequest struct {
+	ChatID         string
+	MessageType    string
+	Content        string
+	IdempotencyKey string
+}
+
+type SendMessageResult struct {
+	MessageID string `json:"message_id"`
+	ChatID    string `json:"chat_id"`
+}
+
 // SearchChatsRequest searches chats visible to the requested identity.
 type SearchChatsRequest struct {
 	Query     string
@@ -821,6 +834,68 @@ func (s *Service) ReplyAsBot(ctx context.Context, req tools.ReplyRequest) (tools
 	return s.reply(ctx, req, IdentityBot)
 }
 
+// SendMessageAsBot sends an HTTP-only bot message to an exact chat. It does not
+// construct or start a WebSocket consumer.
+func (s *Service) SendMessageAsBot(ctx context.Context, req SendMessageRequest) (SendMessageResult, error) {
+	if s.caller == nil {
+		return SendMessageResult{}, errs.NewInternalError(errs.SubtypeUnknown, "IM API caller is not configured")
+	}
+	if strings.TrimSpace(req.ChatID) == "" {
+		return SendMessageResult{}, errs.NewValidationError(errs.SubtypeInvalidArgument, "chat_id is required").WithParam("chat_id")
+	}
+	switch req.MessageType {
+	case "text", "post":
+	default:
+		return SendMessageResult{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"unsupported message type %q",
+			req.MessageType,
+		).WithParam("message_type")
+	}
+	if strings.TrimSpace(req.Content) == "" || !json.Valid([]byte(req.Content)) {
+		return SendMessageResult{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"message content must be valid non-empty JSON",
+		).WithParam("content")
+	}
+	if err := validateMessageUUID(req.IdempotencyKey); err != nil {
+		return SendMessageResult{}, err
+	}
+	body := map[string]any{
+		"receive_id": req.ChatID,
+		"msg_type":   req.MessageType,
+		"content":    req.Content,
+	}
+	if req.IdempotencyKey != "" {
+		body["uuid"] = req.IdempotencyKey
+	}
+	result, err := s.caller.CallAPI(ctx, APIRequest{
+		Method: http.MethodPost,
+		Path:   "/open-apis/im/v1/messages",
+		Params: map[string]any{"receive_id_type": "chat_id"},
+		Data:   body,
+		As:     IdentityBot,
+	})
+	if err != nil {
+		return SendMessageResult{}, err
+	}
+	data := responseData(result)
+	out := SendMessageResult{
+		MessageID: stringValue(data["message_id"]),
+		ChatID:    stringValue(data["chat_id"]),
+	}
+	if out.MessageID == "" {
+		return SendMessageResult{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"message create response is missing message_id",
+		)
+	}
+	if out.ChatID == "" {
+		out.ChatID = req.ChatID
+	}
+	return out, nil
+}
+
 func (s *Service) reply(ctx context.Context, req tools.ReplyRequest, as Identity) (tools.ReplyResult, error) {
 	if s.caller == nil {
 		return tools.ReplyResult{}, errs.NewInternalError(errs.SubtypeUnknown, "IM API caller is not configured")
@@ -1054,6 +1129,13 @@ func textFromContent(raw any) string {
 		}
 		return v
 	case map[string]any:
+		for _, locale := range []string{"en_us", "zh_cn", "ja_jp"} {
+			if localized, ok := v[locale]; ok {
+				if text := textFromContent(localized); text != "" {
+					return text
+				}
+			}
+		}
 		if content := stringValue(v["content"]); content != "" {
 			return textFromContent(content)
 		}

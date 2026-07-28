@@ -55,6 +55,29 @@ func TestParseMessagePreservesConversationRelations(t *testing.T) {
 	}
 }
 
+func TestParseMessageExtractsTrustedMarkerFromLocalizedPost(t *testing.T) {
+	marker := "[lark-agent-github-ref:v1:synthetic]"
+	message := parseMessage(map[string]any{
+		"message_id": "om_notification",
+		"chat_id":    "oc_synthetic",
+		"msg_type":   "post",
+		"sender": map[string]any{
+			"id":          "cli_current",
+			"id_type":     "app_id",
+			"sender_type": "app",
+		},
+		"body": map[string]any{
+			"content": `{"en_us":{"title":"GitHub failure","content":[[{"tag":"text","text":"Status: failure"}],[{"tag":"text","text":"` + marker + `"}]]}}`,
+		},
+	})
+	if message.SenderOpenID != "cli_current" || message.SenderType != "app" {
+		t.Fatalf("sender=%q type=%q", message.SenderOpenID, message.SenderType)
+	}
+	if !strings.Contains(message.Content, marker) {
+		t.Fatalf("localized post lost trusted marker: %q", message.Content)
+	}
+}
+
 func TestBatchGetChatsReturnsPrivatePartnerIdentity(t *testing.T) {
 	caller := &fakeCaller{response: map[string]any{
 		"data": map[string]any{
@@ -183,6 +206,40 @@ func TestNotifyOwnerUsesBotIdentity(t *testing.T) {
 	}
 }
 
+func TestSendMessageAsBotUsesChatIdentityAndReturnsTypedResult(t *testing.T) {
+	caller := &fakeCaller{response: map[string]any{
+		"data": map[string]any{
+			"message_id": "om_notification",
+			"chat_id":    "oc_synthetic",
+		},
+	}}
+	svc := NewService(caller, "ou_owner")
+	result, err := svc.SendMessageAsBot(context.Background(), SendMessageRequest{
+		ChatID:         "oc_synthetic",
+		MessageType:    "post",
+		Content:        `{"zh_cn":{"title":"CI failed","content":[[{"tag":"text","text":"failure"}]]}}`,
+		IdempotencyKey: "gh-1234",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if caller.req.As != IdentityBot ||
+		caller.req.Path != "/open-apis/im/v1/messages" ||
+		caller.req.Params["receive_id_type"] != "chat_id" {
+		t.Fatalf("request=%+v", caller.req)
+	}
+	body := caller.req.Data.(map[string]any)
+	if body["receive_id"] != "oc_synthetic" ||
+		body["msg_type"] != "post" ||
+		body["content"] == "" ||
+		body["uuid"] != "gh-1234" {
+		t.Fatalf("body=%+v", body)
+	}
+	if result.MessageID != "om_notification" || result.ChatID != "oc_synthetic" {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
 func TestMessageWritesRejectOversizedUUIDBeforeAPICall(t *testing.T) {
 	oversized := strings.Repeat("a", 51)
 	tests := []struct {
@@ -207,6 +264,18 @@ func TestMessageWritesRejectOversizedUUIDBeforeAPICall(t *testing.T) {
 					Text:           "notice",
 					IdempotencyKey: oversized,
 				})
+			},
+		},
+		{
+			name: "chat notification",
+			call: func(svc *Service) error {
+				_, err := svc.SendMessageAsBot(context.Background(), SendMessageRequest{
+					ChatID:         "oc_synthetic",
+					MessageType:    "post",
+					Content:        `{}`,
+					IdempotencyKey: oversized,
+				})
+				return err
 			},
 		},
 	}

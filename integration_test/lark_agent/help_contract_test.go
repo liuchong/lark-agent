@@ -63,6 +63,14 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 			args: []string{"daemon", "run", "--help"},
 			want: []string{"--chat-query", "configured and validation groups", "Non-owner requests are read-only", "environment reconnaissance"},
 		},
+		{
+			args: []string{"github", "notify", "--help"},
+			want: []string{"--chat-id", "--dry-run", "GITHUB_EVENT_PATH", "HTTP-only"},
+		},
+		{
+			args: []string{"github", "auth", "--help"},
+			want: []string{"login", "status", "Keychain", "stdin"},
+		},
 	}
 	for _, testCase := range cases {
 		code, stdout, stderr := runAgent(t, bin, testCase.args...)

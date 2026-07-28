@@ -36,7 +36,9 @@ import (
 	"github.com/liuchong/lark-agent/agent/workspace"
 	"github.com/liuchong/lark-agent/internal/apperr"
 	vfs "github.com/liuchong/lark-agent/internal/fsx"
+	internalgithub "github.com/liuchong/lark-agent/internal/github"
 	serviceim "github.com/liuchong/lark-agent/internal/lark"
+	"github.com/liuchong/lark-agent/internal/secretstore"
 )
 
 // Execute runs the command tree.
@@ -75,8 +77,8 @@ assistant requests add a keyboard working reaction before work starts and
 remove it when work finishes.
 Programming questions use a bounded coding investigation path with planning,
 code search fallback, source-backed verify, and replay transcript export.
-Simple questions use at most 2 model turns; coding questions use 20 turns,
-10 tool calls, and a 3-step no-progress stop by default. One interactive
+Simple questions use at most 3 model turns; coding questions use 20 turns,
+16 tool calls, and a 3-step no-progress stop by default. One interactive
 worker is reserved from the foreground pool, while CodingGoal work uses
 background workers. Time, date, ping, status, doctor, queue summary, and help
 use a deterministic fast path before any model loop.
@@ -112,6 +114,7 @@ Modes:
 		newApprovalCommand(out, &statePath),
 		newMemoryCommand(out),
 		newRulesCommand(out, &configPath),
+		newGitHubCommand(in, out, &configPath),
 		newDoctorCommand(out, &configPath, &statePath),
 	)
 	return cmd
@@ -197,6 +200,307 @@ type authLoginInput struct {
 	AppSecret       string `json:"app_secret"`
 	UserAccessToken string `json:"user_access_token"`
 	RefreshToken    string `json:"refresh_token"`
+}
+
+func newGitHubCommand(in io.Reader, out io.Writer, configPath *string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "github",
+		Short: "Bridge trusted GitHub workflow facts into Lark",
+		Long: "Send HTTP-only GitHub workflow notifications and manage the local read-only " +
+			"GitHub token. The token is read as JSON from stdin and stored in Keychain.",
+	}
+	cmd.AddCommand(newGitHubAuthCommand(in, out, configPath))
+
+	var chatID, eventPath, eventName string
+	var dryRun bool
+	notify := &cobra.Command{
+		Use:   "notify",
+		Short: "Send one trusted GitHub event notification to an exact Lark chat",
+		Long: "Read a typed event from GITHUB_EVENT_PATH and GITHUB_EVENT_NAME, optionally " +
+			"enrich it through the GitHub API, and send one HTTP-only Lark bot post. " +
+			"This command never starts a Lark WebSocket consumer.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadGitHubNotifyConfig(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			if !cfg.GitHub.Enabled {
+				return errs.NewConfigError(
+					errs.SubtypeFailedPrecondition,
+					"github bridge is disabled",
+				).WithField("github.enabled")
+			}
+			if strings.TrimSpace(chatID) == "" {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "--chat-id is required").
+					WithParam("--chat-id")
+			}
+			path := firstNonEmpty(eventPath, os.Getenv("GITHUB_EVENT_PATH"))
+			name := firstNonEmpty(eventName, os.Getenv("GITHUB_EVENT_NAME"))
+			if path == "" || name == "" {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"GITHUB_EVENT_PATH and GITHUB_EVENT_NAME are required",
+				)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return errs.NewInternalError(errs.SubtypeFileIO, "read GitHub event path").WithCause(err)
+			}
+			snapshot, err := internalgithub.ParseEvent(name, data)
+			if err != nil {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "parse GitHub event").WithCause(err)
+			}
+			if !repositoryAllowed(snapshot.Reference.Repository, cfg.GitHub.AllowedRepositories) {
+				return errs.NewPermissionError(
+					errs.SubtypeFailedPrecondition,
+					"github repository is not allowed: %s",
+					snapshot.Reference.Repository,
+				)
+			}
+
+			token, tokenErr := secretstore.Read(
+				cmd.Context(),
+				cfg.GitHub.TokenKeychainService,
+				cfg.GitHub.TokenKeychainKey,
+				"GITHUB_TOKEN",
+			)
+			if tokenErr == nil {
+				client, err := newGitHubClient(cfg, token)
+				if err != nil {
+					return err
+				}
+				result, err := client.FetchContext(
+					cmd.Context(),
+					snapshot.Reference,
+					[]internalgithub.Section{
+						internalgithub.SectionSummary,
+						internalgithub.SectionChecks,
+						internalgithub.SectionFiles,
+						internalgithub.SectionReviews,
+					},
+				)
+				if err != nil {
+					snapshot.Partial = true
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "GitHub enrichment unavailable: %s\n", err)
+				} else {
+					snapshot.Name = firstNonEmpty(result.Name, snapshot.Name)
+					snapshot.Status = firstNonEmpty(result.Status, snapshot.Status)
+					snapshot.Conclusion = firstNonEmpty(result.Conclusion, snapshot.Conclusion)
+					snapshot.FailedJobs = failedGitHubJobs(result.Jobs)
+					snapshot.Files = result.Files
+					snapshot.Reviews = result.Reviews
+					snapshot.Annotations = result.Annotations
+					snapshot.Omitted = result.Omitted
+					snapshot.Partial = result.Partial || result.Truncated.Any()
+				}
+			} else {
+				snapshot.Partial = true
+				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "GitHub enrichment unavailable: read-only token is not configured")
+			}
+			credentials, err := serviceim.LoadCredentials(cmd.Context(), credentialRefs(cfg))
+			if err != nil {
+				return err
+			}
+			notification, err := internalgithub.RenderNotification(snapshot, credentials.AppSecret)
+			if err != nil {
+				return errs.NewInternalError(errs.SubtypeInvalidResponse, "render GitHub notification").WithCause(err)
+			}
+			idempotencyKey := internalgithub.StableNotificationKey(chatID, snapshot.Reference)
+			result := map[string]any{
+				"chat_id":         chatID,
+				"message_type":    notification.MessageType,
+				"idempotency_key": idempotencyKey,
+				"reference":       snapshot.Reference,
+				"partial":         snapshot.Partial,
+				"dry_run":         dryRun,
+			}
+			if dryRun {
+				result["content"] = notification.Content
+				return writeData(out, result)
+			}
+			larkClient, err := serviceim.NewClient(serviceim.ClientConfig{
+				AppID:     cfg.Lark.AppID,
+				AppSecret: credentials.AppSecret,
+				BaseURL:   cfg.Lark.BaseURL,
+				Timeout:   30 * time.Second,
+			})
+			if err != nil {
+				return err
+			}
+			sent, err := serviceim.NewService(larkClient, cfg.Owner.OpenID).SendMessageAsBot(
+				cmd.Context(),
+				serviceim.SendMessageRequest{
+					ChatID:         chatID,
+					MessageType:    notification.MessageType,
+					Content:        notification.Content,
+					IdempotencyKey: idempotencyKey,
+				},
+			)
+			if err != nil {
+				return err
+			}
+			result["message_id"] = sent.MessageID
+			result["chat_id"] = sent.ChatID
+			return writeData(out, result)
+		},
+	}
+	notify.Flags().StringVar(&chatID, "chat-id", "", "exact destination Lark chat ID")
+	notify.Flags().StringVar(&eventPath, "event-path", "", "typed GitHub event JSON path (default: GITHUB_EVENT_PATH)")
+	notify.Flags().StringVar(&eventName, "event-name", "", "GitHub event name (default: GITHUB_EVENT_NAME)")
+	notify.Flags().BoolVar(&dryRun, "dry-run", false, "render structured output without sending to Lark")
+	cmd.AddCommand(notify)
+	return cmd
+}
+
+func newGitHubAuthCommand(in io.Reader, out io.Writer, configPath *string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "auth",
+		Short: "Manage the read-only GitHub token",
+		Long:  "Use login to read a token as JSON from stdin and store it in Keychain; use status without printing the token.",
+	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "login",
+		Short: "Read {\"token\":\"...\"} from stdin and store it in Keychain",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if in == nil {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "stdin is required").WithParam("stdin")
+			}
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			var input struct {
+				Token string `json:"token"`
+			}
+			decoder := json.NewDecoder(in)
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&input); err != nil {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "decode GitHub token JSON from stdin").WithCause(err)
+			}
+			if err := secretstore.Write(
+				cmd.Context(),
+				cfg.GitHub.TokenKeychainService,
+				cfg.GitHub.TokenKeychainKey,
+				strings.TrimSpace(input.Token),
+			); err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{
+				"stored":           true,
+				"keychain_service": cfg.GitHub.TokenKeychainService,
+				"account":          cfg.GitHub.TokenKeychainKey,
+			})
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "status",
+		Short: "Check whether the GitHub token is readable without printing it",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			token, readErr := secretstore.Read(
+				cmd.Context(),
+				cfg.GitHub.TokenKeychainService,
+				cfg.GitHub.TokenKeychainKey,
+				"GITHUB_TOKEN",
+			)
+			return writeData(out, map[string]any{
+				"configured":       readErr == nil && token != "",
+				"keychain_service": cfg.GitHub.TokenKeychainService,
+				"account":          cfg.GitHub.TokenKeychainKey,
+				"error":            errorString(readErr),
+			})
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "logout",
+		Short: "Delete the configured GitHub token from Keychain",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			if err := secretstore.Delete(
+				cmd.Context(),
+				cfg.GitHub.TokenKeychainService,
+				cfg.GitHub.TokenKeychainKey,
+			); err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"deleted": true})
+		},
+	})
+	return cmd
+}
+
+func newGitHubClient(cfg config.Config, token string) (*internalgithub.Client, error) {
+	return internalgithub.NewClient(internalgithub.ClientConfig{
+		BaseURL: cfg.GitHub.APIBaseURL,
+		Token:   token,
+		Limits: internalgithub.Limits{
+			MaxFiles:       cfg.GitHub.MaxFiles,
+			MaxPatchBytes:  cfg.GitHub.MaxPatchBytes,
+			MaxAnnotations: cfg.GitHub.MaxAnnotations,
+			MaxReviews:     cfg.GitHub.MaxReviews,
+		},
+	})
+}
+
+func loadGitHubNotifyConfig(path string) (config.Config, error) {
+	cfg, err := config.Load(path)
+	if err == nil {
+		return cfg, nil
+	}
+	if os.Getenv("GITHUB_ACTIONS") != "true" {
+		return config.Config{}, err
+	}
+	workspaceRoot := firstNonEmpty(os.Getenv("GITHUB_WORKSPACE"), "/github/workspace")
+	if !filepath.IsAbs(workspaceRoot) {
+		return config.Config{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"GITHUB_WORKSPACE must be absolute",
+		)
+	}
+	cfg = config.Default()
+	cfg.Lark.AppID = strings.TrimSpace(os.Getenv("LARK_AGENT_APP_ID"))
+	cfg.Lark.BaseURL = strings.TrimSpace(os.Getenv("LARK_AGENT_LARK_BASE_URL"))
+	if cfg.Lark.BaseURL == "" {
+		return config.Config{}, errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"LARK_AGENT_LARK_BASE_URL is required in GitHub Actions",
+		).WithField("lark.base_url")
+	}
+	cfg.Owner.OpenID = "github-action-sender"
+	cfg.Workspace.Root = workspaceRoot
+	cfg.GitHub.Enabled = true
+	cfg.GitHub.APIBaseURL = firstNonEmpty(os.Getenv("GITHUB_API_URL"), cfg.GitHub.APIBaseURL)
+	cfg.GitHub.AllowedRepositories = []string{strings.TrimSpace(os.Getenv("GITHUB_REPOSITORY"))}
+	if err := cfg.Validate(); err != nil {
+		return config.Config{}, err
+	}
+	return cfg, nil
+}
+
+func repositoryAllowed(repository string, allowed []string) bool {
+	for _, candidate := range allowed {
+		if strings.EqualFold(strings.TrimSpace(repository), strings.TrimSpace(candidate)) {
+			return true
+		}
+	}
+	return false
+}
+
+func failedGitHubJobs(jobs []internalgithub.JobSummary) []internalgithub.JobSummary {
+	var failed []internalgithub.JobSummary
+	for _, job := range jobs {
+		switch job.Conclusion {
+		case "failure", "cancelled", "timed_out", "action_required", "startup_failure":
+			failed = append(failed, job)
+		}
+	}
+	return failed
 }
 
 func mergeAuthLoginInput(existing serviceim.Credentials, input authLoginInput) (serviceim.Credentials, error) {
@@ -866,8 +1170,34 @@ func buildLiveOptions(
 		return nil, nil, nil, info, err
 	}
 	userContextEnabled := credentials.UserAccessToken != ""
+	var githubClient *internalgithub.Client
+	if cfg.GitHub.Enabled {
+		token, tokenErr := secretstore.Read(
+			ctx,
+			cfg.GitHub.TokenKeychainService,
+			cfg.GitHub.TokenKeychainKey,
+			"GITHUB_TOKEN",
+		)
+		if tokenErr == nil {
+			githubClient, err = newGitHubClient(cfg, token)
+			if err != nil {
+				return nil, nil, nil, info, err
+			}
+			info["github_context"] = true
+		} else {
+			info["github_context"] = false
+			info["github_token"] = "missing"
+		}
+	} else {
+		info["github_context"] = false
+	}
 	builder := &conversationBuilder{
-		svc: imSvc,
+		svc:                 imSvc,
+		store:               store,
+		currentAppID:        cfg.Lark.AppID,
+		referenceSigningKey: credentials.AppSecret,
+		allowedRepositories: append([]string(nil), cfg.GitHub.AllowedRepositories...),
+		githubEnabled:       cfg.GitHub.Enabled,
 		base: agentcontext.Builder{
 			Scope:  scope,
 			Rules:  ruleSet,
@@ -909,6 +1239,9 @@ func buildLiveOptions(
 		definitions = append(definitions, agenttools.WorkspaceDefinitions(scope)...)
 		if userContextEnabled {
 			definitions = append(definitions, agenttools.LarkContextDefinitions(larkToolContext{svc: imSvc})...)
+		}
+		if githubClient != nil {
+			definitions = append(definitions, agenttools.GitHubContextDefinition(githubClient))
 		}
 		definitions = append(definitions,
 			agenttools.ShellDefinition(scope, agenttools.ShellOptions{
@@ -1169,11 +1502,13 @@ func agentConfigFingerprintForContract(cfg config.Config, contract agentOperatin
 	data, _ := json.Marshal(struct {
 		Agent             config.AgentConfig
 		Policy            config.PolicyConfig
+		GitHub            config.GitHubConfig
 		Workspace         config.WorkspaceConfig
 		OperatingContract agentOperatingContract
 	}{
 		Agent:             cfg.Agent,
 		Policy:            cfg.Policy,
+		GitHub:            cfg.GitHub,
 		Workspace:         cfg.Workspace,
 		OperatingContract: contract,
 	})
@@ -1182,9 +1517,14 @@ func agentConfigFingerprintForContract(cfg config.Config, contract agentOperatin
 }
 
 type conversationBuilder struct {
-	svc                *serviceim.Service
-	includeLarkContext bool
-	base               agentcontext.Builder
+	svc                 *serviceim.Service
+	store               *storage.Store
+	currentAppID        string
+	referenceSigningKey string
+	allowedRepositories []string
+	githubEnabled       bool
+	includeLarkContext  bool
+	base                agentcontext.Builder
 }
 
 type larkToolContext struct {
@@ -1310,12 +1650,74 @@ func (b *conversationBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, 
 				Incomplete:       true,
 				Reason:           "lark_context_unavailable",
 			}
+			if err := b.applyStoredGitHubReference(&builder, item.Event); err != nil {
+				return agentcontext.Bundle{}, err
+			}
 			return builder.Build(item)
 		}
 		builder.Conversation = append(builder.Conversation, normalizeToolMessages(messageContext.Messages)...)
 		builder.ContextSelection = messageContext.Selection
+		if b.githubEnabled {
+			verified, ok, err := agentcontext.ResolveGitHubReference(
+				item.Event,
+				builder.Conversation,
+				b.currentAppID,
+				b.allowedRepositories,
+				b.referenceSigningKey,
+			)
+			if err != nil {
+				return agentcontext.Bundle{}, err
+			}
+			if ok {
+				if b.store != nil {
+					verified, err = b.store.UpsertExternalReference(context.Background(), verified)
+					if err != nil {
+						return agentcontext.Bundle{}, err
+					}
+				}
+				ref := verified.Reference
+				builder.GitHubReference = &ref
+			} else if err := b.applyStoredGitHubReference(&builder, item.Event); err != nil {
+				return agentcontext.Bundle{}, err
+			}
+		}
+	} else if err := b.applyStoredGitHubReference(&builder, item.Event); err != nil {
+		return agentcontext.Bundle{}, err
 	}
 	return builder.Build(item)
+}
+
+func (b *conversationBuilder) applyStoredGitHubReference(
+	builder *agentcontext.Builder,
+	event domain.NormalizedEvent,
+) error {
+	if !b.githubEnabled || b.store == nil {
+		return nil
+	}
+	var selected *domain.GitHubReference
+	for _, messageID := range []string{event.ReplyToMessageID, event.RootMessageID} {
+		if messageID == "" {
+			continue
+		}
+		stored, ok, err := b.store.GetExternalReference(context.Background(), "github", messageID)
+		if err != nil {
+			return err
+		}
+		if !ok || stored.ChatID != event.ChatID || stored.SenderAppID != b.currentAppID ||
+			!repositoryAllowed(stored.Reference.Repository, b.allowedRepositories) {
+			continue
+		}
+		if selected != nil && *selected != stored.Reference {
+			return errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"conflicting stored GitHub references in reply chain",
+			)
+		}
+		ref := stored.Reference
+		selected = &ref
+	}
+	builder.GitHubReference = selected
+	return nil
 }
 
 type liveThreadState struct {
@@ -1981,11 +2383,26 @@ func newDoctorCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 			if err != nil {
 				return err
 			}
+			githubToken, githubTokenErr := secretstore.Read(
+				cmd.Context(),
+				cfg.GitHub.TokenKeychainService,
+				cfg.GitHub.TokenKeychainKey,
+				"GITHUB_TOKEN",
+			)
 			return writeData(out, map[string]any{
 				"ok":        true,
 				"lark":      larkStatus,
 				"workspace": scope.Snapshot(),
 				"mode":      cfg.Policy.Mode,
+				"github": map[string]any{
+					"enabled":              cfg.GitHub.Enabled,
+					"read_only":            true,
+					"single_lark_listener": true,
+					"api_base_url":         cfg.GitHub.APIBaseURL,
+					"allowed_repositories": cfg.GitHub.AllowedRepositories,
+					"token_configured":     githubTokenErr == nil && githubToken != "",
+					"token_error":          errorString(githubTokenErr),
+				},
 				"reply_scopes": map[string]any{
 					"assistant_mentions": cfg.Assistant.ReplyScope,
 					"owner_mentions":     cfg.Policy.ReplyScope,

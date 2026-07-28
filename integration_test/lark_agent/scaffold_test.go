@@ -988,7 +988,15 @@ func runAgentWithEnv(t *testing.T, extraEnv []string, bin string, args ...string
 func cleanAgentTestEnv(env []string) []string {
 	out := make([]string, 0, len(env))
 	for _, item := range env {
-		if strings.HasPrefix(item, "LARKSUITE_CLI_") {
+		switch {
+		case strings.HasPrefix(item, "LARKSUITE_CLI_"),
+			strings.HasPrefix(item, "LARK_AGENT_"),
+			strings.HasPrefix(item, "GITHUB_ACTIONS="),
+			strings.HasPrefix(item, "GITHUB_EVENT_"),
+			strings.HasPrefix(item, "GITHUB_REPOSITORY="),
+			strings.HasPrefix(item, "GITHUB_API_URL="),
+			strings.HasPrefix(item, "GITHUB_WORKSPACE="),
+			strings.HasPrefix(item, "GITHUB_TOKEN="):
 			continue
 		}
 		out = append(out, item)
@@ -1015,7 +1023,8 @@ func TestHelpContract(t *testing.T) {
 		"coding investigation",
 		"fast path",
 		"Time, date, ping",
-		"2 model turns",
+		"3 model turns",
+		"16 tool calls",
 		"interactive",
 		"queue summary",
 		"approval",
@@ -1671,7 +1680,11 @@ func TestDoctorReportsAssistantOwnerDirect(t *testing.T) {
 		!strings.Contains(stdout, `"owner_direct_enabled":false`) ||
 		!strings.Contains(stdout, `"assistant_mentions":"all_groups"`) ||
 		!strings.Contains(stdout, `"owner_mentions":"all_groups"`) ||
-		!strings.Contains(stdout, `"reply_scope":"all_groups"`) {
+		!strings.Contains(stdout, `"reply_scope":"all_groups"`) ||
+		!strings.Contains(stdout, `"github"`) ||
+		!strings.Contains(stdout, `"enabled":false`) ||
+		!strings.Contains(stdout, `"read_only":true`) ||
+		!strings.Contains(stdout, `"single_lark_listener":true`) {
 		t.Fatalf("doctor missing assistant owner direct state:\n%s", stdout)
 	}
 }

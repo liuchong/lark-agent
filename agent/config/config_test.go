@@ -111,6 +111,44 @@ func TestDefaultReplyScopeAllowsAllGroups(t *testing.T) {
 	}
 }
 
+func TestGitHubConfigIsDisabledByDefaultAndBoundedWhenEnabled(t *testing.T) {
+	cfg := validConfigForTest(t)
+	if cfg.GitHub.Enabled {
+		t.Fatalf("github enabled by default: %+v", cfg.GitHub)
+	}
+	if cfg.GitHub.APIBaseURL != "https://api.github.com" ||
+		cfg.GitHub.MaxFiles != 50 ||
+		cfg.GitHub.MaxPatchBytes != 64*1024 ||
+		cfg.GitHub.MaxAnnotations != 50 ||
+		cfg.GitHub.MaxReviews != 50 {
+		t.Fatalf("github defaults=%+v", cfg.GitHub)
+	}
+	cfg.GitHub.Enabled = true
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "github.allowed_repositories") {
+		t.Fatalf("enabled config without allowlist error=%v", err)
+	}
+	cfg.GitHub.AllowedRepositories = []string{"example/widgets"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.GitHub.AllowedRepositories = []string{"invalid"}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("accepted invalid repository")
+	}
+}
+
+func TestLarkBaseURLMustBeAbsoluteWhenConfigured(t *testing.T) {
+	cfg := validConfigForTest(t)
+	cfg.Lark.BaseURL = "open.larksuite.com"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "lark.base_url") {
+		t.Fatalf("accepted invalid Lark base URL: %v", err)
+	}
+	cfg.Lark.BaseURL = "https://open.larksuite.com"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("rejected valid Lark base URL: %v", err)
+	}
+}
+
 func TestValidateRejectsUnsupportedReplyScope(t *testing.T) {
 	cfg := validConfigForTest(t)
 	cfg.Policy.ReplyScope = domain.ReplyScope("test_chat")
@@ -137,6 +175,8 @@ func TestConfigRoundTrip(t *testing.T) {
 	cfg.Policy.Mode = domain.ModeAuto
 	cfg.Assistant.ReplyScope = domain.ReplyScopeConfiguredGroups
 	cfg.Policy.ReplyScope = domain.ReplyScopeConfiguredGroups
+	cfg.GitHub.Enabled = true
+	cfg.GitHub.AllowedRepositories = []string{"example/widgets"}
 
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := Save(path, cfg); err != nil {
@@ -149,7 +189,10 @@ func TestConfigRoundTrip(t *testing.T) {
 	if got.Workspace.Root != root ||
 		got.Policy.Mode != domain.ModeAuto ||
 		got.Assistant.ReplyScope != domain.ReplyScopeConfiguredGroups ||
-		got.Policy.ReplyScope != domain.ReplyScopeConfiguredGroups {
+		got.Policy.ReplyScope != domain.ReplyScopeConfiguredGroups ||
+		!got.GitHub.Enabled ||
+		len(got.GitHub.AllowedRepositories) != 1 ||
+		got.GitHub.AllowedRepositories[0] != "example/widgets" {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
 }

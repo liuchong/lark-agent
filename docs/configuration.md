@@ -22,9 +22,19 @@ lark-agent config show
 - `lark.keychain_service`、`lark.app_secret_keychain_key`、
   `lark.user_token_keychain_key`、`lark.refresh_token_keychain_key`：macOS
   Keychain 中的凭据引用。配置只保存引用，不保存 secret 或 token。
-- `lark.base_url`：可选的 Lark/Feishu OpenAPI 域名覆盖，通常留空。
+- `lark.base_url`：可选的 Lark/Feishu OpenAPI 域名覆盖。本地已有配置可留空沿用 SDK
+  默认值；GitHub Action 必须显式传入，国际版使用
+  `https://open.larksuite.com`。
 - `lark.subscriptions`：文档、Wiki、Base 监控订阅的非秘密配置投影；运行态状态仍以
   SQLite 为准。
+- `github.enabled`：是否启用可信 GitHub 证据桥。默认关闭。
+- `github.allowed_repositories`：允许通知和后续读取的精确 `owner/repository`
+  列表；不支持通配符，也不能由模型或消息正文扩大。
+- `github.api_base_url`：GitHub 或 GitHub Enterprise 的 API 根地址。
+- `github.token_keychain_service`、`github.token_keychain_key`：本地只读 GitHub
+  令牌的 Keychain 引用。
+- `github.max_files`、`max_patch_bytes`、`max_annotations`、`max_reviews`：
+  单次模型读取的硬上限。
 - `owner.open_id`：唯一 Owner 的 open ID。
 - `assistant.open_ids`、`assistant.names`：Owner 私聊和群 @机器人的识别身份。
 - `assistant.owner_direct.enabled`：是否接受 Owner 直接发给机器人的请求。
@@ -52,6 +62,34 @@ lark-agent config show
 配置不保存官方 Lark 凭据，也没有模型密钥字段。Lark app secret 放在 macOS
 Keychain；用户 access token 和 refresh token 可选，只用于用户身份轮询和代回复。
 模型密钥放在当前用户环境或安装器创建的权限为 `0600` 的私有 env 文件中。
+
+## GitHub 只读证据桥
+
+启用示例：
+
+```yaml
+github:
+  enabled: true
+  api_base_url: https://api.github.com
+  token_keychain_service: lark-agent
+  token_keychain_key: github_token
+  allowed_repositories:
+    - owner/repository
+  max_files: 50
+  max_patch_bytes: 65536
+  max_annotations: 50
+  max_reviews: 50
+```
+
+本地令牌用 `lark-agent github auth login` 从标准输入写入 Keychain，输入格式为
+`{"token":"..."}`。GitHub Action 运行时使用当前仓库的只读 `GITHUB_TOKEN`；
+Lark app secret 只来自受保护的 GitHub Environment。两者都不会写入 YAML、消息、
+日志或命令参数。
+
+消息中的仓库名、PR 号或 run ID 不是权限来源。只有当前 Lark 应用自己发送、同群
+引用关系可验证、标记 HMAC 签名能由相同 Lark app secret 验证且仓库在 allowlist
+中的通知，才能建立后续 GitHub 读取范围。工具参数只能选择 `summary`、`checks`、
+`files`、`reviews`，不能改变仓库、PR 或 workflow run。
 
 ## 模式
 

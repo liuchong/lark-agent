@@ -14,6 +14,10 @@ Agent 通过官方公开 Go SDK 访问 Lark。配置只保存 app id 和 Keychai
 必须在 macOS Keychain 中。用户 token 可选，只用于用户身份轮询和代回复。凭据不写入
 plist、脚本参数或仓库文件。
 
+可选的 GitHub 证据桥使用独立的只读 GitHub token Keychain 引用。启用
+`github.enabled` 时，还必须配置精确的 `github.allowed_repositories`，并在安装前
+执行 `lark-agent github auth status`。缺少该令牌不会扩大或改变 Lark 权限。
+
 ## 新安装
 
 ```bash
@@ -23,6 +27,7 @@ go build -o ./lark-agent ./cmd/lark-agent
   --app-id cli_xxx \
   --owner-open-id ou_xxx
 ./lark-agent auth login < /path/to/private-lark-credentials.json
+./lark-agent github auth login < /path/to/private-github-token.json
 ./lark-agent doctor --lark-only
 ./scripts/macos/install-lark-agent.sh
 ```
@@ -80,3 +85,18 @@ tool_policy:
 
 这不会放宽安全边界。非 Owner 请求仍是同群和 Workspace 只读，环境刺探与工作目录
 外访问仍被强制拒绝。
+
+## GitHub Environment
+
+仓库工作流使用名为 `lark-production` 的受保护 GitHub Environment：
+
+- secret `LARK_APP_SECRET`：与本地 daemon 相同的 Lark 应用 secret；
+- variable `LARK_APP_ID`：同一个 Lark 应用 ID；
+- variable `LARK_CHAT_ID`：通知目标的精确 chat ID。
+- variable `LARK_BASE_URL`：显式 OpenAPI 根地址；国际版 Lark 使用
+  `https://open.larksuite.com`，飞书中国站使用 `https://open.feishu.cn`。
+
+这不会创建第二个实时监听实例。Action 只执行
+`lark-agent github notify --chat-id ...` 并通过 Lark HTTP API 发送一次消息；本地
+LaunchAgent 继续独占 WebSocket 事件消费。Environment 应只允许默认分支部署，避免
+不可信分支取得 Lark secret。

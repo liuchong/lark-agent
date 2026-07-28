@@ -19,10 +19,21 @@ as a subprocess and does not copy the official CLI's internal Go implementation.
    actions before they are attempted.
 6. Workspace tools are independent of Lark transport and enforce the configured
    filesystem boundary in code.
+7. `internal/github` is the only GitHub HTTP and event-decoding boundary. It
+   returns Agent-owned typed values and never executes pull-request code,
+   artifacts, logs, or event-derived shell commands.
+8. A GitHub Action is a short-lived Lark HTTP sender. The installed daemon is
+   the single WebSocket event consumer even when both processes authenticate as
+   the same Lark application.
 
 No production package imports `github.com/larksuite/cli`; no production path
 depends on a local `lark-cli` executable, profile, stdout envelope, or event
 stdin lifecycle. YAML stores only non-secret app and Keychain references.
+
+GitHub follow-up tools take their repository and run identity from the verified
+invocation reference, never from model arguments. Missing or untrusted
+references make the tool unavailable. Non-owner invocations retain the same
+read-only authority they have for workspace and same-chat evidence.
 
 ## Durable state
 
@@ -32,6 +43,11 @@ at most one work item, while later real-time or poll observations append
 duplicate receipts. Work items carry the owning session and a unique claim
 token. Model runs, tool steps, reply/notification actions, lifecycle actions,
 and interruption snapshots are persisted before dependent side effects.
+
+Verified external references are separate durable control records keyed by
+provider and Lark message ID. They store canonical reference data and sender
+identity, not GitHub credentials or an unbounded GitHub snapshot. The model
+receives a reference only after same-chat relation and current-app verification.
 
 Opening the database for an operator command does not create or stop a daemon
 session. On startup, unfinished work from older sessions becomes `interrupted`

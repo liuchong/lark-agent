@@ -24,6 +24,9 @@
   调研前直接拒绝。
 - 代回复必须先完成可审计的相关读取，并简要说明已检查内容、初步发现或明确未知；
   “已提醒 Owner”、复述原问题和未经批准的后续承诺不会发送。
+- GitHub Actions 可以用同一个 Lark 应用身份把可信的工作流结果发进指定群。Action
+  只通过 HTTP 发送一次消息，不启动第二个 WebSocket 监听；常驻 Agent 验证被引用的
+  机器人消息及其 HMAC 签名后，才允许模型按该引用读取有界、只读的 GitHub 事实。
 - 所有消息、模型步骤和外部动作都写入 SQLite 账本。跨重启工作不会自动回放。
 
 ## 要求
@@ -83,11 +86,30 @@ lark-agent mode auto
 lark-agent queue summary
 lark-agent queue inspect --message-id om_xxx
 lark-agent queue resume --message-id om_xxx
+lark-agent github auth status
 ```
 
 离线积压和中断工作只有在指定 work ID 或 message ID 后才可恢复。已经完成、忽略、
 取消或进入死信的终态工作还必须明确加 `--force-terminal`。结果不确定的外部动作
 不会自动重发。
+
+## GitHub 与 Lark
+
+仓库根目录的 `action.yml` 和 `.github/workflows/lark-notify.yml` 提供完整通知路径。
+`workflow_run` 工作流只检出可信默认分支上的 Action 实现，不检出 PR 头、不下载
+不可信产物，也不执行 PR 中的代码。GitHub Environment `lark-production` 保存 Lark
+app secret 和目标 chat ID；仓库配置不保存这些秘密或部署值。
+
+本地常驻 Agent 的 GitHub 读取令牌单独放在 macOS Keychain：
+
+```bash
+lark-agent github auth login < /path/to/private-github-token.json
+lark-agent github auth status
+lark-agent doctor
+```
+
+登录 JSON 只有 `token` 字段。该令牌只用于读取已验证引用所指向的仓库、PR、
+workflow run、检查结果和审查信息，不提供评论、合并、重跑、取消或其他写能力。
 
 ## 文档
 

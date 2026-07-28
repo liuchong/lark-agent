@@ -2,8 +2,10 @@
 package config
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -13,12 +15,13 @@ import (
 	"github.com/liuchong/lark-agent/internal/fsx"
 )
 
-const currentVersion = 3
+const currentVersion = 4
 
 // Config is the YAML configuration stored under the standalone lark-agent config directory.
 type Config struct {
 	Version    int              `json:"version" yaml:"version"`
 	Lark       LarkConfig       `json:"lark" yaml:"lark"`
+	GitHub     GitHubConfig     `json:"github" yaml:"github"`
 	Owner      OwnerConfig      `json:"owner" yaml:"owner"`
 	Assistant  AssistantConfig  `json:"assistant" yaml:"assistant"`
 	Model      ModelConfig      `json:"model" yaml:"model"`
@@ -106,6 +109,20 @@ type LarkConfig struct {
 	RefreshTokenKeychainKey string                 `json:"refresh_token_keychain_key" yaml:"refresh_token_keychain_key"`
 	OAuthCallback           string                 `json:"oauth_callback,omitempty" yaml:"oauth_callback,omitempty"`
 	Subscriptions           []ResourceSubscription `json:"subscriptions,omitempty" yaml:"subscriptions,omitempty"`
+}
+
+// GitHubConfig controls the optional trusted GitHub evidence bridge. Tokens are
+// referenced by Keychain account and never serialized here.
+type GitHubConfig struct {
+	Enabled              bool     `json:"enabled" yaml:"enabled"`
+	APIBaseURL           string   `json:"api_base_url" yaml:"api_base_url"`
+	TokenKeychainService string   `json:"token_keychain_service" yaml:"token_keychain_service"`
+	TokenKeychainKey     string   `json:"token_keychain_key" yaml:"token_keychain_key"`
+	AllowedRepositories  []string `json:"allowed_repositories,omitempty" yaml:"allowed_repositories,omitempty"`
+	MaxFiles             int      `json:"max_files" yaml:"max_files"`
+	MaxPatchBytes        int      `json:"max_patch_bytes" yaml:"max_patch_bytes"`
+	MaxAnnotations       int      `json:"max_annotations" yaml:"max_annotations"`
+	MaxReviews           int      `json:"max_reviews" yaml:"max_reviews"`
 }
 
 // ResourceSubscription is the config-level projection used before the durable
@@ -203,6 +220,15 @@ func Default() Config {
 			AppSecretKeychainKey:    "app_secret",
 			UserTokenKeychainKey:    "user_access_token",
 			RefreshTokenKeychainKey: "user_refresh_token",
+		},
+		GitHub: GitHubConfig{
+			APIBaseURL:           "https://api.github.com",
+			TokenKeychainService: "lark-agent",
+			TokenKeychainKey:     "github_token",
+			MaxFiles:             50,
+			MaxPatchBytes:        64 * 1024,
+			MaxAnnotations:       50,
+			MaxReviews:           50,
 		},
 		Assistant: AssistantConfig{
 			Names:       []string{"Lark Agent", "lark-agent", "机器人", "Agent"},
@@ -323,6 +349,16 @@ func (c Config) Validate() error {
 		c.Lark.UserTokenKeychainKey == "" || c.Lark.RefreshTokenKeychainKey == "" {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "lark keychain references are required").WithField("lark.keychain")
 	}
+	if c.Lark.BaseURL != "" {
+		parsed, err := url.Parse(strings.TrimSpace(c.Lark.BaseURL))
+		if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+			return errs.NewConfigError(errs.SubtypeInvalidConfig, "lark.base_url must be an absolute HTTP URL").
+				WithField("lark.base_url")
+		}
+	}
+	if err := validateGitHubConfig(c.GitHub); err != nil {
+		return err
+	}
 	if c.Owner.OpenID == "" {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "owner.open_id is required").WithField("owner.open_id")
 	}
@@ -414,4 +450,57 @@ func (c Config) Validate() error {
 		).WithField("workspace.root")
 	}
 	return nil
+}
+
+func validateGitHubConfig(cfg GitHubConfig) error {
+	parsed, err := url.Parse(strings.TrimSpace(cfg.APIBaseURL))
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "github.api_base_url must be an absolute HTTP URL").
+			WithField("github.api_base_url")
+	}
+	if cfg.TokenKeychainService == "" || cfg.TokenKeychainKey == "" {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "github keychain references are required").
+			WithField("github.token_keychain")
+	}
+	if cfg.MaxFiles <= 0 || cfg.MaxPatchBytes <= 0 || cfg.MaxAnnotations <= 0 || cfg.MaxReviews <= 0 {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "github result limits must be positive").
+			WithField("github")
+	}
+	if cfg.Enabled && len(cfg.AllowedRepositories) == 0 {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"github.allowed_repositories is required when github is enabled",
+		).WithField("github.allowed_repositories")
+	}
+	seen := map[string]bool{}
+	for _, repository := range cfg.AllowedRepositories {
+		parts := strings.Split(repository, "/")
+		if len(parts) != 2 || !validRepositoryPart(parts[0]) || !validRepositoryPart(parts[1]) {
+			return errs.NewConfigError(errs.SubtypeInvalidConfig, "invalid github repository %q", repository).
+				WithField("github.allowed_repositories")
+		}
+		canonical := strings.ToLower(repository)
+		if seen[canonical] {
+			return errs.NewConfigError(errs.SubtypeInvalidConfig, "duplicate github repository %q", repository).
+				WithField("github.allowed_repositories")
+		}
+		seen[canonical] = true
+	}
+	return nil
+}
+
+func validRepositoryPart(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '-' || char == '_' || char == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }
