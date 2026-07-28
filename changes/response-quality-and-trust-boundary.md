@@ -119,7 +119,9 @@ configurable; the actual installation keeps both at `all_groups`.
 
 The default initial context is reduced and tool investigation budget is raised
 only enough to support production-source verification after wasted validation
-calls stop counting. The installed config is updated to the same effective
+calls stop counting. The simple-request budget uses three model turns so the
+runtime can search, read, and then submit a conclusion instead of ending after
+the second tool batch. The installed config is updated to the same effective
 values after code verification and commit.
 
 ### Fixtures
@@ -193,6 +195,13 @@ Given a non-owner-triggered draft says that the owner or team will later
 deliver, coordinate, or report back,
 when no exact owner approval exists,
 then the draft cannot be sent as an automatic reply.
+
+### Scenario: Simple request retains a conclusion turn
+
+Given a simple assistant request performs broad search in its first model turn
+and narrowed production reads in its second,
+when those reads complete,
+then a third model turn remains for `submit_decision`.
 
 ## Test Locations
 

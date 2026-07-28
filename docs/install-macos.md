@@ -71,6 +71,8 @@ policy:
 ```yaml
 agent:
   max_context_bytes: 65536
+fast_path:
+  simple_max_turns: 3
 tool_policy:
   coding_max_tool_calls: 16
 ```

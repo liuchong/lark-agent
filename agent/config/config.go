@@ -224,7 +224,7 @@ func Default() Config {
 			ShellTimeout:       2 * time.Minute,
 			ShellApproval:      false,
 		},
-		FastPath: FastPathConfig{Enabled: true, SimpleMaxTurns: 2, CodingMaxTurns: 20},
+		FastPath: FastPathConfig{Enabled: true, SimpleMaxTurns: 3, CodingMaxTurns: 20},
 		Scheduler: SchedulerConfig{
 			DuplicateWindow:     2 * time.Minute,
 			PollIndexLookback:   2 * time.Minute,

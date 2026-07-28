@@ -78,10 +78,12 @@ Fast-path work does not enter this loop. A configured owner asking deterministic
 local questions such as time, date, ping, daemon status, help, doctor, or queue
 summary receives a local answer through the normal reply runtime without a
 coding investigation. A simple non-coding owner question may use at most the
-simple-agent budget and cannot call shell. A coding question has a separate
-foreground budget. When useful evidence exists and the coding run approaches
-its budget, the runtime forces a truthful partial answer or clarification
-instead of continuing broad search.
+simple-agent budget and cannot call shell. The default simple-agent budget is
+three model turns so an evidence-backed request can perform initial search,
+read one narrowed production source, and then submit its conclusion. A coding
+question has a separate foreground budget. When useful evidence exists and the
+coding run approaches its budget, the runtime forces a truthful partial answer
+or clarification instead of continuing broad search.
 
 `submit_decision` is the only terminal model tool. It has no external side
 effect. Its structured output is validated by Go and then passed to the normal
@@ -984,6 +986,10 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given a coding reply cites only an example, test, fixture, or documentation,
   when it claims definite production behavior, then verification rejects it
   until production source is cited or the reply states the production unknown.
+- Given a simple assistant request uses its first two model turns for bounded
+  search and narrowed production-source reads, when the second tool batch
+  completes, then the default third model turn remains available for
+  `submit_decision` instead of failing the work item at the old two-turn limit.
 - Given a non-owner-triggered automatic reply says the owner or team will later
   deliver, coordinate, or report back, when no exact approval exists, then the
   terminal quality gate rejects the commitment before send.

@@ -43,6 +43,8 @@ lark-agent config show
 
 默认 `agent.max_context_bytes` 为 `65536`，初始业务上下文进一步限制在约
 48 KiB；规则、代码和技能按需读取，避免把大目录和历史消息一次性塞给模型。
+`fast_path.simple_max_turns` 默认为 `3`，给需要证据的简单请求保留“检索、精读、
+提交结论”三个模型轮次。
 `tool_policy.coding_max_tool_calls` 默认为 `16`，只有成功执行的调查工具才消耗这项
 额度；参数或策略校验失败仍受模型轮次和无进展上限约束，但不会挤掉后续生产代码读取。
 

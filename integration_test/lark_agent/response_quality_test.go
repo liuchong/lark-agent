@@ -10,6 +10,7 @@ import (
 	einomodel "github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 
+	agentconfig "github.com/liuchong/lark-agent/agent/config"
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
 	"github.com/liuchong/lark-agent/agent/policy"
@@ -323,6 +324,80 @@ func TestNonOwnerCannotExecuteHiddenSideEffectTool(t *testing.T) {
 	}
 	if !trajectoryContains(trajectory, "invocation scope denies tool execution") {
 		t.Fatalf("hidden side-effect call was not rejected: %+v", trajectory)
+	}
+}
+
+func TestDefaultSimpleTurnBudgetLeavesThirdTurnForConclusion(t *testing.T) {
+	model := &responseQualityModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
+			"search",
+			"search_workspace",
+			`{"query":"thumbnail production entry"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
+			"read",
+			"read_workspace",
+			`{"path":"service/image.go"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
+			"submit",
+			"submit_decision",
+			`{
+				"decision":"reply",
+				"relevance_confidence":0.95,
+				"reply_confidence":0.9,
+				"risk":"low",
+				"reply_text":"结论：生产入口已定位。依据：读取了 service/image.go。未知：审核透传仍需确认。",
+				"reason":"bounded investigation completed",
+				"source_refs":[{"relative_path":"service/image.go","digest":"sha256:prod","kind":"workspace_file"}]
+			}`,
+		)}),
+	}}
+	registry, err := agenttools.NewRegistry(
+		agenttools.Definition{
+			Info: &schema.ToolInfo{Name: "search_workspace"},
+			Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+				return agenttools.Execution{Content: `{"results":["service/image.go"]}`}, nil
+			},
+		},
+		agenttools.Definition{
+			Info: &schema.ToolInfo{Name: "read_workspace"},
+			Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+				return agenttools.Execution{
+					Content: "func uploadThumbnail() {}",
+					Sources: []domain.SourceRef{{
+						RelativePath: "service/image.go",
+						Digest:       "sha256:prod",
+						Kind:         "workspace_file",
+					}},
+				}, nil
+			},
+		},
+		agentruntime.SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := agentconfig.Default()
+	decision, _, err := (agentruntime.AgentLoop{
+		Model:          model,
+		Tools:          registry,
+		MaxTurns:       cfg.Agent.MaxTurns,
+		SimpleMaxTurns: cfg.FastPath.SimpleMaxTurns,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		WorkKind: domain.WorkKindSimpleQuestion,
+		User:     agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_simple_research",
+			SenderID:  "ou_owner",
+			Content:   "请检查示例文件预览上传与审核相关的生产入口",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply || model.calls != 3 {
+		t.Fatalf("decision=%+v calls=%d", decision, model.calls)
 	}
 }
 
