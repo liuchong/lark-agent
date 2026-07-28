@@ -542,6 +542,12 @@ If a separate operator process briefly holds the SQLite write lock, durable
 worker transitions wait for a bounded interval and continue after the lock is
 released. A write that remains blocked beyond that interval fails explicitly;
 the agent must not report or imply that the transition succeeded.
+Approval decisions follow the same rule in the opposite direction: while the
+daemon is writing, `approval approve` and `approval reject` must wait for the
+bounded SQLite interval and then atomically update the exact action and work
+item. They must not establish a stale read snapshot before requesting the write
+lock, because a normal concurrent daemon write must not make an operator
+decision fail with a snapshot-upgrade error.
 
 Operators use `queue inspect --work-id <id>` or
 `queue inspect --message-id <id>` to
@@ -804,6 +810,11 @@ The multi-step loop is accepted by these executable BDD scenarios:
   process briefly holds the SQLite write lock, when that lock is released within
   the configured wait interval, then both run starts persist without a
   `database is locked` failure.
+- Given the daemon holds a brief SQLite write transaction while an exact action
+  is awaiting approval, when an operator approves or rejects that action and the
+  daemon releases the lock within the configured wait interval, then the
+  operator command completes the exact decision atomically without a stale
+  snapshot failure.
 - Given a running coding question updates its heartbeat, when recovery scans
   leases in the same online session, then the item remains owned; given the
   process dies, when the next session starts, then recovery abandons the run,

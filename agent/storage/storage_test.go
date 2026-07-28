@@ -806,6 +806,101 @@ func TestShellApprovalIsExactOneTimeAndRequeuesWork(t *testing.T) {
 	}
 }
 
+func TestDecideActionWaitsForConcurrentWriterWithoutSnapshotFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		approve        bool
+		wantAction     domain.ActionStatus
+		wantWorkStatus domain.WorkItemStatus
+	}{
+		{
+			name: "approve", approve: true,
+			wantAction: domain.ActionReady, wantWorkStatus: domain.StatusReceived,
+		},
+		{
+			name: "reject", approve: false,
+			wantAction: domain.ActionCancelled, wantWorkStatus: domain.StatusCancelled,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			statePath := filepath.Join(t.TempDir(), "state.db")
+			daemonStore, err := Open(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = daemonStore.Close() })
+			operatorStore, err := OpenInspection(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = operatorStore.Close() })
+
+			event := domain.NormalizedEvent{
+				MessageID: "om_concurrent_approval_" + tc.name,
+				Content:   "decide me",
+			}
+			if _, err := daemonStore.EnqueueEvent(event); err != nil {
+				t.Fatal(err)
+			}
+			item, ok, err := daemonStore.ClaimNext("daemon-worker")
+			if err != nil || !ok {
+				t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+			}
+			actionID, err := daemonStore.RequestShellApproval(
+				context.Background(), item.DedupKey, "gofmt -w .", ".",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			writer, err := daemonStore.db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := writer.Exec(
+				`UPDATE work_items SET updated_at = ? WHERE id = ?`,
+				time.Now().UTC().Format(time.RFC3339Nano), item.ID,
+			); err != nil {
+				_ = writer.Rollback()
+				t.Fatal(err)
+			}
+
+			decided := make(chan error, 1)
+			go func() {
+				decided <- operatorStore.DecideAction(actionID, tc.approve)
+			}()
+			time.Sleep(100 * time.Millisecond)
+			if err := writer.Commit(); err != nil {
+				t.Fatal(err)
+			}
+
+			select {
+			case err := <-decided:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(6 * time.Second):
+				t.Fatal("approval did not continue after the concurrent writer released its lock")
+			}
+			action, err := daemonStore.GetActionAttempt(actionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if action.Status != tc.wantAction {
+				t.Fatalf("action=%+v", action)
+			}
+			items, err := daemonStore.ListWorkItems()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(items) != 1 || items[0].ID != item.ID ||
+				items[0].Status != tc.wantWorkStatus {
+				t.Fatalf("items=%+v", items)
+			}
+		})
+	}
+}
+
 func TestRetryLimitDeadLettersAndRuntimeUpgradeRequeues(t *testing.T) {
 	store := openStore(t)
 	store.ConfigureRecovery(2)

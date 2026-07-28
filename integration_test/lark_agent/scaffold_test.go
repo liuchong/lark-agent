@@ -1044,16 +1044,72 @@ func TestApprovalCommandRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(func() { _ = store.Close() })
 	code, stdout, stderr := runAgent(t, bin, "--state", state, "approval", "list")
 	if code != 0 || !strings.Contains(stdout, `"status":"awaiting_approval"`) {
 		t.Fatalf("list exit=%d stdout=%s stderr=%s", code, stdout, stderr)
 	}
-	code, stdout, stderr = runAgent(t, bin, "--state", state, "approval", "approve", fmt.Sprint(actionID))
+
+	writerDB, err := sql.Open("sqlite", state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = writerDB.Close() })
+	writer, err := writerDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(
+		`UPDATE work_items SET updated_at = ? WHERE dedup_key = ?`,
+		time.Now().UTC().Format(time.RFC3339Nano), domain.DedupKey(event),
+	); err != nil {
+		_ = writer.Rollback()
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(
+		ctx, bin, "--state", state, "approval", "approve", fmt.Sprint(actionID),
+	)
+	cmd.Env = cleanAgentTestEnv(os.Environ())
+	var approveOut, approveErr strings.Builder
+	cmd.Stdout = &approveOut
+	cmd.Stderr = &approveErr
+	if err := cmd.Start(); err != nil {
+		_ = writer.Rollback()
+		t.Fatal(err)
+	}
+	commandDone := make(chan error, 1)
+	go func() { commandDone <- cmd.Wait() }()
+	time.Sleep(100 * time.Millisecond)
+	if err := writer.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	err = <-commandDone
+	code = 0
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		code = exitErr.ExitCode()
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr = approveOut.String(), approveErr.String()
 	if code != 0 || !strings.Contains(stdout, `"action":"approve"`) {
 		t.Fatalf("approve exit=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	action, err := store.GetActionAttempt(actionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Status != domain.ActionReady {
+		t.Fatalf("action=%+v", action)
+	}
+	items, err := store.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Status != domain.StatusReceived {
+		t.Fatalf("items=%+v", items)
 	}
 }
 

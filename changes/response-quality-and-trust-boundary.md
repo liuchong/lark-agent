@@ -223,6 +223,16 @@ Given both durable sources lack a recognized relevance,
 when recovery starts,
 then it fails before sending instead of guessing an identity.
 
+### Scenario: Approval survives concurrent daemon writes
+
+Given a daemon write transaction briefly overlaps an exact pending reply
+approval,
+when the operator runs `approval approve ACTION_ID` or
+`approval reject ACTION_ID`,
+then the command waits for the bounded SQLite busy interval and atomically
+updates the action and work item after the daemon releases the lock,
+without failing because a stale read snapshot cannot be upgraded to a writer.
+
 ### Scenario: Unauthorized commitment
 
 Given a non-owner-triggered draft says that the owner or team will later

@@ -1766,15 +1766,6 @@ func (s *Store) DecideAction(id int64, approve bool) error {
 		return errs.NewInternalError(errs.SubtypeStorage, "begin approval decision").WithCause(err)
 	}
 	defer tx.Rollback() //nolint:errcheck
-	var workItemID int64
-	if err := tx.QueryRow(
-		`SELECT work_item_id FROM action_attempts WHERE id = ? AND status = ?`,
-		id, domain.ActionAwaitingApproval).Scan(&workItemID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return errs.NewValidationError(errs.SubtypeFailedPrecondition, "action %d is not awaiting approval", id)
-		}
-		return errs.NewInternalError(errs.SubtypeStorage, "read pending approval").WithCause(err)
-	}
 	actionStatus := domain.ActionReady
 	workStatus := domain.StatusReceived
 	if !approve {
@@ -1782,9 +1773,17 @@ func (s *Store) DecideAction(id int64, approve bool) error {
 		workStatus = domain.StatusCancelled
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := tx.Exec(
-		`UPDATE action_attempts SET status = ?, updated_at = ? WHERE id = ?`,
-		actionStatus, now, id); err != nil {
+	var workItemID int64
+	if err := tx.QueryRow(
+		`UPDATE action_attempts
+		 SET status = ?, updated_at = ?
+		 WHERE id = ? AND status = ?
+		 RETURNING work_item_id`,
+		actionStatus, now, id, domain.ActionAwaitingApproval,
+	).Scan(&workItemID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errs.NewValidationError(errs.SubtypeFailedPrecondition, "action %d is not awaiting approval", id)
+		}
 		return errs.NewInternalError(errs.SubtypeStorage, "update approval decision").WithCause(err)
 	}
 	if _, err := tx.Exec(
