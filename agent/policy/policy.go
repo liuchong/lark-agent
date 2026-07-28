@@ -17,6 +17,7 @@ type ThreadState interface {
 // Config controls reply gates.
 type Config struct {
 	Mode                domain.Mode
+	OwnerOpenID         string
 	ReplyScope          domain.ReplyScope
 	AssistantReplyScope domain.ReplyScope
 	ReplyConfidenceMin  float64
@@ -60,6 +61,12 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 	if g.cfg.Mode == domain.ModePaused {
 		action.Status = domain.ActionCancelled
 		action.CancelReason = "agent_paused"
+		return action, nil
+	}
+	if isAssistantFacingRequest(decision.Relevance) &&
+		(g.cfg.OwnerOpenID == "" || item.Event.SenderID != g.cfg.OwnerOpenID) {
+		action.Status = domain.ActionBlocked
+		action.CancelReason = "assistant_request_from_non_owner"
 		return action, nil
 	}
 	if decision.Risk == domain.RiskForbidden {

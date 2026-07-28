@@ -7,9 +7,11 @@
 
 ## 能做什么
 
-- Owner 可以私聊“Assistant Bot”；任意真人都可以在允许的群里直接 @机器人提问或
-  要求执行操作，机器人用机器人身份回答。可以通过 `assistant.reply_scope` 选择所有
-  群或仅配置群；处理期间添加键盘工作表情，结束后删除。
+- 只有 Owner 可以私聊“Assistant Bot”或在允许的群里直接 @机器人提问、要求执行
+  操作，机器人用机器人身份回答。可以通过 `assistant.reply_scope` 选择所有群或仅
+  配置群；处理期间添加键盘工作表情，结束后删除。
+- 非 Owner 私聊机器人或直接 @机器人时保持静默；非 Owner 只有在群里直接 @Owner
+  时，才可能触发只读的智能代回复。
 - 他人在任意用户可见群里直接 @Owner 时，Agent 默认可按策略用 Owner 身份回复；
   回复成功后再由机器人私聊 Owner 说明已经回复以及仍需处理的事项。可以通过
   `policy.reply_scope` 改回仅允许配置群。
@@ -69,8 +71,8 @@ export OPENAI_MODEL='model-name'
 
 `CHAT_QUERY` 只用于发现和标记配置群与验收群。默认
 `assistant.reply_scope: all_groups` 和 `policy.reply_scope: all_groups` 时，它不会
-限制其他群正常 `@机器人` 或 `@Owner`。真实 live 验收仍只在本次明确授权的群和
-机器人私聊中发送测试消息。
+限制 Owner 在其他群正常 `@机器人`，也不会限制其他人在其他群 `@Owner`。真实 live
+验收仍只在本次明确授权的群和机器人私聊中发送测试消息。
 
 ## 常用操作
 

@@ -60,6 +60,33 @@ func (c *Controller) Handle(ctx context.Context, item domain.WorkItem, decision 
 	}
 	result := Result{Action: action}
 	var approvalID int64
+	if (action.Status == domain.ActionBlocked || action.Status == domain.ActionCancelled) &&
+		c.approvals != nil &&
+		decision.Mode == domain.ModeApproval {
+		var approved bool
+		approvalID, approved, err = c.approvals.ConsumeReplyApproval(
+			ctx,
+			item.DedupKey,
+			decision.ReplyText,
+			decision.Reason,
+			decision.OwnerAction,
+			decision.Relevance,
+		)
+		if err != nil {
+			return result, err
+		}
+		if approved {
+			if err := c.approvals.CompleteReplyApproval(
+				ctx,
+				approvalID,
+				"",
+				action.CancelReason,
+			); err != nil {
+				return result, err
+			}
+			result.Action.Idempotency = fmt.Sprintf("approval:%d", approvalID)
+		}
+	}
 	if action.Status == domain.ActionAwaitingApproval && c.approvals != nil {
 		var approved bool
 		approvalID, approved, err = c.approvals.ConsumeReplyApproval(

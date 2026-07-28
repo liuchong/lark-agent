@@ -5,13 +5,21 @@ Do not infer a production reply boundary from an operational discovery flag.
 `policy.reply_scope` independently decides whether delegated owner replies are
 allowed in all visible groups or only those marked groups.
 
-Group assistant invocation is a separate product entry point and must have a
-separate `assistant.reply_scope`. It decides whether any human can natively
-mention the assistant in every bot-visible group or only in groups resolved
-from `--chat-query`. Restricted assistant scope must resolve the query with bot
-identity before real-time intake starts; delegated owner scope continues to use
-user-visible polling metadata. Never reuse sender-is-owner as an assistant
-mention gate.
+Group assistant invocation is a separate owner-only product entry point and
+must have a separate `assistant.reply_scope`. It decides whether the configured
+owner can natively mention the assistant in every bot-visible group or only in
+groups resolved from `--chat-query`. Restricted assistant scope must resolve
+the query with bot identity before real-time intake starts; delegated owner
+scope continues to use user-visible polling metadata. Sender-is-owner is an
+independent mandatory gate before assistant scope; a non-owner private message
+or native assistant mention is always silent.
+
+Repeat the sender-is-owner check at the final reply gate. Intake and routing
+cannot protect an older persisted approval created under a broader contract;
+when such a draft resumes, consume and settle the approval as blocked without
+sending it. Empty or whitespace assistant IDs and names never count as an
+identity match, especially on the user-polling path that also carries delegated
+owner mentions.
 
 Do not reuse one persisted scope boolean for bot-visible assistant groups and
 user-visible delegated groups. Carry separate normalized-event markers through

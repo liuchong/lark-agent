@@ -192,17 +192,25 @@ func (s *Source) accept(event domain.NormalizedEvent) bool {
 			(firstAssistantOpenID(s.cfg.AssistantOpenIDs) != "" ||
 				firstNonEmpty(s.cfg.AssistantNames) != "")
 	}
+	if event.SenderID != s.cfg.OwnerOpenID {
+		return false
+	}
 	if s.cfg.AssistantReplyScope == domain.ReplyScopeConfiguredGroups && !event.InAssistantScope {
 		return false
 	}
 	for _, assistantOpenID := range s.cfg.AssistantOpenIDs {
+		if strings.TrimSpace(assistantOpenID) == "" {
+			continue
+		}
 		if event.MentionsUser(assistantOpenID) {
 			return true
 		}
 	}
 	for _, mention := range event.Mentions {
 		for _, assistantName := range s.cfg.AssistantNames {
-			if strings.EqualFold(strings.TrimSpace(mention.Name), strings.TrimSpace(assistantName)) {
+			assistantName = strings.TrimSpace(assistantName)
+			if assistantName != "" &&
+				strings.EqualFold(strings.TrimSpace(mention.Name), assistantName) {
 				return true
 			}
 		}

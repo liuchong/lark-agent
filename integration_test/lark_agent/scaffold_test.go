@@ -56,12 +56,18 @@ func (f configuredAssistantPollIM) SearchMessages(
 	return serviceim.SearchMessagesResult{Items: []serviceim.Message{
 		{
 			MessageID: "om_bot_scope", ChatID: "oc_bot_scope", ChatType: "group",
-			SenderOpenID: "ou_other", SenderType: "user", Content: "@_user_1 在吗",
+			SenderOpenID: "ou_owner", SenderType: "user", Content: "@_user_1 在吗",
 			Mentions:   []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
 			CreateTime: f.now.Format(time.RFC3339),
 		},
 		{
 			MessageID: "om_user_scope", ChatID: "oc_user_scope", ChatType: "group",
+			SenderOpenID: "ou_owner", SenderType: "user", Content: "@_user_1 在吗",
+			Mentions:   []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
+			CreateTime: f.now.Format(time.RFC3339),
+		},
+		{
+			MessageID: "om_non_owner_bot", ChatID: "oc_bot_scope", ChatType: "group",
 			SenderOpenID: "ou_other", SenderType: "user", Content: "@_user_1 在吗",
 			Mentions:   []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
 			CreateTime: f.now.Format(time.RFC3339),
@@ -127,6 +133,9 @@ func TestPolledAssistantScopeUsesBotResolvedGroupsEndToEnd(t *testing.T) {
 	for _, item := range items {
 		byMessageID[item.Event.MessageID] = item
 	}
+	if _, exists := byMessageID["om_non_owner_bot"]; exists {
+		t.Fatalf("non-owner assistant mention was queued: %+v", byMessageID["om_non_owner_bot"])
+	}
 	botScoped := byMessageID["om_bot_scope"]
 	if !botScoped.Event.InAssistantScope || botScoped.Event.InTestScope {
 		t.Fatalf("bot-scoped item=%+v", botScoped)
@@ -140,6 +149,7 @@ func TestPolledAssistantScopeUsesBotResolvedGroupsEndToEnd(t *testing.T) {
 	}
 	gate := policy.NewReplyGate(policy.Config{
 		Mode:                domain.ModeAuto,
+		OwnerOpenID:         "ou_owner",
 		AssistantReplyScope: domain.ReplyScopeConfiguredGroups,
 	}, privateReplyThreadState{})
 	action, err := gate.Prepare(context.Background(), botScoped, domain.Decision{
@@ -409,7 +419,9 @@ func TestRealtimeOwnerIntakeDedupesWithPollFallback(t *testing.T) {
 		store,
 		agentRouter,
 		app.WithReplyHandler(reply.NewController(
-			policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, privateReplyThreadState{}),
+			policy.NewReplyGate(policy.Config{
+				Mode: domain.ModeAuto, OwnerOpenID: "ou_owner",
+			}, privateReplyThreadState{}),
 			messenger,
 			store,
 		)),
@@ -532,7 +544,9 @@ func TestDelegatedReplyScopeControlsOutsideGroupReply(t *testing.T) {
 func TestPrivateOwnerRequestUsesBotReplyPath(t *testing.T) {
 	messenger := &privateReplyMessenger{}
 	controller := reply.NewController(
-		policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, privateReplyThreadState{}),
+		policy.NewReplyGate(policy.Config{
+			Mode: domain.ModeAuto, OwnerOpenID: "ou_owner",
+		}, privateReplyThreadState{}),
 		messenger,
 	)
 	result, err := controller.Handle(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
@@ -551,21 +565,27 @@ func TestPrivateOwnerRequestUsesBotReplyPath(t *testing.T) {
 }
 
 func TestApprovedAssistantReplyResumesWithBotIdentity(t *testing.T) {
-	testApprovedReplyResumesWithIdentity(t, domain.RelevanceAssistantRequest, false)
+	testApprovedReplyOutcome(t, domain.RelevanceAssistantRequest, false, "ou_owner", false)
 }
 
 func TestLegacyApprovedAssistantReplyResumesWithBotIdentity(t *testing.T) {
-	testApprovedReplyResumesWithIdentity(t, domain.RelevanceAssistantRequest, true)
+	testApprovedReplyOutcome(t, domain.RelevanceAssistantRequest, true, "ou_owner", false)
 }
 
 func TestApprovedDelegatedReplyResumesWithUserIdentityThenNotifiesOwner(t *testing.T) {
-	testApprovedReplyResumesWithIdentity(t, domain.RelevanceDirectMention, false)
+	testApprovedReplyOutcome(t, domain.RelevanceDirectMention, false, "ou_requester", false)
 }
 
-func testApprovedReplyResumesWithIdentity(
+func TestApprovedNonOwnerAssistantReplyIsBlockedAfterAuthorizationChange(t *testing.T) {
+	testApprovedReplyOutcome(t, domain.RelevanceAssistantRequest, false, "ou_requester", true)
+}
+
+func testApprovedReplyOutcome(
 	t *testing.T,
 	relevance domain.Relevance,
 	legacy bool,
+	senderID string,
+	wantBlocked bool,
 ) {
 	t.Helper()
 	statePath := filepath.Join(t.TempDir(), "state.db")
@@ -574,12 +594,17 @@ func testApprovedReplyResumesWithIdentity(
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
+	mentions := []domain.Mention{{OpenID: "ou_owner", Name: "测试负责人"}}
+	if relevance == domain.RelevanceAssistantRequest {
+		mentions = []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}}
+	}
 	item := domain.NewWorkItem(domain.NormalizedEvent{
 		Source:           domain.SourceRealtime,
 		MessageID:        "om_approved_reply",
 		ChatID:           "oc_any_group",
 		ChatType:         "group",
-		SenderID:         "ou_requester",
+		SenderID:         senderID,
+		Mentions:         mentions,
 		InAssistantScope: relevance == domain.RelevanceAssistantRequest,
 	})
 	if _, err := store.EnqueueWorkItem(item); err != nil {
@@ -629,9 +654,16 @@ func testApprovedReplyResumesWithIdentity(
 	notifier := &approvalNotificationHandler{events: &messenger.events}
 	daemon := app.NewDaemon(
 		store,
-		router.New(router.Config{Mode: domain.ModeAuto}),
+		router.New(router.Config{
+			OwnerOpenID:      "ou_owner",
+			AssistantOpenIDs: []string{"ou_bot"},
+			Mode:             domain.ModeAuto,
+		}),
 		app.WithReplyHandler(reply.NewController(
-			policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, privateReplyThreadState{}),
+			policy.NewReplyGate(policy.Config{
+				Mode:        domain.ModeAuto,
+				OwnerOpenID: "ou_owner",
+			}, privateReplyThreadState{}),
 			messenger,
 			store,
 		)),
@@ -640,6 +672,22 @@ func testApprovedReplyResumesWithIdentity(
 	result, err := daemon.RunOnce(context.Background())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if wantBlocked {
+		if !result.Processed || result.Decision.Kind != domain.DecisionIgnore ||
+			!strings.Contains(result.Decision.Reason, "assistant_request_from_non_owner") ||
+			messenger.botReplies != 0 || messenger.userReplies != 0 || notifier.calls != 0 {
+			t.Fatalf("blocked result=%+v messenger=%+v notifier=%+v", result, messenger, notifier)
+		}
+		approval, err := store.GetActionAttempt(actionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if approval.Status != domain.ActionBlocked ||
+			!strings.Contains(approval.Error, "assistant_request_from_non_owner") {
+			t.Fatalf("blocked approval=%+v", approval)
+		}
+		return
 	}
 	if !result.Processed || result.Decision.Relevance != relevance {
 		t.Fatalf("result=%+v messenger=%+v", result, messenger)
@@ -742,7 +790,9 @@ func TestPrivateOwnerAvailabilityReplyCompletesWithoutModel(t *testing.T) {
 			AssistantOpenIDs: []string{"ou_bot"},
 		}),
 		app.WithReplyHandler(reply.NewController(
-			policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, privateReplyThreadState{}),
+			policy.NewReplyGate(policy.Config{
+				Mode: domain.ModeAuto, OwnerOpenID: "ou_owner",
+			}, privateReplyThreadState{}),
 			messenger,
 			store,
 		)),
@@ -790,7 +840,9 @@ func TestGroupOwnerAvailabilityMentionCompletesWithoutModel(t *testing.T) {
 			AssistantNames:   []string{"Lark Agent"},
 		}),
 		app.WithReplyHandler(reply.NewController(
-			policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, privateReplyThreadState{}),
+			policy.NewReplyGate(policy.Config{
+				Mode: domain.ModeAuto, OwnerOpenID: "ou_owner",
+			}, privateReplyThreadState{}),
 			messenger,
 			store,
 		)),
@@ -833,7 +885,9 @@ func TestOwnerPrivateFeedbackAndReplyAreAudited(t *testing.T) {
 		t.Fatal(err)
 	}
 	controller := reply.NewController(
-		policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, privateReplyThreadState{}),
+		policy.NewReplyGate(policy.Config{
+			Mode: domain.ModeAuto, OwnerOpenID: "ou_owner",
+		}, privateReplyThreadState{}),
 		messenger,
 		store,
 	)
@@ -910,7 +964,7 @@ func TestHelpContract(t *testing.T) {
 		"workspace",
 		"mode",
 		"model",
-		"Any human can mention the assistant bot",
+		"Only the configured owner can mention the assistant bot",
 		"assistant bot",
 		"independent all-groups or configured-groups scopes",
 		"keyboard working reaction",
@@ -1266,11 +1320,11 @@ func TestOwnerAssistantContractIsSharedByPromptAndDecisionTool(t *testing.T) {
 	for _, want := range []string{
 		"two explicit Lark roles",
 		"assistant_request",
-		"answer that sender as the assistant bot",
+		"answer the configured owner as the assistant bot",
 		"directly mentions the owner",
 		"owner_request",
 		"act on behalf of that owner",
-		"Do not require the sender to be the configured owner",
+		"Never answer a non-owner direct assistant invocation",
 		"complete bounded relevant read-only work",
 		"concrete business questions",
 		"run is read-only",
@@ -1306,7 +1360,7 @@ func TestOwnerAssistantContractIsSharedByPromptAndDecisionTool(t *testing.T) {
 	}
 }
 
-func TestGroupAssistantInvocationRoutesAnyHumanSender(t *testing.T) {
+func TestOwnerAssistantInvocationRoutesOnlyOwner(t *testing.T) {
 	r := router.New(router.Config{
 		OwnerOpenID:         "ou_owner",
 		AssistantOpenIDs:    []string{"ou_bot"},
@@ -1317,6 +1371,7 @@ func TestGroupAssistantInvocationRoutesAnyHumanSender(t *testing.T) {
 	owner, err := r.Route(context.Background(), domain.WorkItem{Event: domain.NormalizedEvent{
 		MessageID: "om_owner_bot",
 		ChatID:    "oc_group",
+		ChatType:  "group",
 		SenderID:  "ou_owner",
 		Mentions:  []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
 		Content:   "@Lark Agent 帮我回答这个编程问题",
@@ -1330,6 +1385,7 @@ func TestGroupAssistantInvocationRoutesAnyHumanSender(t *testing.T) {
 	other, err := r.Route(context.Background(), domain.WorkItem{Event: domain.NormalizedEvent{
 		MessageID: "om_other_bot",
 		ChatID:    "oc_group",
+		ChatType:  "group",
 		SenderID:  "ou_other",
 		Mentions:  []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
 		Content:   "@Lark Agent 帮我回答这个编程问题",
@@ -1337,8 +1393,42 @@ func TestGroupAssistantInvocationRoutesAnyHumanSender(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if other.Kind != domain.DecisionNotify || other.Relevance != domain.RelevanceAssistantRequest {
+	if other.Kind != domain.DecisionIgnore ||
+		other.Relevance != domain.RelevanceNone ||
+		other.Reason != "assistant_request_from_non_owner" {
 		t.Fatalf("other decision=%+v", other)
+	}
+	delegated, err := r.Route(context.Background(), domain.WorkItem{Event: domain.NormalizedEvent{
+		MessageID: "om_other_owner",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_other",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner", Name: "测试负责人"}},
+		Content:   "@测试负责人 帮忙确认这个接口",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delegated.Kind != domain.DecisionNotify ||
+		delegated.Relevance != domain.RelevanceDirectMention ||
+		delegated.Reason != "direct_mention" {
+		t.Fatalf("delegated decision=%+v", delegated)
+	}
+	private, err := r.Route(context.Background(), domain.WorkItem{Event: domain.NormalizedEvent{
+		MessageID: "om_other_private",
+		ChatID:    "oc_private",
+		ChatName:  "Lark Agent",
+		ChatType:  "p2p",
+		SenderID:  "ou_other",
+		Content:   "帮我确认这个接口",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if private.Kind != domain.DecisionIgnore ||
+		private.Relevance != domain.RelevanceNone ||
+		private.Reason != "assistant_request_from_non_owner" {
+		t.Fatalf("private decision=%+v", private)
 	}
 }
 

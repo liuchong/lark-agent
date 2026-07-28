@@ -386,13 +386,13 @@ func TestPollerKeepsAssistantAndDelegatedConfiguredScopesIndependent(t *testing.
 		generalMessages: serviceim.SearchMessagesResult{Items: []serviceim.Message{
 			{
 				MessageID: "om_bot_scope", ChatID: "oc_bot_scope", ChatType: "group",
-				SenderOpenID: "ou_other", Content: "@_user_1 在吗",
+				SenderOpenID: "ou_owner", Content: "@_user_1 在吗",
 				Mentions:   []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
 				CreateTime: now.Format(time.RFC3339),
 			},
 			{
 				MessageID: "om_user_scope", ChatID: "oc_user_scope", ChatType: "group",
-				SenderOpenID: "ou_other", Content: "@_user_1 在吗",
+				SenderOpenID: "ou_owner", Content: "@_user_1 在吗",
 				Mentions:   []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
 				CreateTime: now.Format(time.RFC3339),
 			},
@@ -401,6 +401,7 @@ func TestPollerKeepsAssistantAndDelegatedConfiguredScopesIndependent(t *testing.
 	poller := New(im, store, Config{
 		OwnerOpenID:                "ou_owner",
 		ChatQuery:                  "Configured Group",
+		AssistantOpenIDs:           []string{"ou_bot"},
 		AssistantNames:             []string{"Lark Agent"},
 		ConfiguredAssistantChatIDs: []string{"oc_bot_scope"},
 		Now:                        func() time.Time { return now },
@@ -415,6 +416,21 @@ func TestPollerKeepsAssistantAndDelegatedConfiguredScopesIndependent(t *testing.
 	userScoped := eventByID(store.events, "om_user_scope")
 	if userScoped.InAssistantScope || !userScoped.InTestScope {
 		t.Fatalf("user-scoped event=%+v", userScoped)
+	}
+}
+
+func TestNonOwnerAssistantMentionIgnoresBlankAssistantIdentity(t *testing.T) {
+	poller := New(&fakeIM{}, &fakeStore{}, Config{
+		OwnerOpenID:      "ou_owner",
+		AssistantOpenIDs: []string{"", "  "},
+		AssistantNames:   []string{"", "  "},
+	})
+	event := domain.NormalizedEvent{
+		SenderID: "ou_other",
+		Mentions: []domain.Mention{{OpenID: "ou_owner", Name: ""}},
+	}
+	if poller.nonOwnerAssistantMention(event) {
+		t.Fatalf("blank assistant identity matched delegated owner mention: %+v", event)
 	}
 }
 

@@ -121,9 +121,12 @@ func TestControllerSendsReplyInAutoMode(t *testing.T) {
 
 func TestControllerUsesBotIdentityForOwnerAssistantPrivateReply(t *testing.T) {
 	m := &fakeMessenger{}
-	controller := NewController(policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, threadState{}), m)
+	controller := NewController(policy.NewReplyGate(policy.Config{
+		Mode: domain.ModeAuto, OwnerOpenID: "ou_owner",
+	}, threadState{}), m)
 	result, err := controller.Handle(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID: "om_private", ChatID: "oc_private", ChatType: "p2p", ChatPartnerID: "ou_bot",
+		SenderID: "ou_owner",
 	}), domain.Decision{
 		Kind: domain.DecisionReply, Relevance: domain.RelevanceOwnerRequest,
 		Confidence: 0.99, Risk: domain.RiskLow, ReplyText: "现在是 05:40。",
@@ -143,7 +146,9 @@ func TestControllerAuditsNormalBotReplyBeforeCompleting(t *testing.T) {
 	m := &fakeMessenger{}
 	store := &auditedApprovalStore{}
 	controller := NewController(
-		policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, threadState{}),
+		policy.NewReplyGate(policy.Config{
+			Mode: domain.ModeAuto, OwnerOpenID: "ou_owner",
+		}, threadState{}),
 		m,
 		store,
 	)
@@ -166,9 +171,12 @@ func TestControllerAuditsNormalBotReplyBeforeCompleting(t *testing.T) {
 
 func TestControllerUsesBotIdentityForGroupAssistantRequest(t *testing.T) {
 	m := &fakeMessenger{}
-	controller := NewController(policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, threadState{}), m)
+	controller := NewController(policy.NewReplyGate(policy.Config{
+		Mode: domain.ModeAuto, OwnerOpenID: "ou_owner",
+	}, threadState{}), m)
 	result, err := controller.Handle(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID: "om_group", ChatID: "oc_group", ChatType: "group",
+		SenderID: "ou_owner",
 		Mentions: []domain.Mention{{OpenID: "ou_bot", Name: "Assistant Bot"}},
 	}), domain.Decision{
 		Kind: domain.DecisionReply, Relevance: domain.RelevanceAssistantRequest,
@@ -187,9 +195,11 @@ func TestControllerUsesBotIdentityForGroupAssistantRequest(t *testing.T) {
 
 func TestControllerRejectsOwnerBotReplyWithoutMessageID(t *testing.T) {
 	m := &fakeMessenger{}
-	controller := NewController(policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, threadState{}), m)
+	controller := NewController(policy.NewReplyGate(policy.Config{
+		Mode: domain.ModeAuto, OwnerOpenID: "ou_owner",
+	}, threadState{}), m)
 	_, err := controller.Handle(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
-		ChatID: "oc_private", ChatType: "p2p",
+		ChatID: "oc_private", ChatType: "p2p", SenderID: "ou_owner",
 	}), domain.Decision{
 		Kind: domain.DecisionReply, Relevance: domain.RelevanceOwnerRequest,
 		Confidence: 0.99, Risk: domain.RiskLow, ReplyText: "现在是 05:40。",
@@ -346,8 +356,12 @@ func TestControllerCompletesReadyApprovalInAutoMode(t *testing.T) {
 func TestControllerDoesNotSendRecoveredApprovalWithoutExactAction(t *testing.T) {
 	m := &fakeMessenger{}
 	approvals := &approvalStore{approved: false}
-	controller := NewController(policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, threadState{}), m, approvals)
-	item := domain.NewWorkItem(domain.NormalizedEvent{MessageID: "om_missing_approval"})
+	controller := NewController(policy.NewReplyGate(policy.Config{
+		Mode: domain.ModeAuto, OwnerOpenID: "ou_owner",
+	}, threadState{}), m, approvals)
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_missing_approval", SenderID: "ou_owner",
+	})
 	decision := domain.Decision{
 		Kind:       domain.DecisionReply,
 		Mode:       domain.ModeApproval,

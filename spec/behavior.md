@@ -93,12 +93,14 @@ registered as model-callable tools. The native tool schema constrains `risk` to
 so an invalid risk sentence cannot turn a terminal decision into a failed tool
 round trip.
 
-The model has two explicit Lark roles. An `assistant_request` answers any human
-who natively mentions the assistant in an allowed group, using bot identity. A
-`direct_mention` acts on behalf of the configured human owner when another
-human mentions that owner, using the delegated-reply policy. A private
-`owner_request` answers the configured owner's own assistant prompt using bot
-identity. A direct owner mention is addressed to this personal-assistant
+The model has two explicit Lark roles. An `assistant_request` answers the
+configured owner when that owner natively mentions the assistant in an allowed
+group, using bot identity. A `direct_mention` acts on behalf of the configured
+human owner when another human mentions that owner, using the delegated-reply
+policy. A private `owner_request` answers the configured owner's own assistant
+prompt using bot identity. Non-owner private messages and non-owner native
+assistant mentions are ignored before model work. A direct owner mention is
+addressed to this personal-assistant
 workflow even when it is a status update, coordination request, commitment, or
 follow-up rather than a grammatical question. Such a message may still need
 evidence before choosing an outcome. `ignore` is for content with no
@@ -606,17 +608,21 @@ projects, memory, rules, message history, and workspace search results. The
 router may see all user-visible conversations, but only candidates that pass
 hard gates and relevance checks enter the model.
 
-Any human sender can initiate the assistant from a group by using a native Lark
-mention whose open ID or mention name matches the configured assistant. That
-message becomes an `assistant_request`; it is answered with bot identity and is
-not treated as a delegated owner reply. Plain text that merely contains an
-assistant name is not enough for a non-owner sender. A private assistant chat
-remains an owner-only `owner_request`: the sender must be the configured owner
-and the private partner must match the configured assistant. Replies to
+Only the configured owner can initiate the assistant from a group by using a
+native Lark mention whose open ID or mention name matches the configured
+assistant. That message becomes an `assistant_request`; it is answered with bot
+identity and is not treated as a delegated owner reply. A non-owner native
+assistant mention, plain-text assistant name, or private assistant message is
+ignored before queueing or model work. A private assistant chat remains an
+owner-only `owner_request`: the sender must be the configured owner and the
+private partner must match the configured assistant. Replies to
 `assistant_request` and `owner_request` messages answer the sender's own prompt,
 so they do not wait for the owner, do not run the "owner already replied"
 cancellation check, do not add the delegated `🤖` marker, and do not create a
-post-reply owner notice. Non-owner private assistant messages remain ignored.
+post-reply owner notice. Non-owner messages can trigger a sender-facing
+response only by natively mentioning the configured human owner in a group
+allowed by `policy.reply_scope`; that path is the read-only delegated-owner
+workflow.
 
 The router attaches a work kind and priority to every accepted item. Assistant
 and owner requests that match a fast-path command are `fast_path` work. Requests
@@ -672,9 +678,11 @@ floor; a draft below the configured threshold waits for approval.
 Group requests addressed to the assistant have an independent
 `assistant.reply_scope` with the same values:
 
-- `all_groups` allows a native assistant mention from every bot-visible group;
-- `configured_groups` allows assistant mentions only in groups discovered by
-  the daemon's `--chat-query`, and startup fails if that query is empty.
+- `all_groups` allows the configured owner's native assistant mention from
+  every bot-visible group;
+- `configured_groups` allows the configured owner's assistant mentions only in
+  groups discovered by the daemon's `--chat-query`, and startup fails if that
+  query is empty.
 
 `assistant.reply_scope` is also `all_groups` by default. In
 `configured_groups` mode, startup resolves the query to concrete group IDs
@@ -739,11 +747,16 @@ The multi-step loop is accepted by these executable BDD scenarios:
   after a terminal outcome, without a timer controlling removal.
 - Given another sender mentions the owner, when the agent evaluates or replies
   as the owner's delegate, then it never adds the assistant working reaction.
-- Given `assistant.reply_scope` is `all_groups` and any human sender natively
-  mentions the assistant in a group that does not match `--chat-query`, when
-  routing runs, then the request enters model or fast-path work and a reply uses
-  bot identity without an owner-delegation marker or post-reply owner notice.
-- Given `assistant.reply_scope` is `configured_groups` and a human sender
+- Given `assistant.reply_scope` is `all_groups` and the configured owner
+  natively mentions the assistant in a group that does not match
+  `--chat-query`, when routing runs, then the request enters model or fast-path
+  work and a reply uses bot identity without an owner-delegation marker or
+  post-reply owner notice.
+- Given a non-owner natively mentions the assistant in any group, regardless of
+  `assistant.reply_scope`, when real-time or polling intake evaluates it, then
+  the request is ignored before queueing, model work, working reactions, or any
+  reply.
+- Given `assistant.reply_scope` is `configured_groups` and the configured owner
   mentions the assistant outside the groups discovered by `--chat-query`, when
   real-time or polling intake evaluates it, then the request is ignored before
   model work and cannot pass the final send gate.
@@ -761,9 +774,10 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given `assistant.reply_scope` contains an unsupported value, when
   configuration is loaded, then validation fails and names the
   `assistant.reply_scope` field.
-- Given a non-owner privately messages the assistant, or writes the assistant
-  name in group text without a native mention, when routing runs, then the
-  runtime ignores it before any model call.
+- Given a non-owner privately messages the assistant, natively mentions the
+  assistant in a group, or writes the assistant name in group text without a
+  native mention, when intake or routing runs, then the runtime remains silent
+  and ignores it before queueing or any model call.
 - Given `policy.reply_scope` is `all_groups` and another sender directly
   mentions the owner in a group that does not match `--chat-query`, when the
   reply passes all other policy checks, then the agent may reply as the owner
@@ -924,9 +938,9 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given the configured owner privately asks the assistant "在吗", when the item
   is processed, then the bot replies "在的。" as fast-path work and removes the
   working reaction without loading conversation history or calling a model.
-- Given any human sender mentions the assistant in an allowed group and asks
-  "在吗", when the item is processed, then the bot replies "在的。" through the
-  same fast path without loading conversation history or calling a model.
+- Given the configured owner mentions the assistant in an allowed group and
+  asks "在吗", when the item is processed, then the bot replies "在的。" through
+  the same fast path without loading conversation history or calling a model.
 - Given a non-fast-path owner request has already been received and bounded Lark
   history loading fails, when context is built, then the current message still
   reaches the model and the bundle marks its context selection incomplete.
@@ -936,10 +950,16 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given no newer access token exists but a refresh token is available, when the
   request recovers, then the official SDK rotates both tokens, persists them,
   and replays the original request once.
-- Given the configured owner or another human mentions the assistant bot in an
-  allowed group, when the message is observed by real-time intake or polling,
-  then it enters as an assistant-request work item and a reply uses bot
-  identity.
+- Given the configured owner mentions the assistant bot in an allowed group,
+  when the message is observed by real-time intake or polling, then it enters
+  as an assistant-request work item and a reply uses bot identity.
+- Given another human mentions the assistant bot in a group or privately
+  messages it, when the message is observed, then no work item, working
+  reaction, model run, or reply is produced.
+- Given an older version already persisted and approved a bot reply for a
+  non-owner assistant mention, when the upgraded daemon resumes that exact
+  approval, then the final sender-identity gate blocks the reply, marks the
+  approval blocked, and completes the work without sending.
 - Given a non-owner privately messages the assistant bot, when routing runs,
   then the runtime ignores it before any model call.
 - Given an owner-request reply is ready to send, when the pre-send thread check
@@ -983,9 +1003,10 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given the agent replies as the owner on the owner's behalf, when the message
   is posted to Lark, then the visible reply text starts with the `🤖` robot
   marker exactly once.
-- Given the assistant bot replies to an owner-request private message or any
-  allowed group assistant mention, when the message is posted to Lark, then it
-  uses bot identity and does not add the owner-delegation `🤖` marker.
+- Given the assistant bot replies to an owner-request private message or an
+  allowed owner-authored group assistant mention, when the message is posted to
+  Lark, then it uses bot identity and does not add the owner-delegation `🤖`
+  marker.
 - Given the group reply is blocked, cancelled, awaiting approval, or fails, when
   reply execution stops, then the owner notice must not claim that the agent
   already replied.
@@ -1015,10 +1036,10 @@ The multi-step loop is accepted by these executable BDD scenarios:
   workspace, when request handling starts, then no evidence tool executes and
   the sender receives a concise refusal that accepts only a concrete business
   question.
-- Given a non-owner triggers an assistant request or delegated owner mention,
-  when the model catalog and registry are evaluated, then shell, cross-chat
-  search, and every owner-only or side-effect tool are unavailable and remain
-  denied even if the model constructs a direct tool call.
+- Given a non-owner triggers a delegated owner mention, when the model catalog
+  and registry are evaluated, then shell, cross-chat search, and every
+  owner-only or side-effect tool are unavailable and remain denied even if the
+  model constructs a direct tool call.
 - Given a non-owner calls `get_lark_context` with a chat ID other than the
   source chat, when the registry authorizes the call, then it rejects the call
   before the Lark provider executes.

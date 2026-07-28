@@ -267,7 +267,7 @@ func TestSourceDropsNonOwnerMessagesBeforeQueue(t *testing.T) {
 	}
 }
 
-func TestSourceAcceptsNonOwnerGroupMessageThatMentionsAssistant(t *testing.T) {
+func TestSourceDropsNonOwnerGroupMessageThatMentionsAssistantBeforeQueue(t *testing.T) {
 	store := &fakeStore{}
 	payload := `{
 	  "type":"im.message.receive_v1",
@@ -286,21 +286,16 @@ func TestSourceAcceptsNonOwnerGroupMessageThatMentionsAssistant(t *testing.T) {
 		AssistantOpenIDs:    []string{"ou_bot"},
 		AssistantReplyScope: domain.ReplyScopeAllGroups,
 		Classify: func(_ context.Context, _ domain.WorkItem) (domain.Decision, error) {
-			return domain.Decision{
-				Relevance: domain.RelevanceAssistantRequest,
-				WorkKind:  domain.WorkKindSimpleQuestion,
-				Priority:  domain.PrioritySimpleQuestion,
-			}, nil
+			t.Fatal("non-owner assistant mention reached classifier")
+			return domain.Decision{}, nil
 		},
 	})
 
 	if err := source.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(store.items) != 1 ||
-		store.items[0].Event.SenderID != "ou_other" ||
-		store.items[0].WorkKind == "" {
-		t.Fatalf("assistant mention items=%+v", store.items)
+	if len(store.items) != 0 {
+		t.Fatalf("non-owner assistant mention items=%+v", store.items)
 	}
 }
 
@@ -313,7 +308,7 @@ func TestSourceConfiguredAssistantScopeDropsOutsideGroupBeforeQueue(t *testing.T
 	  "create_time":"1784853999000",
 	  "chat_id":"oc_outside",
 	  "chat_type":"group",
-	  "sender_id":"ou_other",
+	  "sender_id":"ou_owner",
 	  "sender_type":"user",
 	  "content":"@_user_1 帮我查这个接口",
 	  "mentions":[{"key":"@_user_1","open_id":"ou_bot","name":"Assistant Bot"}]
@@ -342,7 +337,7 @@ func TestSourceConfiguredAssistantScopeMarksBotResolvedGroup(t *testing.T) {
 	  "create_time":"1784853999000",
 	  "chat_id":"oc_configured",
 	  "chat_type":"group",
-	  "sender_id":"ou_other",
+	  "sender_id":"ou_owner",
 	  "sender_type":"user",
 	  "content":"@_user_1 帮我查这个接口",
 	  "mentions":[{"key":"@_user_1","open_id":"ou_bot","name":"Assistant Bot"}]

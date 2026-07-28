@@ -681,7 +681,7 @@ func TestDaemonDoesNotSendPostReplyNoticeForOwnerRequest(t *testing.T) {
 func TestDaemonDoesNotSendPostReplyNoticeForAssistantRequest(t *testing.T) {
 	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID: "om_group_assistant", ChatID: "oc_group", ChatType: "group",
-		SenderID: "ou_other",
+		SenderID: "ou_owner",
 		Mentions: []domain.Mention{{OpenID: "ou_bot", Name: "Assistant Bot"}},
 	})}
 	replier := &fakeReplyHandler{}

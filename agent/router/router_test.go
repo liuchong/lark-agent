@@ -255,7 +255,7 @@ func TestCodingQuestionContainingDateOrTimeDoesNotHitFastPath(t *testing.T) {
 	}
 }
 
-func TestNonOwnerMentioningAssistantRoutesAsAssistantRequest(t *testing.T) {
+func TestNonOwnerMentioningAssistantIsIgnored(t *testing.T) {
 	r := New(Config{
 		OwnerOpenID:         "ou_owner",
 		AssistantOpenIDs:    []string{"ou_bot"},
@@ -267,6 +267,7 @@ func TestNonOwnerMentioningAssistantRoutesAsAssistantRequest(t *testing.T) {
 		Event: domain.NormalizedEvent{
 			MessageID: "om_other_bot",
 			ChatID:    "oc_group",
+			ChatType:  "group",
 			SenderID:  "ou_other",
 			Mentions:  []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
 			Content:   "@Lark Agent 帮我查这个接口",
@@ -275,9 +276,9 @@ func TestNonOwnerMentioningAssistantRoutesAsAssistantRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Kind != domain.DecisionNotify ||
-		decision.Relevance != domain.RelevanceAssistantRequest ||
-		decision.Reason != "assistant_mention" {
+	if decision.Kind != domain.DecisionIgnore ||
+		decision.Relevance != domain.RelevanceNone ||
+		decision.Reason != "assistant_request_from_non_owner" {
 		t.Fatalf("decision=%+v", decision)
 	}
 }
@@ -293,7 +294,7 @@ func TestConfiguredAssistantScopeIgnoresMentionOutsideConfiguredGroups(t *testin
 		MessageID:   "om_other_bot",
 		ChatID:      "oc_outside",
 		ChatType:    "group",
-		SenderID:    "ou_other",
+		SenderID:    "ou_owner",
 		InTestScope: true,
 		Mentions:    []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
 		Content:     "@Lark Agent 帮我查这个接口",
@@ -317,7 +318,7 @@ func TestConfiguredAssistantScopeDoesNotReuseDelegatedScopeMarker(t *testing.T) 
 		MessageID:   "om_user_configured_only",
 		ChatID:      "oc_user_configured",
 		ChatType:    "group",
-		SenderID:    "ou_other",
+		SenderID:    "ou_owner",
 		InTestScope: true,
 		Mentions:    []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
 		Content:     "@Lark Agent 在吗",
@@ -341,7 +342,7 @@ func TestConfiguredAssistantScopeAcceptsMentionInsideConfiguredGroups(t *testing
 		MessageID:        "om_other_bot",
 		ChatID:           "oc_configured",
 		ChatType:         "group",
-		SenderID:         "ou_other",
+		SenderID:         "ou_owner",
 		InAssistantScope: true,
 		Mentions:         []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
 		Content:          "@Lark Agent 帮我查这个接口",

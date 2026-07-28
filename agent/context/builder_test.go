@@ -217,11 +217,11 @@ func TestAgentSystemPromptDefinesAssistantAndDelegatedOwnerRoles(t *testing.T) {
 	for _, want := range []string{
 		"two explicit Lark roles",
 		"assistant_request",
-		"answer that sender as the assistant bot",
+		"answer the configured owner as the assistant bot",
 		"directly mentions the owner",
 		"act on behalf of that owner",
 		"owner_request",
-		"Do not require the sender to be the configured owner",
+		"Never answer a non-owner direct assistant invocation",
 		"quoted reply or thread context is authoritative",
 		"never import messages from another chat",
 		"context selection is marked incomplete",

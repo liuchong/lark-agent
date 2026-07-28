@@ -28,9 +28,10 @@ lark-agent config show
 - `owner.open_id`：唯一 Owner 的 open ID。
 - `assistant.open_ids`、`assistant.names`：Owner 私聊和群 @机器人的识别身份。
 - `assistant.owner_direct.enabled`：是否接受 Owner 直接发给机器人的请求。
-- `assistant.reply_scope`：群内 @机器人范围。`all_groups` 是默认值，允许任意真人在
-  任意机器人可见群里原生 `@机器人`；`configured_groups` 只允许 daemon
-  `--chat-query` 发现的群，并要求启动时查询至少匹配一个机器人可见群。
+- `assistant.reply_scope`：Owner 群内 @机器人范围。`all_groups` 是默认值，允许
+  Owner 在任意机器人可见群里原生 `@机器人`；`configured_groups` 只允许 Owner
+  在 daemon `--chat-query` 发现的群里调用，并要求启动时查询至少匹配一个机器人
+  可见群。非 Owner 私聊或 @机器人始终静默。
 - `workspace.root`：唯一 Workspace，必须是绝对路径。
 - `workspace.excludes`：不可读写的秘密或构建目录模式。
 - `policy.mode`：`auto`、`approval` 或 `paused`。
@@ -96,7 +97,7 @@ policy:
 
 这两个字段相互独立：
 
-- `assistant.reply_scope` 控制任意真人在群里 `@机器人` 后，机器人是否接收并用
+- `assistant.reply_scope` 控制 Owner 在群里 `@机器人` 后，机器人是否接收并用
   机器人身份回答。
 - `policy.reply_scope` 控制任意真人在群里 `@Owner` 后，Agent 是否可以用 Owner
   身份代回复。

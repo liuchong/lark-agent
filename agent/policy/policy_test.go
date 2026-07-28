@@ -22,8 +22,10 @@ func (f fakeThreadState) MessageWithdrawn(context.Context, domain.WorkItem) (boo
 }
 
 func TestAutoReplyCancelsWhenOwnerAlreadyReplied(t *testing.T) {
-	gate := NewReplyGate(Config{Mode: domain.ModeAuto}, fakeThreadState{ownerReplied: true})
-	action, err := gate.Prepare(context.Background(), domain.WorkItem{}, domain.Decision{
+	gate := NewReplyGate(Config{Mode: domain.ModeAuto, OwnerOpenID: "ou_owner"}, fakeThreadState{ownerReplied: true})
+	action, err := gate.Prepare(context.Background(), domain.WorkItem{
+		Event: domain.NormalizedEvent{SenderID: "ou_owner"},
+	}, domain.Decision{
 		Kind:       domain.DecisionReply,
 		Confidence: 0.98,
 		Risk:       domain.RiskLow,
@@ -37,8 +39,12 @@ func TestAutoReplyCancelsWhenOwnerAlreadyReplied(t *testing.T) {
 }
 
 func TestOwnerRequestDoesNotCancelBecauseOwnerSentPrompt(t *testing.T) {
-	gate := NewReplyGate(Config{Mode: domain.ModeAuto}, fakeThreadState{ownerReplied: true})
-	action, err := gate.Prepare(context.Background(), domain.WorkItem{}, domain.Decision{
+	gate := NewReplyGate(Config{
+		Mode: domain.ModeAuto, OwnerOpenID: "ou_owner",
+	}, fakeThreadState{ownerReplied: true})
+	action, err := gate.Prepare(context.Background(), domain.WorkItem{
+		Event: domain.NormalizedEvent{SenderID: "ou_owner"},
+	}, domain.Decision{
 		Kind:       domain.DecisionReply,
 		Relevance:  domain.RelevanceOwnerRequest,
 		Confidence: 0.98,
@@ -133,6 +139,34 @@ func TestBlockedUserBlocksAtFinalGate(t *testing.T) {
 	}
 }
 
+func TestAssistantFacingReplyFromNonOwnerBlocksAtFinalGate(t *testing.T) {
+	for _, relevance := range []domain.Relevance{
+		domain.RelevanceAssistantRequest,
+		domain.RelevanceOwnerRequest,
+	} {
+		gate := NewReplyGate(Config{
+			Mode:        domain.ModeAuto,
+			OwnerOpenID: "ou_owner",
+		}, fakeThreadState{})
+		action, err := gate.Prepare(context.Background(), domain.WorkItem{
+			Event: domain.NormalizedEvent{SenderID: "ou_other"},
+		}, domain.Decision{
+			Kind:       domain.DecisionReply,
+			Relevance:  relevance,
+			Confidence: 1,
+			Risk:       domain.RiskLow,
+			ReplyText:  "不应发送",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if action.Status != domain.ActionBlocked ||
+			action.CancelReason != "assistant_request_from_non_owner" {
+			t.Fatalf("relevance=%s action=%+v", relevance, action)
+		}
+	}
+}
+
 func TestConfiguredGroupsScopeBlocksOutsideConfiguredGroup(t *testing.T) {
 	gate := NewReplyGate(Config{Mode: domain.ModeAuto, ReplyScope: domain.ReplyScopeConfiguredGroups}, fakeThreadState{})
 	action, err := gate.Prepare(context.Background(), domain.WorkItem{
@@ -173,11 +207,12 @@ func TestAllGroupsScopeAllowsOutsideConfiguredGroup(t *testing.T) {
 func TestConfiguredAssistantScopeBlocksOutsideConfiguredGroup(t *testing.T) {
 	gate := NewReplyGate(Config{
 		Mode:                domain.ModeAuto,
+		OwnerOpenID:         "ou_owner",
 		AssistantReplyScope: domain.ReplyScopeConfiguredGroups,
 	}, fakeThreadState{})
 	action, err := gate.Prepare(context.Background(), domain.WorkItem{
 		Event: domain.NormalizedEvent{
-			MessageID: "om_assistant", ChatType: "group",
+			MessageID: "om_assistant", ChatType: "group", SenderID: "ou_owner",
 			InTestScope: true, InAssistantScope: false,
 		},
 	}, domain.Decision{
@@ -198,11 +233,12 @@ func TestConfiguredAssistantScopeBlocksOutsideConfiguredGroup(t *testing.T) {
 func TestConfiguredAssistantScopeAllowsBotResolvedGroup(t *testing.T) {
 	gate := NewReplyGate(Config{
 		Mode:                domain.ModeAuto,
+		OwnerOpenID:         "ou_owner",
 		AssistantReplyScope: domain.ReplyScopeConfiguredGroups,
 	}, fakeThreadState{})
 	action, err := gate.Prepare(context.Background(), domain.WorkItem{
 		Event: domain.NormalizedEvent{
-			MessageID: "om_assistant", ChatType: "group",
+			MessageID: "om_assistant", ChatType: "group", SenderID: "ou_owner",
 			InTestScope: false, InAssistantScope: true,
 		},
 	}, domain.Decision{
@@ -223,10 +259,13 @@ func TestConfiguredAssistantScopeAllowsBotResolvedGroup(t *testing.T) {
 func TestAllGroupsAssistantScopeAllowsOutsideConfiguredGroup(t *testing.T) {
 	gate := NewReplyGate(Config{
 		Mode:                domain.ModeAuto,
+		OwnerOpenID:         "ou_owner",
 		AssistantReplyScope: domain.ReplyScopeAllGroups,
 	}, fakeThreadState{ownerReplied: true})
 	action, err := gate.Prepare(context.Background(), domain.WorkItem{
-		Event: domain.NormalizedEvent{MessageID: "om_assistant", ChatType: "group", InTestScope: false},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_assistant", ChatType: "group", SenderID: "ou_owner", InTestScope: false,
+		},
 	}, domain.Decision{
 		Kind:       domain.DecisionReply,
 		Relevance:  domain.RelevanceAssistantRequest,
@@ -243,9 +282,15 @@ func TestAllGroupsAssistantScopeAllowsOutsideConfiguredGroup(t *testing.T) {
 }
 
 func TestOwnerRequestBypassesConfiguredGroupsReplyLimit(t *testing.T) {
-	gate := NewReplyGate(Config{Mode: domain.ModeAuto, ReplyScope: domain.ReplyScopeConfiguredGroups}, fakeThreadState{})
+	gate := NewReplyGate(Config{
+		Mode:        domain.ModeAuto,
+		OwnerOpenID: "ou_owner",
+		ReplyScope:  domain.ReplyScopeConfiguredGroups,
+	}, fakeThreadState{})
 	action, err := gate.Prepare(context.Background(), domain.WorkItem{
-		Event: domain.NormalizedEvent{MessageID: "om_owner_request", InTestScope: false},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_owner_request", SenderID: "ou_owner", InTestScope: false,
+		},
 	}, domain.Decision{
 		Kind:       domain.DecisionReply,
 		Relevance:  domain.RelevanceOwnerRequest,
@@ -290,14 +335,17 @@ func TestInteractiveOwnerRequestsDoNotWait(t *testing.T) {
 	for _, kind := range []domain.WorkKind{domain.WorkKindFastPath, domain.WorkKindSimpleQuestion} {
 		waited := false
 		gate := NewReplyGate(Config{
-			Mode:      domain.ModeAuto,
-			OwnerWait: time.Minute,
+			Mode:        domain.ModeAuto,
+			OwnerOpenID: "ou_owner",
+			OwnerWait:   time.Minute,
 			Sleeper: func(context.Context, time.Duration) error {
 				waited = true
 				return nil
 			},
 		}, fakeThreadState{})
-		action, err := gate.Prepare(context.Background(), domain.WorkItem{}, domain.Decision{
+		action, err := gate.Prepare(context.Background(), domain.WorkItem{
+			Event: domain.NormalizedEvent{SenderID: "ou_owner"},
+		}, domain.Decision{
 			Kind:       domain.DecisionReply,
 			Relevance:  domain.RelevanceOwnerRequest,
 			WorkKind:   kind,

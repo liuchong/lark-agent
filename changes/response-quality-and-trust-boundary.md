@@ -120,6 +120,12 @@ The protection is mandatory and has no disable flag. Existing
 `assistant.reply_scope` and `policy.reply_scope` remain independently
 configurable; the actual installation keeps both at `all_groups`.
 
+`assistant.reply_scope` controls only where the configured owner may directly
+invoke the assistant bot. A non-owner private message or native assistant
+mention is always silent and is rejected before queueing or model work.
+`policy.reply_scope` independently controls where a non-owner may mention the
+human owner and trigger a read-only delegated reply.
+
 The default initial context is reduced and tool investigation budget is raised
 only enough to support production-source verification after wasted validation
 calls stop counting. The simple-request budget uses three model turns so the
@@ -150,10 +156,24 @@ when the model reads same-chat context and production workspace code,
 then the tools execute read-only, the reply briefly states completed
 investigation and findings, and no mutation tool is available or executable.
 
+### Scenario: Non-owner cannot invoke the assistant
+
+Given a non-owner privately messages the assistant or natively mentions it in a
+group, when intake and routing evaluate the event, then it is silently rejected
+before queueing, model work, working reactions, or any reply.
+
+### Scenario: Verifiable and false-premise quality probes
+
+Given the owner asks one question whose answer can be independently verified
+from production workspace source and one question containing a nonexistent
+function or unsupported premise, when the installed assistant answers, then
+the first answer matches the inspected source and the second explicitly rejects
+or qualifies the premise without inventing files, functions, calls, or facts.
+
 ### Scenario: Non-owner mutation request
 
-Given a non-owner mentions the assistant or owner and asks it to modify, delete,
-commit, deploy, or send through shell,
+Given a non-owner mentions the owner and asks the delegated workflow to modify,
+delete, commit, deploy, or send through shell,
 when the model attempts a side-effect tool,
 then the registry rejects the call before execution and the final reply does
 not claim the action happened.

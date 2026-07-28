@@ -106,6 +106,7 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"assistant.reply_scope",
 		"policy.reply_scope",
 		"all_groups",
+		"非 Owner 私聊机器人或直接 @机器人时保持静默",
 	} {
 		if !strings.Contains(string(readme), want) {
 			t.Fatalf("README missing %q", want)

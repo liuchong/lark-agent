@@ -80,6 +80,10 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 		return decision, nil
 	}
 	if r.assistantMentioned(item.Event) && item.Event.ChatType != "p2p" {
+		if !r.cfg.OwnerDirect || item.Event.SenderID != r.cfg.OwnerOpenID {
+			decision.Reason = "assistant_request_from_non_owner"
+			return decision, nil
+		}
 		if !assistantGroupScopeAllows(r.cfg.AssistantReplyScope, item.Event) {
 			decision.Reason = "outside_assistant_reply_scope"
 			return decision, nil

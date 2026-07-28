@@ -107,10 +107,11 @@ Owner 私聊 Assistant Bot 发送“在吗”或简单问候时走本地快速�
 会话历史。其他问题在构建上下文时，会把飞书会话历史作为可选增强；历史读取暂时失败
 不会中断当前消息处理。
 
-任意真人在机器人可见群里原生 `@Assistant Bot` 时，由官方 Go SDK 的实时事件入口
-接收，并以机器人身份回答。`assistant.reply_scope: all_groups` 允许所有机器人可见群；
-`configured_groups` 只允许 `--chat-query` 在启动时用机器人身份解析出的群，查询为空
-或没有匹配群都会使启动明确失败。
+只有 Owner 在机器人可见群里原生 `@Assistant Bot` 时，官方 Go SDK 的实时事件入口
+才会接收并以机器人身份回答。非 Owner 私聊机器人或直接 `@Assistant Bot` 会在排队和
+模型调用前静默丢弃。`assistant.reply_scope: all_groups` 允许 Owner 在所有机器人可见
+群调用；`configured_groups` 只允许 Owner 在 `--chat-query` 启动时用机器人身份解析
+出的群调用，查询为空或没有匹配群都会使启动明确失败。
 
 群内其他人直接 `@Owner` 由用户身份轮询接收，再经过模型判断和代回复策略。
 `policy.reply_scope: all_groups` 允许所有可见群进入其余门禁；改为
@@ -119,8 +120,9 @@ Owner 私聊 Assistant Bot 发送“在吗”或简单问候时走本地快速�
 `reply_scopes.owner_mentions` 分别确认实际值。两个范围相互独立，范围变化不会自动
 重放旧消息。
 
-非 Owner 发起的两类群请求都按只读权限运行：只能读取来源群的有界上下文和配置
-Workspace 内的业务代码，不能执行 shell、搜索其他群、修改、删除、提交或部署。
+非 Owner 只有群内直接 `@Owner` 的代回复请求会进入运行，并且只按只读权限执行：
+只能读取来源群的有界上下文和配置 Workspace 内的业务代码，不能执行 shell、搜索
+其他群、修改、删除、提交或部署。
 要求读取工作目录外路径，或询问凭据、环境变量、用户目录、进程、网络和主机清单时，
 系统会在模型和工具调查前直接拒绝。
 

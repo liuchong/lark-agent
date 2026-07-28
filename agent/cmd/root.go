@@ -65,9 +65,11 @@ func NewRootCommand(in io.Reader, out io.Writer) *cobra.Command {
 
 It monitors Lark messages, applies workspace-bounded rules, routes relevant
 work to an Eino-based agent loop, and can reply as the owner in auto mode.
-Any human can mention the assistant bot in an allowed group to ask a question
-or request an operation; that path replies with bot identity. The configured
-owner can also privately message the assistant. Assistant mentions and owner
+Only the configured owner can mention the assistant bot in an allowed group to
+ask a question or request an operation; that path replies with bot identity.
+The configured owner can also privately message the assistant. Non-owner bot
+private messages and direct assistant mentions stay silent; non-owners can only
+trigger a reply by mentioning the human owner. Assistant mentions and owner
 mentions have independent all-groups or configured-groups scopes. Direct
 assistant requests add a keyboard working reaction before work starts and
 remove it when work finishes.
@@ -959,6 +961,7 @@ func buildLiveOptions(
 		}
 		gate := policy.NewReplyGate(policy.Config{
 			Mode:                cfg.Policy.Mode,
+			OwnerOpenID:         cfg.Owner.OpenID,
 			ReplyScope:          cfg.Policy.ReplyScope,
 			AssistantReplyScope: cfg.Assistant.ReplyScope,
 			ReplyConfidenceMin:  cfg.Policy.ReplyConfidenceMin,
@@ -1048,6 +1051,7 @@ func newConfiguredLivePoller(
 	return poll.New(im, store, poll.Config{
 		OwnerOpenID:                cfg.Owner.OpenID,
 		ChatQuery:                  chatQuery,
+		AssistantOpenIDs:           cfg.Assistant.OpenIDs,
 		AssistantNames:             cfg.Assistant.Names,
 		ConfiguredAssistantChatIDs: configuredAssistantChatIDs,
 		IncludePrivate:             includePrivate,
