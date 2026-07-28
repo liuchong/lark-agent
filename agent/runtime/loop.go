@@ -141,6 +141,8 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	repeatedCalls := map[string]int{}
 	sourceLessWorkspaceSearches := 0
 	toolBudgetConvergencePrompted := false
+	codingEvidenceConvergencePrompted := false
+	codingEvidenceAvailable := hasProductionSource(bundle.Sources)
 	investigationPlanSubmitted := false
 	noProgressLarkContext := false
 	toolCalls := 0
@@ -155,8 +157,16 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		messages = compactMessages(messages, l.MaxContextBytes)
 		requestMessages := append([]*schema.Message(nil), messages...)
 		requestMessages = append(requestMessages, schema.SystemMessage(modelTurnProgressPrompt(turn+1, l.MaxTurns)))
+		codingTerminalOnly := bundle.WorkKind == domain.WorkKindCodingQuestion &&
+			codingEvidenceAvailable &&
+			turn >= l.MaxTurns-2
+		terminalOnly := forceDecision || codingTerminalOnly
+		turnToolInfos := visibleToolInfos
+		if terminalOnly {
+			turnToolInfos = submitDecisionOnly(visibleToolInfos)
+		}
 		assistant, err := l.Model.Generate(ctx, requestMessages,
-			einomodel.WithTools(visibleToolInfos),
+			einomodel.WithTools(turnToolInfos),
 			einomodel.WithToolChoice(l.ToolChoice))
 		if err != nil {
 			return domain.Decision{}, trajectory, err
@@ -207,7 +217,13 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			toolCtx = agenttools.WithInvocationScope(toolCtx, invocationScope)
 			var execution agenttools.Execution
 			var toolErr error
-			if forceDecision && call.Function.Name != "submit_decision" {
+			if codingTerminalOnly && call.Function.Name != "submit_decision" {
+				toolErr = errs.NewInternalError(
+					errs.SubtypeInvalidResponse,
+					"final coding turns are reserved for submit_decision; answer now with verified facts and explicit unknowns",
+				)
+				forceDecision = true
+			} else if forceDecision && call.Function.Name != "submit_decision" {
 				toolErr = errs.NewInternalError(
 					errs.SubtypeInvalidResponse,
 					"investigation made no progress or exhausted its tool budget; submit_decision now with verified facts and explicit unknowns",
@@ -312,6 +328,13 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			for _, source := range execution.Sources {
 				allowedSources[sourceKey(source)] = true
 			}
+			if bundle.WorkKind == domain.WorkKindCodingQuestion && hasProductionSource(execution.Sources) {
+				codingEvidenceAvailable = true
+				if !codingEvidenceConvergencePrompted {
+					messages = append(messages, schema.SystemMessage(codingEvidenceConvergencePrompt()))
+					codingEvidenceConvergencePrompted = true
+				}
+			}
 			if execution.Decision != nil {
 				if l.Recorder != nil {
 					if err := l.Recorder.FinishAgentRun(ctx, runID, domain.AgentRunCompleted, ""); err != nil {
@@ -412,6 +435,19 @@ func shouldPromptToolBudgetConvergence(rawToolBytes, maxToolBytes, totalToolByte
 
 func toolBudgetConvergencePrompt() string {
 	return "Tool output budget is near or above the configured limit. Old raw tool output has been clipped for context safety. Summarize the evidence already gathered, avoid broad repeat searches, and converge with submit_decision unless one narrow read is required to avoid a false claim."
+}
+
+func codingEvidenceConvergencePrompt() string {
+	return "Citable workspace evidence is now available. If it answers the concrete fields the user asked for, call submit_decision now. Do not expand into unrelated Lark history, repository-wide searches, or production call-site proof unless the user explicitly asked about reachability. For an exact function's direct behavior, its digest-backed definition is sufficient; preserve explicit unknowns instead of over-investigating."
+}
+
+func submitDecisionOnly(infos []*schema.ToolInfo) []*schema.ToolInfo {
+	for _, info := range infos {
+		if info != nil && info.Name == "submit_decision" {
+			return []*schema.ToolInfo{info}
+		}
+	}
+	return infos
 }
 
 func compactMessages(messages []*schema.Message, maxBytes int) []*schema.Message {

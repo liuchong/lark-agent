@@ -170,6 +170,16 @@ function or unsupported premise, when the installed assistant answers, then
 the first answer matches the inspected source and the second explicitly rejects
 or qualifies the premise without inventing files, functions, calls, or facts.
 
+Given either probe has already produced citable workspace evidence, when the
+model has enough evidence to answer every requested field or reaches its final
+two turns, then it submits the evidence-backed answer or explicit unknown
+instead of expanding into unrelated Lark history or exhausting the run and
+retrying the whole investigation.
+
+Given the resulting auto-mode reply has no approved draft to consume, when the
+controller checks current and legacy approval keys, then absence is not an
+identity error and the generated reply proceeds to the Lark send action.
+
 ### Scenario: Non-owner mutation request
 
 Given a non-owner mentions the owner and asks the delegated workflow to modify,

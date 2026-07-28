@@ -81,9 +81,16 @@ coding investigation. A simple non-coding owner question may use at most the
 simple-agent budget and cannot call shell. The default simple-agent budget is
 three model turns so an evidence-backed request can perform initial search,
 read one narrowed production source, and then submit its conclusion. A coding
-question has a separate foreground budget. When useful evidence exists and the
-coding run approaches its budget, the runtime forces a truthful partial answer
-or clarification instead of continuing broad search.
+question has a separate foreground budget. Once a coding run has citable
+workspace evidence, the model is told to answer immediately when that evidence
+covers the requested fields instead of expanding into unrelated chat history,
+call-site proof, or repository-wide searches. An exact function definition is
+sufficient evidence for that function's direct return behavior unless the user
+also asks whether it is reachable from a production entry point. When useful
+evidence exists and the coding run reaches its final two turns, the runtime
+reserves those turns for `submit_decision`: additional investigation calls are
+rejected so the model can return a truthful answer, explicit unknown, or
+clarification without exhausting the run and retrying the whole investigation.
 
 `submit_decision` is the only terminal model tool. It has no external side
 effect. Its structured output is validated by Go and then passed to the normal
@@ -896,6 +903,14 @@ The multi-step loop is accepted by these executable BDD scenarios:
   useful evidence already exists, then the runtime summarizes stale evidence and
   forces convergence instead of failing the whole work item only because raw
   output exceeded a bound.
+- Given a coding question names an exact function and a digest-backed read
+  establishes that function's direct behavior, when the model considers more
+  unrelated chat or call-site searches, then it is told that the requested
+  evidence is already sufficient unless reachability was part of the question.
+- Given a coding run has citable workspace evidence and enters its final two
+  model turns, when the model attempts another investigation tool, then the
+  runtime rejects that tool call and preserves the final turn for
+  `submit_decision` instead of failing and retrying the entire run.
 - Given repeated `get_lark_context` calls return no new target-message context,
   when the model asks again, then the runtime rejects the no-progress call and
   requires a decision or a different evidence tool.
@@ -912,6 +927,11 @@ The multi-step loop is accepted by these executable BDD scenarios:
   approved and resumed, then the persisted direct-mention relevance selects
   user identity, adds the delegated robot prefix, and creates the post-reply
   owner notice only after the sender-facing reply succeeds.
+- Given an ordinary auto-mode reply has no current or legacy approved draft,
+  when the reply controller checks for a reusable approval, then the storage
+  layer returns "not found" without requiring a persisted legacy relevance and
+  the normal reply continues. Legacy relevance is read and validated only when
+  a matching ready legacy approval action actually exists.
 - Given an exact reply approval was written before action requests stored
   relevance, when the approved work resumes after upgrade, then relevance is
   restored from the work item's durable decision, the legacy exact-draft key is

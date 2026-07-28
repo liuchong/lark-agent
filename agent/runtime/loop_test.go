@@ -439,6 +439,67 @@ func TestAgentLoopForcesTerminalBeforeTurnExhaustion(t *testing.T) {
 	}
 }
 
+func TestAgentLoopReservesFinalCodingTurnsAfterCitableEvidence(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{
+			"question":"GetType 对 .JPG 返回什么",
+			"entry_points":["content_type.go"],
+			"symbols":["GetType"],
+			"tools":["read_workspace"],
+			"stop_conditions":["读到 GetType 定义"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("read", "read_workspace", `{"path":"content_type.go"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("extra", "search_workspace", `{"query":"unrelated call sites"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"relevance_confidence":0.95,
+			"reply_confidence":0.92,
+			"risk":"low",
+			"reply_text":"结论：.JPG 返回 image/jpeg。依据：content_type.go 的 GetType 会去掉前导点并做小写映射。未知/下一步：没有。",
+			"reason":"exact function definition answers the requested behavior",
+			"source_refs":[{"relative_path":"content_type.go","digest":"sha256:test","kind":"workspace_file"}]
+		}`)}),
+	}}
+	extraSearches := 0
+	registry, err := agenttools.NewRegistry(
+		testTool("read_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			return agenttools.Execution{
+				Content: `func GetType(s string) string { return "image/jpeg" }`,
+				Sources: []domain.SourceRef{{RelativePath: "content_type.go", Digest: "sha256:test", Kind: "workspace_file"}},
+			}, nil
+		}),
+		testTool("search_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			extraSearches++
+			return agenttools.Execution{Content: `{"results":[]}`}, nil
+		}),
+		SubmitInvestigationPlanDefinition(),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop := AgentLoop{Model: model, Tools: registry, MaxTurns: 4}
+	decision, trajectory, err := loop.Decide(context.Background(), agentcontext.Bundle{
+		Event:    domain.NormalizedEvent{MessageID: "om_exact", Content: "请检查 GetType 对 .JPG 返回什么"},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply || model.calls != 4 {
+		t.Fatalf("decision=%+v calls=%d", decision, model.calls)
+	}
+	if extraSearches != 0 {
+		t.Fatalf("extra searches executed=%d", extraSearches)
+	}
+	if !messagesContain(model.inputs[2], "Citable workspace evidence is now available") {
+		t.Fatalf("third model input missing evidence convergence prompt: %+v", model.inputs[2])
+	}
+	if !trajectoryContains(trajectory, "final coding turns are reserved for submit_decision") {
+		t.Fatalf("trajectory missing terminal-only rejection: %+v", trajectory)
+	}
+}
+
 func TestCompactMessagesPreservesRecentTurnsWithinBudget(t *testing.T) {
 	messages := []*schema.Message{
 		schema.SystemMessage("system"),

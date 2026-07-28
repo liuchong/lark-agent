@@ -1172,6 +1172,35 @@ func TestReplyApprovalIdentityIncludesReasonAndOwnerAction(t *testing.T) {
 	}
 }
 
+func TestConsumeReplyApprovalReturnsNotFoundWhenNoApprovalExists(t *testing.T) {
+	store := openStore(t)
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_auto_reply_without_approval",
+		Content:   "question",
+	})
+	if _, err := store.EnqueueWorkItem(item); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	if err := store.MarkRetry(item.ID, "previous transient failure"); err != nil {
+		t.Fatal(err)
+	}
+	actionID, consumed, err := store.ConsumeReplyApproval(
+		context.Background(),
+		item.DedupKey,
+		"evidence-backed answer",
+		"code evidence",
+		"",
+		domain.RelevanceOwnerRequest,
+	)
+	if err != nil || consumed || actionID != 0 {
+		t.Fatalf("actionID=%d consumed=%v err=%v", actionID, consumed, err)
+	}
+}
+
 func TestPostReplyNotificationRecoversWithoutReplyReplay(t *testing.T) {
 	store := openStore(t)
 	event := domain.NormalizedEvent{MessageID: "om_post_reply_notice", Content: "coordinate"}

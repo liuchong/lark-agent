@@ -1580,18 +1580,21 @@ func (s *Store) ConsumeReplyApproval(
 		`SELECT id FROM action_attempts WHERE idempotency_key = ? AND status = ?`,
 		key, domain.ActionReady).Scan(&actionID)
 	if errors.Is(err, sql.ErrNoRows) {
-		legacyRelevance, found, legacyErr := s.replyApprovalDecisionRelevance(ctx, dedupKey)
-		if legacyErr != nil {
-			return 0, false, legacyErr
-		}
-		if !found || legacyRelevance != relevance {
-			return 0, false, nil
-		}
 		key = legacyReplyActionKey(dedupKey, text, reason, ownerAction)
 		err = s.db.QueryRowContext(ctx,
 			`SELECT id FROM action_attempts WHERE idempotency_key = ? AND status = ?`,
 			key, domain.ActionReady).Scan(&actionID)
 		if errors.Is(err, sql.ErrNoRows) {
+			return 0, false, nil
+		}
+		if err != nil {
+			return 0, false, errs.NewInternalError(errs.SubtypeStorage, "read approved reply action").WithCause(err)
+		}
+		legacyRelevance, found, legacyErr := s.replyApprovalDecisionRelevance(ctx, dedupKey)
+		if legacyErr != nil {
+			return 0, false, legacyErr
+		}
+		if !found || legacyRelevance != relevance {
 			return 0, false, nil
 		}
 	}

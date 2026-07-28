@@ -564,6 +564,50 @@ func TestPrivateOwnerRequestUsesBotReplyPath(t *testing.T) {
 	}
 }
 
+func TestPrivateOwnerAutoReplyWithDurableStoreDoesNotRequireApprovalHistory(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:     "om_private_durable_auto",
+		ChatID:        "oc_private",
+		ChatType:      "p2p",
+		ChatPartnerID: "ou_bot",
+		SenderID:      "ou_owner",
+		Content:       "请检查代码",
+	})
+	if _, err := store.EnqueueWorkItem(item); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	if err := store.MarkRetry(item.ID, "previous transient failure"); err != nil {
+		t.Fatal(err)
+	}
+	messenger := &privateReplyMessenger{}
+	controller := reply.NewController(
+		policy.NewReplyGate(policy.Config{
+			Mode: domain.ModeAuto, OwnerOpenID: "ou_owner",
+		}, privateReplyThreadState{}),
+		messenger,
+		store,
+	)
+	result, err := controller.Handle(context.Background(), item, domain.Decision{
+		Kind: domain.DecisionReply, Relevance: domain.RelevanceOwnerRequest,
+		Confidence: 0.99, Risk: domain.RiskLow, ReplyText: "已核对生产代码。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Action.Status != domain.ActionCompleted || messenger.botReplies != 1 {
+		t.Fatalf("result=%+v messenger=%+v", result, messenger)
+	}
+}
+
 func TestApprovedAssistantReplyResumesWithBotIdentity(t *testing.T) {
 	testApprovedReplyOutcome(t, domain.RelevanceAssistantRequest, false, "ou_owner", false)
 }

@@ -113,6 +113,68 @@ func handler() {
 	}
 }
 
+func TestCodingQuestionWithEvidenceCannotWasteFinalTurnsOnMoreSearch(t *testing.T) {
+	root := t.TempDir()
+	source := `package content_type
+
+func GetType(value string) string {
+	return "image/jpeg"
+}`
+	if err := os.WriteFile(filepath.Join(root, "content_type.go"), []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(source))
+	digest := fmt.Sprintf("sha256:%s", hex.EncodeToString(sum[:8]))
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agenttools.NewRegistry(append(
+		agenttools.CodeIndexDefinitions(scope, nil),
+		append(agenttools.WorkspaceDefinitions(scope),
+			agentruntime.SubmitInvestigationPlanDefinition(),
+			agentruntime.SubmitDecisionDefinition(),
+		)...,
+	)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("plan", "submit_investigation_plan", `{
+			"question":"GetType 的直接返回行为",
+			"entry_points":["content_type.go"],
+			"symbols":["GetType"],
+			"tools":["read_workspace"],
+			"stop_conditions":["读取 GetType 定义"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("read", "read_workspace", `{"path":"content_type.go"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("waste", "search_code_symbols", `{"query":"unrelated history","max_results":5}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"relevance_confidence":0.95,
+			"reply_confidence":0.9,
+			"risk":"low",
+			"reply_text":"结论：GetType 直接返回 image/jpeg。依据：content_type.go 的函数定义。未知/下一步：没有。",
+			"reason":"the exact definition is sufficient for direct behavior",
+			"source_refs":[{"relative_path":"content_type.go","digest":"`+digest+`","kind":"workspace_file"}]
+		}`)}),
+	}}
+	loop := agentruntime.AgentLoop{Model: model, Tools: registry, MaxTurns: 4}
+	decision, trajectory, err := loop.Decide(context.Background(), agentcontext.Bundle{
+		Event:    domain.NormalizedEvent{MessageID: "om_converge", Content: "请检查 GetType 的直接返回行为"},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if !codingEvalTrajectoryContains(trajectory, "final coding turns are reserved for submit_decision") {
+		t.Fatalf("trajectory did not reject the extra search: %+v", trajectory)
+	}
+}
+
 func codingEvalToolCall(id, name, arguments string) schema.ToolCall {
 	return schema.ToolCall{
 		ID:   id,
@@ -122,4 +184,13 @@ func codingEvalToolCall(id, name, arguments string) schema.ToolCall {
 			Arguments: arguments,
 		},
 	}
+}
+
+func codingEvalTrajectoryContains(messages []*schema.Message, substring string) bool {
+	for _, message := range messages {
+		if message != nil && strings.Contains(message.Content, substring) {
+			return true
+		}
+	}
+	return false
 }
