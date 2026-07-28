@@ -21,6 +21,16 @@ model is only one part of the system: queueing, routing, workspace boundaries,
 identity checks, idempotency, audit, and rollback decisions are enforced by
 code outside the prompt.
 
+The runtime may also bridge a trusted GitHub workflow notification into Lark.
+A short-lived GitHub Action sends one bot-authored notification through the
+HTTP API and exits. The installed daemon remains the only WebSocket consumer.
+The Action requires an explicit Lark OpenAPI base URL and never relies on the
+official SDK's Feishu default for an international Lark installation.
+When a human replies to that notification, the daemon verifies a versioned
+GitHub reference from the quoted current-app message and may expose fresh,
+bounded, read-only GitHub evidence to the model. It never treats a human or
+another app's marker as trusted control data.
+
 ## Harness Architecture
 
 The runtime is split into explicit layers so a slow or divergent model run
@@ -29,9 +39,10 @@ cannot hold the whole Lark assistant hostage:
 - Intake normalizes user-token polling and bot-visible real-time events into
   the same durable event shape, dedupes by message ID, and stores the event
   before any model call or reply side effect.
-- Router and fast path are deterministic. They classify owner-only assistant
-  requests, direct owner mentions, simple local questions, coding questions,
-  and long-running coding goals before a model run is selected.
+- Router and fast path are deterministic. They classify group assistant
+  requests, private owner requests, direct owner mentions, simple local
+  questions, coding questions, and long-running coding goals before a model run
+  is selected.
 - The scheduler claims work by lane and priority instead of a single FIFO
   stream. Post-reply owner notices and fast owner requests are foreground
   lanes; coding questions have bounded foreground budgets; coding goals run in
@@ -77,10 +88,19 @@ Fast-path work does not enter this loop. A configured owner asking deterministic
 local questions such as time, date, ping, daemon status, help, doctor, or queue
 summary receives a local answer through the normal reply runtime without a
 coding investigation. A simple non-coding owner question may use at most the
-simple-agent budget and cannot call shell. A coding question has a separate
-foreground budget. When useful evidence exists and the coding run approaches
-its budget, the runtime forces a truthful partial answer or clarification
-instead of continuing broad search.
+simple-agent budget and cannot call shell. The default simple-agent budget is
+three model turns so an evidence-backed request can perform initial search,
+read one narrowed production source, and then submit its conclusion. A coding
+question has a separate foreground budget. Once a coding run has citable
+workspace evidence, the model is told to answer immediately when that evidence
+covers the requested fields instead of expanding into unrelated chat history,
+call-site proof, or repository-wide searches. An exact function definition is
+sufficient evidence for that function's direct return behavior unless the user
+also asks whether it is reachable from a production entry point. When useful
+evidence exists and the coding run reaches its final two turns, the runtime
+reserves those turns for `submit_decision`: additional investigation calls are
+rejected so the model can return a truthful answer, explicit unknown, or
+clarification without exhausting the run and retrying the whole investigation.
 
 `submit_decision` is the only terminal model tool. It has no external side
 effect. Its structured output is validated by Go and then passed to the normal
@@ -90,29 +110,72 @@ registered as model-callable tools. The native tool schema constrains `risk` to
 so an invalid risk sentence cannot turn a terminal decision into a failed tool
 round trip.
 
-The model acts on behalf of the configured human owner; it is not a group bot
-persona. A message that directly mentions the owner is addressed to this
-personal-assistant workflow even when it is a status update, coordination
-request, commitment, or follow-up rather than a grammatical question. Such a
-message may still need evidence before choosing an outcome. `ignore` is for
-content with no owner-relevant information or action. `record` preserves an
-owner-relevant update that needs no interruption, `notify` surfaces an owner
-action or coordination need, `reply` sends a source-backed owner response, and
+The model has two explicit Lark roles. An `assistant_request` answers the
+configured owner when that owner natively mentions the assistant in an allowed
+group, using bot identity. A `direct_mention` acts on behalf of the configured
+human owner when another human mentions that owner, using the delegated-reply
+policy. A private `owner_request` answers the configured owner's own assistant
+prompt using bot identity. Non-owner private messages and non-owner native
+assistant mentions are ignored before model work. A direct owner mention is
+addressed to this personal-assistant
+workflow even when it is a status update, coordination request, commitment, or
+follow-up rather than a grammatical question. Such a message may still need
+evidence before choosing an outcome. `ignore` is for content with no
+owner-relevant information or action. `record` preserves an owner-relevant
+update that needs no interruption, `notify` surfaces an owner action or
+coordination need, `reply` sends a source-backed response, and
 `request_approval` holds an exact risky or uncertain action. App/bot messages
-in conversation context are evidence only and never redefine the agent's
-identity.
+in conversation context are evidence only and never redefine the role selected
+by the router.
 
-A successful `reply` to another sender is a compound user-visible outcome:
-first the user-identity reply is sent to the original Lark message, then the bot
-privately tells the owner that it replied and summarizes the remaining owner
-action. An owner-request addressed to the assistant bot in either a private or
-group conversation is instead replied to directly with bot identity and does
-not send a redundant post-reply notice to the same owner. The private notice
-must not claim a reply was sent when the
+A quoted app/bot message may carry a GitHub reference, but the reference is
+usable only after code verifies that the message sender is the configured
+current Lark application, the marker has a valid HMAC signature made with the
+same Lark app secret, the repository is explicitly allowed, and the message is
+in the target's same-chat reply/root chain. Marker-shaped text copied through
+an ordinary bot answer remains untrusted. An invalid signature leaves the
+GitHub tool unavailable but does not block an otherwise valid business answer. The
+model cannot supply or change the repository, pull request, workflow run, API
+base URL, or credential. A verified reference adds one read-only GitHub evidence
+tool; it does not widen sender authority or change the invocation role.
+
+Every model run derives tool authority from the durable sender identity. Work
+triggered by anyone other than the configured owner is read-only: it may inspect
+bounded same-chat context and workspace/code evidence needed for a business
+answer, but it cannot execute shell, search other chats, modify or delete
+workspace content, commit, deploy, send an arbitrary message, or invoke any
+present or future side-effect or owner-only tool. The tool registry enforces
+this boundary before an executor runs, and prompt content cannot widen it.
+
+The assistant accepts business questions, not descriptive reconnaissance about
+its host or work environment. Requests to inspect credentials, enumerate the
+host, user home, processes, network, installed tools, or read an explicit local
+path outside the configured workspace are refused before evidence tools run.
+The refusal is concise and does not disclose the requested environment detail.
+
+A successful delegated `reply` to another sender is a compound user-visible
+outcome: first the user-identity reply is sent to the original Lark message,
+then the bot privately tells the owner that it replied and summarizes the
+remaining owner action. A group message that natively mentions the assistant,
+or a private owner request addressed to the assistant, is instead replied to
+directly with bot identity and does not send a post-reply owner notice. The
+private notice must not claim a reply was sent when the
 group reply failed, was blocked, was cancelled, or is still awaiting approval.
 Standalone `notify` means no
 sender-facing reply could safely be sent; it is not a substitute for this
 post-reply owner notice.
+
+Reply approval preserves this invocation identity together with the exact
+draft. Approving a held assistant request or private owner request still sends
+that draft with bot identity and does not create a delegated post-reply owner
+notice. Approving a delegated owner mention still sends with user identity and
+then creates the owner notice. Approval may authorize the exact content and
+commitment, but it never changes who the original request addressed.
+For an approval written by an older version before relevance was embedded in
+the action request, the daemon restores relevance from the work item's durable
+decision and consumes the legacy exact-draft idempotency key. It never guesses
+a sender identity from an absent or unknown relevance, and it completes the
+legacy approval audit after the external reply succeeds.
 
 Every terminal `reply` requires a configured reply executor. A missing executor
 is a retryable runtime error, never permission to persist a successful reply
@@ -120,13 +183,13 @@ decision without an external message. Normal auto replies, not only approval
 resumes, are recorded as durable idempotent reply actions before calling Lark
 and completed with the returned message ID or exact error.
 
-For owner requests addressed directly to the assistant, the bot adds the
-keyboard working reaction to the owner's source message after deterministic
-routing and before fast-path or model work starts. Lark names this keyboard
-reaction `Typing` in its API; it is a message reaction, not a timer or native
-typing-status signal. This applies to the assistant private chat and to
-owner-authored group messages that mention the assistant bot. The reaction is
-removed only after reply, ignore, approval, failure, or cancellation reaches
+For requests addressed directly to the assistant, the bot adds the keyboard
+working reaction to the source message after deterministic routing and before
+fast-path or model work starts. Lark names this keyboard reaction `Typing` in
+its API; it is a message reaction, not a timer or native typing-status signal.
+This applies to the assistant private chat for the configured owner and to any
+accepted group message that natively mentions the assistant bot. The reaction
+is removed only after reply, ignore, approval, failure, or cancellation reaches
 its terminal outcome; no fixed display delay controls the lifecycle. It is not
 used when another sender mentions the owner and the agent is acting as the
 owner's delegate. Reaction cleanup is audited and retried without resending an
@@ -145,20 +208,42 @@ exact `reply_text`; the runtime persists that draft and its `owner_action`, then
 resumes the same values after approval without asking the model to rewrite them.
 
 For a direct owner question, status update, handoff, or coordination request,
-the model must prefer `reply` whenever it can send a safe and useful response.
-That response may acknowledge receipt, state verified current facts, identify
-unknown dependencies, and describe the next coordination boundary without
-inventing a completion promise or personal commitment. Remaining owner work is
-not by itself a reason to replace the sender-facing reply with `notify`.
-Incomplete facts are not by themselves a reason to replace the sender-facing
-reply with `notify`; the reply should truthfully state what is known, what is
-unknown, and which point needs owner confirmation. `notify` is reserved for
-owner-relevant messages that do not directly mention the owner, or for direct
-mentions where a sender-facing reply would expose sensitive private context.
+the model sends a reply only when it can provide a safe and useful response.
+An assignment, investigation, or coordination reply must first complete at
+least one bounded relevant read, such as reading the same-chat thread or
+checking the corresponding production code. Its concise reply states what was
+actually checked, the initial finding or explicit unknown, and what concrete
+information was passed to the owner. Merely saying that the owner was reminded,
+paraphrasing the request, or promising future work is not useful work and is
+rejected before sending.
+
+When no useful sender-facing response can be produced without exposing private
+context, inventing work, or making an owner commitment, the model may choose
+`record` or `notify`; a direct mention is not forced to produce filler.
 `request_approval` holds an exact commitment or risky response that needs the
-owner's approval. Shell output may locate evidence but is not itself a citable
+owner's approval. An automatic delegated reply never says that the owner or
+team will later deliver, coordinate, or report back unless that exact commitment
+has been approved. Shell output may locate evidence but is not itself a citable
 source; before replying from a shell-discovered file, the model reads that file
 through `read_workspace` to obtain a digest-backed source reference.
+
+Availability checks and simple greetings from the configured owner to the
+assistant bot, including "在吗", are fast-path work. The bot replies immediately
+with bot identity without requiring Lark conversation history or a model call.
+
+Lark conversation history is optional enrichment for an already-received work
+item. If that bounded history cannot be loaded, the context bundle records an
+incomplete selection with a non-secret reason and continues with the current
+message. A history lookup failure must not make the working reaction disappear
+and leave the owner request silently waiting for retry.
+
+User-identity Lark calls use the current Keychain credentials. If a cached
+user_access_token is rejected as expired, the client serializes recovery,
+reloads any newer Keychain token, and otherwise uses the current refresh_token
+through the official SDK. A successful refresh rotates both tokens in Keychain
+before replaying the original request exactly once. Refresh failure remains a
+typed authorization error; the client never loops indefinitely or logs token
+values.
 
 ## User-Visible Modes
 
@@ -320,6 +405,11 @@ binds the run, tool call, argument hash, result digest, and source references.
 The model may not claim it read, searched, tested, or verified something when no
 matching receipt exists.
 
+Examples, tests, fixtures, and documentation are supporting evidence. A
+definite claim about production implementation requires at least one production
+source; otherwise the reply must explicitly state that production behavior
+remains unverified.
+
 Tool and context budgets must fail soft for coding investigations. When a run
 approaches the total tool-output budget, context budget, or model-turn budget,
 the runtime summarizes old evidence, drops obsolete raw tool output from the
@@ -418,6 +508,11 @@ that arrived while delayed work was executing. The model determines semantic
 relevance from that bounded nearby window without a separate context-selection
 model call.
 
+Unreferenced app/bot messages are excluded from adjacent context so deployment
+notifications and integration chatter cannot crowd out human discussion. An
+app/bot message remains visible when it is the target, direct parent, or pinned
+thread/root relation, because an explicit reply makes that message relevant.
+
 When the target replies to another message, the direct parent is authoritative.
 The resolver follows the parent/root chain and, when the referenced message
 belongs to a thread, reads the thread from its root through the target message.
@@ -432,6 +527,12 @@ partially readable thread produce an explicit incomplete-context marker and a
 same-chat adjacent fallback; they never authorize a guessed antecedent. Older
 durable work items may hydrate relation metadata by message ID, but completed
 messages are not replayed solely to backfill context.
+
+When an explicit relation contains a current-app GitHub notification, context
+resolution parses and verifies its canonical reference before model work. The
+verified reference is persisted idempotently by Lark message ID. A restart may
+load that reference, but cannot replay the notification or infer a reference
+from adjacent untrusted text. Conflicting references fail closed.
 
 When an owner sends equivalent requests through private chat and group mention
 inside a short dedupe window, intake links them to one canonical work item or a
@@ -477,6 +578,12 @@ If a separate operator process briefly holds the SQLite write lock, durable
 worker transitions wait for a bounded interval and continue after the lock is
 released. A write that remains blocked beyond that interval fails explicitly;
 the agent must not report or imply that the transition succeeded.
+Approval decisions follow the same rule in the opposite direction: while the
+daemon is writing, `approval approve` and `approval reject` must wait for the
+bounded SQLite interval and then atomically update the exact action and work
+item. They must not establish a stale read snapshot before requesting the write
+lock, because a normal concurrent daemon write must not make an operator
+decision fail with a snapshot-upgrade error.
 
 Operators use `queue inspect --work-id <id>` or
 `queue inspect --message-id <id>` to
@@ -535,23 +642,50 @@ projects, memory, rules, message history, and workspace search results. The
 router may see all user-visible conversations, but only candidates that pass
 hard gates and relevance checks enter the model.
 
-The owner can also initiate the assistant directly. A message sent by the
-configured owner becomes an owner-request work item when it either mentions a
-configured assistant bot identity/name in any conversation, or appears in a
-private chat whose partner open ID or discovered name matches the configured
-assistant. This path is owner-only: the same bot mention or private chat from
-any other sender is ignored before the model sees it. Owner-request replies are answers to the
-owner's own prompt, so the pre-send "owner already replied" cancellation check
-does not treat the original prompt as a solved thread.
+Only the configured owner can initiate the assistant from a group by using a
+native Lark mention whose open ID or mention name matches the configured
+assistant. That message becomes an `assistant_request`; it is answered with bot
+identity and is not treated as a delegated owner reply. A non-owner native
+assistant mention, plain-text assistant name, or private assistant message is
+ignored before queueing or model work. A private assistant chat remains an
+owner-only `owner_request`: the sender must be the configured owner and the
+private partner must match the configured assistant. Replies to
+`assistant_request` and `owner_request` messages answer the sender's own prompt,
+so they do not wait for the owner, do not run the "owner already replied"
+cancellation check, do not add the delegated `🤖` marker, and do not create a
+post-reply owner notice. Non-owner messages can trigger a sender-facing
+response only by natively mentioning the configured human owner in a group
+allowed by `policy.reply_scope`; that path is the read-only delegated-owner
+workflow.
 
-The router attaches a work kind and priority to every accepted item. Owner
-assistant requests that match a fast-path command are `fast_path` work. Owner
-assistant requests that need a short answer but no code evidence are
-`simple_question` work. Engineering requests that require code evidence are
-`coding_question` work unless they explicitly need durable follow-up, in which
-case they become `coding_goal` work with persisted completion and blocking
-conditions. Non-owner assistant private messages and bot mentions remain
-ignored before any model call.
+The router attaches a work kind and priority to every accepted item. Assistant
+and owner requests that match a fast-path command are `fast_path` work. Requests
+that need a short answer but no code evidence are `simple_question` work.
+Engineering requests that require code evidence are `coding_question` work
+unless they explicitly need durable follow-up, in which case they become
+`coding_goal` work with persisted completion and blocking conditions. Explicit
+requests for source code, production or code entry points, APIs, handlers, or
+database evidence are code-evidence requests. Merely mentioning the configured
+Workspace or a business warehouse is not enough. Routing and runtime evidence
+validation use the same classifier.
+
+For `coding_question` work, a successful authoritative `read_workspace` result
+containing a production source is the convergence boundary. Code-index and
+workspace-search results only locate candidates and cannot trigger convergence
+before the production file is actually read. The immediately following model
+turn exposes only `submit_decision`; it cannot spend more turns on Lark
+history, rules, tests, broad search, or shell commands. The model must answer
+from the verified production facts and state any remaining unknowns explicitly.
+A definite coding reply must declare `evidence_status=verified` and cite at
+least one production source returned by an authoritative `read_workspace`
+result in the current run. A reply that cannot make a definite claim declares
+`evidence_status=insufficient`; the runtime replaces its free-form reply text
+with a canonical evidence-limited response so an unknown marker cannot be mixed
+with an unsupported definite inference. An insufficient coding reply is only
+accepted after at least one successful workspace/code search, trace, explore,
+or read in the current run; reading Lark history alone does not count as code
+investigation. Search-only candidate sources cannot support a definite code
+claim.
 
 ## Reply Policy
 
@@ -573,10 +707,55 @@ acknowledgement fallback. `notify` performs a real owner notification,
 auditable trajectory, and ignore/reply outcomes preserve the actual action
 status rather than treating blocked or awaiting actions as completed.
 
+Delegated group replies have an explicit `policy.reply_scope`:
+
+- `all_groups` allows a direct owner mention from every user-visible group to
+  pass the reply-scope gate;
+- `configured_groups` allows delegated replies only in groups discovered by
+  the daemon's `--chat-query`, and startup fails if that query is empty.
+
+`all_groups` is the default. `--chat-query` still discovers and marks the
+primary validation group, but it does not restrict delegated replies while
+`reply_scope` is `all_groups`. Reply scope does not bypass blocked chats or
+users, model relevance and risk checks, confidence and approval policy, the
+owner wait window, withdrawn-message and owner-already-replied checks, or
+idempotent sending. Changing reply scope never replays completed, ignored, or
+interrupted historical work; operators must inspect and explicitly resume an
+individual work item.
+
+The configured `policy.reply_confidence_min` applies uniformly. Direct owner
+mentions and assistant-facing requests do not receive a hidden lower confidence
+floor; a draft below the configured threshold waits for approval.
+Every `reply` decision must explicitly provide `reply_confidence`. Omitting the
+field is an invalid model response that remains inside the bounded model repair
+loop; omission is never interpreted as confidence zero and must not silently
+turn an otherwise valid assistant reply into an approval.
+
+Group requests addressed to the assistant have an independent
+`assistant.reply_scope` with the same values:
+
+- `all_groups` allows the configured owner's native assistant mention from
+  every bot-visible group;
+- `configured_groups` allows the configured owner's assistant mentions only in
+  groups discovered by the daemon's `--chat-query`, and startup fails if that
+  query is empty.
+
+`assistant.reply_scope` is also `all_groups` by default. In
+`configured_groups` mode, startup resolves the query to concrete group IDs
+with bot identity before intake starts, following every result page. Those bot
+resolved IDs are projected into a dedicated assistant-scope marker for both
+real-time and polling events; the user-identity configured-group marker remains
+independent for delegated owner replies. A query that resolves no group is an
+explicit startup error. Both scope checks run before model work and again before
+sending. Neither scope bypasses the global blocked chat/user lists, model risk
+and confidence checks, approval policy, message withdrawal checks, or
+idempotent sending.
+
 `--dry-run` uses the same intake, context, and model decision path but does not
 execute the reply tool. Initial live validation should run dry-run across
-visible conversations, then allow one bounded configured test-chat reply. The
-current live acceptance chat is `Test Group`; Example Group is excluded from live testing.
+visible conversations, then allow one bounded authorized chat reply. Live
+validation targets are operational constraints and are independent from the
+configured reply scope.
 
 The model is not given tools for payments, contracts, personnel decisions,
 permission grants, permanent external deletion, subjective commitments,
@@ -613,6 +792,12 @@ Every behavior change must have an integration test. Required regression areas:
 - token or scope failures for user-identity replies;
 - daemon restart and retry behavior.
 
+The GitHub-Lark bridge additionally requires executable integration coverage
+for HTTP-only notification sending, stable Lark idempotency keys, hostile
+pull-request text, verified and spoofed quoted references, owner and non-owner
+permission behavior, bounded GitHub results, truthful API failures, and
+reference recovery after restart.
+
 The multi-step loop is accepted by these executable BDD scenarios:
 
 - Given owner asks `@assistant 几点了`, when routing runs, then the work item is
@@ -624,6 +809,50 @@ The multi-step loop is accepted by these executable BDD scenarios:
   after a terminal outcome, without a timer controlling removal.
 - Given another sender mentions the owner, when the agent evaluates or replies
   as the owner's delegate, then it never adds the assistant working reaction.
+- Given `assistant.reply_scope` is `all_groups` and the configured owner
+  natively mentions the assistant in a group that does not match
+  `--chat-query`, when routing runs, then the request enters model or fast-path
+  work and a reply uses bot identity without an owner-delegation marker or
+  post-reply owner notice.
+- Given a non-owner natively mentions the assistant in any group, regardless of
+  `assistant.reply_scope`, when real-time or polling intake evaluates it, then
+  the request is ignored before queueing, model work, working reactions, or any
+  reply.
+- Given `assistant.reply_scope` is `configured_groups` and the configured owner
+  mentions the assistant outside the groups discovered by `--chat-query`, when
+  real-time or polling intake evaluates it, then the request is ignored before
+  model work and cannot pass the final send gate.
+- Given bot and user identities resolve different groups for the same
+  `--chat-query`, when polling observes an assistant mention, then assistant
+  scope uses only the bot-resolved group IDs and does not reuse the delegated
+  owner scope marker.
+- Given bot chat search returns multiple pages, when configured assistant scope
+  starts, then every page is consumed with bot identity and every matched group
+  is allowed consistently by real-time and polling intake.
+- Given `assistant.reply_scope` is `configured_groups` but the daemon has no
+  `--chat-query`, or the query resolves no group, when live options are built,
+  then startup fails explicitly instead of silently ignoring all assistant
+  requests.
+- Given `assistant.reply_scope` contains an unsupported value, when
+  configuration is loaded, then validation fails and names the
+  `assistant.reply_scope` field.
+- Given a non-owner privately messages the assistant, natively mentions the
+  assistant in a group, or writes the assistant name in group text without a
+  native mention, when intake or routing runs, then the runtime remains silent
+  and ignores it before queueing or any model call.
+- Given `policy.reply_scope` is `all_groups` and another sender directly
+  mentions the owner in a group that does not match `--chat-query`, when the
+  reply passes all other policy checks, then the agent may reply as the owner
+  and the query is not used as a final reply gate.
+- Given `policy.reply_scope` is `configured_groups` and another sender directly
+  mentions the owner outside the groups discovered by `--chat-query`, when the
+  final reply gate runs, then the reply is blocked as outside the configured
+  scope.
+- Given `policy.reply_scope` is `configured_groups` but the daemon has no
+  `--chat-query`, when live options are built, then startup fails with a
+  configuration error instead of silently blocking every delegated reply.
+- Given `policy.reply_scope` contains an unsupported value, when configuration
+  is loaded, then validation fails and names the `policy.reply_scope` field.
 - Given an owner request is visible through `im.message.receive_v1`, when the
   real-time adapter receives it, then it is classified and persisted immediately,
   without waiting for the next user-token poll.
@@ -645,6 +874,11 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given owner asks the same coding question in private chat and in a group
   mention inside the dedupe window, when both events are ingested, then only
   one canonical investigation runs and the duplicate item links to that result.
+- Given an assistant request asks to inspect source code or a production/code
+  entry point inside the configured Workspace and report evidence,
+  when deterministic routing classifies the work, then it enters
+  `coding_question` rather than `simple_question`, so code investigation tools
+  and the evidence-backed conclusion flow are available.
 - Given a foreground coding investigation is active, when owner sends a new
   fast-path request, then the scheduler processes the fast-path item before the
   background or lower-priority coding work.
@@ -652,6 +886,11 @@ The multi-step loop is accepted by these executable BDD scenarios:
   process briefly holds the SQLite write lock, when that lock is released within
   the configured wait interval, then both run starts persist without a
   `database is locked` failure.
+- Given the daemon holds a brief SQLite write transaction while an exact action
+  is awaiting approval, when an operator approves or rejects that action and the
+  daemon releases the lock within the configured wait interval, then the
+  operator command completes the exact decision atomically without a stale
+  snapshot failure.
 - Given a running coding question updates its heartbeat, when recovery scans
   leases in the same online session, then the item remains owned; given the
   process dies, when the next session starts, then recovery abandons the run,
@@ -719,6 +958,14 @@ The multi-step loop is accepted by these executable BDD scenarios:
   useful evidence already exists, then the runtime summarizes stale evidence and
   forces convergence instead of failing the whole work item only because raw
   output exceeded a bound.
+- Given a coding question names an exact function and a digest-backed read
+  establishes that function's direct behavior, when the model considers more
+  unrelated chat or call-site searches, then it is told that the requested
+  evidence is already sufficient unless reachability was part of the question.
+- Given a coding run has citable workspace evidence and enters its final two
+  model turns, when the model attempts another investigation tool, then the
+  runtime rejects that tool call and preserves the final turn for
+  `submit_decision` instead of failing and retrying the entire run.
 - Given repeated `get_lark_context` calls return no new target-message context,
   when the model asks again, then the runtime rejects the no-progress call and
   requires a decision or a different evidence tool.
@@ -726,6 +973,28 @@ The multi-step loop is accepted by these executable BDD scenarios:
   the reply is sent only if it addresses the original question, is supported by
   cited code evidence, and obeys current policy; otherwise the draft is repaired
   or held for approval.
+- Given an assistant group request or private owner request is held for
+  approval, when the exact draft is approved and resumed without another model
+  call, then the persisted assistant/owner-request relevance selects bot
+  identity, no delegated robot prefix is added, and no post-reply owner notice
+  is created.
+- Given a delegated owner mention is held for approval, when its exact draft is
+  approved and resumed, then the persisted direct-mention relevance selects
+  user identity, adds the delegated robot prefix, and creates the post-reply
+  owner notice only after the sender-facing reply succeeds.
+- Given an ordinary auto-mode reply has no current or legacy approved draft,
+  when the reply controller checks for a reusable approval, then the storage
+  layer returns "not found" without requiring a persisted legacy relevance and
+  the normal reply continues. Legacy relevance is read and validated only when
+  a matching ready legacy approval action actually exists.
+- Given an exact reply approval was written before action requests stored
+  relevance, when the approved work resumes after upgrade, then relevance is
+  restored from the work item's durable decision, the legacy exact-draft key is
+  atomically consumed, and the legacy approval action becomes completed with
+  the returned Lark message ID.
+- Given neither the approval request nor the durable work decision contains a
+  recognized relevance, when approval recovery runs, then it fails explicitly
+  before selecting bot or user identity.
 - Given the default agent configuration, when a deep investigation starts,
   then it has 150 model turns and a two-hour ceiling; given an operator selects
   a custom budget, then values through 300 are accepted and larger values fail
@@ -741,12 +1010,33 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given the configured owner privately messages the assistant chat, when the
   message is polled, then it enters the model as an owner-request work item and
   the assistant replies with bot identity without a redundant owner notice.
-- Given the configured owner mentions the assistant bot in any conversation,
-  when the message is polled, then it enters the model as an owner-request work
-  item even when the owner did not mention themselves, and a reply uses bot
-  identity.
-- Given any non-owner privately messages or mentions the assistant bot, when
-  routing runs, then the runtime ignores it before any model call.
+- Given the configured owner privately asks the assistant "在吗", when the item
+  is processed, then the bot replies "在的。" as fast-path work and removes the
+  working reaction without loading conversation history or calling a model.
+- Given the configured owner mentions the assistant in an allowed group and
+  asks "在吗", when the item is processed, then the bot replies "在的。" through
+  the same fast path without loading conversation history or calling a model.
+- Given a non-fast-path owner request has already been received and bounded Lark
+  history loading fails, when context is built, then the current message still
+  reaches the model and the bundle marks its context selection incomplete.
+- Given a user-identity Lark request rejects the cached access token as expired
+  and Keychain contains a newer token, when the request recovers, then it reloads
+  and replays once without consuming the refresh token.
+- Given no newer access token exists but a refresh token is available, when the
+  request recovers, then the official SDK rotates both tokens, persists them,
+  and replays the original request once.
+- Given the configured owner mentions the assistant bot in an allowed group,
+  when the message is observed by real-time intake or polling, then it enters
+  as an assistant-request work item and a reply uses bot identity.
+- Given another human mentions the assistant bot in a group or privately
+  messages it, when the message is observed, then no work item, working
+  reaction, model run, or reply is produced.
+- Given an older version already persisted and approved a bot reply for a
+  non-owner assistant mention, when the upgraded daemon resumes that exact
+  approval, then the final sender-identity gate blocks the reply, marks the
+  approval blocked, and completes the work without sending.
+- Given a non-owner privately messages the assistant bot, when routing runs,
+  then the runtime ignores it before any model call.
 - Given an owner-request reply is ready to send, when the pre-send thread check
   runs, then the original owner prompt is not treated as an existing owner
   answer that cancels the reply.
@@ -761,14 +1051,51 @@ The multi-step loop is accepted by these executable BDD scenarios:
   plus explicit unknowns, when the model chooses a terminal action, then it
   replies to the original message instead of notifying the owner merely because
   the answer is not exhaustive.
-- Given a direct status update, task handoff, or coordination request and the
-  model can safely acknowledge it with current facts and dependency boundaries,
-  when it chooses a terminal action, then it replies to the sender instead of
-  privately notifying the owner merely because owner work remains.
-- Given a direct owner question and the model has incomplete factual evidence,
-  when it chooses a terminal action, then it still sends a truthful
-  sender-facing reply naming the unknowns and owner confirmation needed instead
-  of finishing as `notify`.
+- Given a direct status update, task handoff, or coordination request, when the
+  model can complete a bounded relevant read, then it replies with the checked
+  facts, explicit unknowns, and concrete information passed to the owner rather
+  than merely acknowledging or restating the request.
+- Given a direct owner question and bounded evidence cannot support a useful
+  sender-facing response without exposing private context or inventing work,
+  when it chooses a terminal action, then it may record or notify instead of
+  sending filler.
+- Given any reply has confidence below `policy.reply_confidence_min`, when the
+  final gate runs, then direct owner mentions and assistant-facing requests
+  enter approval just like other replies and do not use a hidden lower floor.
+- Given a coding question has read a production source that supports a useful
+  answer, when the next model turn starts, then only `submit_decision` is
+  available and no Lark-history, rule, test, search, or shell tool can run.
+- Given code-index or workspace search returns a candidate production path,
+  when the model has not yet read that file with `read_workspace`, then the
+  candidate source does not trigger convergence and the production read remains
+  available.
+- Given the model cites only code-index or workspace-search candidate sources,
+  when it submits a definite coding claim without an authoritative production
+  read, then the terminal decision is rejected and the bounded investigation
+  continues.
+- Given a search-only coding reply uses an ordinary requirement phrase such as
+  "需要返回", when it still makes a definite code claim, then that phrase does
+  not misclassify the reply as an explicit unknown or bypass the authoritative
+  read requirement.
+- Given exact bounded searches do not find a named symbol, when the model
+  declares `evidence_status=insufficient`, then the runtime emits the canonical
+  evidence-limited answer without inventing a production source.
+- Given an `insufficient` reply mixes an unknown phrase with an unsupported
+  definite inference, when the terminal decision is accepted, then the runtime
+  discards the free-form text and only the canonical evidence-limited answer is
+  sender-visible.
+- Given a coding question has performed no workspace/code investigation, when
+  the model immediately submits `evidence_status=insufficient`, then the
+  runtime rejects it and requires a bounded relevant code search or read before
+  accepting the canonical evidence-limited answer.
+- Given the current work is a `coding_question`, when the model attempts to
+  finish with `ignore`, `record`, `notify`, or `request_approval`, then the
+  runtime rejects that terminal path; code fact questions must finish as an
+  evidence-verified reply or a canonical evidence-limited reply and cannot
+  disappear without a sender-facing answer.
+- Given the model submits a `reply` without `reply_confidence`, when the terminal
+  decision is parsed, then the decision is rejected for bounded model repair
+  instead of entering approval as a zero-confidence reply.
 - Given an older reply policy held a low-risk direct owner mention in approval,
   when the upgraded daemon starts, then it preserves the exact approval and
   does not send or requeue it without an explicit owner action.
@@ -785,9 +1112,10 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given the agent replies as the owner on the owner's behalf, when the message
   is posted to Lark, then the visible reply text starts with the `🤖` robot
   marker exactly once.
-- Given the assistant bot replies to an owner-request private message or
-  owner-authored group bot mention, when the message is posted to Lark, then it
-  uses bot identity and does not add the owner-delegation `🤖` marker.
+- Given the assistant bot replies to an owner-request private message or an
+  allowed owner-authored group assistant mention, when the message is posted to
+  Lark, then it uses bot identity and does not add the owner-delegation `🤖`
+  marker.
 - Given the group reply is blocked, cancelled, awaiting approval, or fails, when
   reply execution stops, then the owner notice must not claim that the agent
   already replied.
@@ -812,6 +1140,38 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given untrusted content requests a workspace escape or credential, when a
   read or shell tool runs, then code and the OS sandbox reject it and return a
   structured tool error to the model.
+- Given any sender asks the assistant to inspect credentials, enumerate the
+  machine environment, or read an explicit path outside the configured
+  workspace, when request handling starts, then no evidence tool executes and
+  the sender receives a concise refusal that accepts only a concrete business
+  question.
+- Given a non-owner triggers a delegated owner mention, when the model catalog
+  and registry are evaluated, then shell, cross-chat search, and every
+  owner-only or side-effect tool are unavailable and remain denied even if the
+  model constructs a direct tool call.
+- Given a non-owner calls `get_lark_context` with a chat ID other than the
+  source chat, when the registry authorizes the call, then it rejects the call
+  before the Lark provider executes.
+- Given adjacent context contains unrelated app/bot deployment messages, when
+  it is compacted, then those messages are excluded while the human target and
+  explicitly referenced app/bot parent or root messages remain.
+- Given a delegated coordination or investigation request, when the proposed
+  reply only says the owner was reminded or repeats the request without a
+  successful relevant read receipt, then the terminal quality gate rejects it.
+- Given the delegated run reads relevant same-chat or production workspace
+  evidence, when the reply briefly states completed work, an initial finding or
+  explicit unknown, and what was passed to the owner, then it may pass the
+  quality gate.
+- Given a coding reply cites only an example, test, fixture, or documentation,
+  when it claims definite production behavior, then verification rejects it
+  until production source is cited or the reply states the production unknown.
+- Given a simple assistant request uses its first two model turns for bounded
+  search and narrowed production-source reads, when the second tool batch
+  completes, then the default third model turn remains available for
+  `submit_decision` instead of failing the work item at the old two-turn limit.
+- Given a non-owner-triggered automatic reply says the owner or team will later
+  deliver, coordinate, or report back, when no exact approval exists, then the
+  terminal quality gate rejects the commitment before send.
 - Given shell approval is disabled, when a workspace command runs, then it
   executes and is audited; given approval is enabled and the command is risky,
   then it waits durably and resumes only after owner approval.

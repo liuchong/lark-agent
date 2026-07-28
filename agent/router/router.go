@@ -11,22 +11,24 @@ import (
 
 // Config controls deterministic routing.
 type Config struct {
-	OwnerOpenID       string
-	AssistantOpenIDs  []string
-	AssistantNames    []string
-	OwnerDirect       bool
-	Mode              domain.Mode
-	AllowChats        []string
-	BlockChats        []string
-	BlockUsers        []string
-	Sensitivity       domain.Sensitivity
-	Now               func() time.Time
-	DisableFastPath   bool
-	DisableCodingGoal bool
-	StatusText        func() string
-	DoctorText        func() string
-	QueueSummaryText  func() string
-	HelpText          string
+	OwnerOpenID         string
+	AssistantOpenIDs    []string
+	AssistantNames      []string
+	AssistantReplyScope domain.ReplyScope
+	OwnerDirect         bool
+	Mode                domain.Mode
+	ReplyScope          domain.ReplyScope
+	AllowChats          []string
+	BlockChats          []string
+	BlockUsers          []string
+	Sensitivity         domain.Sensitivity
+	Now                 func() time.Time
+	DisableFastPath     bool
+	DisableCodingGoal   bool
+	StatusText          func() string
+	DoctorText          func() string
+	QueueSummaryText    func() string
+	HelpText            string
 }
 
 // Router decides whether a work item should enter the agent loop.
@@ -38,6 +40,12 @@ type Router struct {
 func New(cfg Config) *Router {
 	if cfg.Mode == "" {
 		cfg.Mode = domain.ModeAuto
+	}
+	if cfg.AssistantReplyScope == "" {
+		cfg.AssistantReplyScope = domain.ReplyScopeAllGroups
+	}
+	if cfg.ReplyScope == "" {
+		cfg.ReplyScope = domain.ReplyScopeAllGroups
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -71,6 +79,35 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 		decision.Reason = "chat_not_allowed"
 		return decision, nil
 	}
+	if r.assistantMentioned(item.Event) && item.Event.ChatType != "p2p" {
+		if !r.cfg.OwnerDirect || item.Event.SenderID != r.cfg.OwnerOpenID {
+			decision.Reason = "assistant_request_from_non_owner"
+			return decision, nil
+		}
+		if !assistantGroupScopeAllows(r.cfg.AssistantReplyScope, item.Event) {
+			decision.Reason = "outside_assistant_reply_scope"
+			return decision, nil
+		}
+		decision.Kind = domain.DecisionNotify
+		decision.Relevance = domain.RelevanceAssistantRequest
+		decision.WorkKind = domain.WorkKindSimpleQuestion
+		decision.Priority = domain.PrioritySimpleQuestion
+		decision.Confidence = 1
+		decision.Reason = "assistant_mention"
+		if !r.cfg.DisableFastPath {
+			if fast, ok := r.fastPathDecision(item.Event, decision); ok {
+				return fast, nil
+			}
+		}
+		if !r.cfg.DisableCodingGoal && isCodingGoal(item.Event.Content) {
+			decision.WorkKind = domain.WorkKindCodingGoal
+			decision.Priority = domain.PriorityBackground
+		} else if domain.IsCodingQuestion(item.Event.Content) {
+			decision.WorkKind = domain.WorkKindCodingQuestion
+			decision.Priority = domain.PriorityCodingQuestion
+		}
+		return decision, nil
+	}
 	if r.assistantMentioned(item.Event) || r.assistantPrivateChat(item.Event) || r.assistantTextMentioned(item.Event) {
 		if !r.cfg.OwnerDirect || item.Event.SenderID != r.cfg.OwnerOpenID {
 			decision.Reason = "assistant_request_from_non_owner"
@@ -96,13 +133,17 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 		if !r.cfg.DisableCodingGoal && isCodingGoal(item.Event.Content) {
 			decision.WorkKind = domain.WorkKindCodingGoal
 			decision.Priority = domain.PriorityBackground
-		} else if isCodingQuestion(item.Event.Content) {
+		} else if domain.IsCodingQuestion(item.Event.Content) {
 			decision.WorkKind = domain.WorkKindCodingQuestion
 			decision.Priority = domain.PriorityCodingQuestion
 		}
 		return decision, nil
 	}
 	if item.Event.MentionsUser(r.cfg.OwnerOpenID) {
+		if !groupScopeAllows(r.cfg.ReplyScope, item.Event) {
+			decision.Reason = "outside_reply_scope"
+			return decision, nil
+		}
 		decision.Kind = domain.DecisionNotify
 		decision.Relevance = domain.RelevanceDirectMention
 		decision.WorkKind = domain.WorkKindDirectMention
@@ -123,6 +164,18 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 	return decision, nil
 }
 
+func groupScopeAllows(scope domain.ReplyScope, event domain.NormalizedEvent) bool {
+	return event.ChatType == "p2p" ||
+		scope != domain.ReplyScopeConfiguredGroups ||
+		event.InTestScope
+}
+
+func assistantGroupScopeAllows(scope domain.ReplyScope, event domain.NormalizedEvent) bool {
+	return event.ChatType == "p2p" ||
+		scope != domain.ReplyScopeConfiguredGroups ||
+		event.InAssistantScope
+}
+
 func (r *Router) fastPathDecision(event domain.NormalizedEvent, base domain.Decision) (domain.Decision, bool) {
 	content := strings.ToLower(strings.TrimSpace(event.Content))
 	for _, name := range r.cfg.AssistantNames {
@@ -135,6 +188,9 @@ func (r *Router) fastPathDecision(event domain.NormalizedEvent, base domain.Deci
 		content = strings.TrimSpace(strings.TrimPrefix(content, fields[0]))
 	}
 	content = strings.TrimSpace(strings.TrimRight(content, "?？。！!"))
+	if oneOf(content, "在吗", "你好", "您好", "hi", "hello") {
+		return fastPathReply(base, "在的。", "fast_path_availability"), true
+	}
 	if oneOf(content, "几点了", "现在几点", "现在几点了", "现在时间", "time") {
 		now := r.cfg.Now()
 		base.Kind = domain.DecisionReply
@@ -215,17 +271,6 @@ func fastPathReply(base domain.Decision, text, reason string) domain.Decision {
 	base.ReplyText = text
 	base.Reason = appendReason(base.Reason, reason)
 	return base
-}
-
-func isCodingQuestion(content string) bool {
-	content = strings.ToLower(content)
-	keywords := []string{"代码", "接口", "sampledb", "mysql", "redis", "函数", "类", "基于代码", "为什么每次", "bug", "报错", "实现"}
-	for _, keyword := range keywords {
-		if strings.Contains(content, strings.ToLower(keyword)) {
-			return true
-		}
-	}
-	return false
 }
 
 func isCodingGoal(content string) bool {

@@ -300,7 +300,7 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 		defer stopHeartbeat()
 		ctx = runCtx
 	}
-	if decision.Relevance == domain.RelevanceOwnerRequest && d.activity != nil {
+	if isAssistantFacingRequest(decision.Relevance) && d.activity != nil {
 		token, activityErr := d.activity.Begin(ctx, item)
 		if activityErr == nil && token != "" {
 			defer func() {
@@ -358,10 +358,10 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 		}
 		decision = inheritRouteFields(modelDecision, decision)
 	}
-	if decision.Kind == domain.DecisionNotify && decision.Relevance == domain.RelevanceOwnerRequest {
+	if decision.Kind == domain.DecisionNotify && isAssistantFacingRequest(decision.Relevance) {
 		err := errs.NewInternalError(
 			errs.SubtypeInvalidResponse,
-			"owner_request cannot finish as notify only; submit reply_text or request_approval",
+			"assistant-facing request cannot finish as notify only; submit reply_text or request_approval",
 		)
 		d.markRetry(item, err)
 		return Result{}, err
@@ -444,7 +444,7 @@ func (d *Daemon) finishDecision(ctx context.Context, item domain.WorkItem, decis
 		}
 	}
 	if decision.Kind == domain.DecisionReply &&
-		decision.Relevance != domain.RelevanceOwnerRequest &&
+		!isAssistantFacingRequest(decision.Relevance) &&
 		d.notifier != nil {
 		if notifications, ok := d.queue.(postReplyNotificationStore); ok {
 			return d.finishPostReplyNotification(ctx, item, decision, notifications)
@@ -569,7 +569,7 @@ func inheritRouteFields(modelDecision, routeDecision domain.Decision) domain.Dec
 	if modelDecision.Mode == "" {
 		modelDecision.Mode = routeDecision.Mode
 	}
-	if routeDecision.Relevance == domain.RelevanceDirectMention || routeDecision.Relevance == domain.RelevanceOwnerRequest {
+	if routeDecision.Relevance == domain.RelevanceDirectMention || isAssistantFacingRequest(routeDecision.Relevance) {
 		modelDecision.Relevance = routeDecision.Relevance
 	} else if modelDecision.Relevance == "" || modelDecision.Relevance == domain.RelevanceNone {
 		modelDecision.Relevance = routeDecision.Relevance
@@ -587,6 +587,11 @@ func inheritRouteFields(modelDecision, routeDecision domain.Decision) domain.Dec
 		modelDecision.Priority = routeDecision.Priority
 	}
 	return modelDecision
+}
+
+func isAssistantFacingRequest(relevance domain.Relevance) bool {
+	return relevance == domain.RelevanceOwnerRequest ||
+		relevance == domain.RelevanceAssistantRequest
 }
 
 func leaseForWorkKind(kind domain.WorkKind, fallback time.Duration, configured map[domain.WorkKind]time.Duration) time.Duration {

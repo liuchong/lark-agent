@@ -382,7 +382,7 @@ func TestDaemonRunOnceUsesModelAndReplyHandler(t *testing.T) {
 	}
 }
 
-func TestDaemonSendsLowRiskDirectMentionReplyWhenModelReturnsInferredRelevance(t *testing.T) {
+func TestDaemonRequestsApprovalWhenDirectMentionFallsBelowConfiguredConfidence(t *testing.T) {
 	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID: "om_direct",
 		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
@@ -409,10 +409,10 @@ func TestDaemonSendsLowRiskDirectMentionReplyWhenModelReturnsInferredRelevance(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Processed || result.Decision.Kind != domain.DecisionReply || q.completed.Kind != domain.DecisionReply {
+	if !result.Processed || result.Decision.Kind != domain.DecisionRequestApproval || q.completed.Kind != domain.DecisionRequestApproval {
 		t.Fatalf("result=%+v completed=%+v", result, q.completed)
 	}
-	if messenger.replies != 1 || messenger.text != "🤖收到，我先确认后同步。" {
+	if messenger.replies != 0 {
 		t.Fatalf("messenger=%+v", messenger)
 	}
 }
@@ -665,6 +665,37 @@ func TestDaemonDoesNotSendPostReplyNoticeForOwnerRequest(t *testing.T) {
 		WithDecider(&fakeDecider{decision: domain.Decision{
 			Kind: domain.DecisionReply, Relevance: domain.RelevanceOwnerRequest,
 			Confidence: 0.99, Risk: domain.RiskLow, ReplyText: "现在是 05:40。",
+		}}),
+		WithReplyHandler(replier),
+		WithNotificationHandler(notifier),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || !replier.called || notifier.called || q.completed.Kind != domain.DecisionReply {
+		t.Fatalf("result=%+v replier=%+v notifier=%+v completed=%+v", result, replier, notifier, q.completed)
+	}
+}
+
+func TestDaemonDoesNotSendPostReplyNoticeForAssistantRequest(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_group_assistant", ChatID: "oc_group", ChatType: "group",
+		SenderID: "ou_owner",
+		Mentions: []domain.Mention{{OpenID: "ou_bot", Name: "Assistant Bot"}},
+	})}
+	replier := &fakeReplyHandler{}
+	notifier := &fakeNotifier{}
+	daemon := NewDaemon(q, router.New(router.Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantReplyScope: domain.ReplyScopeAllGroups,
+		Mode:                domain.ModeAuto,
+	}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(&fakeDecider{decision: domain.Decision{
+			Kind: domain.DecisionReply, Relevance: domain.RelevanceAssistantRequest,
+			Confidence: 0.99, Risk: domain.RiskLow, ReplyText: "可以。",
 		}}),
 		WithReplyHandler(replier),
 		WithNotificationHandler(notifier),

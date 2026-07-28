@@ -36,7 +36,9 @@ import (
 	"github.com/liuchong/lark-agent/agent/workspace"
 	"github.com/liuchong/lark-agent/internal/apperr"
 	vfs "github.com/liuchong/lark-agent/internal/fsx"
+	internalgithub "github.com/liuchong/lark-agent/internal/github"
 	serviceim "github.com/liuchong/lark-agent/internal/lark"
+	"github.com/liuchong/lark-agent/internal/secretstore"
 )
 
 // Execute runs the command tree.
@@ -65,15 +67,18 @@ func NewRootCommand(in io.Reader, out io.Writer) *cobra.Command {
 
 It monitors Lark messages, applies workspace-bounded rules, routes relevant
 work to an Eino-based agent loop, and can reply as the owner in auto mode.
-The configured owner can also privately message the assistant chat or mention
-the assistant bot anywhere to initiate a question or coding investigation; this
-owner-request path uses bot real-time events, ignores all non-owner senders, and
-adds a keyboard working reaction before work starts, removing it when work
-finishes.
+Only the configured owner can mention the assistant bot in an allowed group to
+ask a question or request an operation; that path replies with bot identity.
+The configured owner can also privately message the assistant. Non-owner bot
+private messages and direct assistant mentions stay silent; non-owners can only
+trigger a reply by mentioning the human owner. Assistant mentions and owner
+mentions have independent all-groups or configured-groups scopes. Direct
+assistant requests add a keyboard working reaction before work starts and
+remove it when work finishes.
 Programming questions use a bounded coding investigation path with planning,
 code search fallback, source-backed verify, and replay transcript export.
-Simple questions use at most 2 model turns; coding questions use 20 turns,
-10 tool calls, and a 3-step no-progress stop by default. One interactive
+Simple questions use at most 3 model turns; coding questions use 20 turns,
+16 tool calls, and a 3-step no-progress stop by default. One interactive
 worker is reserved from the foreground pool, while CodingGoal work uses
 background workers. Time, date, ping, status, doctor, queue summary, and help
 use a deterministic fast path before any model loop.
@@ -109,6 +114,7 @@ Modes:
 		newApprovalCommand(out, &statePath),
 		newMemoryCommand(out),
 		newRulesCommand(out, &configPath),
+		newGitHubCommand(in, out, &configPath),
 		newDoctorCommand(out, &configPath, &statePath),
 	)
 	return cmd
@@ -194,6 +200,307 @@ type authLoginInput struct {
 	AppSecret       string `json:"app_secret"`
 	UserAccessToken string `json:"user_access_token"`
 	RefreshToken    string `json:"refresh_token"`
+}
+
+func newGitHubCommand(in io.Reader, out io.Writer, configPath *string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "github",
+		Short: "Bridge trusted GitHub workflow facts into Lark",
+		Long: "Send HTTP-only GitHub workflow notifications and manage the local read-only " +
+			"GitHub token. The token is read as JSON from stdin and stored in Keychain.",
+	}
+	cmd.AddCommand(newGitHubAuthCommand(in, out, configPath))
+
+	var chatID, eventPath, eventName string
+	var dryRun bool
+	notify := &cobra.Command{
+		Use:   "notify",
+		Short: "Send one trusted GitHub event notification to an exact Lark chat",
+		Long: "Read a typed event from GITHUB_EVENT_PATH and GITHUB_EVENT_NAME, optionally " +
+			"enrich it through the GitHub API, and send one HTTP-only Lark bot post. " +
+			"This command never starts a Lark WebSocket consumer.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadGitHubNotifyConfig(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			if !cfg.GitHub.Enabled {
+				return errs.NewConfigError(
+					errs.SubtypeFailedPrecondition,
+					"github bridge is disabled",
+				).WithField("github.enabled")
+			}
+			if strings.TrimSpace(chatID) == "" {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "--chat-id is required").
+					WithParam("--chat-id")
+			}
+			path := firstNonEmpty(eventPath, os.Getenv("GITHUB_EVENT_PATH"))
+			name := firstNonEmpty(eventName, os.Getenv("GITHUB_EVENT_NAME"))
+			if path == "" || name == "" {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"GITHUB_EVENT_PATH and GITHUB_EVENT_NAME are required",
+				)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return errs.NewInternalError(errs.SubtypeFileIO, "read GitHub event path").WithCause(err)
+			}
+			snapshot, err := internalgithub.ParseEvent(name, data)
+			if err != nil {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "parse GitHub event").WithCause(err)
+			}
+			if !repositoryAllowed(snapshot.Reference.Repository, cfg.GitHub.AllowedRepositories) {
+				return errs.NewPermissionError(
+					errs.SubtypeFailedPrecondition,
+					"github repository is not allowed: %s",
+					snapshot.Reference.Repository,
+				)
+			}
+
+			token, tokenErr := secretstore.Read(
+				cmd.Context(),
+				cfg.GitHub.TokenKeychainService,
+				cfg.GitHub.TokenKeychainKey,
+				"GITHUB_TOKEN",
+			)
+			if tokenErr == nil {
+				client, err := newGitHubClient(cfg, token)
+				if err != nil {
+					return err
+				}
+				result, err := client.FetchContext(
+					cmd.Context(),
+					snapshot.Reference,
+					[]internalgithub.Section{
+						internalgithub.SectionSummary,
+						internalgithub.SectionChecks,
+						internalgithub.SectionFiles,
+						internalgithub.SectionReviews,
+					},
+				)
+				if err != nil {
+					snapshot.Partial = true
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "GitHub enrichment unavailable: %s\n", err)
+				} else {
+					snapshot.Name = firstNonEmpty(result.Name, snapshot.Name)
+					snapshot.Status = firstNonEmpty(result.Status, snapshot.Status)
+					snapshot.Conclusion = firstNonEmpty(result.Conclusion, snapshot.Conclusion)
+					snapshot.FailedJobs = failedGitHubJobs(result.Jobs)
+					snapshot.Files = result.Files
+					snapshot.Reviews = result.Reviews
+					snapshot.Annotations = result.Annotations
+					snapshot.Omitted = result.Omitted
+					snapshot.Partial = result.Partial || result.Truncated.Any()
+				}
+			} else {
+				snapshot.Partial = true
+				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "GitHub enrichment unavailable: read-only token is not configured")
+			}
+			credentials, err := serviceim.LoadCredentials(cmd.Context(), credentialRefs(cfg))
+			if err != nil {
+				return err
+			}
+			notification, err := internalgithub.RenderNotification(snapshot, credentials.AppSecret)
+			if err != nil {
+				return errs.NewInternalError(errs.SubtypeInvalidResponse, "render GitHub notification").WithCause(err)
+			}
+			idempotencyKey := internalgithub.StableNotificationKey(chatID, snapshot.Reference)
+			result := map[string]any{
+				"chat_id":         chatID,
+				"message_type":    notification.MessageType,
+				"idempotency_key": idempotencyKey,
+				"reference":       snapshot.Reference,
+				"partial":         snapshot.Partial,
+				"dry_run":         dryRun,
+			}
+			if dryRun {
+				result["content"] = notification.Content
+				return writeData(out, result)
+			}
+			larkClient, err := serviceim.NewClient(serviceim.ClientConfig{
+				AppID:     cfg.Lark.AppID,
+				AppSecret: credentials.AppSecret,
+				BaseURL:   cfg.Lark.BaseURL,
+				Timeout:   30 * time.Second,
+			})
+			if err != nil {
+				return err
+			}
+			sent, err := serviceim.NewService(larkClient, cfg.Owner.OpenID).SendMessageAsBot(
+				cmd.Context(),
+				serviceim.SendMessageRequest{
+					ChatID:         chatID,
+					MessageType:    notification.MessageType,
+					Content:        notification.Content,
+					IdempotencyKey: idempotencyKey,
+				},
+			)
+			if err != nil {
+				return err
+			}
+			result["message_id"] = sent.MessageID
+			result["chat_id"] = sent.ChatID
+			return writeData(out, result)
+		},
+	}
+	notify.Flags().StringVar(&chatID, "chat-id", "", "exact destination Lark chat ID")
+	notify.Flags().StringVar(&eventPath, "event-path", "", "typed GitHub event JSON path (default: GITHUB_EVENT_PATH)")
+	notify.Flags().StringVar(&eventName, "event-name", "", "GitHub event name (default: GITHUB_EVENT_NAME)")
+	notify.Flags().BoolVar(&dryRun, "dry-run", false, "render structured output without sending to Lark")
+	cmd.AddCommand(notify)
+	return cmd
+}
+
+func newGitHubAuthCommand(in io.Reader, out io.Writer, configPath *string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "auth",
+		Short: "Manage the read-only GitHub token",
+		Long:  "Use login to read a token as JSON from stdin and store it in Keychain; use status without printing the token.",
+	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "login",
+		Short: "Read {\"token\":\"...\"} from stdin and store it in Keychain",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if in == nil {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "stdin is required").WithParam("stdin")
+			}
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			var input struct {
+				Token string `json:"token"`
+			}
+			decoder := json.NewDecoder(in)
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&input); err != nil {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "decode GitHub token JSON from stdin").WithCause(err)
+			}
+			if err := secretstore.Write(
+				cmd.Context(),
+				cfg.GitHub.TokenKeychainService,
+				cfg.GitHub.TokenKeychainKey,
+				strings.TrimSpace(input.Token),
+			); err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{
+				"stored":           true,
+				"keychain_service": cfg.GitHub.TokenKeychainService,
+				"account":          cfg.GitHub.TokenKeychainKey,
+			})
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "status",
+		Short: "Check whether the GitHub token is readable without printing it",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			token, readErr := secretstore.Read(
+				cmd.Context(),
+				cfg.GitHub.TokenKeychainService,
+				cfg.GitHub.TokenKeychainKey,
+				"GITHUB_TOKEN",
+			)
+			return writeData(out, map[string]any{
+				"configured":       readErr == nil && token != "",
+				"keychain_service": cfg.GitHub.TokenKeychainService,
+				"account":          cfg.GitHub.TokenKeychainKey,
+				"error":            errorString(readErr),
+			})
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "logout",
+		Short: "Delete the configured GitHub token from Keychain",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			if err := secretstore.Delete(
+				cmd.Context(),
+				cfg.GitHub.TokenKeychainService,
+				cfg.GitHub.TokenKeychainKey,
+			); err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"deleted": true})
+		},
+	})
+	return cmd
+}
+
+func newGitHubClient(cfg config.Config, token string) (*internalgithub.Client, error) {
+	return internalgithub.NewClient(internalgithub.ClientConfig{
+		BaseURL: cfg.GitHub.APIBaseURL,
+		Token:   token,
+		Limits: internalgithub.Limits{
+			MaxFiles:       cfg.GitHub.MaxFiles,
+			MaxPatchBytes:  cfg.GitHub.MaxPatchBytes,
+			MaxAnnotations: cfg.GitHub.MaxAnnotations,
+			MaxReviews:     cfg.GitHub.MaxReviews,
+		},
+	})
+}
+
+func loadGitHubNotifyConfig(path string) (config.Config, error) {
+	cfg, err := config.Load(path)
+	if err == nil {
+		return cfg, nil
+	}
+	if os.Getenv("GITHUB_ACTIONS") != "true" {
+		return config.Config{}, err
+	}
+	workspaceRoot := firstNonEmpty(os.Getenv("GITHUB_WORKSPACE"), "/github/workspace")
+	if !filepath.IsAbs(workspaceRoot) {
+		return config.Config{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"GITHUB_WORKSPACE must be absolute",
+		)
+	}
+	cfg = config.Default()
+	cfg.Lark.AppID = strings.TrimSpace(os.Getenv("LARK_AGENT_APP_ID"))
+	cfg.Lark.BaseURL = strings.TrimSpace(os.Getenv("LARK_AGENT_LARK_BASE_URL"))
+	if cfg.Lark.BaseURL == "" {
+		return config.Config{}, errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"LARK_AGENT_LARK_BASE_URL is required in GitHub Actions",
+		).WithField("lark.base_url")
+	}
+	cfg.Owner.OpenID = "github-action-sender"
+	cfg.Workspace.Root = workspaceRoot
+	cfg.GitHub.Enabled = true
+	cfg.GitHub.APIBaseURL = firstNonEmpty(os.Getenv("GITHUB_API_URL"), cfg.GitHub.APIBaseURL)
+	cfg.GitHub.AllowedRepositories = []string{strings.TrimSpace(os.Getenv("GITHUB_REPOSITORY"))}
+	if err := cfg.Validate(); err != nil {
+		return config.Config{}, err
+	}
+	return cfg, nil
+}
+
+func repositoryAllowed(repository string, allowed []string) bool {
+	for _, candidate := range allowed {
+		if strings.EqualFold(strings.TrimSpace(repository), strings.TrimSpace(candidate)) {
+			return true
+		}
+	}
+	return false
+}
+
+func failedGitHubJobs(jobs []internalgithub.JobSummary) []internalgithub.JobSummary {
+	var failed []internalgithub.JobSummary
+	for _, job := range jobs {
+		switch job.Conclusion {
+		case "failure", "cancelled", "timed_out", "action_required", "startup_failure":
+			failed = append(failed, job)
+		}
+	}
+	return failed
 }
 
 func mergeAuthLoginInput(existing serviceim.Credentials, input authLoginInput) (serviceim.Credentials, error) {
@@ -385,6 +692,9 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 	runCmd := &cobra.Command{
 		Use:   "run",
 		Short: "Run daemon in the foreground",
+		Long: "Run the daemon in the foreground. Non-owner requests are read-only and confined to " +
+			"same-chat plus configured-workspace evidence; environment reconnaissance and paths outside " +
+			"the workspace are refused.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(resolveConfigPath(*configPath))
 			if err != nil {
@@ -553,7 +863,7 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 	runCmd.Flags().BoolVar(&once, "once", false, "process at most one queued item and exit")
 	runCmd.Flags().BoolVar(&live, "live", false, "consume owner bot events in real time and poll user-visible Lark conversations as fallback")
 	runCmd.Flags().BoolVar(&dryRun, "dry-run", false, "run live intake and model decisions without sending replies")
-	runCmd.Flags().StringVar(&chatQuery, "chat-query", "", "chat keyword used to mark the primary test chat, for example Test Group")
+	runCmd.Flags().StringVar(&chatQuery, "chat-query", "", "chat keyword used to mark configured and validation groups")
 	runCmd.Flags().BoolVar(&includePrivate, "include-private", true, "include private chats in live user-visible polling")
 	runCmd.Flags().DurationVar(&pollInterval, "poll-interval", 30*time.Second, "live polling interval")
 	cmd.AddCommand(runCmd)
@@ -677,7 +987,7 @@ func newDaemonInstallAppCommand(out io.Writer, configPath, statePath *string) *c
 	cmd.Flags().BoolVar(&load, "load", false, "load and start the LaunchAgent after writing")
 	cmd.Flags().StringVar(&program, "program", "", "lark-agent binary path (default: current executable)")
 	cmd.Flags().BoolVar(&live, "live", true, "run daemon with live Lark polling")
-	cmd.Flags().StringVar(&chatQuery, "chat-query", "Test Group", "test chat query used by live daemon")
+	cmd.Flags().StringVar(&chatQuery, "chat-query", "Test Group", "chat keyword used to mark configured and validation groups")
 	cmd.Flags().DurationVar(&pollInterval, "poll-interval", 10*time.Second, "daemon live polling interval")
 	return cmd
 }
@@ -791,11 +1101,17 @@ func buildLiveOptions(
 		"dry_run":                 dryRun,
 		"model_configured":        false,
 		"chat_query":              chatQuery,
+		"assistant_reply_scope":   cfg.Assistant.ReplyScope,
+		"reply_scope":             cfg.Policy.ReplyScope,
 		"include_private":         includePrivate,
 		"realtime_owner_requests": false,
+		"realtime_requests":       false,
 	}
 	if !live {
 		return nil, nil, nil, info, nil
+	}
+	if err := validateLiveReplyScopes(cfg.Assistant.ReplyScope, cfg.Policy.ReplyScope, chatQuery); err != nil {
+		return nil, nil, nil, info, err
 	}
 	if os.Getenv("LARK_AGENT_OFFLINE_LIVE_TEST") == "1" {
 		info["offline_live_test"] = true
@@ -810,6 +1126,8 @@ func buildLiveOptions(
 		AppID:           cfg.Lark.AppID,
 		AppSecret:       credentials.AppSecret,
 		UserAccessToken: credentials.UserAccessToken,
+		RefreshToken:    credentials.RefreshToken,
+		UserTokenStore:  serviceim.NewKeychainUserTokenStore(credentialRefs(cfg)),
 		BaseURL:         cfg.Lark.BaseURL,
 		Timeout:         30 * time.Second,
 	})
@@ -818,19 +1136,30 @@ func buildLiveOptions(
 	}
 	imSvc := serviceim.NewService(apiClient, cfg.Owner.OpenID)
 	var realtimeSource realtime.Runner
-	if cfg.Assistant.OwnerDirect.Enabled {
+	var configuredAssistantChatIDs []string
+	if cfg.Assistant.ReplyScope == domain.ReplyScopeConfiguredGroups {
+		configuredAssistantChatIDs, err = discoverConfiguredAssistantChats(ctx, imSvc, chatQuery)
+		if err != nil {
+			return nil, nil, nil, info, err
+		}
+		info["configured_assistant_chat_ids"] = configuredAssistantChatIDs
+	}
+	if cfg.Assistant.OwnerDirect.Enabled || len(cfg.Assistant.OpenIDs) > 0 || len(cfg.Assistant.Names) > 0 {
 		consumer := realtime.NewLarkConsumer(apiClient, realtime.LarkConsumerConfig{
 			AppID:     cfg.Lark.AppID,
 			AppSecret: credentials.AppSecret,
 			BaseURL:   cfg.Lark.BaseURL,
 		})
 		realtimeSource = realtime.NewSource(consumer, store, realtime.Config{
-			OwnerOpenID:      cfg.Owner.OpenID,
-			AssistantOpenIDs: cfg.Assistant.OpenIDs,
-			AssistantNames:   cfg.Assistant.Names,
-			Classify:         agentRouter.Route,
+			OwnerOpenID:         cfg.Owner.OpenID,
+			AssistantOpenIDs:    cfg.Assistant.OpenIDs,
+			AssistantNames:      cfg.Assistant.Names,
+			AssistantReplyScope: cfg.Assistant.ReplyScope,
+			ConfiguredChatIDs:   configuredAssistantChatIDs,
+			Classify:            agentRouter.Route,
 		})
 		info["realtime_owner_requests"] = true
+		info["realtime_requests"] = true
 	}
 	scope, err := workspace.NewScopeWithExcludes(cfg.Workspace.Root, cfg.Workspace.Excludes)
 	if err != nil {
@@ -841,8 +1170,34 @@ func buildLiveOptions(
 		return nil, nil, nil, info, err
 	}
 	userContextEnabled := credentials.UserAccessToken != ""
+	var githubClient *internalgithub.Client
+	if cfg.GitHub.Enabled {
+		token, tokenErr := secretstore.Read(
+			ctx,
+			cfg.GitHub.TokenKeychainService,
+			cfg.GitHub.TokenKeychainKey,
+			"GITHUB_TOKEN",
+		)
+		if tokenErr == nil {
+			githubClient, err = newGitHubClient(cfg, token)
+			if err != nil {
+				return nil, nil, nil, info, err
+			}
+			info["github_context"] = true
+		} else {
+			info["github_context"] = false
+			info["github_token"] = "missing"
+		}
+	} else {
+		info["github_context"] = false
+	}
 	builder := &conversationBuilder{
-		svc: imSvc,
+		svc:                 imSvc,
+		store:               store,
+		currentAppID:        cfg.Lark.AppID,
+		referenceSigningKey: credentials.AppSecret,
+		allowedRepositories: append([]string(nil), cfg.GitHub.AllowedRepositories...),
+		githubEnabled:       cfg.GitHub.Enabled,
 		base: agentcontext.Builder{
 			Scope:  scope,
 			Rules:  ruleSet,
@@ -856,7 +1211,15 @@ func buildLiveOptions(
 	options := []app.Option{app.WithContextBuilder(builder)}
 	info["user_context"] = userContextEnabled
 	if userContextEnabled {
-		livePoller := newConfiguredLivePoller(imSvc, store, agentRouter, cfg, chatQuery, includePrivate)
+		livePoller := newConfiguredLivePoller(
+			imSvc,
+			store,
+			agentRouter,
+			cfg,
+			chatQuery,
+			configuredAssistantChatIDs,
+			includePrivate,
+		)
 		options = append(options, app.WithPoller(livePoller))
 		info["user_polling"] = true
 	} else {
@@ -876,6 +1239,9 @@ func buildLiveOptions(
 		definitions = append(definitions, agenttools.WorkspaceDefinitions(scope)...)
 		if userContextEnabled {
 			definitions = append(definitions, agenttools.LarkContextDefinitions(larkToolContext{svc: imSvc})...)
+		}
+		if githubClient != nil {
+			definitions = append(definitions, agenttools.GitHubContextDefinition(githubClient))
 		}
 		definitions = append(definitions,
 			agenttools.ShellDefinition(scope, agenttools.ShellOptions{
@@ -927,12 +1293,14 @@ func buildLiveOptions(
 			threadState.svc = imSvc
 		}
 		gate := policy.NewReplyGate(policy.Config{
-			Mode:               cfg.Policy.Mode,
-			ReplyConfidenceMin: cfg.Policy.ReplyConfidenceMin,
-			OwnerWait:          cfg.Policy.OwnerWait,
-			BlockChats:         cfg.Policy.BlockChats,
-			BlockUsers:         cfg.Policy.BlockUsers,
-			RequireTestScope:   chatQuery != "",
+			Mode:                cfg.Policy.Mode,
+			OwnerOpenID:         cfg.Owner.OpenID,
+			ReplyScope:          cfg.Policy.ReplyScope,
+			AssistantReplyScope: cfg.Assistant.ReplyScope,
+			ReplyConfidenceMin:  cfg.Policy.ReplyConfidenceMin,
+			OwnerWait:           cfg.Policy.OwnerWait,
+			BlockChats:          cfg.Policy.BlockChats,
+			BlockUsers:          cfg.Policy.BlockUsers,
 		}, threadState)
 		options = append(options,
 			app.WithReplyHandler(reply.NewController(gate, imSvc, store)),
@@ -943,22 +1311,86 @@ func buildLiveOptions(
 	return options, realtimeSource, imSvc, info, nil
 }
 
+func validateLiveReplyScope(scope domain.ReplyScope, chatQuery string) error {
+	if scope == domain.ReplyScopeConfiguredGroups && strings.TrimSpace(chatQuery) == "" {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"policy.reply_scope configured_groups requires --chat-query",
+		).WithField("policy.reply_scope").
+			WithHint("set policy.reply_scope to all_groups or provide --chat-query")
+	}
+	return nil
+}
+
+func validateLiveReplyScopes(assistantScope, delegatedScope domain.ReplyScope, chatQuery string) error {
+	if assistantScope == domain.ReplyScopeConfiguredGroups && strings.TrimSpace(chatQuery) == "" {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"assistant.reply_scope configured_groups requires --chat-query",
+		).WithField("assistant.reply_scope").
+			WithHint("set assistant.reply_scope to all_groups or provide --chat-query")
+	}
+	return validateLiveReplyScope(delegatedScope, chatQuery)
+}
+
+func discoverConfiguredAssistantChats(
+	ctx context.Context,
+	imSvc *serviceim.Service,
+	chatQuery string,
+) ([]string, error) {
+	var chatIDs []string
+	seen := map[string]bool{}
+	pageToken := ""
+	for {
+		result, err := imSvc.SearchChats(ctx, serviceim.SearchChatsRequest{
+			Query:     strings.TrimSpace(chatQuery),
+			PageSize:  100,
+			PageToken: pageToken,
+			As:        serviceim.IdentityBot,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, chat := range result.Items {
+			if chat.ChatID != "" && !seen[chat.ChatID] {
+				seen[chat.ChatID] = true
+				chatIDs = append(chatIDs, chat.ChatID)
+			}
+		}
+		if !result.HasMore || result.PageToken == "" {
+			break
+		}
+		pageToken = result.PageToken
+	}
+	if len(chatIDs) == 0 {
+		return nil, errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"assistant.reply_scope configured_groups query matched no bot-visible group",
+		).WithField("assistant.reply_scope").
+			WithHint("adjust --chat-query or set assistant.reply_scope to all_groups")
+	}
+	return chatIDs, nil
+}
+
 func newConfiguredLivePoller(
 	im poll.IMClient,
 	store poll.Store,
 	agentRouter *router.Router,
 	cfg config.Config,
 	chatQuery string,
+	configuredAssistantChatIDs []string,
 	includePrivate bool,
 ) *poll.Poller {
 	return poll.New(im, store, poll.Config{
-		OwnerOpenID:    cfg.Owner.OpenID,
-		ChatQuery:      chatQuery,
-		AssistantNames: cfg.Assistant.Names,
-		IncludePrivate: includePrivate,
-		PageSize:       20,
-		IndexLookback:  cfg.Scheduler.PollIndexLookback,
-		Classify:       agentRouter.Route,
+		OwnerOpenID:                cfg.Owner.OpenID,
+		ChatQuery:                  chatQuery,
+		AssistantOpenIDs:           cfg.Assistant.OpenIDs,
+		AssistantNames:             cfg.Assistant.Names,
+		ConfiguredAssistantChatIDs: configuredAssistantChatIDs,
+		IncludePrivate:             includePrivate,
+		PageSize:                   20,
+		IndexLookback:              cfg.Scheduler.PollIndexLookback,
+		Classify:                   agentRouter.Route,
 	})
 }
 
@@ -974,20 +1406,22 @@ func newAgentRouter(cfg config.Config, store *storage.Store) *router.Router {
 		)
 	}
 	return router.New(router.Config{
-		OwnerOpenID:       cfg.Owner.OpenID,
-		AssistantOpenIDs:  cfg.Assistant.OpenIDs,
-		AssistantNames:    cfg.Assistant.Names,
-		OwnerDirect:       cfg.Assistant.OwnerDirect.Enabled,
-		Mode:              cfg.Policy.Mode,
-		AllowChats:        cfg.Policy.AllowChats,
-		BlockChats:        cfg.Policy.BlockChats,
-		BlockUsers:        cfg.Policy.BlockUsers,
-		Sensitivity:       cfg.Policy.Sensitivity,
-		DisableFastPath:   !cfg.FastPath.Enabled,
-		DisableCodingGoal: !cfg.Goal.Enabled,
-		StatusText:        func() string { return "lark-agent 正在运行，调度器可用。" + queueText() },
-		DoctorText:        func() string { return "基础诊断正常。" + queueText() },
-		QueueSummaryText:  queueText,
+		OwnerOpenID:         cfg.Owner.OpenID,
+		AssistantOpenIDs:    cfg.Assistant.OpenIDs,
+		AssistantNames:      cfg.Assistant.Names,
+		AssistantReplyScope: cfg.Assistant.ReplyScope,
+		OwnerDirect:         cfg.Assistant.OwnerDirect.Enabled,
+		Mode:                cfg.Policy.Mode,
+		ReplyScope:          cfg.Policy.ReplyScope,
+		AllowChats:          cfg.Policy.AllowChats,
+		BlockChats:          cfg.Policy.BlockChats,
+		BlockUsers:          cfg.Policy.BlockUsers,
+		Sensitivity:         cfg.Policy.Sensitivity,
+		DisableFastPath:     !cfg.FastPath.Enabled,
+		DisableCodingGoal:   !cfg.Goal.Enabled,
+		StatusText:          func() string { return "lark-agent 正在运行，调度器可用。" + queueText() },
+		DoctorText:          func() string { return "基础诊断正常。" + queueText() },
+		QueueSummaryText:    queueText,
 	})
 }
 
@@ -1068,11 +1502,13 @@ func agentConfigFingerprintForContract(cfg config.Config, contract agentOperatin
 	data, _ := json.Marshal(struct {
 		Agent             config.AgentConfig
 		Policy            config.PolicyConfig
+		GitHub            config.GitHubConfig
 		Workspace         config.WorkspaceConfig
 		OperatingContract agentOperatingContract
 	}{
 		Agent:             cfg.Agent,
 		Policy:            cfg.Policy,
+		GitHub:            cfg.GitHub,
 		Workspace:         cfg.Workspace,
 		OperatingContract: contract,
 	})
@@ -1081,9 +1517,14 @@ func agentConfigFingerprintForContract(cfg config.Config, contract agentOperatin
 }
 
 type conversationBuilder struct {
-	svc                *serviceim.Service
-	includeLarkContext bool
-	base               agentcontext.Builder
+	svc                 *serviceim.Service
+	store               *storage.Store
+	currentAppID        string
+	referenceSigningKey string
+	allowedRepositories []string
+	githubEnabled       bool
+	includeLarkContext  bool
+	base                agentcontext.Builder
 }
 
 type larkToolContext struct {
@@ -1201,12 +1642,82 @@ func (b *conversationBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, 
 			Limit:            30,
 		})
 		if err != nil {
-			return agentcontext.Bundle{}, err
+			builder.ContextSelection = domain.ContextSelection{
+				Mode:             domain.ContextModeAdjacent,
+				AnchorMessageID:  item.Event.MessageID,
+				RootMessageID:    item.Event.RootMessageID,
+				ReplyToMessageID: item.Event.ReplyToMessageID,
+				Incomplete:       true,
+				Reason:           "lark_context_unavailable",
+			}
+			if err := b.applyStoredGitHubReference(&builder, item.Event); err != nil {
+				return agentcontext.Bundle{}, err
+			}
+			return builder.Build(item)
 		}
 		builder.Conversation = append(builder.Conversation, normalizeToolMessages(messageContext.Messages)...)
 		builder.ContextSelection = messageContext.Selection
+		if b.githubEnabled {
+			verified, ok, err := agentcontext.ResolveGitHubReference(
+				item.Event,
+				builder.Conversation,
+				b.currentAppID,
+				b.allowedRepositories,
+				b.referenceSigningKey,
+			)
+			if err != nil {
+				return agentcontext.Bundle{}, err
+			}
+			if ok {
+				if b.store != nil {
+					verified, err = b.store.UpsertExternalReference(context.Background(), verified)
+					if err != nil {
+						return agentcontext.Bundle{}, err
+					}
+				}
+				ref := verified.Reference
+				builder.GitHubReference = &ref
+			} else if err := b.applyStoredGitHubReference(&builder, item.Event); err != nil {
+				return agentcontext.Bundle{}, err
+			}
+		}
+	} else if err := b.applyStoredGitHubReference(&builder, item.Event); err != nil {
+		return agentcontext.Bundle{}, err
 	}
 	return builder.Build(item)
+}
+
+func (b *conversationBuilder) applyStoredGitHubReference(
+	builder *agentcontext.Builder,
+	event domain.NormalizedEvent,
+) error {
+	if !b.githubEnabled || b.store == nil {
+		return nil
+	}
+	var selected *domain.GitHubReference
+	for _, messageID := range []string{event.ReplyToMessageID, event.RootMessageID} {
+		if messageID == "" {
+			continue
+		}
+		stored, ok, err := b.store.GetExternalReference(context.Background(), "github", messageID)
+		if err != nil {
+			return err
+		}
+		if !ok || stored.ChatID != event.ChatID || stored.SenderAppID != b.currentAppID ||
+			!repositoryAllowed(stored.Reference.Repository, b.allowedRepositories) {
+			continue
+		}
+		if selected != nil && *selected != stored.Reference {
+			return errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"conflicting stored GitHub references in reply chain",
+			)
+		}
+		ref := stored.Reference
+		selected = &ref
+	}
+	builder.GitHubReference = selected
+	return nil
 }
 
 type liveThreadState struct {
@@ -1449,6 +1960,8 @@ func newQueueBackfillCommand(out io.Writer, configPath, statePath *string) *cobr
 				AppID:           cfg.Lark.AppID,
 				AppSecret:       credentials.AppSecret,
 				UserAccessToken: credentials.UserAccessToken,
+				RefreshToken:    credentials.RefreshToken,
+				UserTokenStore:  serviceim.NewKeychainUserTokenStore(credentialRefs(cfg)),
 				BaseURL:         cfg.Lark.BaseURL,
 				Timeout:         30 * time.Second,
 			})
@@ -1467,6 +1980,7 @@ func newQueueBackfillCommand(out io.Writer, configPath, statePath *string) *cobr
 				agentRouter,
 				cfg,
 				chatQuery,
+				nil,
 				includePrivate,
 			)
 			result, err := poller.Backfill(cmd.Context(), poll.BackfillRequest{
@@ -1869,11 +2383,31 @@ func newDoctorCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 			if err != nil {
 				return err
 			}
+			githubToken, githubTokenErr := secretstore.Read(
+				cmd.Context(),
+				cfg.GitHub.TokenKeychainService,
+				cfg.GitHub.TokenKeychainKey,
+				"GITHUB_TOKEN",
+			)
 			return writeData(out, map[string]any{
 				"ok":        true,
 				"lark":      larkStatus,
 				"workspace": scope.Snapshot(),
 				"mode":      cfg.Policy.Mode,
+				"github": map[string]any{
+					"enabled":              cfg.GitHub.Enabled,
+					"read_only":            true,
+					"single_lark_listener": true,
+					"api_base_url":         cfg.GitHub.APIBaseURL,
+					"allowed_repositories": cfg.GitHub.AllowedRepositories,
+					"token_configured":     githubTokenErr == nil && githubToken != "",
+					"token_error":          errorString(githubTokenErr),
+				},
+				"reply_scopes": map[string]any{
+					"assistant_mentions": cfg.Assistant.ReplyScope,
+					"owner_mentions":     cfg.Policy.ReplyScope,
+				},
+				"reply_scope": cfg.Policy.ReplyScope,
 				"scheduler": map[string]any{
 					"fast_path_enabled":     cfg.FastPath.Enabled,
 					"foreground_workers":    cfg.Scheduler.ForegroundWorkers,
@@ -1913,6 +2447,8 @@ func checkLarkSDK(ctx context.Context, cfg config.Config) (map[string]any, error
 		AppID:           cfg.Lark.AppID,
 		AppSecret:       credentials.AppSecret,
 		UserAccessToken: credentials.UserAccessToken,
+		RefreshToken:    credentials.RefreshToken,
+		UserTokenStore:  serviceim.NewKeychainUserTokenStore(credentialRefs(cfg)),
 		BaseURL:         cfg.Lark.BaseURL,
 		Timeout:         15 * time.Second,
 	})

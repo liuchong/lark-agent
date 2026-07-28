@@ -1,0 +1,29 @@
+name: Lark workflow notification
+description: Send trusted GitHub workflow facts to Lark without starting a second event listener
+inputs:
+  lark_app_id:
+    description: Lark application ID
+    required: true
+  lark_app_secret:
+    description: Lark application secret from a protected GitHub Environment
+    required: true
+  lark_chat_id:
+    description: Exact destination Lark chat ID
+    required: true
+  github_token:
+    description: Read-only GitHub token, normally github.token
+    required: true
+  lark_base_url:
+    description: Explicit Lark or Feishu OpenAPI base URL
+    required: true
+runs:
+  using: docker
+  image: Dockerfile
+  env:
+    LARK_AGENT_APP_ID: ${{ inputs.lark_app_id }}
+    LARK_AGENT_APP_SECRET: ${{ inputs.lark_app_secret }}
+    LARK_AGENT_LARK_BASE_URL: ${{ inputs.lark_base_url }}
+    GITHUB_TOKEN: ${{ inputs.github_token }}
+  args:
+    - --chat-id
+    - ${{ inputs.lark_chat_id }}

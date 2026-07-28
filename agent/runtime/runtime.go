@@ -130,8 +130,9 @@ func ParseDecision(raw string) (domain.Decision, error) {
 	var payload struct {
 		Decision            string             `json:"decision"`
 		RelevanceConfidence float64            `json:"relevance_confidence"`
-		ReplyConfidence     float64            `json:"reply_confidence"`
+		ReplyConfidence     *float64           `json:"reply_confidence"`
 		Risk                string             `json:"risk"`
+		EvidenceStatus      string             `json:"evidence_status"`
 		ReplyText           string             `json:"reply_text"`
 		OwnerAction         string             `json:"owner_action"`
 		Reason              string             `json:"reason"`
@@ -156,7 +157,29 @@ func ParseDecision(raw string) (domain.Decision, error) {
 	default:
 		return domain.Decision{}, errs.NewInternalError(errs.SubtypeInvalidResponse, "invalid model risk: %s", payload.Risk)
 	}
-	confidence := payload.ReplyConfidence
+	evidenceStatus := domain.EvidenceStatus(payload.EvidenceStatus)
+	if evidenceStatus == "" {
+		evidenceStatus = domain.EvidenceVerified
+	}
+	switch evidenceStatus {
+	case domain.EvidenceVerified, domain.EvidenceInsufficient:
+	default:
+		return domain.Decision{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"invalid evidence_status: %s",
+			payload.EvidenceStatus,
+		)
+	}
+	if kind == domain.DecisionReply && payload.ReplyConfidence == nil {
+		return domain.Decision{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"reply decision missing reply_confidence",
+		)
+	}
+	confidence := 0.0
+	if payload.ReplyConfidence != nil {
+		confidence = *payload.ReplyConfidence
+	}
 	if kind != domain.DecisionReply && confidence == 0 {
 		confidence = payload.RelevanceConfidence
 	}
@@ -172,14 +195,15 @@ func ParseDecision(raw string) (domain.Decision, error) {
 		)
 	}
 	return domain.Decision{
-		Kind:        kind,
-		Relevance:   relevanceFor(payload.RelevanceConfidence, kind),
-		Confidence:  confidence,
-		Risk:        risk,
-		Reason:      payload.Reason,
-		ReplyText:   strings.TrimSpace(payload.ReplyText),
-		OwnerAction: strings.TrimSpace(payload.OwnerAction),
-		Sources:     payload.SourceRefs,
+		Kind:           kind,
+		Relevance:      relevanceFor(payload.RelevanceConfidence, kind),
+		Confidence:     confidence,
+		Risk:           risk,
+		EvidenceStatus: evidenceStatus,
+		Reason:         payload.Reason,
+		ReplyText:      strings.TrimSpace(payload.ReplyText),
+		OwnerAction:    strings.TrimSpace(payload.OwnerAction),
+		Sources:        payload.SourceRefs,
 	}, nil
 }
 

@@ -337,6 +337,24 @@ func (s *Store) migrate() error {
 			`CREATE INDEX IF NOT EXISTS idx_resource_subscriptions_resource
 			 ON resource_subscriptions(resource_type, file_token, app_token, table_id)`,
 		}},
+		{version: 9, statements: []string{
+			`CREATE TABLE IF NOT EXISTS external_references (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				provider TEXT NOT NULL,
+				kind TEXT NOT NULL,
+				external_key TEXT NOT NULL,
+				lark_message_id TEXT NOT NULL,
+				chat_id TEXT NOT NULL,
+				sender_app_id TEXT NOT NULL,
+				reference_json TEXT NOT NULL,
+				reference_digest TEXT NOT NULL,
+				verified_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				UNIQUE(provider, lark_message_id)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_external_references_key
+			 ON external_references(provider, external_key)`,
+		}},
 	}
 	for _, migration := range migrations {
 		if version >= migration.version {
@@ -367,6 +385,183 @@ func (s *Store) migrate() error {
 		version = migration.version
 	}
 	return nil
+}
+
+// UpsertExternalReference persists an identical verified reference
+// idempotently and rejects any attempt to reuse the Lark message for a
+// different external object.
+func (s *Store) UpsertExternalReference(
+	ctx context.Context,
+	ref domain.ExternalReference,
+) (domain.ExternalReference, error) {
+	if strings.TrimSpace(ref.Provider) == "" ||
+		strings.TrimSpace(ref.Kind) == "" ||
+		strings.TrimSpace(ref.ExternalKey) == "" ||
+		strings.TrimSpace(ref.LarkMessageID) == "" ||
+		strings.TrimSpace(ref.ChatID) == "" ||
+		strings.TrimSpace(ref.SenderAppID) == "" {
+		return domain.ExternalReference{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"external reference identity fields are required",
+		)
+	}
+	if err := ref.Reference.Validate(); err != nil {
+		return domain.ExternalReference{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"invalid external reference",
+		).WithCause(err)
+	}
+	referenceJSON, err := json.Marshal(ref.Reference)
+	if err != nil {
+		return domain.ExternalReference{}, errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"encode external reference",
+		).WithCause(err)
+	}
+	sum := sha256.Sum256(referenceJSON)
+	digest := fmt.Sprintf("sha256:%x", sum[:])
+	now := time.Now().UTC()
+	if ref.VerifiedAt.IsZero() {
+		ref.VerifiedAt = now
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.ExternalReference{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin external reference transaction",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	existing, found, err := queryExternalReference(
+		tx.QueryRowContext(ctx, externalReferenceSelect+` WHERE provider = ? AND lark_message_id = ?`,
+			ref.Provider, ref.LarkMessageID),
+	)
+	if err != nil {
+		return domain.ExternalReference{}, err
+	}
+	if found {
+		if existing.ReferenceDigest != digest ||
+			existing.ExternalKey != ref.ExternalKey ||
+			existing.ChatID != ref.ChatID ||
+			existing.SenderAppID != ref.SenderAppID {
+			return domain.ExternalReference{}, errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"conflicting external reference for Lark message %s",
+				ref.LarkMessageID,
+			)
+		}
+		return existing, nil
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO external_references(
+			provider, kind, external_key, lark_message_id, chat_id, sender_app_id,
+			reference_json, reference_digest, verified_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ref.Provider,
+		ref.Kind,
+		ref.ExternalKey,
+		ref.LarkMessageID,
+		ref.ChatID,
+		ref.SenderAppID,
+		string(referenceJSON),
+		digest,
+		ref.VerifiedAt.UTC().Format(time.RFC3339Nano),
+		now.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return domain.ExternalReference{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"insert external reference",
+		).WithCause(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return domain.ExternalReference{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read external reference id",
+		).WithCause(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.ExternalReference{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit external reference",
+		).WithCause(err)
+	}
+	ref.ID = id
+	ref.ReferenceDigest = digest
+	ref.UpdatedAt = now
+	return ref, nil
+}
+
+const externalReferenceSelect = `SELECT id, provider, kind, external_key,
+	lark_message_id, chat_id, sender_app_id, reference_json, reference_digest,
+	verified_at, updated_at FROM external_references`
+
+// GetExternalReference reads one verified reference without changing work
+// admission or replay state.
+func (s *Store) GetExternalReference(
+	ctx context.Context,
+	provider string,
+	larkMessageID string,
+) (domain.ExternalReference, bool, error) {
+	return queryExternalReference(s.db.QueryRowContext(
+		ctx,
+		externalReferenceSelect+` WHERE provider = ? AND lark_message_id = ?`,
+		provider,
+		larkMessageID,
+	))
+}
+
+type externalReferenceRowScanner interface {
+	Scan(...any) error
+}
+
+func queryExternalReference(row externalReferenceRowScanner) (domain.ExternalReference, bool, error) {
+	var ref domain.ExternalReference
+	var referenceJSON, verifiedAt, updatedAt string
+	err := row.Scan(
+		&ref.ID,
+		&ref.Provider,
+		&ref.Kind,
+		&ref.ExternalKey,
+		&ref.LarkMessageID,
+		&ref.ChatID,
+		&ref.SenderAppID,
+		&referenceJSON,
+		&ref.ReferenceDigest,
+		&verifiedAt,
+		&updatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.ExternalReference{}, false, nil
+	}
+	if err != nil {
+		return domain.ExternalReference{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read external reference",
+		).WithCause(err)
+	}
+	if err := json.Unmarshal([]byte(referenceJSON), &ref.Reference); err != nil {
+		return domain.ExternalReference{}, false, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"decode stored external reference",
+		).WithCause(err)
+	}
+	ref.VerifiedAt, err = time.Parse(time.RFC3339Nano, verifiedAt)
+	if err != nil {
+		return domain.ExternalReference{}, false, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"parse external reference verified_at",
+		).WithCause(err)
+	}
+	ref.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt)
+	if err != nil {
+		return domain.ExternalReference{}, false, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"parse external reference updated_at",
+		).WithCause(err)
+	}
+	return ref, true, nil
 }
 
 // GetPollCursor returns the stored polling cursor for a scope.
@@ -1534,7 +1729,11 @@ func (s *Store) ClaimOwnerActivityCleanup(
 }
 
 // RequestReplyApproval creates or returns an exact draft-reply approval.
-func (s *Store) RequestReplyApproval(ctx context.Context, dedupKey, text, reason, ownerAction string) (int64, error) {
+func (s *Store) RequestReplyApproval(
+	ctx context.Context,
+	dedupKey, text, reason, ownerAction string,
+	relevance domain.Relevance,
+) (int64, error) {
 	var workItemID int64
 	if err := s.db.QueryRowContext(ctx, `SELECT id FROM work_items WHERE dedup_key = ?`, dedupKey).Scan(&workItemID); err != nil {
 		return 0, errs.NewInternalError(errs.SubtypeStorage, "locate reply approval work item").WithCause(err)
@@ -1543,11 +1742,12 @@ func (s *Store) RequestReplyApproval(ctx context.Context, dedupKey, text, reason
 		"text":         text,
 		"reason":       reason,
 		"owner_action": ownerAction,
+		"relevance":    string(relevance),
 	})
 	if err != nil {
 		return 0, errs.NewInternalError(errs.SubtypeUnknown, "encode reply approval request").WithCause(err)
 	}
-	key := replyActionKey(dedupKey, text, reason, ownerAction)
+	key := replyActionKey(dedupKey, text, reason, ownerAction, relevance)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO action_attempts(
@@ -1567,14 +1767,31 @@ func (s *Store) RequestReplyApproval(ctx context.Context, dedupKey, text, reason
 func (s *Store) ConsumeReplyApproval(
 	ctx context.Context,
 	dedupKey, text, reason, ownerAction string,
+	relevance domain.Relevance,
 ) (int64, bool, error) {
-	key := replyActionKey(dedupKey, text, reason, ownerAction)
+	key := replyActionKey(dedupKey, text, reason, ownerAction, relevance)
 	var actionID int64
 	err := s.db.QueryRowContext(ctx,
 		`SELECT id FROM action_attempts WHERE idempotency_key = ? AND status = ?`,
 		key, domain.ActionReady).Scan(&actionID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, false, nil
+		key = legacyReplyActionKey(dedupKey, text, reason, ownerAction)
+		err = s.db.QueryRowContext(ctx,
+			`SELECT id FROM action_attempts WHERE idempotency_key = ? AND status = ?`,
+			key, domain.ActionReady).Scan(&actionID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, false, nil
+		}
+		if err != nil {
+			return 0, false, errs.NewInternalError(errs.SubtypeStorage, "read approved reply action").WithCause(err)
+		}
+		legacyRelevance, found, legacyErr := s.replyApprovalDecisionRelevance(ctx, dedupKey)
+		if legacyErr != nil {
+			return 0, false, legacyErr
+		}
+		if !found || legacyRelevance != relevance {
+			return 0, false, nil
+		}
 	}
 	if err != nil {
 		return 0, false, errs.NewInternalError(errs.SubtypeStorage, "read approved reply action").WithCause(err)
@@ -1747,15 +1964,6 @@ func (s *Store) DecideAction(id int64, approve bool) error {
 		return errs.NewInternalError(errs.SubtypeStorage, "begin approval decision").WithCause(err)
 	}
 	defer tx.Rollback() //nolint:errcheck
-	var workItemID int64
-	if err := tx.QueryRow(
-		`SELECT work_item_id FROM action_attempts WHERE id = ? AND status = ?`,
-		id, domain.ActionAwaitingApproval).Scan(&workItemID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return errs.NewValidationError(errs.SubtypeFailedPrecondition, "action %d is not awaiting approval", id)
-		}
-		return errs.NewInternalError(errs.SubtypeStorage, "read pending approval").WithCause(err)
-	}
 	actionStatus := domain.ActionReady
 	workStatus := domain.StatusReceived
 	if !approve {
@@ -1763,9 +1971,17 @@ func (s *Store) DecideAction(id int64, approve bool) error {
 		workStatus = domain.StatusCancelled
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := tx.Exec(
-		`UPDATE action_attempts SET status = ?, updated_at = ? WHERE id = ?`,
-		actionStatus, now, id); err != nil {
+	var workItemID int64
+	if err := tx.QueryRow(
+		`UPDATE action_attempts
+		 SET status = ?, updated_at = ?
+		 WHERE id = ? AND status = ?
+		 RETURNING work_item_id`,
+		actionStatus, now, id, domain.ActionAwaitingApproval,
+	).Scan(&workItemID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errs.NewValidationError(errs.SubtypeFailedPrecondition, "action %d is not awaiting approval", id)
+		}
 		return errs.NewInternalError(errs.SubtypeStorage, "update approval decision").WithCause(err)
 	}
 	if _, err := tx.Exec(
@@ -1793,11 +2009,14 @@ func (s *Store) DecideAction(id int64, approve bool) error {
 // without another nondeterministic model call.
 func (s *Store) ReadyApprovedReply(workItemID int64) (domain.Decision, bool, error) {
 	var requestJSON string
+	var decisionJSON string
 	err := s.db.QueryRow(
-		`SELECT request_json FROM action_attempts
-		 WHERE work_item_id = ? AND kind = 'reply' AND status = ?
-		 ORDER BY id LIMIT 1`,
-		workItemID, domain.ActionReady).Scan(&requestJSON)
+		`SELECT a.request_json, COALESCE(w.decision_json, '')
+		 FROM action_attempts a
+		 JOIN work_items w ON w.id = a.work_item_id
+		 WHERE a.work_item_id = ? AND a.kind = 'reply' AND a.status = ?
+		 ORDER BY a.id LIMIT 1`,
+		workItemID, domain.ActionReady).Scan(&requestJSON, &decisionJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Decision{}, false, nil
 	}
@@ -1808,6 +2027,7 @@ func (s *Store) ReadyApprovedReply(workItemID int64) (domain.Decision, bool, err
 		Text        string `json:"text"`
 		Reason      string `json:"reason"`
 		OwnerAction string `json:"owner_action"`
+		Relevance   string `json:"relevance"`
 	}
 	if err := json.Unmarshal([]byte(requestJSON), &request); err != nil {
 		return domain.Decision{}, false, errs.NewInternalError(errs.SubtypeStorage, "decode approved reply draft").WithCause(err)
@@ -1815,10 +2035,34 @@ func (s *Store) ReadyApprovedReply(workItemID int64) (domain.Decision, bool, err
 	if strings.TrimSpace(request.Text) == "" {
 		return domain.Decision{}, false, errs.NewInternalError(errs.SubtypeStorage, "approved reply draft is empty")
 	}
+	relevance := domain.Relevance(request.Relevance)
+	if relevance == "" {
+		var persisted domain.Decision
+		if strings.TrimSpace(decisionJSON) == "" {
+			return domain.Decision{}, false, errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"legacy approved reply is missing durable decision relevance",
+			)
+		}
+		if err := json.Unmarshal([]byte(decisionJSON), &persisted); err != nil {
+			return domain.Decision{}, false, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"decode legacy approved reply decision",
+			).WithCause(err)
+		}
+		relevance = persisted.Relevance
+	}
+	if !validReplyApprovalRelevance(relevance) {
+		return domain.Decision{}, false, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"approved reply has invalid relevance %q",
+			relevance,
+		)
+	}
 	return domain.Decision{
 		Kind:        domain.DecisionReply,
 		Mode:        domain.ModeApproval,
-		Relevance:   domain.RelevanceInferred,
+		Relevance:   relevance,
 		Confidence:  1,
 		Risk:        domain.RiskLow,
 		Reason:      request.Reason,
@@ -1832,11 +2076,73 @@ func shellActionKey(dedupKey, command, cwd string) string {
 	return fmt.Sprintf("shell:%x", sum[:])
 }
 
-func replyActionKey(dedupKey, text, reason, ownerAction string) string {
+func replyActionKey(
+	dedupKey, text, reason, ownerAction string,
+	relevance domain.Relevance,
+) string {
+	sum := sha256.Sum256([]byte(
+		dedupKey + "\x00" + text + "\x00" + reason + "\x00" + ownerAction +
+			"\x00" + string(relevance),
+	))
+	return fmt.Sprintf("reply:%x", sum[:])
+}
+
+func legacyReplyActionKey(dedupKey, text, reason, ownerAction string) string {
 	sum := sha256.Sum256([]byte(
 		dedupKey + "\x00" + text + "\x00" + reason + "\x00" + ownerAction,
 	))
 	return fmt.Sprintf("reply:%x", sum[:])
+}
+
+func (s *Store) replyApprovalDecisionRelevance(
+	ctx context.Context,
+	dedupKey string,
+) (domain.Relevance, bool, error) {
+	var decisionJSON string
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT COALESCE(decision_json, '') FROM work_items WHERE dedup_key = ?`,
+		dedupKey,
+	).Scan(&decisionJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read reply approval work decision",
+		).WithCause(err)
+	}
+	if strings.TrimSpace(decisionJSON) == "" {
+		return "", false, nil
+	}
+	var decision domain.Decision
+	if err := json.Unmarshal([]byte(decisionJSON), &decision); err != nil {
+		return "", false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"decode reply approval work decision",
+		).WithCause(err)
+	}
+	if !validReplyApprovalRelevance(decision.Relevance) {
+		return "", false, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"reply approval work decision has invalid relevance %q",
+			decision.Relevance,
+		)
+	}
+	return decision.Relevance, true, nil
+}
+
+func validReplyApprovalRelevance(relevance domain.Relevance) bool {
+	switch relevance {
+	case domain.RelevanceDirectMention,
+		domain.RelevanceInferred,
+		domain.RelevanceOwnerRequest,
+		domain.RelevanceAssistantRequest:
+		return true
+	default:
+		return false
+	}
 }
 
 func postReplyNotificationActionKey(dedupKey string, decisionJSON []byte) string {

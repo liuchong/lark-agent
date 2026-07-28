@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/liuchong/lark-agent/agent/config"
+	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
 	"github.com/liuchong/lark-agent/agent/storage"
 	serviceim "github.com/liuchong/lark-agent/internal/lark"
@@ -146,6 +148,51 @@ func (f configuredPollerIM) SearchMessages(_ context.Context, req serviceim.Sear
 	return serviceim.SearchMessagesResult{Items: []serviceim.Message{f.message}}, nil
 }
 
+type chatSearchCaller struct {
+	requests  []serviceim.APIRequest
+	responses map[string]map[string]any
+}
+
+func (f *chatSearchCaller) CallAPI(_ context.Context, req serviceim.APIRequest) (any, error) {
+	f.requests = append(f.requests, req)
+	pageToken, _ := req.Params["page_token"].(string)
+	data := f.responses[pageToken]
+	if data == nil {
+		data = map[string]any{}
+	}
+	return map[string]any{
+		"data": data,
+	}, nil
+}
+
+type failingMessageContextCaller struct{}
+
+func (failingMessageContextCaller) CallAPI(context.Context, serviceim.APIRequest) (any, error) {
+	return nil, errors.New("Authentication token expired. Please request a new one.")
+}
+
+func TestConversationBuilderContinuesWhenLarkHistoryIsUnavailable(t *testing.T) {
+	builder := &conversationBuilder{
+		svc:                serviceim.NewService(failingMessageContextCaller{}, "ou_owner"),
+		includeLarkContext: true,
+		base:               agentcontext.Builder{},
+	}
+	bundle, err := builder.Build(domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_context_unavailable",
+		ChatID:    "oc_private",
+		Content:   "请继续处理这个问题",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bundle.ContextSelection.Incomplete ||
+		bundle.ContextSelection.AnchorMessageID != "om_context_unavailable" ||
+		bundle.ContextSelection.Reason != "lark_context_unavailable" ||
+		len(bundle.Conversation) != 0 {
+		t.Fatalf("bundle=%+v", bundle)
+	}
+}
+
 func TestConfiguredLivePollerPersistsRouterPriority(t *testing.T) {
 	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -167,7 +214,7 @@ func TestConfiguredLivePollerPersistsRouterPriority(t *testing.T) {
 		SenderOpenID: "owner", Content: "@_user_1 ping",
 		Mentions:   []domain.Mention{{OpenID: "assistant", Name: "Agent"}},
 		CreateTime: time.Now().UTC().Format(time.RFC3339),
-	}}, store, r, cfg, "Test Group", true)
+	}}, store, r, cfg, "Test Group", nil, true)
 	if _, err := poller.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -214,6 +261,9 @@ func TestLiveOptionsWithoutUserTokenDoNotExposeUserContextTools(t *testing.T) {
 	if realtimeRunner == nil {
 		t.Fatal("realtime owner-request source should still be configured")
 	}
+	if info["realtime_owner_requests"] != true || info["realtime_requests"] != true {
+		t.Fatalf("realtime compatibility fields=%+v", info)
+	}
 	if info["user_polling"] != false || info["user_context"] != false || info["user_token"] != "missing" {
 		t.Fatalf("info=%+v", info)
 	}
@@ -222,6 +272,83 @@ func TestLiveOptionsWithoutUserTokenDoNotExposeUserContextTools(t *testing.T) {
 	}
 	if len(options) == 0 {
 		t.Fatal("expected daemon options")
+	}
+}
+
+func TestConfiguredGroupsReplyScopesRequireChatQuery(t *testing.T) {
+	if err := validateLiveReplyScopes(domain.ReplyScopeAllGroups, domain.ReplyScopeConfiguredGroups, ""); err == nil ||
+		!strings.Contains(err.Error(), "policy.reply_scope") ||
+		!strings.Contains(err.Error(), "--chat-query") {
+		t.Fatalf("missing delegated configured-groups validation: %v", err)
+	}
+	if err := validateLiveReplyScopes(domain.ReplyScopeConfiguredGroups, domain.ReplyScopeAllGroups, ""); err == nil ||
+		!strings.Contains(err.Error(), "assistant.reply_scope") ||
+		!strings.Contains(err.Error(), "--chat-query") {
+		t.Fatalf("missing assistant configured-groups validation: %v", err)
+	}
+	if err := validateLiveReplyScopes(
+		domain.ReplyScopeConfiguredGroups,
+		domain.ReplyScopeConfiguredGroups,
+		"龙虾群",
+	); err != nil {
+		t.Fatalf("configured groups with query rejected: %v", err)
+	}
+	if err := validateLiveReplyScopes(
+		domain.ReplyScopeAllGroups,
+		domain.ReplyScopeAllGroups,
+		"",
+	); err != nil {
+		t.Fatalf("all groups without query rejected: %v", err)
+	}
+}
+
+func TestConfiguredAssistantChatsResolveEveryPageWithBotIdentity(t *testing.T) {
+	caller := &chatSearchCaller{responses: map[string]map[string]any{
+		"": {
+			"items": []any{map[string]any{"meta_data": map[string]any{
+				"chat_id": "oc_lobster",
+				"name":    "龙虾群🦞",
+			}}},
+			"has_more":   true,
+			"page_token": "next",
+		},
+		"next": {
+			"items": []any{map[string]any{"meta_data": map[string]any{
+				"chat_id": "oc_second",
+				"name":    "第二个配置群",
+			}}},
+		},
+	}}
+	chatIDs, err := discoverConfiguredAssistantChats(
+		context.Background(),
+		serviceim.NewService(caller, "ou_owner"),
+		"龙虾群",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chatIDs) != 2 || chatIDs[0] != "oc_lobster" || chatIDs[1] != "oc_second" {
+		t.Fatalf("chat IDs=%v", chatIDs)
+	}
+	if len(caller.requests) != 2 ||
+		caller.requests[0].As != serviceim.IdentityBot ||
+		caller.requests[1].As != serviceim.IdentityBot ||
+		caller.requests[1].Params["page_token"] != "next" {
+		t.Fatalf("search requests=%+v", caller.requests)
+	}
+}
+
+func TestConfiguredAssistantChatsFailWhenBotSeesNoMatch(t *testing.T) {
+	caller := &chatSearchCaller{responses: map[string]map[string]any{}}
+	_, err := discoverConfiguredAssistantChats(
+		context.Background(),
+		serviceim.NewService(caller, "ou_owner"),
+		"missing",
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "assistant.reply_scope") ||
+		!strings.Contains(err.Error(), "no bot-visible group") {
+		t.Fatalf("error=%v", err)
 	}
 }
 
@@ -242,7 +369,8 @@ func TestAgentConfigFingerprintIncludesDecisionToolContract(t *testing.T) {
 	if contract.SubmitDecisionName != "submit_decision" ||
 		!strings.Contains(contract.SubmitDecisionDescription, "structured decision") ||
 		!strings.Contains(contract.SubmitDecisionSchema, `"decision"`) ||
-		!strings.Contains(contract.SubmitDecisionSchema, "unknowns remain") {
+		!strings.Contains(contract.SubmitDecisionSchema, `"evidence_status"`) ||
+		!strings.Contains(contract.SubmitDecisionSchema, "canonical evidence-limited response") {
 		t.Fatalf("incomplete current operating contract: %+v", contract)
 	}
 }

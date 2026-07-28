@@ -48,14 +48,16 @@ type Store interface {
 
 // Config controls user-message polling.
 type Config struct {
-	OwnerOpenID    string
-	ChatQuery      string
-	AssistantNames []string
-	IncludePrivate bool
-	PageSize       int
-	IndexLookback  time.Duration
-	Now            func() time.Time
-	Classify       func(context.Context, domain.WorkItem) (domain.Decision, error)
+	OwnerOpenID                string
+	ChatQuery                  string
+	AssistantOpenIDs           []string
+	AssistantNames             []string
+	ConfiguredAssistantChatIDs []string
+	IncludePrivate             bool
+	PageSize                   int
+	IndexLookback              time.Duration
+	Now                        func() time.Time
+	Classify                   func(context.Context, domain.WorkItem) (domain.Decision, error)
 }
 
 // Result summarizes a poll cycle.
@@ -87,15 +89,16 @@ type BackfillResult struct {
 
 // Poller discovers visible conversations and ingests new messages.
 type Poller struct {
-	im            IMClient
-	store         Store
-	cfg           Config
-	testChats     map[string]serviceim.Chat
-	chatDetails   map[string]serviceim.Chat
-	discovered    bool
-	pageSize      int
-	indexLookback time.Duration
-	currentTime   func() time.Time
+	im               IMClient
+	store            Store
+	cfg              Config
+	testChats        map[string]serviceim.Chat
+	assistantChatIDs map[string]bool
+	chatDetails      map[string]serviceim.Chat
+	discovered       bool
+	pageSize         int
+	indexLookback    time.Duration
+	currentTime      func() time.Time
 }
 
 // New creates a user-message poller.
@@ -115,15 +118,22 @@ func New(im IMClient, store Store, cfg Config) *Poller {
 	if indexLookback <= 0 {
 		indexLookback = 2 * time.Minute
 	}
+	assistantChatIDs := make(map[string]bool, len(cfg.ConfiguredAssistantChatIDs))
+	for _, chatID := range cfg.ConfiguredAssistantChatIDs {
+		if chatID = strings.TrimSpace(chatID); chatID != "" {
+			assistantChatIDs[chatID] = true
+		}
+	}
 	return &Poller{
-		im:            im,
-		store:         store,
-		cfg:           cfg,
-		testChats:     map[string]serviceim.Chat{},
-		chatDetails:   map[string]serviceim.Chat{},
-		pageSize:      pageSize,
-		indexLookback: indexLookback,
-		currentTime:   now,
+		im:               im,
+		store:            store,
+		cfg:              cfg,
+		testChats:        map[string]serviceim.Chat{},
+		assistantChatIDs: assistantChatIDs,
+		chatDetails:      map[string]serviceim.Chat{},
+		pageSize:         pageSize,
+		indexLookback:    indexLookback,
+		currentTime:      now,
 	}
 }
 
@@ -372,6 +382,9 @@ func (p *Poller) Poll(ctx context.Context) (Result, error) {
 	result.Seen = len(seen)
 	for _, msg := range seen {
 		event := p.eventFromMessage(msg, mentioned[msg.MessageID])
+		if p.nonOwnerAssistantMention(event) {
+			continue
+		}
 		item := domain.NewWorkItem(event)
 		if p.cfg.Classify != nil {
 			decision, err := p.cfg.Classify(ctx, item)
@@ -393,6 +406,30 @@ func (p *Poller) Poll(ctx context.Context) (Result, error) {
 		return result, err
 	}
 	return result, nil
+}
+
+func (p *Poller) nonOwnerAssistantMention(event domain.NormalizedEvent) bool {
+	if event.SenderID == p.cfg.OwnerOpenID {
+		return false
+	}
+	for _, assistantOpenID := range p.cfg.AssistantOpenIDs {
+		if strings.TrimSpace(assistantOpenID) == "" {
+			continue
+		}
+		if event.MentionsUser(assistantOpenID) {
+			return true
+		}
+	}
+	for _, mention := range event.Mentions {
+		for _, assistantName := range p.cfg.AssistantNames {
+			assistantName = strings.TrimSpace(assistantName)
+			if assistantName != "" &&
+				strings.EqualFold(strings.TrimSpace(mention.Name), assistantName) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (p *Poller) hydrateChatMetadata(ctx context.Context, messages map[string]serviceim.Message) error {
@@ -659,6 +696,7 @@ func (p *Poller) eventFromMessage(msg serviceim.Message, mentionedOwner bool) do
 		CreatedAt:        parseMessageTime(msg.CreateTime),
 		RawDigest:        digestMessage(msg),
 		InTestScope:      chat.ChatID != "",
+		InAssistantScope: p.assistantChatIDs[msg.ChatID],
 	}
 }
 

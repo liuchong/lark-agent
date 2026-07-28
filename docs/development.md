@@ -15,6 +15,7 @@ Go SDK，并把 SDK HTTP 响应或 WebSocket 事件转为有类型数据。
 - `agent/cmd`：命令、daemon 组合和公开 help。
 - `agent/storage`：SQLite 接收回执、工作队列、动作和恢复。
 - `internal/lark`：唯一飞书 SDK 适配层。
+- `internal/github`：唯一 GitHub HTTP、事件解析和可信通知适配层。
 - `integration_test/lark_agent`：跨包行为和隔离安装验收。
 - `spec`：合并后长期行为、架构和资源订阅契约。
 
@@ -43,6 +44,7 @@ go test -race ./...
 go vet ./...
 go mod tidy
 go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.1.6 run
+actionlint .github/workflows/lark-notify.yml
 ```
 
 并确认：
@@ -61,3 +63,13 @@ go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.1.6 run
 内部包。
 
 live 验收必须在代码完成验证、提交并安装该提交之后执行；不得部署未提交二进制。
+
+## GitHub Action 边界测试
+
+`workflow_run` 具有读取受保护 secret 的能力，因此必须把触发事件全部当作不可信
+数据。集成测试必须证明工作流只检出默认分支的 Action 实现，不引用触发 run 的
+`head_sha`，不下载 artifacts，也没有执行 PR 内容的 `run` 步骤。
+
+本地可用 `github notify --dry-run` 验证消息结构。真实同账号并发验收时，只启动现有
+daemon 的一个 WebSocket 消费者，再独立运行一次 HTTP-only notify；不能为 Action
+启动第二个 daemon。消息必须发送到用户明确授权的精确 chat ID，不能按群名猜测。

@@ -4,6 +4,8 @@ package domain
 
 import (
 	"fmt"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -24,6 +26,24 @@ func ParseMode(raw string) (Mode, error) {
 		return Mode(raw), nil
 	default:
 		return "", fmt.Errorf("unsupported mode %q", raw)
+	}
+}
+
+// ReplyScope controls which groups permit one configured reply entry point.
+type ReplyScope string
+
+const (
+	ReplyScopeAllGroups        ReplyScope = "all_groups"
+	ReplyScopeConfiguredGroups ReplyScope = "configured_groups"
+)
+
+// ParseReplyScope validates a user-visible reply scope.
+func ParseReplyScope(raw string) (ReplyScope, error) {
+	switch ReplyScope(raw) {
+	case ReplyScopeAllGroups, ReplyScopeConfiguredGroups:
+		return ReplyScope(raw), nil
+	default:
+		return "", fmt.Errorf("unsupported reply scope %q", raw)
 	}
 }
 
@@ -73,6 +93,7 @@ type NormalizedEvent struct {
 	RawDigest        string      `json:"raw_digest,omitempty" yaml:"raw_digest,omitempty"`
 	WorkspaceID      string      `json:"workspace_id,omitempty" yaml:"workspace_id,omitempty"`
 	InTestScope      bool        `json:"in_test_scope,omitempty" yaml:"in_test_scope,omitempty"`
+	InAssistantScope bool        `json:"in_assistant_scope,omitempty" yaml:"in_assistant_scope,omitempty"`
 }
 
 // ContextMode describes how same-chat messages were selected around a target.
@@ -154,6 +175,96 @@ type ResourceSubscription struct {
 	LastError            string                     `json:"last_error,omitempty" yaml:"last_error,omitempty"`
 	CreatedAt            time.Time                  `json:"created_at" yaml:"created_at"`
 	UpdatedAt            time.Time                  `json:"updated_at" yaml:"updated_at"`
+}
+
+// GitHubReferenceKind identifies the trusted external object behind one Lark
+// notification.
+type GitHubReferenceKind string
+
+const (
+	GitHubReferenceWorkflowRun GitHubReferenceKind = "workflow_run"
+	GitHubReferencePullRequest GitHubReferenceKind = "pull_request"
+)
+
+// GitHubReference is trusted only after the Lark relation and app sender are
+// verified outside the model.
+type GitHubReference struct {
+	SchemaVersion      int                 `json:"schema_version" yaml:"schema_version"`
+	Repository         string              `json:"repository" yaml:"repository"`
+	Kind               GitHubReferenceKind `json:"kind" yaml:"kind"`
+	WorkflowRunID      int64               `json:"workflow_run_id,omitempty" yaml:"workflow_run_id,omitempty"`
+	WorkflowRunAttempt int                 `json:"workflow_run_attempt,omitempty" yaml:"workflow_run_attempt,omitempty"`
+	PullRequestNumber  int                 `json:"pull_request_number,omitempty" yaml:"pull_request_number,omitempty"`
+	HeadSHA            string              `json:"head_sha,omitempty" yaml:"head_sha,omitempty"`
+	HTMLURL            string              `json:"html_url,omitempty" yaml:"html_url,omitempty"`
+}
+
+var (
+	gitHubRepositoryPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+	gitHubSHAPattern        = regexp.MustCompile(`^[a-fA-F0-9]{40}([a-fA-F0-9]{24})?$`)
+)
+
+func (r GitHubReference) Validate() error {
+	if r.SchemaVersion != 1 {
+		return fmt.Errorf("unsupported github reference schema version %d", r.SchemaVersion)
+	}
+	if !gitHubRepositoryPattern.MatchString(r.Repository) {
+		return fmt.Errorf("invalid github repository %q", r.Repository)
+	}
+	switch r.Kind {
+	case GitHubReferenceWorkflowRun:
+		if r.WorkflowRunID <= 0 {
+			return fmt.Errorf("github workflow_run_id must be positive")
+		}
+		if r.WorkflowRunAttempt < 0 {
+			return fmt.Errorf("github workflow_run_attempt cannot be negative")
+		}
+	case GitHubReferencePullRequest:
+		if r.PullRequestNumber <= 0 {
+			return fmt.Errorf("github pull_request_number must be positive")
+		}
+	default:
+		return fmt.Errorf("unsupported github reference kind %q", r.Kind)
+	}
+	if r.PullRequestNumber < 0 {
+		return fmt.Errorf("github pull_request_number cannot be negative")
+	}
+	if r.HeadSHA != "" && !gitHubSHAPattern.MatchString(r.HeadSHA) {
+		return fmt.Errorf("invalid github head_sha")
+	}
+	if r.HTMLURL != "" {
+		parsed, err := url.Parse(r.HTMLURL)
+		if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+			return fmt.Errorf("invalid github html_url")
+		}
+	}
+	return nil
+}
+
+func (r GitHubReference) ExternalKey() string {
+	switch r.Kind {
+	case GitHubReferenceWorkflowRun:
+		return fmt.Sprintf("%s:workflow_run:%d:%d", r.Repository, r.WorkflowRunID, r.WorkflowRunAttempt)
+	case GitHubReferencePullRequest:
+		return fmt.Sprintf("%s:pull_request:%d", r.Repository, r.PullRequestNumber)
+	default:
+		return ""
+	}
+}
+
+// ExternalReference is one verified Lark-message-to-external-object binding.
+type ExternalReference struct {
+	ID              int64           `json:"id" yaml:"id"`
+	Provider        string          `json:"provider" yaml:"provider"`
+	Kind            string          `json:"kind" yaml:"kind"`
+	ExternalKey     string          `json:"external_key" yaml:"external_key"`
+	LarkMessageID   string          `json:"lark_message_id" yaml:"lark_message_id"`
+	ChatID          string          `json:"chat_id" yaml:"chat_id"`
+	SenderAppID     string          `json:"sender_app_id" yaml:"sender_app_id"`
+	Reference       GitHubReference `json:"reference" yaml:"reference"`
+	ReferenceDigest string          `json:"reference_digest" yaml:"reference_digest"`
+	VerifiedAt      time.Time       `json:"verified_at" yaml:"verified_at"`
+	UpdatedAt       time.Time       `json:"updated_at" yaml:"updated_at"`
 }
 
 // IntakeDisposition records whether an observed event entered the work queue.
@@ -377,10 +488,11 @@ const (
 type Relevance string
 
 const (
-	RelevanceNone          Relevance = "none"
-	RelevanceDirectMention Relevance = "direct_mention"
-	RelevanceInferred      Relevance = "inferred"
-	RelevanceOwnerRequest  Relevance = "owner_request"
+	RelevanceNone             Relevance = "none"
+	RelevanceDirectMention    Relevance = "direct_mention"
+	RelevanceInferred         Relevance = "inferred"
+	RelevanceOwnerRequest     Relevance = "owner_request"
+	RelevanceAssistantRequest Relevance = "assistant_request"
 )
 
 // Risk is a policy classification for proposed side effects.
@@ -393,19 +505,29 @@ const (
 	RiskForbidden Risk = "forbidden"
 )
 
+// EvidenceStatus records whether a reply makes a verified claim or stops at
+// an evidence-limited result.
+type EvidenceStatus string
+
+const (
+	EvidenceVerified     EvidenceStatus = "verified"
+	EvidenceInsufficient EvidenceStatus = "insufficient"
+)
+
 // Decision is an auditable routing or agent decision.
 type Decision struct {
-	Kind        DecisionKind `json:"kind" yaml:"kind"`
-	Mode        Mode         `json:"mode" yaml:"mode"`
-	Relevance   Relevance    `json:"relevance" yaml:"relevance"`
-	WorkKind    WorkKind     `json:"work_kind,omitempty" yaml:"work_kind,omitempty"`
-	Priority    int          `json:"priority,omitempty" yaml:"priority,omitempty"`
-	Confidence  float64      `json:"confidence" yaml:"confidence"`
-	Risk        Risk         `json:"risk" yaml:"risk"`
-	Reason      string       `json:"reason" yaml:"reason"`
-	ReplyText   string       `json:"reply_text,omitempty" yaml:"reply_text,omitempty"`
-	OwnerAction string       `json:"owner_action,omitempty" yaml:"owner_action,omitempty"`
-	Sources     []SourceRef  `json:"sources,omitempty" yaml:"sources,omitempty"`
+	Kind           DecisionKind   `json:"kind" yaml:"kind"`
+	Mode           Mode           `json:"mode" yaml:"mode"`
+	Relevance      Relevance      `json:"relevance" yaml:"relevance"`
+	WorkKind       WorkKind       `json:"work_kind,omitempty" yaml:"work_kind,omitempty"`
+	Priority       int            `json:"priority,omitempty" yaml:"priority,omitempty"`
+	Confidence     float64        `json:"confidence" yaml:"confidence"`
+	Risk           Risk           `json:"risk" yaml:"risk"`
+	EvidenceStatus EvidenceStatus `json:"evidence_status,omitempty" yaml:"evidence_status,omitempty"`
+	Reason         string         `json:"reason" yaml:"reason"`
+	ReplyText      string         `json:"reply_text,omitempty" yaml:"reply_text,omitempty"`
+	OwnerAction    string         `json:"owner_action,omitempty" yaml:"owner_action,omitempty"`
+	Sources        []SourceRef    `json:"sources,omitempty" yaml:"sources,omitempty"`
 }
 
 // SourceRef identifies a source that may be shown to the model or owner.

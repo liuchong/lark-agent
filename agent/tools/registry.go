@@ -54,11 +54,15 @@ type ToolReceipt struct {
 
 // Definition binds a model-visible schema to its controlled implementation.
 type Definition struct {
-	Info       *schema.ToolInfo
-	Permission ToolPermission
-	Risk       ToolRisk
-	SideEffect bool
-	Execute    func(context.Context, json.RawMessage) (Execution, error)
+	Info                    *schema.ToolInfo
+	Permission              ToolPermission
+	Risk                    ToolRisk
+	SideEffect              bool
+	OwnerOnly               bool
+	NonOwnerReadOnly        bool
+	SameChatArgument        string
+	RequiresGitHubReference bool
+	Execute                 func(context.Context, json.RawMessage) (Execution, error)
 }
 
 // Registry is the sole model-callable tool catalog.
@@ -67,6 +71,15 @@ type Registry struct {
 }
 
 type workItemContextKey struct{}
+type invocationScopeContextKey struct{}
+
+// InvocationScope is derived from durable sender identity and source chat.
+type InvocationScope struct {
+	Owner           bool
+	ReadOnly        bool
+	ChatID          string
+	GitHubReference *domain.GitHubReference
+}
 
 // WithWorkItemDedup makes the current durable work identity available to tools.
 func WithWorkItemDedup(ctx context.Context, dedupKey string) context.Context {
@@ -76,6 +89,16 @@ func WithWorkItemDedup(ctx context.Context, dedupKey string) context.Context {
 func workItemDedup(ctx context.Context) string {
 	value, _ := ctx.Value(workItemContextKey{}).(string)
 	return value
+}
+
+// WithInvocationScope binds non-model-authored tool authority to one run.
+func WithInvocationScope(ctx context.Context, scope InvocationScope) context.Context {
+	return context.WithValue(ctx, invocationScopeContextKey{}, scope)
+}
+
+func invocationScope(ctx context.Context) (InvocationScope, bool) {
+	value, ok := ctx.Value(invocationScopeContextKey{}).(InvocationScope)
+	return value, ok
 }
 
 // NewRegistry validates and indexes model-callable tools.
@@ -101,11 +124,19 @@ func NewRegistry(definitions ...Definition) (*Registry, error) {
 
 // Infos returns a deterministic model tool catalog.
 func (r *Registry) Infos() []*schema.ToolInfo {
+	return r.InfosFor(InvocationScope{Owner: true})
+}
+
+// InfosFor returns only tools visible under the durable invocation scope.
+func (r *Registry) InfosFor(scope InvocationScope) []*schema.ToolInfo {
 	if r == nil {
 		return nil
 	}
 	names := make([]string, 0, len(r.definitions))
-	for name := range r.definitions {
+	for name, definition := range r.definitions {
+		if !toolAllowedForScope(definition, scope) {
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -132,6 +163,48 @@ func (r *Registry) Execute(ctx context.Context, name string, arguments json.RawM
 			name,
 		)
 	}
+	if scope, scoped := invocationScope(ctx); scoped {
+		if !toolAllowedForScope(definition, scope) {
+			return Execution{}, errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"invocation scope denies tool execution: %s",
+				name,
+			)
+		}
+		if definition.RequiresGitHubReference && scope.GitHubReference == nil {
+			return Execution{}, errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"tool requires a verified GitHub reference: %s",
+				name,
+			)
+		}
+		if !scope.Owner && definition.SameChatArgument != "" {
+			var argumentsObject map[string]json.RawMessage
+			if err := json.Unmarshal(arguments, &argumentsObject); err != nil {
+				return Execution{}, errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"tool arguments must be a JSON object: %s",
+					name,
+				).WithCause(err)
+			}
+			var requestedChat string
+			if rawChat, ok := argumentsObject[definition.SameChatArgument]; ok {
+				if err := json.Unmarshal(rawChat, &requestedChat); err != nil {
+					return Execution{}, errs.NewValidationError(
+						errs.SubtypeInvalidArgument,
+						"tool chat argument must be a string: %s",
+						definition.SameChatArgument,
+					).WithCause(err)
+				}
+			}
+			if strings.TrimSpace(requestedChat) == "" || requestedChat != scope.ChatID {
+				return Execution{}, errs.NewValidationError(
+					errs.SubtypeFailedPrecondition,
+					"non-owner tool access is confined to the source chat",
+				).WithParam(definition.SameChatArgument)
+			}
+		}
+	}
 	execution, err := definition.Execute(ctx, arguments)
 	if err != nil {
 		return execution, err
@@ -140,6 +213,22 @@ func (r *Registry) Execute(ctx context.Context, name string, arguments json.RawM
 		execution.Receipt = newToolReceipt(definition, arguments, execution)
 	}
 	return execution, nil
+}
+
+func toolAllowedForScope(definition Definition, scope InvocationScope) bool {
+	if definition.RequiresGitHubReference && scope.GitHubReference == nil {
+		return false
+	}
+	if scope.Owner {
+		return true
+	}
+	if definition.OwnerOnly {
+		return false
+	}
+	if scope.ReadOnly && definition.SideEffect {
+		return false
+	}
+	return definition.NonOwnerReadOnly
 }
 
 func newToolReceipt(definition Definition, arguments json.RawMessage, execution Execution) *ToolReceipt {

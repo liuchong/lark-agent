@@ -375,6 +375,65 @@ func TestPollerEnqueuesVisibleMessagesAndMarksMentions(t *testing.T) {
 	}
 }
 
+func TestPollerKeepsAssistantAndDelegatedConfiguredScopesIndependent(t *testing.T) {
+	start := time.Date(2026, 7, 23, 2, 0, 0, 0, time.UTC)
+	now := start.Add(30 * time.Second)
+	store := &fakeStore{cursorSet: true, cursor: start}
+	im := &fakeIM{
+		chats: serviceim.SearchChatsResult{Items: []serviceim.Chat{{
+			ChatID: "oc_user_scope", Name: "Configured Group", ChatMode: "group",
+		}}},
+		generalMessages: serviceim.SearchMessagesResult{Items: []serviceim.Message{
+			{
+				MessageID: "om_bot_scope", ChatID: "oc_bot_scope", ChatType: "group",
+				SenderOpenID: "ou_owner", Content: "@_user_1 在吗",
+				Mentions:   []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
+				CreateTime: now.Format(time.RFC3339),
+			},
+			{
+				MessageID: "om_user_scope", ChatID: "oc_user_scope", ChatType: "group",
+				SenderOpenID: "ou_owner", Content: "@_user_1 在吗",
+				Mentions:   []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
+				CreateTime: now.Format(time.RFC3339),
+			},
+		}},
+	}
+	poller := New(im, store, Config{
+		OwnerOpenID:                "ou_owner",
+		ChatQuery:                  "Configured Group",
+		AssistantOpenIDs:           []string{"ou_bot"},
+		AssistantNames:             []string{"Lark Agent"},
+		ConfiguredAssistantChatIDs: []string{"oc_bot_scope"},
+		Now:                        func() time.Time { return now },
+	})
+	if _, err := poller.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	botScoped := eventByID(store.events, "om_bot_scope")
+	if !botScoped.InAssistantScope || botScoped.InTestScope {
+		t.Fatalf("bot-scoped event=%+v", botScoped)
+	}
+	userScoped := eventByID(store.events, "om_user_scope")
+	if userScoped.InAssistantScope || !userScoped.InTestScope {
+		t.Fatalf("user-scoped event=%+v", userScoped)
+	}
+}
+
+func TestNonOwnerAssistantMentionIgnoresBlankAssistantIdentity(t *testing.T) {
+	poller := New(&fakeIM{}, &fakeStore{}, Config{
+		OwnerOpenID:      "ou_owner",
+		AssistantOpenIDs: []string{"", "  "},
+		AssistantNames:   []string{"", "  "},
+	})
+	event := domain.NormalizedEvent{
+		SenderID: "ou_other",
+		Mentions: []domain.Mention{{OpenID: "ou_owner", Name: ""}},
+	}
+	if poller.nonOwnerAssistantMention(event) {
+		t.Fatalf("blank assistant identity matched delegated owner mention: %+v", event)
+	}
+}
+
 func TestPollerDiscoversAssistantPrivateChatName(t *testing.T) {
 	start := time.Date(2026, 7, 23, 2, 0, 0, 0, time.UTC)
 	now := start.Add(30 * time.Second)

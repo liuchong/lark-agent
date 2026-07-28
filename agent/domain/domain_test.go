@@ -17,6 +17,21 @@ func TestModeParsing(t *testing.T) {
 	}
 }
 
+func TestReplyScopeParsing(t *testing.T) {
+	for _, scope := range []ReplyScope{ReplyScopeAllGroups, ReplyScopeConfiguredGroups} {
+		got, err := ParseReplyScope(string(scope))
+		if err != nil {
+			t.Fatalf("ParseReplyScope(%q): %v", scope, err)
+		}
+		if got != scope {
+			t.Fatalf("ParseReplyScope(%q)=%q", scope, got)
+		}
+	}
+	if _, err := ParseReplyScope("test_chat"); err == nil {
+		t.Fatal("ParseReplyScope accepted invalid scope")
+	}
+}
+
 func TestWorkItemFromEventUsesMessageIDAsDedupKey(t *testing.T) {
 	ev := NormalizedEvent{
 		Source:    SourceRealtime,

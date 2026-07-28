@@ -55,6 +55,29 @@ func TestParseMessagePreservesConversationRelations(t *testing.T) {
 	}
 }
 
+func TestParseMessageExtractsTrustedMarkerFromLocalizedPost(t *testing.T) {
+	marker := "[lark-agent-github-ref:v1:synthetic]"
+	message := parseMessage(map[string]any{
+		"message_id": "om_notification",
+		"chat_id":    "oc_synthetic",
+		"msg_type":   "post",
+		"sender": map[string]any{
+			"id":          "cli_current",
+			"id_type":     "app_id",
+			"sender_type": "app",
+		},
+		"body": map[string]any{
+			"content": `{"en_us":{"title":"GitHub failure","content":[[{"tag":"text","text":"Status: failure"}],[{"tag":"text","text":"` + marker + `"}]]}}`,
+		},
+	})
+	if message.SenderOpenID != "cli_current" || message.SenderType != "app" {
+		t.Fatalf("sender=%q type=%q", message.SenderOpenID, message.SenderType)
+	}
+	if !strings.Contains(message.Content, marker) {
+		t.Fatalf("localized post lost trusted marker: %q", message.Content)
+	}
+}
+
 func TestBatchGetChatsReturnsPrivatePartnerIdentity(t *testing.T) {
 	caller := &fakeCaller{response: map[string]any{
 		"data": map[string]any{
@@ -183,6 +206,40 @@ func TestNotifyOwnerUsesBotIdentity(t *testing.T) {
 	}
 }
 
+func TestSendMessageAsBotUsesChatIdentityAndReturnsTypedResult(t *testing.T) {
+	caller := &fakeCaller{response: map[string]any{
+		"data": map[string]any{
+			"message_id": "om_notification",
+			"chat_id":    "oc_synthetic",
+		},
+	}}
+	svc := NewService(caller, "ou_owner")
+	result, err := svc.SendMessageAsBot(context.Background(), SendMessageRequest{
+		ChatID:         "oc_synthetic",
+		MessageType:    "post",
+		Content:        `{"zh_cn":{"title":"CI failed","content":[[{"tag":"text","text":"failure"}]]}}`,
+		IdempotencyKey: "gh-1234",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if caller.req.As != IdentityBot ||
+		caller.req.Path != "/open-apis/im/v1/messages" ||
+		caller.req.Params["receive_id_type"] != "chat_id" {
+		t.Fatalf("request=%+v", caller.req)
+	}
+	body := caller.req.Data.(map[string]any)
+	if body["receive_id"] != "oc_synthetic" ||
+		body["msg_type"] != "post" ||
+		body["content"] == "" ||
+		body["uuid"] != "gh-1234" {
+		t.Fatalf("body=%+v", body)
+	}
+	if result.MessageID != "om_notification" || result.ChatID != "oc_synthetic" {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
 func TestMessageWritesRejectOversizedUUIDBeforeAPICall(t *testing.T) {
 	oversized := strings.Repeat("a", 51)
 	tests := []struct {
@@ -207,6 +264,18 @@ func TestMessageWritesRejectOversizedUUIDBeforeAPICall(t *testing.T) {
 					Text:           "notice",
 					IdempotencyKey: oversized,
 				})
+			},
+		},
+		{
+			name: "chat notification",
+			call: func(svc *Service) error {
+				_, err := svc.SendMessageAsBot(context.Background(), SendMessageRequest{
+					ChatID:         "oc_synthetic",
+					MessageType:    "post",
+					Content:        `{}`,
+					IdempotencyKey: oversized,
+				})
+				return err
 			},
 		},
 	}
@@ -258,6 +327,22 @@ func TestSearchChatsUsesUserIdentity(t *testing.T) {
 	}
 	if len(chats.Items) != 1 || chats.Items[0].ChatID != "oc_rd" || chats.Items[0].Name != "Example Group" {
 		t.Fatalf("chats=%+v", chats)
+	}
+}
+
+func TestSearchChatsUsesRequestedBotIdentity(t *testing.T) {
+	caller := &fakeCaller{response: map[string]any{
+		"data": map[string]any{"items": []any{}},
+	}}
+	svc := NewService(caller, "ou_owner")
+	if _, err := svc.SearchChats(context.Background(), SearchChatsRequest{
+		Query: "龙虾群",
+		As:    IdentityBot,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if caller.req.As != IdentityBot {
+		t.Fatalf("identity=%q", caller.req.As)
 	}
 }
 
@@ -930,6 +1015,28 @@ func TestCompactMessagesPinsRootParentAndTarget(t *testing.T) {
 	for _, pinned := range []string{"om_0", "om_1", "om_34"} {
 		if !containsMessage(compacted, pinned) {
 			t.Fatalf("pinned message %s missing: %v", pinned, messageIDs(compacted))
+		}
+	}
+}
+
+func TestCompactMessagesDropsUnreferencedAppNoise(t *testing.T) {
+	messages := []Message{
+		{MessageID: "om_human_1", SenderType: "user", Content: "请看审核链路", CreateTime: "2026-07-24T01:00:00Z"},
+		{MessageID: "om_app_1", SenderType: "app", Content: "deployment succeeded", CreateTime: "2026-07-24T01:00:01Z"},
+		{MessageID: "om_bot_1", SenderType: "bot", Content: "pull request merged", CreateTime: "2026-07-24T01:00:02Z"},
+		{MessageID: "om_parent", SenderType: "app", Content: "explicitly referenced build", CreateTime: "2026-07-24T01:00:03Z"},
+		{MessageID: "om_target", SenderType: "user", Content: "@Owner 请初步调研", CreateTime: "2026-07-24T01:00:04Z"},
+	}
+	compacted, _ := compactMessages(messages, MessageContextRequest{
+		MessageID:        "om_target",
+		ReplyToMessageID: "om_parent",
+	}, 30)
+	if containsMessage(compacted, "om_app_1") || containsMessage(compacted, "om_bot_1") {
+		t.Fatalf("unreferenced app noise remained: %v", messageIDs(compacted))
+	}
+	for _, want := range []string{"om_human_1", "om_parent", "om_target"} {
+		if !containsMessage(compacted, want) {
+			t.Fatalf("wanted message %s missing: %v", want, messageIDs(compacted))
 		}
 	}
 }

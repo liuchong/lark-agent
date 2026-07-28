@@ -14,6 +14,10 @@ Agent 通过官方公开 Go SDK 访问 Lark。配置只保存 app id 和 Keychai
 必须在 macOS Keychain 中。用户 token 可选，只用于用户身份轮询和代回复。凭据不写入
 plist、脚本参数或仓库文件。
 
+可选的 GitHub 证据桥使用独立的只读 GitHub token Keychain 引用。启用
+`github.enabled` 时，还必须配置精确的 `github.allowed_repositories`，并在安装前
+执行 `lark-agent github auth status`。缺少该令牌不会扩大或改变 Lark 权限。
+
 ## 新安装
 
 ```bash
@@ -23,6 +27,7 @@ go build -o ./lark-agent ./cmd/lark-agent
   --app-id cli_xxx \
   --owner-open-id ou_xxx
 ./lark-agent auth login < /path/to/private-lark-credentials.json
+./lark-agent github auth login < /path/to/private-github-token.json
 ./lark-agent doctor --lark-only
 ./scripts/macos/install-lark-agent.sh
 ```
@@ -45,9 +50,53 @@ go build -o ./lark-agent ./cmd/lark-agent
 安装脚本支持以下环境变量：
 
 - `CONFIG_PATH`、`STATE_PATH`：覆盖独立目标路径。
-- `CHAT_QUERY`：限制初始验收群关键词，默认“Test Group”。
+- `CHAT_QUERY`：发现并标记配置群和验收群的关键词，默认“Test Group”。默认
+  `assistant.reply_scope: all_groups` 和 `policy.reply_scope: all_groups` 时不会据此
+  限制其他群；任一字段设为 `configured_groups` 时，该字段对应的群范围由它限制。
 - `POLL_INTERVAL`：轮询间隔，默认 `10s`。
 - `INSTALL_LOAD=0`：只安装，不加载，供隔离验证使用。
 - `OPEN_STATUS_APP=0`：安装后不打开状态栏，供隔离验证使用。
 
 不要把 token、私钥或模型密钥写进仓库、plist 或命令参数。
+
+当前全群安装应在配置中明确保存：
+
+```yaml
+assistant:
+  reply_scope: all_groups
+policy:
+  reply_scope: all_groups
+```
+
+前者控制 Owner 可在哪些群里 `@机器人`，后者控制其他人可在哪些群里 `@Owner`
+后触发智能代回复。非 Owner 私聊机器人或直接 `@机器人` 始终静默；两种群范围
+配置不会互相代替。
+
+建议同时使用当前默认调查预算：
+
+```yaml
+agent:
+  max_context_bytes: 65536
+fast_path:
+  simple_max_turns: 3
+tool_policy:
+  coding_max_tool_calls: 16
+```
+
+这不会放宽安全边界。非 Owner 请求仍是同群和 Workspace 只读，环境刺探与工作目录
+外访问仍被强制拒绝。
+
+## GitHub Environment
+
+仓库工作流使用名为 `lark-production` 的受保护 GitHub Environment：
+
+- secret `LARK_APP_SECRET`：与本地 daemon 相同的 Lark 应用 secret；
+- variable `LARK_APP_ID`：同一个 Lark 应用 ID；
+- variable `LARK_CHAT_ID`：通知目标的精确 chat ID。
+- variable `LARK_BASE_URL`：显式 OpenAPI 根地址；国际版 Lark 使用
+  `https://open.larksuite.com`，飞书中国站使用 `https://open.feishu.cn`。
+
+这不会创建第二个实时监听实例。Action 只执行
+`lark-agent github notify --chat-id ...` 并通过 Lark HTTP API 发送一次消息；本地
+LaunchAgent 继续独占 WebSocket 事件消费。Environment 应只允许默认分支部署，避免
+不可信分支取得 Lark secret。

@@ -3,7 +3,6 @@ package policy
 
 import (
 	"context"
-	"math"
 	"time"
 
 	"github.com/liuchong/lark-agent/agent/domain"
@@ -17,13 +16,15 @@ type ThreadState interface {
 
 // Config controls reply gates.
 type Config struct {
-	Mode               domain.Mode
-	ReplyConfidenceMin float64
-	OwnerWait          time.Duration
-	BlockChats         []string
-	BlockUsers         []string
-	RequireTestScope   bool
-	Sleeper            func(context.Context, time.Duration) error
+	Mode                domain.Mode
+	OwnerOpenID         string
+	ReplyScope          domain.ReplyScope
+	AssistantReplyScope domain.ReplyScope
+	ReplyConfidenceMin  float64
+	OwnerWait           time.Duration
+	BlockChats          []string
+	BlockUsers          []string
+	Sleeper             func(context.Context, time.Duration) error
 }
 
 // ReplyGate prepares a reply action or blocks/cancels it.
@@ -36,6 +37,12 @@ type ReplyGate struct {
 func NewReplyGate(cfg Config, state ThreadState) *ReplyGate {
 	if cfg.Mode == "" {
 		cfg.Mode = domain.ModeAuto
+	}
+	if cfg.ReplyScope == "" {
+		cfg.ReplyScope = domain.ReplyScopeAllGroups
+	}
+	if cfg.AssistantReplyScope == "" {
+		cfg.AssistantReplyScope = domain.ReplyScopeAllGroups
 	}
 	if cfg.ReplyConfidenceMin == 0 {
 		cfg.ReplyConfidenceMin = 0.85
@@ -56,6 +63,12 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 		action.CancelReason = "agent_paused"
 		return action, nil
 	}
+	if isAssistantFacingRequest(decision.Relevance) &&
+		(g.cfg.OwnerOpenID == "" || item.Event.SenderID != g.cfg.OwnerOpenID) {
+		action.Status = domain.ActionBlocked
+		action.CancelReason = "assistant_request_from_non_owner"
+		return action, nil
+	}
 	if decision.Risk == domain.RiskForbidden {
 		action.Status = domain.ActionBlocked
 		action.CancelReason = "forbidden_risk"
@@ -71,14 +84,24 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 		action.CancelReason = "blocked_target"
 		return action, nil
 	}
-	if g.cfg.RequireTestScope && !item.Event.InTestScope && decision.Relevance != domain.RelevanceOwnerRequest {
+	if g.cfg.ReplyScope == domain.ReplyScopeConfiguredGroups &&
+		!item.Event.InTestScope &&
+		decision.Relevance != domain.RelevanceOwnerRequest &&
+		decision.Relevance != domain.RelevanceAssistantRequest {
 		action.Status = domain.ActionBlocked
-		action.CancelReason = "outside_test_scope"
+		action.CancelReason = "outside_reply_scope"
+		return action, nil
+	}
+	if g.cfg.AssistantReplyScope == domain.ReplyScopeConfiguredGroups &&
+		!item.Event.InAssistantScope &&
+		decision.Relevance == domain.RelevanceAssistantRequest {
+		action.Status = domain.ActionBlocked
+		action.CancelReason = "outside_assistant_reply_scope"
 		return action, nil
 	}
 	if g.cfg.OwnerWait > 0 &&
 		decision.WorkKind != domain.WorkKindFastPath &&
-		decision.Relevance != domain.RelevanceOwnerRequest {
+		!isAssistantFacingRequest(decision.Relevance) {
 		sleep := g.cfg.Sleeper
 		if sleep == nil {
 			sleep = func(ctx context.Context, d time.Duration) error {
@@ -106,7 +129,7 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 			action.CancelReason = "message_withdrawn"
 			return action, nil
 		}
-		if decision.Relevance != domain.RelevanceOwnerRequest {
+		if !isAssistantFacingRequest(decision.Relevance) {
 			replied, err := g.state.OwnerAlreadyReplied(ctx, item)
 			if err != nil {
 				return action, err
@@ -128,11 +151,12 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 }
 
 func (g *ReplyGate) replyConfidenceMin(decision domain.Decision) float64 {
-	minimum := g.cfg.ReplyConfidenceMin
-	if (decision.Relevance == domain.RelevanceDirectMention || decision.Relevance == domain.RelevanceOwnerRequest) && decision.Risk == domain.RiskLow {
-		minimum = math.Min(minimum, 0.6)
-	}
-	return minimum
+	return g.cfg.ReplyConfidenceMin
+}
+
+func isAssistantFacingRequest(relevance domain.Relevance) bool {
+	return relevance == domain.RelevanceOwnerRequest ||
+		relevance == domain.RelevanceAssistantRequest
 }
 
 func contains(values []string, target string) bool {

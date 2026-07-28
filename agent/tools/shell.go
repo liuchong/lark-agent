@@ -58,6 +58,8 @@ func ShellDefinition(scope *workspace.Scope, options ShellOptions) Definition {
 		options.MaxOutputBytes = 64 * 1024
 	}
 	return Definition{
+		SideEffect: true,
+		OwnerOnly:  true,
 		Info: &schema.ToolInfo{
 			Name: "shell",
 			Desc: "Run a shell command inside the workspace sandbox. Local file access is confined to the workspace. Avoid destructive commands and unnecessary external side effects. Do not use shell to send Lark IM messages; submit reply decisions through submit_decision so the runtime renders mentions and audits the send.",

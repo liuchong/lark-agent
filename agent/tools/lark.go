@@ -35,6 +35,8 @@ type LarkContextResult struct {
 func LarkContextDefinitions(provider LarkContextProvider) []Definition {
 	return []Definition{
 		{
+			SameChatArgument: "chat_id",
+			NonOwnerReadOnly: true,
 			Info: toolInfo("get_lark_context", "Read bounded same-chat context. Auto mode follows quoted reply/thread relations; adjacent mode reads only nearby messages at or before the target.", map[string]*schema.ParameterInfo{
 				"chat_id":    {Type: schema.String, Required: true},
 				"message_id": {Type: schema.String},
@@ -84,6 +86,7 @@ func LarkContextDefinitions(provider LarkContextProvider) []Definition {
 			},
 		},
 		{
+			OwnerOnly: true,
 			Info: toolInfo("search_lark_messages", "Search messages visible to the owner when recent conversation context is insufficient.", map[string]*schema.ParameterInfo{
 				"query":    {Type: schema.String, Required: true},
 				"chat_ids": {Type: schema.Array, ElemInfo: &schema.ParameterInfo{Type: schema.String}},

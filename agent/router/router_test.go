@@ -27,7 +27,7 @@ func TestMentionedOwnerAlwaysRoutes(t *testing.T) {
 	}
 }
 
-func TestOwnerMentioningAssistantRoutesAsOwnerRequest(t *testing.T) {
+func TestOwnerMentioningAssistantInGroupRoutesAsAssistantRequest(t *testing.T) {
 	r := New(Config{
 		OwnerOpenID:      "ou_owner",
 		AssistantOpenIDs: []string{"ou_bot"},
@@ -46,7 +46,7 @@ func TestOwnerMentioningAssistantRoutesAsOwnerRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Kind != domain.DecisionNotify || decision.Relevance != domain.RelevanceOwnerRequest || decision.Reason != "owner_assistant_mention" {
+	if decision.Kind != domain.DecisionNotify || decision.Relevance != domain.RelevanceAssistantRequest || decision.Reason != "assistant_mention" {
 		t.Fatalf("decision=%+v", decision)
 	}
 }
@@ -77,6 +77,34 @@ func TestOwnerFastPathTimeRoutesAsReplyWithoutModel(t *testing.T) {
 		decision.Priority < domain.PriorityFastPath ||
 		!strings.Contains(decision.ReplyText, "04:13") {
 		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestOwnerAvailabilityQuestionRoutesAsFastPathReplyWithoutModel(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:      "ou_owner",
+		AssistantOpenIDs: []string{"ou_bot"},
+		AssistantNames:   []string{"Assistant Bot"},
+		Mode:             domain.ModeAuto,
+	})
+	for _, content := range []string{"在吗？", "你好", "@Assistant Bot 在吗"} {
+		decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID:     "om_availability",
+			ChatID:        "oc_private",
+			ChatType:      "p2p",
+			ChatPartnerID: "ou_bot",
+			SenderID:      "ou_owner",
+			Content:       content,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision.Kind != domain.DecisionReply ||
+			decision.WorkKind != domain.WorkKindFastPath ||
+			decision.Relevance != domain.RelevanceOwnerRequest ||
+			decision.ReplyText != "在的。" {
+			t.Fatalf("content=%q decision=%+v", content, decision)
+		}
 	}
 }
 
@@ -127,7 +155,7 @@ func TestOwnerCodingQuestionClassifiesWorkKind(t *testing.T) {
 		t.Fatal(err)
 	}
 	if decision.Kind != domain.DecisionNotify ||
-		decision.Relevance != domain.RelevanceOwnerRequest ||
+		decision.Relevance != domain.RelevanceAssistantRequest ||
 		decision.WorkKind != domain.WorkKindCodingQuestion ||
 		decision.Priority != domain.PriorityCodingQuestion {
 		t.Fatalf("decision=%+v", decision)
@@ -229,15 +257,17 @@ func TestCodingQuestionContainingDateOrTimeDoesNotHitFastPath(t *testing.T) {
 
 func TestNonOwnerMentioningAssistantIsIgnored(t *testing.T) {
 	r := New(Config{
-		OwnerOpenID:      "ou_owner",
-		AssistantOpenIDs: []string{"ou_bot"},
-		AssistantNames:   []string{"Lark Agent"},
-		Mode:             domain.ModeAuto,
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantNames:      []string{"Lark Agent"},
+		AssistantReplyScope: domain.ReplyScopeAllGroups,
+		Mode:                domain.ModeAuto,
 	})
 	decision, err := r.Route(context.Background(), domain.WorkItem{
 		Event: domain.NormalizedEvent{
 			MessageID: "om_other_bot",
 			ChatID:    "oc_group",
+			ChatType:  "group",
 			SenderID:  "ou_other",
 			Mentions:  []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
 			Content:   "@Lark Agent 帮我查这个接口",
@@ -246,7 +276,81 @@ func TestNonOwnerMentioningAssistantIsIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Kind != domain.DecisionIgnore || decision.Reason != "assistant_request_from_non_owner" {
+	if decision.Kind != domain.DecisionIgnore ||
+		decision.Relevance != domain.RelevanceNone ||
+		decision.Reason != "assistant_request_from_non_owner" {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestConfiguredAssistantScopeIgnoresMentionOutsideConfiguredGroups(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantReplyScope: domain.ReplyScopeConfiguredGroups,
+		Mode:                domain.ModeAuto,
+	})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:   "om_other_bot",
+		ChatID:      "oc_outside",
+		ChatType:    "group",
+		SenderID:    "ou_owner",
+		InTestScope: true,
+		Mentions:    []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
+		Content:     "@Lark Agent 帮我查这个接口",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionIgnore || decision.Reason != "outside_assistant_reply_scope" {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestConfiguredAssistantScopeDoesNotReuseDelegatedScopeMarker(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantReplyScope: domain.ReplyScopeConfiguredGroups,
+		Mode:                domain.ModeAuto,
+	})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:   "om_user_configured_only",
+		ChatID:      "oc_user_configured",
+		ChatType:    "group",
+		SenderID:    "ou_owner",
+		InTestScope: true,
+		Mentions:    []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
+		Content:     "@Lark Agent 在吗",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionIgnore || decision.Reason != "outside_assistant_reply_scope" {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestConfiguredAssistantScopeAcceptsMentionInsideConfiguredGroups(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantReplyScope: domain.ReplyScopeConfiguredGroups,
+		Mode:                domain.ModeAuto,
+	})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:        "om_other_bot",
+		ChatID:           "oc_configured",
+		ChatType:         "group",
+		SenderID:         "ou_owner",
+		InAssistantScope: true,
+		Mentions:         []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}},
+		Content:          "@Lark Agent 帮我查这个接口",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionNotify || decision.Relevance != domain.RelevanceAssistantRequest {
 		t.Fatalf("decision=%+v", decision)
 	}
 }

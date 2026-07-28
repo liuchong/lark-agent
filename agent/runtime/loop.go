@@ -58,6 +58,9 @@ func (a LoopDecisionAgent) Decide(ctx context.Context, bundle agentcontext.Bundl
 
 // Decide runs until submit_decision produces a validated terminal decision.
 func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (decision domain.Decision, trajectory []*schema.Message, err error) {
+	if guardedDecision, guarded := guardedRequestDecision(bundle); guarded {
+		return guardedDecision, nil, nil
+	}
 	if l.Model == nil {
 		return domain.Decision{}, nil, errs.NewInternalError(errs.SubtypeUnknown, "agent loop model is not configured")
 	}
@@ -81,7 +84,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		l.MaxTotalBytes = 128 * 1024
 	}
 	if l.MaxContextBytes <= 0 {
-		l.MaxContextBytes = 192 * 1024
+		l.MaxContextBytes = 64 * 1024
 	}
 	if l.MaxElapsed <= 0 {
 		l.MaxElapsed = 10 * time.Minute
@@ -90,7 +93,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		l.MaxRepeatedCalls = 3
 	}
 	if l.MaxToolCalls <= 0 {
-		l.MaxToolCalls = 10
+		l.MaxToolCalls = 16
 	}
 	if l.MaxNoProgress <= 0 {
 		l.MaxNoProgress = 3
@@ -104,6 +107,14 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	if l.ToolChoice == "" {
 		l.ToolChoice = schema.ToolChoiceForced
 	}
+	invocationScope := agenttools.InvocationScope{
+		Owner:           bundle.User.OpenID != "" && bundle.Event.SenderID == bundle.User.OpenID,
+		ReadOnly:        bundle.User.OpenID == "" || bundle.Event.SenderID != bundle.User.OpenID,
+		ChatID:          bundle.Event.ChatID,
+		GitHubReference: bundle.GitHubReference,
+	}
+	visibleToolInfos := l.Tools.InfosFor(invocationScope)
+	bundle = filterBundleTools(bundle, visibleToolInfos, invocationScope)
 	messages := []*schema.Message{
 		schema.SystemMessage(l.SystemPrompt),
 		schema.UserMessage(agentcontext.AgentUserPrompt(bundle)),
@@ -124,6 +135,8 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	}
 	sequence := 0
 	allowedSources := make(map[string]bool)
+	authoritativeSources := make(map[string]bool)
+	codingEvidenceReads := 0
 	for _, source := range bundle.Sources {
 		allowedSources[sourceKey(source)] = true
 	}
@@ -131,12 +144,17 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	repeatedCalls := map[string]int{}
 	sourceLessWorkspaceSearches := 0
 	toolBudgetConvergencePrompted := false
+	codingEvidenceConvergencePrompted := false
+	// Initial rules and memories are citable context, but only a fresh successful
+	// tool result may close a coding investigation.
+	codingEvidenceAvailable := false
 	investigationPlanSubmitted := false
 	noProgressLarkContext := false
 	toolCalls := 0
 	noProgressStreak := 0
 	lastObservation := ""
 	forceDecision := false
+	evidence := responseEvidence{}
 	for turn := 0; turn < l.MaxTurns; turn++ {
 		if err := ctx.Err(); err != nil {
 			return domain.Decision{}, trajectory, err
@@ -144,8 +162,15 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		messages = compactMessages(messages, l.MaxContextBytes)
 		requestMessages := append([]*schema.Message(nil), messages...)
 		requestMessages = append(requestMessages, schema.SystemMessage(modelTurnProgressPrompt(turn+1, l.MaxTurns)))
+		codingTerminalOnly := bundle.WorkKind == domain.WorkKindCodingQuestion &&
+			codingEvidenceAvailable
+		terminalOnly := forceDecision || codingTerminalOnly
+		turnToolInfos := visibleToolInfos
+		if terminalOnly {
+			turnToolInfos = submitDecisionOnly(visibleToolInfos)
+		}
 		assistant, err := l.Model.Generate(ctx, requestMessages,
-			einomodel.WithTools(l.Tools.Infos()),
+			einomodel.WithTools(turnToolInfos),
 			einomodel.WithToolChoice(l.ToolChoice))
 		if err != nil {
 			return domain.Decision{}, trajectory, err
@@ -193,24 +218,28 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				)
 			}
 			toolCtx := agenttools.WithWorkItemDedup(ctx, domain.DedupKey(bundle.Event))
+			toolCtx = agenttools.WithInvocationScope(toolCtx, invocationScope)
 			var execution agenttools.Execution
 			var toolErr error
-			if call.Function.Name != "submit_decision" {
-				toolCalls++
-			}
-			if forceDecision && call.Function.Name != "submit_decision" {
+			if codingTerminalOnly && call.Function.Name != "submit_decision" {
+				toolErr = errs.NewInternalError(
+					errs.SubtypeInvalidResponse,
+					"coding evidence is complete; submit_decision is required now with verified facts and explicit unknowns",
+				)
+				forceDecision = true
+			} else if forceDecision && call.Function.Name != "submit_decision" {
 				toolErr = errs.NewInternalError(
 					errs.SubtypeInvalidResponse,
 					"investigation made no progress or exhausted its tool budget; submit_decision now with verified facts and explicit unknowns",
 				)
-			} else if toolCalls > l.MaxToolCalls && call.Function.Name != "submit_decision" {
+			} else if toolCalls >= l.MaxToolCalls && call.Function.Name != "submit_decision" {
 				toolErr = errs.NewInternalError(
 					errs.SubtypeInvalidResponse,
 					"tool-call budget exhausted after %d calls; submit_decision now",
 					l.MaxToolCalls,
 				)
 				forceDecision = true
-			} else if isCodingQuestion(bundle.Event.Content) && !investigationPlanSubmitted && call.Function.Name == "search_workspace" {
+			} else if domain.IsCodingQuestion(bundle.Event.Content) && !investigationPlanSubmitted && call.Function.Name == "search_workspace" {
 				toolErr = errs.NewInternalError(
 					errs.SubtypeInvalidResponse,
 					"coding investigation requires submit_investigation_plan before broad workspace search; name entry points, symbols, tools, and stop conditions first",
@@ -232,9 +261,40 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				)
 			} else {
 				execution, toolErr = l.Tools.Execute(toolCtx, call.Function.Name, json.RawMessage(call.Function.Arguments))
+				if toolErr == nil && call.Function.Name != "submit_decision" {
+					toolCalls++
+				}
 			}
 			if toolErr == nil && execution.Decision != nil {
 				if err := validateTerminalDecision(bundle, *execution.Decision); err != nil {
+					toolErr = err
+					execution.Decision = nil
+				}
+			}
+			if toolErr == nil && execution.Decision != nil {
+				if err := validateDecisionSources(*execution.Decision, allowedSources); err != nil {
+					toolErr = err
+					execution.Decision = nil
+				}
+			}
+			if toolErr == nil && execution.Decision != nil {
+				normalized := normalizeCodingDecision(bundle, *execution.Decision)
+				execution.Decision = &normalized
+			}
+			if toolErr == nil && execution.Decision != nil {
+				if err := verifyCodingDecision(
+					bundle,
+					*execution.Decision,
+					allowedSources,
+					authoritativeSources,
+					codingEvidenceReads,
+				); err != nil {
+					toolErr = err
+					execution.Decision = nil
+				}
+			}
+			if toolErr == nil && execution.Decision != nil {
+				if err := validateResponseQuality(bundle, *execution.Decision, evidence); err != nil {
 					toolErr = err
 					execution.Decision = nil
 				}
@@ -247,6 +307,15 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			}
 			if toolErr == nil && call.Function.Name == "get_lark_context" && toolContentNoNewContext(execution.Content) {
 				noProgressLarkContext = true
+			}
+			if toolErr == nil && execution.Decision == nil && isRelevantEvidenceTool(call.Function.Name) {
+				evidence.SuccessfulReads++
+			}
+			if toolErr == nil &&
+				execution.Decision == nil &&
+				domain.IsCodingQuestion(bundle.Event.Content) &&
+				isCodingEvidenceTool(call.Function.Name) {
+				codingEvidenceReads++
 			}
 			content := toolResultContent(execution, toolErr)
 			observation := callSignature + "\x00" + content
@@ -278,14 +347,21 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			}
 			for _, source := range execution.Sources {
 				allowedSources[sourceKey(source)] = true
+				if call.Function.Name == "read_workspace" &&
+					hasProductionSource([]domain.SourceRef{source}) {
+					authoritativeSources[sourceKey(source)] = true
+				}
+			}
+			if bundle.WorkKind == domain.WorkKindCodingQuestion &&
+				call.Function.Name == "read_workspace" &&
+				hasProductionSource(execution.Sources) {
+				codingEvidenceAvailable = true
+				if !codingEvidenceConvergencePrompted {
+					messages = append(messages, schema.SystemMessage(codingEvidenceConvergencePrompt()))
+					codingEvidenceConvergencePrompted = true
+				}
 			}
 			if execution.Decision != nil {
-				if err := validateDecisionSources(*execution.Decision, allowedSources); err != nil {
-					return domain.Decision{}, trajectory, err
-				}
-				if err := verifyCodingDecision(bundle, *execution.Decision, allowedSources); err != nil {
-					return domain.Decision{}, trajectory, err
-				}
 				if l.Recorder != nil {
 					if err := l.Recorder.FinishAgentRun(ctx, runID, domain.AgentRunCompleted, ""); err != nil {
 						return domain.Decision{}, trajectory, err
@@ -297,6 +373,30 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		}
 	}
 	return domain.Decision{}, trajectory, errs.NewInternalError(errs.SubtypeInvalidResponse, "agent loop exceeded maximum turns")
+}
+
+func filterBundleTools(
+	bundle agentcontext.Bundle,
+	infos []*schema.ToolInfo,
+	scope agenttools.InvocationScope,
+) agentcontext.Bundle {
+	allowed := make(map[string]bool, len(infos))
+	for _, info := range infos {
+		if info != nil {
+			allowed[info.Name] = true
+		}
+	}
+	filtered := bundle
+	filtered.Environment.Tools = make([]agentcontext.ToolSpec, 0, len(bundle.Environment.Tools))
+	for _, tool := range bundle.Environment.Tools {
+		if allowed[tool.Name] {
+			filtered.Environment.Tools = append(filtered.Environment.Tools, tool)
+		}
+	}
+	if scope.ReadOnly {
+		filtered.Environment.Commands = nil
+	}
+	return filtered
 }
 
 func (l AgentLoop) maxTurnsForWorkKind(kind domain.WorkKind) int {
@@ -361,6 +461,19 @@ func shouldPromptToolBudgetConvergence(rawToolBytes, maxToolBytes, totalToolByte
 
 func toolBudgetConvergencePrompt() string {
 	return "Tool output budget is near or above the configured limit. Old raw tool output has been clipped for context safety. Summarize the evidence already gathered, avoid broad repeat searches, and converge with submit_decision unless one narrow read is required to avoid a false claim."
+}
+
+func codingEvidenceConvergencePrompt() string {
+	return "Citable workspace evidence is now available. If it answers the concrete fields the user asked for, call submit_decision now. Do not expand into unrelated Lark history, repository-wide searches, or production call-site proof unless the user explicitly asked about reachability. For an exact function's direct behavior, its digest-backed definition is sufficient; preserve explicit unknowns instead of over-investigating."
+}
+
+func submitDecisionOnly(infos []*schema.ToolInfo) []*schema.ToolInfo {
+	for _, info := range infos {
+		if info != nil && info.Name == "submit_decision" {
+			return []*schema.ToolInfo{info}
+		}
+	}
+	return infos
 }
 
 func compactMessages(messages []*schema.Message, maxBytes int) []*schema.Message {
@@ -480,6 +593,7 @@ func (l AgentLoop) recordToolStep(ctx context.Context, runID string, sequence in
 // SubmitDecisionDefinition is the terminal no-side-effect model tool.
 func SubmitDecisionDefinition() agenttools.Definition {
 	return agenttools.Definition{
+		NonOwnerReadOnly: true,
 		Info: &schema.ToolInfo{
 			Name: "submit_decision",
 			Desc: "Finish the owner-assistant task with a structured decision. This tool does not send a Lark message. Use it instead of shell for every sender-facing reply.",
@@ -488,19 +602,27 @@ func SubmitDecisionDefinition() agenttools.Definition {
 					Type:     schema.String,
 					Required: true,
 					Enum:     []string{"ignore", "record", "notify", "reply", "request_approval"},
-					Desc:     "ignore only owner-irrelevant content; record a relevant update that needs no response; reply to a direct owner question, owner_request, status update, handoff, or coordination request whenever a safe useful owner response can acknowledge it without inventing a commitment, even when remaining owner work or unknowns remain—the runtime then privately notifies the owner that it replied and what work remains; direct owner mentions cannot finish as notify only, because incomplete facts should be stated as unknowns in reply_text; owner_request messages also cannot finish as notify only; notify only for owner-relevant messages that do not directly mention the owner or when a sender-facing reply would expose sensitive private context; request_approval only with an exact proposed reply_text for a risky response or personal commitment",
+					Desc:     "ignore only irrelevant content; record an owner-relevant update that needs no response; reply only with a useful evidence-backed response; delegated assignments and coordination requests require completed bounded read work plus a concise initial finding, not an acknowledgement or restatement; direct owner mentions may notify when no useful sender-facing response is possible without exposing private context or inventing work; assistant_request and owner_request cannot finish as notify only; coding questions must finish as reply and cannot use ignore, record, notify, or request_approval; request_approval is only for a non-coding risky response or personal commitment with an exact proposed reply_text",
 				},
 				"relevance_confidence": {Type: schema.Number, Required: true},
-				"reply_confidence":     {Type: schema.Number},
+				"reply_confidence": {
+					Type: schema.Number,
+					Desc: "Required for reply decisions. Omission is invalid and must be repaired; use an explicit value below the configured threshold when human approval is needed.",
+				},
 				"risk": {
 					Type:     schema.String,
 					Required: true,
 					Enum:     []string{"low", "medium", "high", "forbidden"},
 					Desc:     "Use exactly one risk enum value; put all explanatory prose in reason.",
 				},
+				"evidence_status": {
+					Type: schema.String,
+					Enum: []string{"verified", "insufficient"},
+					Desc: "Required for coding replies. Use verified only after an authoritative current-run read_workspace production read; use insufficient when a definite code claim cannot be supported. Insufficient free-form reply_text is replaced by a canonical evidence-limited response.",
+				},
 				"reply_text": {
 					Type: schema.String,
-					Desc: "Exact sender-facing text. Required for reply and request_approval. For coding replies, keep the structure as 结论、依据、未知/下一步; cite source_refs for definite code claims, or explicitly state unknowns when code evidence is insufficient. Lark mention placeholders like @_user_1 are internal keys from the mentions mapping: do not invent them, and do not use shell to send messages. The runtime renders known mention placeholders into Lark-native mentions and adds the robot marker only when replying as the owner on the owner's behalf.",
+					Desc: "Exact sender-facing text. Required for reply and request_approval. For delegated work, state completed read-only work, a concise initial finding or explicit unknown, and concrete information passed to the owner; do not merely acknowledge, restate, or promise future coordination. For verified coding replies, keep the structure as 结论、依据、未知/下一步 and cite authoritative production source_refs. For insufficient coding replies, the runtime emits canonical evidence-limited text. Lark mention placeholders like @_user_1 are internal keys from the mentions mapping: do not invent them, and do not use shell to send messages. The runtime renders known mention placeholders into Lark-native mentions and adds the robot marker only when replying as the owner on the owner's behalf.",
 				},
 				"owner_action": {
 					Type: schema.String,
@@ -533,6 +655,7 @@ func SubmitDecisionDefinition() agenttools.Definition {
 // SubmitInvestigationPlanDefinition records a bounded plan before broad coding search.
 func SubmitInvestigationPlanDefinition() agenttools.Definition {
 	return agenttools.Definition{
+		NonOwnerReadOnly: true,
 		Info: &schema.ToolInfo{
 			Name: "submit_investigation_plan",
 			Desc: "Submit a bounded read-only investigation plan for a coding question before broad workspace search. This tool has no external side effect.",
@@ -651,18 +774,31 @@ func validateTerminalDecision(bundle agentcontext.Bundle, decision domain.Decisi
 	if decision.Kind != domain.DecisionNotify {
 		return nil
 	}
-	if !bundle.Event.MentionsUser(bundle.User.OpenID) {
+	if bundle.WorkKind == domain.WorkKindDirectMention {
 		return nil
 	}
 	return errs.NewInternalError(
 		errs.SubtypeInvalidResponse,
-		"direct owner mention cannot finish as notify only; submit a reply with exact reply_text, or request_approval with exact reply_text if the sender-facing response contains a risky commitment",
+		"assistant_request and owner_request cannot finish as notify only; submit a useful reply or request_approval with exact reply_text",
 	)
 }
 
-func verifyCodingDecision(bundle agentcontext.Bundle, decision domain.Decision, allowed map[string]bool) error {
-	if !isCodingQuestion(bundle.Event.Content) || decision.Kind != domain.DecisionReply {
+func verifyCodingDecision(
+	bundle agentcontext.Bundle,
+	decision domain.Decision,
+	allowed map[string]bool,
+	authoritative map[string]bool,
+	codingEvidenceReads int,
+) error {
+	if !domain.IsCodingQuestion(bundle.Event.Content) {
 		return nil
+	}
+	if decision.Kind != domain.DecisionReply {
+		return errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"coding question cannot finish as %s; submit a verified or insufficient reply",
+			decision.Kind,
+		)
 	}
 	if strings.TrimSpace(decision.ReplyText) == "" {
 		return errs.NewInternalError(errs.SubtypeInvalidResponse, "coding reply does not answer the original question")
@@ -670,10 +806,25 @@ func verifyCodingDecision(bundle agentcontext.Bundle, decision domain.Decision, 
 	if decision.Risk == domain.RiskHigh || decision.Risk == domain.RiskForbidden {
 		return errs.NewInternalError(errs.SubtypeInvalidResponse, "coding reply with high or forbidden risk requires approval")
 	}
-	if len(decision.Sources) == 0 && !replyStatesInsufficientEvidence(decision.ReplyText) {
+	if decision.EvidenceStatus == domain.EvidenceInsufficient {
+		if codingEvidenceReads == 0 {
+			return errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"insufficient coding reply requires at least one successful workspace code investigation",
+			)
+		}
+		return nil
+	}
+	if decision.EvidenceStatus != domain.EvidenceVerified {
 		return errs.NewInternalError(
 			errs.SubtypeInvalidResponse,
-			"coding reply has no cited code evidence; cite source_refs or state the unknowns and next confirmation step",
+			"coding reply missing evidence_status; use verified or insufficient",
+		)
+	}
+	if len(decision.Sources) == 0 {
+		return errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"verified coding reply has no cited code evidence",
 		)
 	}
 	for _, source := range decision.Sources {
@@ -685,53 +836,63 @@ func verifyCodingDecision(bundle agentcontext.Bundle, decision domain.Decision, 
 			)
 		}
 	}
-	return nil
-}
-
-func replyStatesInsufficientEvidence(reply string) bool {
-	for _, marker := range []string{
-		"没有足够",
-		"不能确认",
-		"无法确认",
-		"还不能确认",
-		"需要",
-		"未知",
-		"缺少",
-		"not enough",
-		"cannot confirm",
-		"unknown",
-	} {
-		if strings.Contains(strings.ToLower(reply), marker) {
-			return true
+	if !hasProductionSource(decision.Sources) {
+		return errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"verified coding reply has supporting evidence only; cite production source or use evidence_status=insufficient",
+		)
+	}
+	for _, source := range decision.Sources {
+		if authoritative[sourceKey(source)] {
+			return nil
 		}
 	}
-	return false
+	return errs.NewInternalError(
+		errs.SubtypeInvalidResponse,
+		"verified coding reply has no authoritative production read; use read_workspace before making a definite code claim",
+	)
 }
 
-func isCodingQuestion(content string) bool {
-	lower := strings.ToLower(content)
-	for _, marker := range []string{
-		"api",
-		"接口",
-		"代码",
-		"数据库",
-		"sampledb",
-		"redis",
-		"sdk",
-		"回调",
-		"限流",
-		"缓存",
-		"高频",
-		"endpoint",
-		"handler",
-		"service",
-		"repository",
-	} {
-		if strings.Contains(lower, marker) {
-			return true
-		}
+const canonicalInsufficientCodingReply = "结论：当前证据不足，不能确认你询问的代码事实。\n" +
+	"依据：已完成有界的工作区代码定位，但没有取得足以支撑确定结论的生产源码证据。\n" +
+	"未知/下一步：相关符号是否存在及实际行为仍未核实，我不会据此推测。"
+
+func normalizeCodingDecision(bundle agentcontext.Bundle, decision domain.Decision) domain.Decision {
+	if domain.IsCodingQuestion(bundle.Event.Content) &&
+		decision.Kind == domain.DecisionReply &&
+		decision.EvidenceStatus == domain.EvidenceInsufficient {
+		decision.ReplyText = canonicalInsufficientCodingReply
 	}
-	return false
+	return decision
+}
+
+func isRelevantEvidenceTool(name string) bool {
+	switch name {
+	case "get_lark_context",
+		"search_lark_messages",
+		"get_github_context",
+		"explore_workspace",
+		"search_workspace",
+		"read_workspace",
+		"search_code_symbols",
+		"trace_code_path":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCodingEvidenceTool(name string) bool {
+	switch name {
+	case "explore_workspace",
+		"search_workspace",
+		"read_workspace",
+		"search_code_symbols",
+		"trace_code_path":
+		return true
+	default:
+		return false
+	}
 }
 
 func toolContentNoNewContext(content string) bool {

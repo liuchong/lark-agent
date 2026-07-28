@@ -2,7 +2,6 @@ package lark
 
 import (
 	"context"
-	"os"
 	"strings"
 )
 
@@ -17,6 +16,43 @@ type Credentials struct {
 	AppSecret       string
 	UserAccessToken string
 	RefreshToken    string
+}
+
+type UserTokens struct {
+	AccessToken  string
+	RefreshToken string
+}
+
+type UserTokenStore interface {
+	LoadUserTokens(context.Context) (UserTokens, error)
+	StoreUserTokens(context.Context, UserTokens) error
+}
+
+type KeychainUserTokenStore struct {
+	refs CredentialRefs
+}
+
+func NewKeychainUserTokenStore(refs CredentialRefs) *KeychainUserTokenStore {
+	return &KeychainUserTokenStore{refs: refs}
+}
+
+func (s *KeychainUserTokenStore) LoadUserTokens(ctx context.Context) (UserTokens, error) {
+	if s == nil {
+		return UserTokens{}, nil
+	}
+	accessToken, _ := readSecret(ctx, s.refs.Service, s.refs.UserTokenAccount, "LARK_AGENT_USER_ACCESS_TOKEN")
+	refreshToken, _ := readSecret(ctx, s.refs.Service, s.refs.RefreshTokenAccount, "LARK_AGENT_REFRESH_TOKEN")
+	return UserTokens{AccessToken: accessToken, RefreshToken: refreshToken}, nil
+}
+
+func (s *KeychainUserTokenStore) StoreUserTokens(ctx context.Context, tokens UserTokens) error {
+	if s == nil {
+		return nil
+	}
+	if err := writeSecret(ctx, s.refs.Service, s.refs.RefreshTokenAccount, tokens.RefreshToken); err != nil {
+		return err
+	}
+	return writeSecret(ctx, s.refs.Service, s.refs.UserTokenAccount, tokens.AccessToken)
 }
 
 func LoadCredentials(ctx context.Context, refs CredentialRefs) (Credentials, error) {
@@ -62,8 +98,4 @@ func DeleteCredentials(ctx context.Context, refs CredentialRefs) error {
 		}
 	}
 	return nil
-}
-
-func envSecret(name string) string {
-	return os.Getenv(name)
 }

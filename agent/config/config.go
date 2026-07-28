@@ -2,8 +2,10 @@
 package config
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -13,12 +15,13 @@ import (
 	"github.com/liuchong/lark-agent/internal/fsx"
 )
 
-const currentVersion = 3
+const currentVersion = 4
 
 // Config is the YAML configuration stored under the standalone lark-agent config directory.
 type Config struct {
 	Version    int              `json:"version" yaml:"version"`
 	Lark       LarkConfig       `json:"lark" yaml:"lark"`
+	GitHub     GitHubConfig     `json:"github" yaml:"github"`
 	Owner      OwnerConfig      `json:"owner" yaml:"owner"`
 	Assistant  AssistantConfig  `json:"assistant" yaml:"assistant"`
 	Model      ModelConfig      `json:"model" yaml:"model"`
@@ -56,7 +59,7 @@ type CodingConfig struct {
 	ToolPermission      map[string]string `json:"tool_permission,omitempty" yaml:"tool_permission,omitempty"`
 }
 
-// FastPathConfig controls deterministic owner-only local answers.
+// FastPathConfig controls deterministic local answers for direct requests.
 type FastPathConfig struct {
 	Enabled        bool `json:"enabled" yaml:"enabled"`
 	SimpleMaxTurns int  `json:"simple_max_turns" yaml:"simple_max_turns"`
@@ -108,6 +111,20 @@ type LarkConfig struct {
 	Subscriptions           []ResourceSubscription `json:"subscriptions,omitempty" yaml:"subscriptions,omitempty"`
 }
 
+// GitHubConfig controls the optional trusted GitHub evidence bridge. Tokens are
+// referenced by Keychain account and never serialized here.
+type GitHubConfig struct {
+	Enabled              bool     `json:"enabled" yaml:"enabled"`
+	APIBaseURL           string   `json:"api_base_url" yaml:"api_base_url"`
+	TokenKeychainService string   `json:"token_keychain_service" yaml:"token_keychain_service"`
+	TokenKeychainKey     string   `json:"token_keychain_key" yaml:"token_keychain_key"`
+	AllowedRepositories  []string `json:"allowed_repositories,omitempty" yaml:"allowed_repositories,omitempty"`
+	MaxFiles             int      `json:"max_files" yaml:"max_files"`
+	MaxPatchBytes        int      `json:"max_patch_bytes" yaml:"max_patch_bytes"`
+	MaxAnnotations       int      `json:"max_annotations" yaml:"max_annotations"`
+	MaxReviews           int      `json:"max_reviews" yaml:"max_reviews"`
+}
+
 // ResourceSubscription is the config-level projection used before the durable
 // SQLite subscription row is synchronized.
 type ResourceSubscription struct {
@@ -147,10 +164,11 @@ type OwnerConfig struct {
 	OpenID string `json:"open_id" yaml:"open_id"`
 }
 
-// AssistantConfig identifies bot-facing owner request entry points.
+// AssistantConfig identifies bot-facing request entry points.
 type AssistantConfig struct {
 	OpenIDs     []string                 `json:"open_ids,omitempty" yaml:"open_ids,omitempty"`
 	Names       []string                 `json:"names,omitempty" yaml:"names,omitempty"`
+	ReplyScope  domain.ReplyScope        `json:"reply_scope" yaml:"reply_scope"`
 	OwnerDirect OwnerDirectRequestConfig `json:"owner_direct" yaml:"owner_direct"`
 }
 
@@ -170,6 +188,7 @@ type ModelConfig struct {
 // PolicyConfig controls routing and reply behavior.
 type PolicyConfig struct {
 	Mode               domain.Mode        `json:"mode" yaml:"mode"`
+	ReplyScope         domain.ReplyScope  `json:"reply_scope" yaml:"reply_scope"`
 	Sensitivity        domain.Sensitivity `json:"sensitivity" yaml:"sensitivity"`
 	OwnerWait          time.Duration      `json:"owner_wait" yaml:"owner_wait"`
 	MentionPoll        time.Duration      `json:"mention_poll" yaml:"mention_poll"`
@@ -202,8 +221,18 @@ func Default() Config {
 			UserTokenKeychainKey:    "user_access_token",
 			RefreshTokenKeychainKey: "user_refresh_token",
 		},
+		GitHub: GitHubConfig{
+			APIBaseURL:           "https://api.github.com",
+			TokenKeychainService: "lark-agent",
+			TokenKeychainKey:     "github_token",
+			MaxFiles:             50,
+			MaxPatchBytes:        64 * 1024,
+			MaxAnnotations:       50,
+			MaxReviews:           50,
+		},
 		Assistant: AssistantConfig{
 			Names:       []string{"Lark Agent", "lark-agent", "机器人", "Agent"},
+			ReplyScope:  domain.ReplyScopeAllGroups,
 			OwnerDirect: OwnerDirectRequestConfig{Enabled: true},
 		},
 		Model: ModelConfig{
@@ -215,13 +244,13 @@ func Default() Config {
 			MaxRetries:         20,
 			MaxToolOutput:      32 * 1024,
 			MaxTotalToolOutput: 128 * 1024,
-			MaxContextBytes:    192 * 1024,
+			MaxContextBytes:    64 * 1024,
 			LoopTimeout:        2 * time.Hour,
 			MaxRepeatedCalls:   3,
 			ShellTimeout:       2 * time.Minute,
 			ShellApproval:      false,
 		},
-		FastPath: FastPathConfig{Enabled: true, SimpleMaxTurns: 2, CodingMaxTurns: 20},
+		FastPath: FastPathConfig{Enabled: true, SimpleMaxTurns: 3, CodingMaxTurns: 20},
 		Scheduler: SchedulerConfig{
 			DuplicateWindow:     2 * time.Minute,
 			PollIndexLookback:   2 * time.Minute,
@@ -249,13 +278,14 @@ func Default() Config {
 		},
 		ToolPolicy: ToolPolicyConfig{
 			DenyUnboundedShellSearch: true,
-			CodingMaxToolCalls:       10,
+			CodingMaxToolCalls:       16,
 			MaxNoProgress:            3,
 		},
 		Goal:  GoalConfig{Enabled: true, MaxActive: 3, MaxInvestigationTurns: 150},
 		State: StateConfig{AllowReset: false},
 		Policy: PolicyConfig{
 			Mode:               domain.ModeAuto,
+			ReplyScope:         domain.ReplyScopeAllGroups,
 			Sensitivity:        domain.SensitivityNormal,
 			OwnerWait:          60 * time.Second,
 			MentionPoll:        30 * time.Second,
@@ -319,12 +349,32 @@ func (c Config) Validate() error {
 		c.Lark.UserTokenKeychainKey == "" || c.Lark.RefreshTokenKeychainKey == "" {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "lark keychain references are required").WithField("lark.keychain")
 	}
+	if c.Lark.BaseURL != "" {
+		parsed, err := url.Parse(strings.TrimSpace(c.Lark.BaseURL))
+		if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+			return errs.NewConfigError(errs.SubtypeInvalidConfig, "lark.base_url must be an absolute HTTP URL").
+				WithField("lark.base_url")
+		}
+	}
+	if err := validateGitHubConfig(c.GitHub); err != nil {
+		return err
+	}
 	if c.Owner.OpenID == "" {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "owner.open_id is required").WithField("owner.open_id")
 	}
 	if _, err := domain.ParseMode(string(c.Policy.Mode)); err != nil {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "invalid policy.mode: %s", c.Policy.Mode).
 			WithField("policy.mode").
+			WithCause(err)
+	}
+	if _, err := domain.ParseReplyScope(string(c.Policy.ReplyScope)); err != nil {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "invalid policy.reply_scope: %s", c.Policy.ReplyScope).
+			WithField("policy.reply_scope").
+			WithCause(err)
+	}
+	if _, err := domain.ParseReplyScope(string(c.Assistant.ReplyScope)); err != nil {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "invalid assistant.reply_scope: %s", c.Assistant.ReplyScope).
+			WithField("assistant.reply_scope").
 			WithCause(err)
 	}
 	if c.Policy.OwnerWait <= 0 {
@@ -400,4 +450,57 @@ func (c Config) Validate() error {
 		).WithField("workspace.root")
 	}
 	return nil
+}
+
+func validateGitHubConfig(cfg GitHubConfig) error {
+	parsed, err := url.Parse(strings.TrimSpace(cfg.APIBaseURL))
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "github.api_base_url must be an absolute HTTP URL").
+			WithField("github.api_base_url")
+	}
+	if cfg.TokenKeychainService == "" || cfg.TokenKeychainKey == "" {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "github keychain references are required").
+			WithField("github.token_keychain")
+	}
+	if cfg.MaxFiles <= 0 || cfg.MaxPatchBytes <= 0 || cfg.MaxAnnotations <= 0 || cfg.MaxReviews <= 0 {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "github result limits must be positive").
+			WithField("github")
+	}
+	if cfg.Enabled && len(cfg.AllowedRepositories) == 0 {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"github.allowed_repositories is required when github is enabled",
+		).WithField("github.allowed_repositories")
+	}
+	seen := map[string]bool{}
+	for _, repository := range cfg.AllowedRepositories {
+		parts := strings.Split(repository, "/")
+		if len(parts) != 2 || !validRepositoryPart(parts[0]) || !validRepositoryPart(parts[1]) {
+			return errs.NewConfigError(errs.SubtypeInvalidConfig, "invalid github repository %q", repository).
+				WithField("github.allowed_repositories")
+		}
+		canonical := strings.ToLower(repository)
+		if seen[canonical] {
+			return errs.NewConfigError(errs.SubtypeInvalidConfig, "duplicate github repository %q", repository).
+				WithField("github.allowed_repositories")
+		}
+		seen[canonical] = true
+	}
+	return nil
+}
+
+func validRepositoryPart(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '-' || char == '_' || char == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }

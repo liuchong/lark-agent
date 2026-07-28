@@ -30,6 +30,18 @@ bot WebSocket owner requests still run but user-identity polling is disabled.
 Both paths write intake receipts before work is claimable, so duplicate
 WebSocket or polling observations cannot rerun model work or repeat replies.
 
+GitHub workflow notifications use the same official SDK boundary through an
+HTTP-only bot message send. The notification process must not create an SDK
+WebSocket client. Its stable message UUID is validated before the SDK call and
+its typed result contains the sent message ID and chat ID.
+
+A quoted GitHub marker is trusted only when the corresponding same-chat
+relation message was authored by the configured current Lark app, its
+HMAC-SHA256 signature verifies with the same Lark app secret, and the
+repository is allowlisted. Human-authored, other-app, adjacent,
+copied-through-bot, malformed, unsigned, or conflicting markers never
+establish external tool authority.
+
 ## Resource Monitoring
 
 `subscription add` accepts Wiki and Base URLs and stores a durable

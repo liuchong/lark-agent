@@ -32,6 +32,7 @@ func TestParseDecisionJSON(t *testing.T) {
 		"relevance_confidence":0.91,
 		"reply_confidence":0.93,
 		"risk":"low",
+		"evidence_status":"insufficient",
 		"reply_text":"我来跟进",
 		"owner_action":"确认后端通知契约",
 		"reason":"direct mention"
@@ -40,8 +41,24 @@ func TestParseDecisionJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	if decision.Kind != domain.DecisionReply || decision.Confidence != 0.93 ||
+		decision.EvidenceStatus != domain.EvidenceInsufficient ||
 		decision.ReplyText != "我来跟进" || decision.OwnerAction != "确认后端通知契约" {
 		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestParseDecisionRejectsInvalidEvidenceStatus(t *testing.T) {
+	_, err := ParseDecision(`{
+		"decision":"reply",
+		"relevance_confidence":0.91,
+		"reply_confidence":0.93,
+		"risk":"low",
+		"evidence_status":"guessed",
+		"reply_text":"猜测结论",
+		"reason":"unsupported"
+	}`)
+	if err == nil || !strings.Contains(err.Error(), "invalid evidence_status") {
+		t.Fatalf("err=%v", err)
 	}
 }
 
@@ -65,6 +82,19 @@ func TestParseDecisionRejectsInvalidJSON(t *testing.T) {
 	}
 	if _, err := ParseDecision(`{"decision":"request_approval","risk":"high","reason":"commitment"}`); err == nil {
 		t.Fatal("ParseDecision accepted request_approval without an exact reply_text")
+	}
+}
+
+func TestParseDecisionRejectsReplyWithoutExplicitConfidence(t *testing.T) {
+	_, err := ParseDecision(`{
+		"decision":"reply",
+		"relevance_confidence":0.98,
+		"risk":"low",
+		"reply_text":"结论明确且有源码依据。",
+		"reason":"source backed"
+	}`)
+	if err == nil || !strings.Contains(err.Error(), "missing reply_confidence") {
+		t.Fatalf("err=%v", err)
 	}
 }
 
