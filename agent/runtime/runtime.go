@@ -130,7 +130,7 @@ func ParseDecision(raw string) (domain.Decision, error) {
 	var payload struct {
 		Decision            string             `json:"decision"`
 		RelevanceConfidence float64            `json:"relevance_confidence"`
-		ReplyConfidence     float64            `json:"reply_confidence"`
+		ReplyConfidence     *float64           `json:"reply_confidence"`
 		Risk                string             `json:"risk"`
 		ReplyText           string             `json:"reply_text"`
 		OwnerAction         string             `json:"owner_action"`
@@ -156,7 +156,16 @@ func ParseDecision(raw string) (domain.Decision, error) {
 	default:
 		return domain.Decision{}, errs.NewInternalError(errs.SubtypeInvalidResponse, "invalid model risk: %s", payload.Risk)
 	}
-	confidence := payload.ReplyConfidence
+	if kind == domain.DecisionReply && payload.ReplyConfidence == nil {
+		return domain.Decision{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"reply decision missing reply_confidence",
+		)
+	}
+	confidence := 0.0
+	if payload.ReplyConfidence != nil {
+		confidence = *payload.ReplyConfidence
+	}
 	if kind != domain.DecisionReply && confidence == 0 {
 		confidence = payload.RelevanceConfidence
 	}

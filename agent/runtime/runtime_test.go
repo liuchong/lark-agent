@@ -68,6 +68,19 @@ func TestParseDecisionRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestParseDecisionRejectsReplyWithoutExplicitConfidence(t *testing.T) {
+	_, err := ParseDecision(`{
+		"decision":"reply",
+		"relevance_confidence":0.98,
+		"risk":"low",
+		"reply_text":"结论明确且有源码依据。",
+		"reason":"source backed"
+	}`)
+	if err == nil || !strings.Contains(err.Error(), "missing reply_confidence") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 type fakeQueryRunner struct {
 	prompt string
 }

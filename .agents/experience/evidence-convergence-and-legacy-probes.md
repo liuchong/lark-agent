@@ -7,11 +7,21 @@ Two live failures established reusable implementation rules.
 - A prompt that mentions a turn budget is not sufficient enforcement.
 - Once a coding run has digest-backed production evidence, tell the model to
   answer if the requested fields are covered.
-- Reserve the final two coding turns for `submit_decision` when such evidence
-  exists. Hide other tools and reject any model-emitted non-terminal call so one
-  final repair turn remains.
+- On the immediately following model turn, expose only `submit_decision`.
+  Reject any model-emitted non-terminal call without execution and keep a
+  bounded repair turn. Waiting until the final two turns still allows long,
+  unrelated investigations after the answer is already known.
 - Do not require production call-site reachability when the user only asks for
   a named function's direct behavior.
+
+## Explicit reply confidence
+
+- A missing numeric field is not evidence of low confidence.
+- Require `reply_confidence` explicitly for every `reply`. Reject omission
+  inside the model loop so the model can repair it.
+- Preserve the configured approval policy only for an explicit confidence
+  value below the threshold; never convert omission to zero and silently hold
+  a useful reply.
 
 ## Legacy approval lookup
 

@@ -642,6 +642,12 @@ database evidence are code-evidence requests. Merely mentioning the configured
 Workspace or a business warehouse is not enough. Routing and runtime evidence
 validation use the same classifier.
 
+For `coding_question` work, a successful tool result containing a production
+source is the convergence boundary. The immediately following model turn
+exposes only `submit_decision`; it cannot spend more turns on Lark history,
+rules, tests, broad search, or shell commands. The model must answer from the
+verified production facts and state any remaining unknowns explicitly.
+
 ## Reply Policy
 
 Before replying as the owner, the runtime must:
@@ -681,6 +687,10 @@ individual work item.
 The configured `policy.reply_confidence_min` applies uniformly. Direct owner
 mentions and assistant-facing requests do not receive a hidden lower confidence
 floor; a draft below the configured threshold waits for approval.
+Every `reply` decision must explicitly provide `reply_confidence`. Omitting the
+field is an invalid model response that remains inside the bounded model repair
+loop; omission is never interpreted as confidence zero and must not silently
+turn an otherwise valid assistant reply into an approval.
 
 Group requests addressed to the assistant have an independent
 `assistant.reply_scope` with the same values:
@@ -1007,6 +1017,12 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given any reply has confidence below `policy.reply_confidence_min`, when the
   final gate runs, then direct owner mentions and assistant-facing requests
   enter approval just like other replies and do not use a hidden lower floor.
+- Given a coding question has read a production source that supports a useful
+  answer, when the next model turn starts, then only `submit_decision` is
+  available and no Lark-history, rule, test, search, or shell tool can run.
+- Given the model submits a `reply` without `reply_confidence`, when the terminal
+  decision is parsed, then the decision is rejected for bounded model repair
+  instead of entering approval as a zero-confidence reply.
 - Given an older reply policy held a low-risk direct owner mention in approval,
   when the upgraded daemon starts, then it preserves the exact approval and
   does not send or requeue it without an explicit owner action.

@@ -142,7 +142,9 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	sourceLessWorkspaceSearches := 0
 	toolBudgetConvergencePrompted := false
 	codingEvidenceConvergencePrompted := false
-	codingEvidenceAvailable := hasProductionSource(bundle.Sources)
+	// Initial rules and memories are citable context, but only a fresh successful
+	// tool result may close a coding investigation.
+	codingEvidenceAvailable := false
 	investigationPlanSubmitted := false
 	noProgressLarkContext := false
 	toolCalls := 0
@@ -158,8 +160,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		requestMessages := append([]*schema.Message(nil), messages...)
 		requestMessages = append(requestMessages, schema.SystemMessage(modelTurnProgressPrompt(turn+1, l.MaxTurns)))
 		codingTerminalOnly := bundle.WorkKind == domain.WorkKindCodingQuestion &&
-			codingEvidenceAvailable &&
-			turn >= l.MaxTurns-2
+			codingEvidenceAvailable
 		terminalOnly := forceDecision || codingTerminalOnly
 		turnToolInfos := visibleToolInfos
 		if terminalOnly {
@@ -220,7 +221,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			if codingTerminalOnly && call.Function.Name != "submit_decision" {
 				toolErr = errs.NewInternalError(
 					errs.SubtypeInvalidResponse,
-					"final coding turns are reserved for submit_decision; answer now with verified facts and explicit unknowns",
+					"coding evidence is complete; submit_decision is required now with verified facts and explicit unknowns",
 				)
 				forceDecision = true
 			} else if forceDecision && call.Function.Name != "submit_decision" {
@@ -579,7 +580,10 @@ func SubmitDecisionDefinition() agenttools.Definition {
 					Desc:     "ignore only irrelevant content; record an owner-relevant update that needs no response; reply only with a useful evidence-backed response; delegated assignments and coordination requests require completed bounded read work plus a concise initial finding, not an acknowledgement or restatement; direct owner mentions may notify when no useful sender-facing response is possible without exposing private context or inventing work; assistant_request and owner_request cannot finish as notify only; request_approval only with an exact proposed reply_text for a risky response or personal commitment",
 				},
 				"relevance_confidence": {Type: schema.Number, Required: true},
-				"reply_confidence":     {Type: schema.Number},
+				"reply_confidence": {
+					Type: schema.Number,
+					Desc: "Required for reply decisions. Omission is invalid and must be repaired; use an explicit value below the configured threshold when human approval is needed.",
+				},
 				"risk": {
 					Type:     schema.String,
 					Required: true,

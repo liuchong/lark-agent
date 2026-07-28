@@ -439,7 +439,7 @@ func TestAgentLoopForcesTerminalBeforeTurnExhaustion(t *testing.T) {
 	}
 }
 
-func TestAgentLoopReservesFinalCodingTurnsAfterCitableEvidence(t *testing.T) {
+func TestAgentLoopConvergesImmediatelyAfterCitableEvidence(t *testing.T) {
 	model := &scriptedModel{responses: []*schema.Message{
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{
 			"question":"GetType 对 .JPG 返回什么",
@@ -478,7 +478,7 @@ func TestAgentLoopReservesFinalCodingTurnsAfterCitableEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loop := AgentLoop{Model: model, Tools: registry, MaxTurns: 4}
+	loop := AgentLoop{Model: model, Tools: registry, MaxTurns: 8}
 	decision, trajectory, err := loop.Decide(context.Background(), agentcontext.Bundle{
 		Event:    domain.NormalizedEvent{MessageID: "om_exact", Content: "请检查 GetType 对 .JPG 返回什么"},
 		WorkKind: domain.WorkKindCodingQuestion,
@@ -495,7 +495,7 @@ func TestAgentLoopReservesFinalCodingTurnsAfterCitableEvidence(t *testing.T) {
 	if !messagesContain(model.inputs[2], "Citable workspace evidence is now available") {
 		t.Fatalf("third model input missing evidence convergence prompt: %+v", model.inputs[2])
 	}
-	if !trajectoryContains(trajectory, "final coding turns are reserved for submit_decision") {
+	if !trajectoryContains(trajectory, "coding evidence is complete; submit_decision is required now") {
 		t.Fatalf("trajectory missing terminal-only rejection: %+v", trajectory)
 	}
 }

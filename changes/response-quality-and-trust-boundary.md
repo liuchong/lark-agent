@@ -283,6 +283,21 @@ when deterministic routing classifies the request,
 then it enters `coding_question` and cannot be trapped in the simple-question
 tool policy.
 
+### Scenario: Production evidence converges immediately
+
+Given a `coding_question` tool result contains a production source,
+when the next model turn starts,
+then only `submit_decision` is available and any attempted history, rules,
+tests, search, or shell call is rejected without execution.
+
+### Scenario: Missing reply confidence is repaired
+
+Given the model submits a `reply` decision without an explicit
+`reply_confidence`,
+when the terminal decision is parsed,
+then the model response is rejected and repaired inside the bounded loop
+instead of becoming a zero-confidence approval.
+
 ## Test Locations
 
 - `integration_test/lark_agent/response_quality_test.go`: end-to-end contracts
