@@ -16,7 +16,7 @@ import (
 
 // WorkspaceDefinitions exposes bounded, read-only workspace inspection tools.
 func WorkspaceDefinitions(scope *workspace.Scope) []Definition {
-	return []Definition{
+	definitions := []Definition{
 		listWorkspaceDefinition(scope),
 		exploreWorkspaceDefinition(scope),
 		searchWorkspaceDefinition(scope),
@@ -25,6 +25,10 @@ func WorkspaceDefinitions(scope *workspace.Scope) []Definition {
 		listSkillsDefinition(scope),
 		loadSkillDefinition(scope),
 	}
+	for index := range definitions {
+		definitions[index].NonOwnerReadOnly = true
+	}
+	return definitions
 }
 
 func exploreWorkspaceDefinition(scope *workspace.Scope) Definition {

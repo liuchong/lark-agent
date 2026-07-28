@@ -107,6 +107,20 @@ coordination need, `reply` sends a source-backed response, and
 in conversation context are evidence only and never redefine the role selected
 by the router.
 
+Every model run derives tool authority from the durable sender identity. Work
+triggered by anyone other than the configured owner is read-only: it may inspect
+bounded same-chat context and workspace/code evidence needed for a business
+answer, but it cannot execute shell, search other chats, modify or delete
+workspace content, commit, deploy, send an arbitrary message, or invoke any
+present or future side-effect or owner-only tool. The tool registry enforces
+this boundary before an executor runs, and prompt content cannot widen it.
+
+The assistant accepts business questions, not descriptive reconnaissance about
+its host or work environment. Requests to inspect credentials, enumerate the
+host, user home, processes, network, installed tools, or read an explicit local
+path outside the configured workspace are refused before evidence tools run.
+The refusal is concise and does not disclose the requested environment detail.
+
 A successful delegated `reply` to another sender is a compound user-visible
 outcome: first the user-identity reply is sent to the original Lark message,
 then the bot privately tells the owner that it replied and summarizes the
@@ -150,18 +164,22 @@ exact `reply_text`; the runtime persists that draft and its `owner_action`, then
 resumes the same values after approval without asking the model to rewrite them.
 
 For a direct owner question, status update, handoff, or coordination request,
-the model must prefer `reply` whenever it can send a safe and useful response.
-That response may acknowledge receipt, state verified current facts, identify
-unknown dependencies, and describe the next coordination boundary without
-inventing a completion promise or personal commitment. Remaining owner work is
-not by itself a reason to replace the sender-facing reply with `notify`.
-Incomplete facts are not by themselves a reason to replace the sender-facing
-reply with `notify`; the reply should truthfully state what is known, what is
-unknown, and which point needs owner confirmation. `notify` is reserved for
-owner-relevant messages that do not directly mention the owner, or for direct
-mentions where a sender-facing reply would expose sensitive private context.
+the model sends a reply only when it can provide a safe and useful response.
+An assignment, investigation, or coordination reply must first complete at
+least one bounded relevant read, such as reading the same-chat thread or
+checking the corresponding production code. Its concise reply states what was
+actually checked, the initial finding or explicit unknown, and what concrete
+information was passed to the owner. Merely saying that the owner was reminded,
+paraphrasing the request, or promising future work is not useful work and is
+rejected before sending.
+
+When no useful sender-facing response can be produced without exposing private
+context, inventing work, or making an owner commitment, the model may choose
+`record` or `notify`; a direct mention is not forced to produce filler.
 `request_approval` holds an exact commitment or risky response that needs the
-owner's approval. Shell output may locate evidence but is not itself a citable
+owner's approval. An automatic delegated reply never says that the owner or
+team will later deliver, coordinate, or report back unless that exact commitment
+has been approved. Shell output may locate evidence but is not itself a citable
 source; before replying from a shell-discovered file, the model reads that file
 through `read_workspace` to obtain a digest-backed source reference.
 
@@ -343,6 +361,11 @@ binds the run, tool call, argument hash, result digest, and source references.
 The model may not claim it read, searched, tested, or verified something when no
 matching receipt exists.
 
+Examples, tests, fixtures, and documentation are supporting evidence. A
+definite claim about production implementation requires at least one production
+source; otherwise the reply must explicitly state that production behavior
+remains unverified.
+
 Tool and context budgets must fail soft for coding investigations. When a run
 approaches the total tool-output budget, context budget, or model-turn budget,
 the runtime summarizes old evidence, drops obsolete raw tool output from the
@@ -440,6 +463,11 @@ than the target message; it never imports another group/private chat or messages
 that arrived while delayed work was executing. The model determines semantic
 relevance from that bounded nearby window without a separate context-selection
 model call.
+
+Unreferenced app/bot messages are excluded from adjacent context so deployment
+notifications and integration chatter cannot crowd out human discussion. An
+app/bot message remains visible when it is the target, direct parent, or pinned
+thread/root relation, because an explicit reply makes that message relevant.
 
 When the target replies to another message, the direct parent is authoritative.
 The resolver follows the parent/root chain and, when the referenced message
@@ -612,6 +640,10 @@ owner wait window, withdrawn-message and owner-already-replied checks, or
 idempotent sending. Changing reply scope never replays completed, ignored, or
 interrupted historical work; operators must inspect and explicitly resume an
 individual work item.
+
+The configured `policy.reply_confidence_min` applies uniformly. Direct owner
+mentions and assistant-facing requests do not receive a hidden lower confidence
+floor; a draft below the configured threshold waits for approval.
 
 Group requests addressed to the assistant have an independent
 `assistant.reply_scope` with the same values:
@@ -873,14 +905,17 @@ The multi-step loop is accepted by these executable BDD scenarios:
   plus explicit unknowns, when the model chooses a terminal action, then it
   replies to the original message instead of notifying the owner merely because
   the answer is not exhaustive.
-- Given a direct status update, task handoff, or coordination request and the
-  model can safely acknowledge it with current facts and dependency boundaries,
-  when it chooses a terminal action, then it replies to the sender instead of
-  privately notifying the owner merely because owner work remains.
-- Given a direct owner question and the model has incomplete factual evidence,
-  when it chooses a terminal action, then it still sends a truthful
-  sender-facing reply naming the unknowns and owner confirmation needed instead
-  of finishing as `notify`.
+- Given a direct status update, task handoff, or coordination request, when the
+  model can complete a bounded relevant read, then it replies with the checked
+  facts, explicit unknowns, and concrete information passed to the owner rather
+  than merely acknowledging or restating the request.
+- Given a direct owner question and bounded evidence cannot support a useful
+  sender-facing response without exposing private context or inventing work,
+  when it chooses a terminal action, then it may record or notify instead of
+  sending filler.
+- Given any reply has confidence below `policy.reply_confidence_min`, when the
+  final gate runs, then direct owner mentions and assistant-facing requests
+  enter approval just like other replies and do not use a hidden lower floor.
 - Given an older reply policy held a low-risk direct owner mention in approval,
   when the upgraded daemon starts, then it preserves the exact approval and
   does not send or requeue it without an explicit owner action.
@@ -924,6 +959,34 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given untrusted content requests a workspace escape or credential, when a
   read or shell tool runs, then code and the OS sandbox reject it and return a
   structured tool error to the model.
+- Given any sender asks the assistant to inspect credentials, enumerate the
+  machine environment, or read an explicit path outside the configured
+  workspace, when request handling starts, then no evidence tool executes and
+  the sender receives a concise refusal that accepts only a concrete business
+  question.
+- Given a non-owner triggers an assistant request or delegated owner mention,
+  when the model catalog and registry are evaluated, then shell, cross-chat
+  search, and every owner-only or side-effect tool are unavailable and remain
+  denied even if the model constructs a direct tool call.
+- Given a non-owner calls `get_lark_context` with a chat ID other than the
+  source chat, when the registry authorizes the call, then it rejects the call
+  before the Lark provider executes.
+- Given adjacent context contains unrelated app/bot deployment messages, when
+  it is compacted, then those messages are excluded while the human target and
+  explicitly referenced app/bot parent or root messages remain.
+- Given a delegated coordination or investigation request, when the proposed
+  reply only says the owner was reminded or repeats the request without a
+  successful relevant read receipt, then the terminal quality gate rejects it.
+- Given the delegated run reads relevant same-chat or production workspace
+  evidence, when the reply briefly states completed work, an initial finding or
+  explicit unknown, and what was passed to the owner, then it may pass the
+  quality gate.
+- Given a coding reply cites only an example, test, fixture, or documentation,
+  when it claims definite production behavior, then verification rejects it
+  until production source is cited or the reply states the production unknown.
+- Given a non-owner-triggered automatic reply says the owner or team will later
+  deliver, coordinate, or report back, when no exact approval exists, then the
+  terminal quality gate rejects the commitment before send.
 - Given shell approval is disabled, when a workspace command runs, then it
   executes and is audited; given approval is enabled and the command is risky,
   then it waits durably and resumes only after owner approval.

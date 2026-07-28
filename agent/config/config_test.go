@@ -64,9 +64,12 @@ func TestDefaultHarnessConfig(t *testing.T) {
 		t.Fatalf("scheduler defaults=%+v", cfg.Scheduler)
 	}
 	if !cfg.ToolPolicy.DenyUnboundedShellSearch ||
-		cfg.ToolPolicy.CodingMaxToolCalls != 10 ||
+		cfg.ToolPolicy.CodingMaxToolCalls != 16 ||
 		cfg.ToolPolicy.MaxNoProgress != 3 {
 		t.Fatalf("tool policy defaults=%+v", cfg.ToolPolicy)
+	}
+	if cfg.Agent.MaxContextBytes != 64*1024 {
+		t.Fatalf("max context bytes=%d, want %d", cfg.Agent.MaxContextBytes, 64*1024)
 	}
 	if !cfg.Goal.Enabled || cfg.Goal.MaxActive <= 0 || cfg.Goal.MaxInvestigationTurns <= 0 {
 		t.Fatalf("goal defaults=%+v", cfg.Goal)

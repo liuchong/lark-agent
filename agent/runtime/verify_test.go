@@ -36,3 +36,25 @@ func TestVerifyCodingDecisionAllowsExplicitUnknownWithoutSources(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestVerifyCodingDecisionRejectsSupportingOnlyEvidenceForProductionClaim(t *testing.T) {
+	source := domain.SourceRef{
+		RelativePath: "examples/upload/main.go",
+		Digest:       "sha256:example",
+		Kind:         "workspace_file",
+	}
+	err := verifyCodingDecision(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{Content: "生产代码的图片审核在哪里执行？"},
+	}, domain.Decision{
+		Kind:      domain.DecisionReply,
+		Risk:      domain.RiskLow,
+		ReplyText: "生产实现会在上传时调用审核接口。",
+		Sources:   []domain.SourceRef{source},
+	}, map[string]bool{sourceKey(source): true})
+	if err == nil {
+		t.Fatal("accepted an example file as proof of production behavior")
+	}
+	if !strings.Contains(err.Error(), "supporting evidence") {
+		t.Fatalf("wrong error: %v", err)
+	}
+}

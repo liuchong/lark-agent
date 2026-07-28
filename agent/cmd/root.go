@@ -386,6 +386,9 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 	runCmd := &cobra.Command{
 		Use:   "run",
 		Short: "Run daemon in the foreground",
+		Long: "Run the daemon in the foreground. Non-owner requests are read-only and confined to " +
+			"same-chat plus configured-workspace evidence; environment reconnaissance and paths outside " +
+			"the workspace are refused.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(resolveConfigPath(*configPath))
 			if err != nil {

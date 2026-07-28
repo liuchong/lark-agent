@@ -67,7 +67,7 @@ func TestApprovalModeRequiresApproval(t *testing.T) {
 	}
 }
 
-func TestLowRiskDirectMentionReplyUsesLowerConfidenceFloor(t *testing.T) {
+func TestLowRiskDirectMentionReplyUsesConfiguredConfidenceFloor(t *testing.T) {
 	gate := NewReplyGate(Config{Mode: domain.ModeAuto, ReplyConfidenceMin: 0.85}, fakeThreadState{})
 	action, err := gate.Prepare(context.Background(), domain.WorkItem{}, domain.Decision{
 		Kind:       domain.DecisionReply,
@@ -79,7 +79,7 @@ func TestLowRiskDirectMentionReplyUsesLowerConfidenceFloor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if action.Status != domain.ActionReady {
+	if action.Status != domain.ActionAwaitingApproval || action.CancelReason != "low_confidence" {
 		t.Fatalf("action=%+v", action)
 	}
 }

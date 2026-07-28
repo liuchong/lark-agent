@@ -382,7 +382,7 @@ func TestDaemonRunOnceUsesModelAndReplyHandler(t *testing.T) {
 	}
 }
 
-func TestDaemonSendsLowRiskDirectMentionReplyWhenModelReturnsInferredRelevance(t *testing.T) {
+func TestDaemonRequestsApprovalWhenDirectMentionFallsBelowConfiguredConfidence(t *testing.T) {
 	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID: "om_direct",
 		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
@@ -409,10 +409,10 @@ func TestDaemonSendsLowRiskDirectMentionReplyWhenModelReturnsInferredRelevance(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Processed || result.Decision.Kind != domain.DecisionReply || q.completed.Kind != domain.DecisionReply {
+	if !result.Processed || result.Decision.Kind != domain.DecisionRequestApproval || q.completed.Kind != domain.DecisionRequestApproval {
 		t.Fatalf("result=%+v completed=%+v", result, q.completed)
 	}
-	if messenger.replies != 1 || messenger.text != "🤖收到，我先确认后同步。" {
+	if messenger.replies != 0 {
 		t.Fatalf("messenger=%+v", messenger)
 	}
 }

@@ -53,10 +53,14 @@ type CodePath struct {
 // provider is configured, search falls back to bounded workspace search and
 // trace returns an actionable unavailable response.
 func CodeIndexDefinitions(scope *workspace.Scope, provider CodeIndexProvider) []Definition {
-	return []Definition{
+	definitions := []Definition{
 		searchCodeSymbolsDefinition(scope, provider),
 		traceCodePathDefinition(provider),
 	}
+	for index := range definitions {
+		definitions[index].NonOwnerReadOnly = true
+	}
+	return definitions
 }
 
 func searchCodeSymbolsDefinition(scope *workspace.Scope, provider CodeIndexProvider) Definition {

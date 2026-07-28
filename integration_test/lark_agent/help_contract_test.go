@@ -61,7 +61,7 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		},
 		{
 			args: []string{"daemon", "run", "--help"},
-			want: []string{"--chat-query", "configured and validation groups"},
+			want: []string{"--chat-query", "configured and validation groups", "Non-owner requests are read-only", "environment reconnaissance"},
 		},
 	}
 	for _, testCase := range cases {

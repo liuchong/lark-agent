@@ -65,3 +65,15 @@ policy:
 
 前者控制任意真人在群里 `@机器人`，后者控制任意真人在群里 `@Owner` 后的智能
 代回复。两者不会互相代替。
+
+建议同时使用当前默认调查预算：
+
+```yaml
+agent:
+  max_context_bytes: 65536
+tool_policy:
+  coding_max_tool_calls: 16
+```
+
+这不会放宽安全边界。非 Owner 请求仍是同群和 Workspace 只读，环境刺探与工作目录
+外访问仍被强制拒绝。

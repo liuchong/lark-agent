@@ -3,7 +3,6 @@ package policy
 
 import (
 	"context"
-	"math"
 	"time"
 
 	"github.com/liuchong/lark-agent/agent/domain"
@@ -145,11 +144,7 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 }
 
 func (g *ReplyGate) replyConfidenceMin(decision domain.Decision) float64 {
-	minimum := g.cfg.ReplyConfidenceMin
-	if (decision.Relevance == domain.RelevanceDirectMention || isAssistantFacingRequest(decision.Relevance)) && decision.Risk == domain.RiskLow {
-		minimum = math.Min(minimum, 0.6)
-	}
-	return minimum
+	return g.cfg.ReplyConfidenceMin
 }
 
 func isAssistantFacingRequest(relevance domain.Relevance) bool {

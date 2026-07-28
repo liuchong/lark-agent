@@ -127,34 +127,37 @@ func TestAgentLoopRejectsPlainTextWithoutSubmit(t *testing.T) {
 	}
 }
 
-func TestAgentLoopRejectsPureNotifyForDirectOwnerMention(t *testing.T) {
+func TestAgentLoopAllowsEvidenceBackedNotifyForDirectOwnerMention(t *testing.T) {
 	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("call_context", "get_lark_context", `{
+			"chat_id":"oc_backend",
+			"message_id":"om_direct_question"
+		}`)}),
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("call_notify", "submit_decision", `{
 			"decision":"notify",
 			"relevance_confidence":0.92,
 			"risk":"medium",
-			"reason":"direct owner question but facts are incomplete",
+			"reason":"same-chat evidence is insufficient for a safe sender-facing answer",
 			"owner_action":"confirm backend rate limiting"
 		}`)}),
-		schema.AssistantMessage("", []schema.ToolCall{toolCall("call_reply", "submit_decision", `{
-			"decision":"reply",
-			"relevance_confidence":0.95,
-			"reply_confidence":0.9,
-			"risk":"low",
-			"reply_text":"我先收到这个问题了。目前我还不能确认线上是否已有独立限频；我会让Owner确认现有防护后同步结论。",
-			"owner_action":"确认现有防刷措施并补充是否需要限频、缓存或查询成本保护",
-			"reason":"direct owner question must receive a sender-facing acknowledgement"
-		}`)}),
 	}}
-	registry, err := agenttools.NewRegistry(SubmitDecisionDefinition())
+	registry, err := agenttools.NewRegistry(
+		testTool("get_lark_context", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			return agenttools.Execution{Content: `{"messages":[{"content":"no implementation detail"}]}`}, nil
+		}),
+		SubmitDecisionDefinition(),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	loop := AgentLoop{Model: model, Tools: registry, MaxTurns: 4}
 	decision, trajectory, err := loop.Decide(context.Background(), agentcontext.Bundle{
-		User: agentcontext.UserProfile{OpenID: "ou_owner"},
+		WorkKind: domain.WorkKindDirectMention,
+		User:     agentcontext.UserProfile{OpenID: "ou_owner"},
 		Event: domain.NormalizedEvent{
 			MessageID: "om_direct_question",
+			ChatID:    "oc_backend",
+			SenderID:  "ou_other",
 			Content:   "@Owner 这个接口如何防高频攻击？",
 			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
 		},
@@ -162,11 +165,27 @@ func TestAgentLoopRejectsPureNotifyForDirectOwnerMention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Kind != domain.DecisionReply || decision.ReplyText == "" || model.calls != 2 {
+	if decision.Kind != domain.DecisionNotify || model.calls != 2 {
 		t.Fatalf("decision=%+v calls=%d", decision, model.calls)
 	}
-	if len(trajectory) < 2 || !strings.Contains(trajectory[1].Content, "direct owner mention cannot finish as notify only") {
+	if len(trajectory) < 2 {
 		t.Fatalf("trajectory=%+v", trajectory)
+	}
+}
+
+func TestTerminalDecisionRejectsAssistantNotifyWhenOwnerIsAlsoMentioned(t *testing.T) {
+	err := validateTerminalDecision(agentcontext.Bundle{
+		WorkKind: domain.WorkKindSimpleQuestion,
+		User:     agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event: domain.NormalizedEvent{
+			Mentions: []domain.Mention{
+				{OpenID: "ou_assistant"},
+				{OpenID: "ou_owner"},
+			},
+		},
+	}, domain.Decision{Kind: domain.DecisionNotify})
+	if err == nil {
+		t.Fatal("assistant request that also mentions owner finished as notify")
 	}
 }
 
@@ -176,7 +195,7 @@ func TestAgentLoopRecoversPlainTextAfterRejectedTerminalDecision(t *testing.T) {
 			"decision":"notify",
 			"relevance_confidence":0.92,
 			"risk":"medium",
-			"reason":"direct owner question but facts are incomplete",
+			"reason":"owner request cannot finish as notify only",
 			"owner_action":"confirm backend rate limiting"
 		}`)}),
 		{Role: schema.Assistant, Content: "我先收到这个问题了，会让Owner确认。"},
@@ -185,9 +204,8 @@ func TestAgentLoopRecoversPlainTextAfterRejectedTerminalDecision(t *testing.T) {
 			"relevance_confidence":0.95,
 			"reply_confidence":0.9,
 			"risk":"low",
-			"reply_text":"我先收到这个问题了。目前我还不能确认线上是否已有独立限频；我会让Owner确认现有防护后同步结论。",
-			"owner_action":"确认现有防刷措施并补充是否需要限频、缓存或查询成本保护",
-			"reason":"direct owner question must receive a sender-facing acknowledgement"
+			"reply_text":"目前没有足够代码证据确认线上是否已有独立限频，需要继续检查生产实现。",
+			"reason":"owner request receives a truthful answer"
 		}`)}),
 	}}
 	registry, err := agenttools.NewRegistry(SubmitDecisionDefinition())
@@ -199,8 +217,8 @@ func TestAgentLoopRecoversPlainTextAfterRejectedTerminalDecision(t *testing.T) {
 		User: agentcontext.UserProfile{OpenID: "ou_owner"},
 		Event: domain.NormalizedEvent{
 			MessageID: "om_direct_question",
-			Content:   "@Owner 这个接口如何防高频攻击？",
-			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+			SenderID:  "ou_owner",
+			Content:   "这个接口如何防高频攻击？",
 		},
 	})
 	if err != nil {
@@ -232,7 +250,7 @@ func TestAgentLoopExhaustsRepeatedSourceLessWorkspaceSearches(t *testing.T) {
 			"relevance_confidence":0.94,
 			"reply_confidence":0.86,
 			"risk":"low",
-			"reply_text":"收到，我会让Owner确认示例状态变更通知是否需要新增 示例客户端回调类型和示例通知，确认后同步。",
+			"reply_text":"我已查了相关工作区入口，但连续三次搜索仍未找到可引用的生产实现。目前无法确认示例状态变更通知是否需要新增 示例客户端回调类型和示例通知，需要测试负责人继续核对具体入口。",
 			"owner_action":"确认示例状态变更通知是否需要新增 示例客户端回调类型和示例通知，并同步给提问人。",
 			"reason":"repeated broad workspace searches produced no source; reply with unknowns and owner confirmation boundary"
 		}`)}),
@@ -467,8 +485,9 @@ func toolCall(id, name, arguments string) schema.ToolCall {
 
 func testTool(name string, execute func(context.Context, json.RawMessage) (agenttools.Execution, error)) agenttools.Definition {
 	return agenttools.Definition{
-		Info:    &schema.ToolInfo{Name: name},
-		Execute: execute,
+		Info:             &schema.ToolInfo{Name: name},
+		NonOwnerReadOnly: true,
+		Execute:          execute,
 	}
 }
 

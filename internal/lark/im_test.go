@@ -950,6 +950,28 @@ func TestCompactMessagesPinsRootParentAndTarget(t *testing.T) {
 	}
 }
 
+func TestCompactMessagesDropsUnreferencedAppNoise(t *testing.T) {
+	messages := []Message{
+		{MessageID: "om_human_1", SenderType: "user", Content: "请看审核链路", CreateTime: "2026-07-24T01:00:00Z"},
+		{MessageID: "om_app_1", SenderType: "app", Content: "deployment succeeded", CreateTime: "2026-07-24T01:00:01Z"},
+		{MessageID: "om_bot_1", SenderType: "bot", Content: "pull request merged", CreateTime: "2026-07-24T01:00:02Z"},
+		{MessageID: "om_parent", SenderType: "app", Content: "explicitly referenced build", CreateTime: "2026-07-24T01:00:03Z"},
+		{MessageID: "om_target", SenderType: "user", Content: "@Owner 请初步调研", CreateTime: "2026-07-24T01:00:04Z"},
+	}
+	compacted, _ := compactMessages(messages, MessageContextRequest{
+		MessageID:        "om_target",
+		ReplyToMessageID: "om_parent",
+	}, 30)
+	if containsMessage(compacted, "om_app_1") || containsMessage(compacted, "om_bot_1") {
+		t.Fatalf("unreferenced app noise remained: %v", messageIDs(compacted))
+	}
+	for _, want := range []string{"om_human_1", "om_parent", "om_target"} {
+		if !containsMessage(compacted, want) {
+			t.Fatalf("wanted message %s missing: %v", want, messageIDs(compacted))
+		}
+	}
+}
+
 func messageIDs(messages []Message) []string {
 	ids := make([]string, 0, len(messages))
 	for _, message := range messages {

@@ -218,7 +218,7 @@ func Default() Config {
 			MaxRetries:         20,
 			MaxToolOutput:      32 * 1024,
 			MaxTotalToolOutput: 128 * 1024,
-			MaxContextBytes:    192 * 1024,
+			MaxContextBytes:    64 * 1024,
 			LoopTimeout:        2 * time.Hour,
 			MaxRepeatedCalls:   3,
 			ShellTimeout:       2 * time.Minute,
@@ -252,7 +252,7 @@ func Default() Config {
 		},
 		ToolPolicy: ToolPolicyConfig{
 			DenyUnboundedShellSearch: true,
-			CodingMaxToolCalls:       10,
+			CodingMaxToolCalls:       16,
 			MaxNoProgress:            3,
 		},
 		Goal:  GoalConfig{Enabled: true, MaxActive: 3, MaxInvestigationTurns: 150},

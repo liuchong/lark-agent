@@ -1228,13 +1228,22 @@ func sortMessagesChronologically(messages []Message) {
 }
 
 func compactMessages(messages []Message, req MessageContextRequest, limit int) ([]Message, bool) {
-	if len(messages) <= limit {
-		return messages, false
-	}
 	pinned := map[string]bool{
 		req.RootMessageID:    req.RootMessageID != "",
 		req.ReplyToMessageID: req.ReplyToMessageID != "",
 		req.MessageID:        req.MessageID != "",
+	}
+	filtered := make([]Message, 0, len(messages))
+	for _, message := range messages {
+		if isAppContextMessage(message) && !pinned[message.MessageID] {
+			continue
+		}
+		filtered = append(filtered, message)
+	}
+	truncated := len(filtered) != len(messages)
+	messages = filtered
+	if len(messages) <= limit {
+		return messages, truncated
 	}
 	selected := make(map[string]Message, limit)
 	for _, message := range messages {
@@ -1252,6 +1261,15 @@ func compactMessages(messages []Message, req MessageContextRequest, limit int) (
 	}
 	sortMessagesChronologically(out)
 	return out, true
+}
+
+func isAppContextMessage(message Message) bool {
+	switch strings.ToLower(strings.TrimSpace(message.SenderType)) {
+	case "app", "bot":
+		return true
+	default:
+		return false
+	}
 }
 
 func containsMessage(messages []Message, messageID string) bool {
