@@ -13,7 +13,10 @@ The accepted scope has four outcomes:
    acknowledging or restating the request;
 3. non-owner-triggered work can use only same-chat and workspace read evidence;
 4. requests for out-of-workspace access or descriptive environment
-   reconnaissance are refused before any evidence tool executes.
+   reconnaissance are refused before any evidence tool executes;
+5. an approved reply preserves whether the original invocation addressed the
+   assistant or the owner; approval never changes bot replies into delegated
+   user-identity replies.
 
 ## Directly Applicable Rules
 
@@ -188,6 +191,37 @@ Given a coding run reads only examples, tests, or documentation,
 when it claims a definite production implementation,
 then the verify gate rejects the reply and asks for a production source or an
 explicit unknown.
+
+### Scenario: Approval preserves assistant identity
+
+Given an assistant group request or private owner request produces a useful
+evidence-backed draft that is held for approval,
+when the owner approves that exact draft and the daemon resumes it without
+calling the model again,
+then the reply is sent with bot identity, without the delegated robot prefix or
+a post-reply owner notification.
+
+### Scenario: Approval preserves delegated identity
+
+Given a non-owner directly mentions the owner and its useful read-only reply is
+held for approval,
+when the owner approves that exact draft,
+then the reply is sent with user identity, keeps the delegated robot prefix,
+and the bot notifies the owner only after the external reply succeeds.
+
+### Scenario: Legacy approval preserves identity and audit
+
+Given an older exact-draft approval stores no relevance and uses the legacy
+idempotency key,
+and the associated work item stores its original decision relevance,
+when the approved work resumes after upgrade,
+then the daemon restores that relevance, consumes the legacy action exactly
+once, sends with the original identity, and completes the legacy action with
+the returned message ID.
+
+Given both durable sources lack a recognized relevance,
+when recovery starts,
+then it fails before sending instead of guessing an identity.
 
 ### Scenario: Unauthorized commitment
 

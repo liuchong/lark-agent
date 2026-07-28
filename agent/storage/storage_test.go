@@ -2,6 +2,9 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -887,6 +890,7 @@ func TestReadyApprovedReplyReturnsPersistedExactDraft(t *testing.T) {
 		"exact persisted draft",
 		"code evidence",
 		"confirm backend contract",
+		domain.RelevanceAssistantRequest,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -900,8 +904,127 @@ func TestReadyApprovedReplyReturnsPersistedExactDraft(t *testing.T) {
 	}
 	if decision.ReplyText != "exact persisted draft" ||
 		decision.OwnerAction != "confirm backend contract" ||
+		decision.Relevance != domain.RelevanceAssistantRequest ||
 		decision.Kind != domain.DecisionReply {
 		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestReadyApprovedReplyRestoresAndConsumesLegacyIdentity(t *testing.T) {
+	store := openStore(t)
+	event := domain.NormalizedEvent{MessageID: "om_legacy_reply_resume", Content: "question"}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	decision := domain.Decision{
+		Kind:        domain.DecisionRequestApproval,
+		Mode:        domain.ModeApproval,
+		Relevance:   domain.RelevanceAssistantRequest,
+		Confidence:  0.6,
+		Risk:        domain.RiskLow,
+		Reason:      "legacy evidence",
+		ReplyText:   "legacy exact draft",
+		OwnerAction: "confirm legacy contract",
+	}
+	actionID, err := store.RequestReplyApproval(
+		context.Background(),
+		item.DedupKey,
+		decision.ReplyText,
+		decision.Reason,
+		decision.OwnerAction,
+		decision.Relevance,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Complete(item.ID, decision); err != nil {
+		t.Fatal(err)
+	}
+	legacyRequest, err := json.Marshal(map[string]string{
+		"text":         decision.ReplyText,
+		"reason":       decision.Reason,
+		"owner_action": decision.OwnerAction,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(
+		item.DedupKey + "\x00" + decision.ReplyText + "\x00" +
+			decision.Reason + "\x00" + decision.OwnerAction,
+	))
+	legacyKey := fmt.Sprintf("reply:%x", sum[:])
+	if _, err := store.db.Exec(
+		`UPDATE action_attempts SET request_json = ?, idempotency_key = ? WHERE id = ?`,
+		string(legacyRequest), legacyKey, actionID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DecideAction(actionID, true); err != nil {
+		t.Fatal(err)
+	}
+	approved, found, err := store.ReadyApprovedReply(item.ID)
+	if err != nil || !found {
+		t.Fatalf("approved=%+v found=%v err=%v", approved, found, err)
+	}
+	if approved.Relevance != domain.RelevanceAssistantRequest {
+		t.Fatalf("approved=%+v", approved)
+	}
+	consumedID, consumed, err := store.ConsumeReplyApproval(
+		context.Background(),
+		item.DedupKey,
+		approved.ReplyText,
+		approved.Reason,
+		approved.OwnerAction,
+		approved.Relevance,
+	)
+	if err != nil || !consumed || consumedID != actionID {
+		t.Fatalf("consumedID=%d consumed=%v actionID=%d err=%v", consumedID, consumed, actionID, err)
+	}
+}
+
+func TestReadyApprovedReplyRejectsLegacyWithoutDurableIdentity(t *testing.T) {
+	store := openStore(t)
+	event := domain.NormalizedEvent{MessageID: "om_legacy_reply_without_identity", Content: "question"}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	actionID, err := store.RequestReplyApproval(
+		context.Background(),
+		item.DedupKey,
+		"legacy exact draft",
+		"legacy evidence",
+		"",
+		domain.RelevanceAssistantRequest,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRequest, err := json.Marshal(map[string]string{
+		"text":   "legacy exact draft",
+		"reason": "legacy evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		`UPDATE action_attempts SET request_json = ? WHERE id = ?`,
+		string(legacyRequest), actionID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DecideAction(actionID, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.ReadyApprovedReply(item.ID); err == nil {
+		t.Fatal("legacy approval without durable relevance was accepted")
 	}
 }
 
@@ -917,12 +1040,21 @@ func TestReplyApprovalIdentityIncludesReasonAndOwnerAction(t *testing.T) {
 	}
 	firstID, err := store.RequestReplyApproval(
 		context.Background(), item.DedupKey, "same reply", "first reason", "first owner action",
+		domain.RelevanceAssistantRequest,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	secondID, err := store.RequestReplyApproval(
 		context.Background(), item.DedupKey, "same reply", "second reason", "second owner action",
+		domain.RelevanceDirectMention,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdID, err := store.RequestReplyApproval(
+		context.Background(), item.DedupKey, "same reply", "second reason", "second owner action",
+		domain.RelevanceAssistantRequest,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -930,11 +1062,15 @@ func TestReplyApprovalIdentityIncludesReasonAndOwnerAction(t *testing.T) {
 	if firstID == secondID {
 		t.Fatalf("distinct exact drafts reused action id %d", firstID)
 	}
+	if secondID == thirdID {
+		t.Fatalf("distinct reply identities reused action id %d", secondID)
+	}
 	if err := store.DecideAction(secondID, true); err != nil {
 		t.Fatal(err)
 	}
 	actionID, consumed, err := store.ConsumeReplyApproval(
 		context.Background(), item.DedupKey, "same reply", "second reason", "second owner action",
+		domain.RelevanceDirectMention,
 	)
 	if err != nil || !consumed || actionID != secondID {
 		t.Fatalf("actionID=%d consumed=%v err=%v", actionID, consumed, err)
@@ -1173,7 +1309,14 @@ func TestRequeueLowRiskDirectMentionApprovals(t *testing.T) {
 		if err := store.Complete(item.ID, decision); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.RequestReplyApproval(context.Background(), item.DedupKey, decision.ReplyText, decision.Reason, decision.OwnerAction); err != nil {
+		if _, err := store.RequestReplyApproval(
+			context.Background(),
+			item.DedupKey,
+			decision.ReplyText,
+			decision.Reason,
+			decision.OwnerAction,
+			decision.Relevance,
+		); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1220,7 +1363,14 @@ func TestRequeueLowRiskDirectMentionApprovalsRecoversCancelledUpgradeAttempt(t *
 	if err := store.Complete(item.ID, decision); err != nil {
 		t.Fatal(err)
 	}
-	actionID, err := store.RequestReplyApproval(context.Background(), item.DedupKey, decision.ReplyText, decision.Reason, decision.OwnerAction)
+	actionID, err := store.RequestReplyApproval(
+		context.Background(),
+		item.DedupKey,
+		decision.ReplyText,
+		decision.Reason,
+		decision.OwnerAction,
+		decision.Relevance,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

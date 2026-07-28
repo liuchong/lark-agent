@@ -3,6 +3,8 @@ package larkagent_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -424,25 +426,31 @@ func TestRealtimeOwnerIntakeDedupesWithPollFallback(t *testing.T) {
 }
 
 type privateReplyMessenger struct {
-	userReplies int
-	botReplies  int
-	reactions   int
-	deletions   int
-	events      []string
+	userReplies  int
+	botReplies   int
+	ownerNotices int
+	reactions    int
+	deletions    int
+	replyText    string
+	events       []string
 }
 
-func (m *privateReplyMessenger) ReplyAsUser(context.Context, tools.ReplyRequest) (tools.ReplyResult, error) {
+func (m *privateReplyMessenger) ReplyAsUser(_ context.Context, req tools.ReplyRequest) (tools.ReplyResult, error) {
 	m.userReplies++
+	m.replyText = req.Text
+	m.events = append(m.events, "user_reply")
 	return tools.ReplyResult{MessageID: "om_user_reply"}, nil
 }
 
-func (m *privateReplyMessenger) ReplyAsBot(context.Context, tools.ReplyRequest) (tools.ReplyResult, error) {
+func (m *privateReplyMessenger) ReplyAsBot(_ context.Context, req tools.ReplyRequest) (tools.ReplyResult, error) {
 	m.botReplies++
+	m.replyText = req.Text
 	m.events = append(m.events, "reply")
 	return tools.ReplyResult{MessageID: "om_bot_reply"}, nil
 }
 
-func (*privateReplyMessenger) NotifyOwner(context.Context, tools.NotifyRequest) error {
+func (m *privateReplyMessenger) NotifyOwner(context.Context, tools.NotifyRequest) error {
+	m.ownerNotices++
 	return nil
 }
 
@@ -539,6 +547,174 @@ func TestPrivateOwnerRequestUsesBotReplyPath(t *testing.T) {
 	}
 	if result.Action.Status != domain.ActionCompleted || messenger.botReplies != 1 || messenger.userReplies != 0 {
 		t.Fatalf("result=%+v messenger=%+v", result, messenger)
+	}
+}
+
+func TestApprovedAssistantReplyResumesWithBotIdentity(t *testing.T) {
+	testApprovedReplyResumesWithIdentity(t, domain.RelevanceAssistantRequest, false)
+}
+
+func TestLegacyApprovedAssistantReplyResumesWithBotIdentity(t *testing.T) {
+	testApprovedReplyResumesWithIdentity(t, domain.RelevanceAssistantRequest, true)
+}
+
+func TestApprovedDelegatedReplyResumesWithUserIdentityThenNotifiesOwner(t *testing.T) {
+	testApprovedReplyResumesWithIdentity(t, domain.RelevanceDirectMention, false)
+}
+
+func testApprovedReplyResumesWithIdentity(
+	t *testing.T,
+	relevance domain.Relevance,
+	legacy bool,
+) {
+	t.Helper()
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	store, err := storage.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		Source:           domain.SourceRealtime,
+		MessageID:        "om_approved_reply",
+		ChatID:           "oc_any_group",
+		ChatType:         "group",
+		SenderID:         "ou_requester",
+		InAssistantScope: relevance == domain.RelevanceAssistantRequest,
+	})
+	if _, err := store.EnqueueWorkItem(item); err != nil {
+		t.Fatal(err)
+	}
+	persisted, ok, err := store.ClaimNext("approval-fixture")
+	if err != nil || !ok {
+		t.Fatalf("claim persisted item=%+v ok=%v err=%v", persisted, ok, err)
+	}
+	actionID, err := store.RequestReplyApproval(
+		context.Background(),
+		item.DedupKey,
+		"已检查生产入口，初步确认缩略图信息由消息创建链路填充。",
+		"source-backed approved reply",
+		"确认是否还需继续追踪上传层。",
+		relevance,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := domain.Decision{
+		Kind:        domain.DecisionRequestApproval,
+		Mode:        domain.ModeApproval,
+		Relevance:   relevance,
+		Confidence:  0.6,
+		Risk:        domain.RiskLow,
+		Reason:      "source-backed approved reply",
+		ReplyText:   "已检查生产入口，初步确认缩略图信息由消息创建链路填充。",
+		OwnerAction: "确认是否还需继续追踪上传层。",
+	}
+	if err := store.Complete(persisted.ID, decision); err != nil {
+		t.Fatal(err)
+	}
+	if legacy {
+		rewriteReplyApprovalAsLegacy(
+			t,
+			statePath,
+			actionID,
+			item.DedupKey,
+			decision,
+		)
+	}
+	if err := store.DecideAction(actionID, true); err != nil {
+		t.Fatal(err)
+	}
+	messenger := &privateReplyMessenger{}
+	notifier := &approvalNotificationHandler{events: &messenger.events}
+	daemon := app.NewDaemon(
+		store,
+		router.New(router.Config{Mode: domain.ModeAuto}),
+		app.WithReplyHandler(reply.NewController(
+			policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, privateReplyThreadState{}),
+			messenger,
+			store,
+		)),
+		app.WithNotificationHandler(notifier),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || result.Decision.Relevance != relevance {
+		t.Fatalf("result=%+v messenger=%+v", result, messenger)
+	}
+	wantMessageID := "om_bot_reply"
+	if relevance == domain.RelevanceAssistantRequest {
+		if messenger.botReplies != 1 || messenger.userReplies != 0 ||
+			notifier.calls != 0 || strings.HasPrefix(messenger.replyText, "🤖") {
+			t.Fatalf("assistant result=%+v messenger=%+v notifier=%+v", result, messenger, notifier)
+		}
+	} else {
+		wantMessageID = "om_user_reply"
+		if messenger.userReplies != 1 || messenger.botReplies != 0 ||
+			notifier.calls != 1 || !strings.HasPrefix(messenger.replyText, "🤖") ||
+			strings.Join(messenger.events, ",") != "user_reply,notify" {
+			t.Fatalf("delegated result=%+v messenger=%+v notifier=%+v", result, messenger, notifier)
+		}
+	}
+	approval, err := store.GetActionAttempt(actionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approval.Status != domain.ActionCompleted ||
+		!strings.Contains(approval.ResponseJSON, wantMessageID) {
+		t.Fatalf("approval=%+v", approval)
+	}
+}
+
+type approvalNotificationHandler struct {
+	calls  int
+	events *[]string
+}
+
+func (h *approvalNotificationHandler) HandleNotification(
+	context.Context,
+	domain.WorkItem,
+	domain.Decision,
+	string,
+) error {
+	h.calls++
+	*h.events = append(*h.events, "notify")
+	return nil
+}
+
+func rewriteReplyApprovalAsLegacy(
+	t *testing.T,
+	statePath string,
+	actionID int64,
+	dedupKey string,
+	decision domain.Decision,
+) {
+	t.Helper()
+	requestJSON, err := json.Marshal(map[string]string{
+		"text":         decision.ReplyText,
+		"reason":       decision.Reason,
+		"owner_action": decision.OwnerAction,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(
+		dedupKey + "\x00" + decision.ReplyText + "\x00" +
+			decision.Reason + "\x00" + decision.OwnerAction,
+	))
+	legacyKey := fmt.Sprintf("reply:%x", sum[:])
+	db, err := sql.Open("sqlite", statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(
+		`UPDATE action_attempts SET request_json = ?, idempotency_key = ? WHERE id = ?`,
+		string(requestJSON), legacyKey, actionID,
+	); err != nil {
+		t.Fatal(err)
 	}
 }
 

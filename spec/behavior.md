@@ -135,6 +135,18 @@ Standalone `notify` means no
 sender-facing reply could safely be sent; it is not a substitute for this
 post-reply owner notice.
 
+Reply approval preserves this invocation identity together with the exact
+draft. Approving a held assistant request or private owner request still sends
+that draft with bot identity and does not create a delegated post-reply owner
+notice. Approving a delegated owner mention still sends with user identity and
+then creates the owner notice. Approval may authorize the exact content and
+commitment, but it never changes who the original request addressed.
+For an approval written by an older version before relevance was embedded in
+the action request, the daemon restores relevance from the work item's durable
+decision and consumes the legacy exact-draft idempotency key. It never guesses
+a sender identity from an absent or unknown relevance, and it completes the
+legacy approval audit after the external reply succeeds.
+
 Every terminal `reply` requires a configured reply executor. A missing executor
 is a retryable runtime error, never permission to persist a successful reply
 decision without an external message. Normal auto replies, not only approval
@@ -866,6 +878,23 @@ The multi-step loop is accepted by these executable BDD scenarios:
   the reply is sent only if it addresses the original question, is supported by
   cited code evidence, and obeys current policy; otherwise the draft is repaired
   or held for approval.
+- Given an assistant group request or private owner request is held for
+  approval, when the exact draft is approved and resumed without another model
+  call, then the persisted assistant/owner-request relevance selects bot
+  identity, no delegated robot prefix is added, and no post-reply owner notice
+  is created.
+- Given a delegated owner mention is held for approval, when its exact draft is
+  approved and resumed, then the persisted direct-mention relevance selects
+  user identity, adds the delegated robot prefix, and creates the post-reply
+  owner notice only after the sender-facing reply succeeds.
+- Given an exact reply approval was written before action requests stored
+  relevance, when the approved work resumes after upgrade, then relevance is
+  restored from the work item's durable decision, the legacy exact-draft key is
+  atomically consumed, and the legacy approval action becomes completed with
+  the returned Lark message ID.
+- Given neither the approval request nor the durable work decision contains a
+  recognized relevance, when approval recovery runs, then it fails explicitly
+  before selecting bot or user identity.
 - Given the default agent configuration, when a deep investigation starts,
   then it has 150 model turns and a two-hour ceiling; given an operator selects
   a custom budget, then values through 300 are accepted and larger values fail

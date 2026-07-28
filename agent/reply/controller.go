@@ -29,8 +29,8 @@ type Controller struct {
 
 // ApprovalStore persists and consumes one-time exact draft approvals.
 type ApprovalStore interface {
-	RequestReplyApproval(context.Context, string, string, string, string) (int64, error)
-	ConsumeReplyApproval(context.Context, string, string, string, string) (int64, bool, error)
+	RequestReplyApproval(context.Context, string, string, string, string, domain.Relevance) (int64, error)
+	ConsumeReplyApproval(context.Context, string, string, string, string, domain.Relevance) (int64, bool, error)
 	CompleteReplyApproval(context.Context, int64, string, string) error
 }
 
@@ -68,6 +68,7 @@ func (c *Controller) Handle(ctx context.Context, item domain.WorkItem, decision 
 			decision.ReplyText,
 			decision.Reason,
 			decision.OwnerAction,
+			decision.Relevance,
 		)
 		if err != nil {
 			return result, err
@@ -79,6 +80,7 @@ func (c *Controller) Handle(ctx context.Context, item domain.WorkItem, decision 
 				decision.ReplyText,
 				decision.Reason,
 				decision.OwnerAction,
+				decision.Relevance,
 			)
 			if err != nil {
 				return result, err
@@ -98,6 +100,7 @@ func (c *Controller) Handle(ctx context.Context, item domain.WorkItem, decision 
 			decision.ReplyText,
 			decision.Reason,
 			decision.OwnerAction,
+			decision.Relevance,
 		)
 		if err != nil {
 			return result, err
@@ -105,6 +108,11 @@ func (c *Controller) Handle(ctx context.Context, item domain.WorkItem, decision 
 		if approved {
 			action.Idempotency = item.DedupKey + ":reply"
 			result.Action = action
+		} else if decision.Mode == domain.ModeApproval {
+			return result, errs.NewInternalError(
+				errs.SubtypeFailedPrecondition,
+				"persisted approved reply has no consumable exact approval action",
+			)
 		}
 	}
 	if action.Status != domain.ActionReady {

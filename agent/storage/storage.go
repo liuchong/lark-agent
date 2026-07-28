@@ -1534,7 +1534,11 @@ func (s *Store) ClaimOwnerActivityCleanup(
 }
 
 // RequestReplyApproval creates or returns an exact draft-reply approval.
-func (s *Store) RequestReplyApproval(ctx context.Context, dedupKey, text, reason, ownerAction string) (int64, error) {
+func (s *Store) RequestReplyApproval(
+	ctx context.Context,
+	dedupKey, text, reason, ownerAction string,
+	relevance domain.Relevance,
+) (int64, error) {
 	var workItemID int64
 	if err := s.db.QueryRowContext(ctx, `SELECT id FROM work_items WHERE dedup_key = ?`, dedupKey).Scan(&workItemID); err != nil {
 		return 0, errs.NewInternalError(errs.SubtypeStorage, "locate reply approval work item").WithCause(err)
@@ -1543,11 +1547,12 @@ func (s *Store) RequestReplyApproval(ctx context.Context, dedupKey, text, reason
 		"text":         text,
 		"reason":       reason,
 		"owner_action": ownerAction,
+		"relevance":    string(relevance),
 	})
 	if err != nil {
 		return 0, errs.NewInternalError(errs.SubtypeUnknown, "encode reply approval request").WithCause(err)
 	}
-	key := replyActionKey(dedupKey, text, reason, ownerAction)
+	key := replyActionKey(dedupKey, text, reason, ownerAction, relevance)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO action_attempts(
@@ -1567,14 +1572,28 @@ func (s *Store) RequestReplyApproval(ctx context.Context, dedupKey, text, reason
 func (s *Store) ConsumeReplyApproval(
 	ctx context.Context,
 	dedupKey, text, reason, ownerAction string,
+	relevance domain.Relevance,
 ) (int64, bool, error) {
-	key := replyActionKey(dedupKey, text, reason, ownerAction)
+	key := replyActionKey(dedupKey, text, reason, ownerAction, relevance)
 	var actionID int64
 	err := s.db.QueryRowContext(ctx,
 		`SELECT id FROM action_attempts WHERE idempotency_key = ? AND status = ?`,
 		key, domain.ActionReady).Scan(&actionID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, false, nil
+		legacyRelevance, found, legacyErr := s.replyApprovalDecisionRelevance(ctx, dedupKey)
+		if legacyErr != nil {
+			return 0, false, legacyErr
+		}
+		if !found || legacyRelevance != relevance {
+			return 0, false, nil
+		}
+		key = legacyReplyActionKey(dedupKey, text, reason, ownerAction)
+		err = s.db.QueryRowContext(ctx,
+			`SELECT id FROM action_attempts WHERE idempotency_key = ? AND status = ?`,
+			key, domain.ActionReady).Scan(&actionID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, false, nil
+		}
 	}
 	if err != nil {
 		return 0, false, errs.NewInternalError(errs.SubtypeStorage, "read approved reply action").WithCause(err)
@@ -1793,11 +1812,14 @@ func (s *Store) DecideAction(id int64, approve bool) error {
 // without another nondeterministic model call.
 func (s *Store) ReadyApprovedReply(workItemID int64) (domain.Decision, bool, error) {
 	var requestJSON string
+	var decisionJSON string
 	err := s.db.QueryRow(
-		`SELECT request_json FROM action_attempts
-		 WHERE work_item_id = ? AND kind = 'reply' AND status = ?
-		 ORDER BY id LIMIT 1`,
-		workItemID, domain.ActionReady).Scan(&requestJSON)
+		`SELECT a.request_json, COALESCE(w.decision_json, '')
+		 FROM action_attempts a
+		 JOIN work_items w ON w.id = a.work_item_id
+		 WHERE a.work_item_id = ? AND a.kind = 'reply' AND a.status = ?
+		 ORDER BY a.id LIMIT 1`,
+		workItemID, domain.ActionReady).Scan(&requestJSON, &decisionJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Decision{}, false, nil
 	}
@@ -1808,6 +1830,7 @@ func (s *Store) ReadyApprovedReply(workItemID int64) (domain.Decision, bool, err
 		Text        string `json:"text"`
 		Reason      string `json:"reason"`
 		OwnerAction string `json:"owner_action"`
+		Relevance   string `json:"relevance"`
 	}
 	if err := json.Unmarshal([]byte(requestJSON), &request); err != nil {
 		return domain.Decision{}, false, errs.NewInternalError(errs.SubtypeStorage, "decode approved reply draft").WithCause(err)
@@ -1815,10 +1838,34 @@ func (s *Store) ReadyApprovedReply(workItemID int64) (domain.Decision, bool, err
 	if strings.TrimSpace(request.Text) == "" {
 		return domain.Decision{}, false, errs.NewInternalError(errs.SubtypeStorage, "approved reply draft is empty")
 	}
+	relevance := domain.Relevance(request.Relevance)
+	if relevance == "" {
+		var persisted domain.Decision
+		if strings.TrimSpace(decisionJSON) == "" {
+			return domain.Decision{}, false, errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"legacy approved reply is missing durable decision relevance",
+			)
+		}
+		if err := json.Unmarshal([]byte(decisionJSON), &persisted); err != nil {
+			return domain.Decision{}, false, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"decode legacy approved reply decision",
+			).WithCause(err)
+		}
+		relevance = persisted.Relevance
+	}
+	if !validReplyApprovalRelevance(relevance) {
+		return domain.Decision{}, false, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"approved reply has invalid relevance %q",
+			relevance,
+		)
+	}
 	return domain.Decision{
 		Kind:        domain.DecisionReply,
 		Mode:        domain.ModeApproval,
-		Relevance:   domain.RelevanceInferred,
+		Relevance:   relevance,
 		Confidence:  1,
 		Risk:        domain.RiskLow,
 		Reason:      request.Reason,
@@ -1832,11 +1879,73 @@ func shellActionKey(dedupKey, command, cwd string) string {
 	return fmt.Sprintf("shell:%x", sum[:])
 }
 
-func replyActionKey(dedupKey, text, reason, ownerAction string) string {
+func replyActionKey(
+	dedupKey, text, reason, ownerAction string,
+	relevance domain.Relevance,
+) string {
+	sum := sha256.Sum256([]byte(
+		dedupKey + "\x00" + text + "\x00" + reason + "\x00" + ownerAction +
+			"\x00" + string(relevance),
+	))
+	return fmt.Sprintf("reply:%x", sum[:])
+}
+
+func legacyReplyActionKey(dedupKey, text, reason, ownerAction string) string {
 	sum := sha256.Sum256([]byte(
 		dedupKey + "\x00" + text + "\x00" + reason + "\x00" + ownerAction,
 	))
 	return fmt.Sprintf("reply:%x", sum[:])
+}
+
+func (s *Store) replyApprovalDecisionRelevance(
+	ctx context.Context,
+	dedupKey string,
+) (domain.Relevance, bool, error) {
+	var decisionJSON string
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT COALESCE(decision_json, '') FROM work_items WHERE dedup_key = ?`,
+		dedupKey,
+	).Scan(&decisionJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read reply approval work decision",
+		).WithCause(err)
+	}
+	if strings.TrimSpace(decisionJSON) == "" {
+		return "", false, nil
+	}
+	var decision domain.Decision
+	if err := json.Unmarshal([]byte(decisionJSON), &decision); err != nil {
+		return "", false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"decode reply approval work decision",
+		).WithCause(err)
+	}
+	if !validReplyApprovalRelevance(decision.Relevance) {
+		return "", false, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"reply approval work decision has invalid relevance %q",
+			decision.Relevance,
+		)
+	}
+	return decision.Relevance, true, nil
+}
+
+func validReplyApprovalRelevance(relevance domain.Relevance) bool {
+	switch relevance {
+	case domain.RelevanceDirectMention,
+		domain.RelevanceInferred,
+		domain.RelevanceOwnerRequest,
+		domain.RelevanceAssistantRequest:
+		return true
+	default:
+		return false
+	}
 }
 
 func postReplyNotificationActionKey(dedupKey string, decisionJSON []byte) string {

@@ -71,12 +71,16 @@ func (s *auditedApprovalStore) CompleteReplyAction(
 	return nil
 }
 
-func (s *approvalStore) RequestReplyApproval(context.Context, string, string, string, string) (int64, error) {
+func (s *approvalStore) RequestReplyApproval(
+	context.Context, string, string, string, string, domain.Relevance,
+) (int64, error) {
 	s.requested++
 	return 7, nil
 }
 
-func (s *approvalStore) ConsumeReplyApproval(context.Context, string, string, string, string) (int64, bool, error) {
+func (s *approvalStore) ConsumeReplyApproval(
+	context.Context, string, string, string, string, domain.Relevance,
+) (int64, bool, error) {
 	return 7, s.approved, nil
 }
 
@@ -336,5 +340,28 @@ func TestControllerCompletesReadyApprovalInAutoMode(t *testing.T) {
 	}
 	if result.Action.Status != domain.ActionCompleted || m.replies != 1 || approvals.completed != 1 {
 		t.Fatalf("result=%+v approvals=%+v messenger=%+v", result, approvals, m)
+	}
+}
+
+func TestControllerDoesNotSendRecoveredApprovalWithoutExactAction(t *testing.T) {
+	m := &fakeMessenger{}
+	approvals := &approvalStore{approved: false}
+	controller := NewController(policy.NewReplyGate(policy.Config{Mode: domain.ModeAuto}, threadState{}), m, approvals)
+	item := domain.NewWorkItem(domain.NormalizedEvent{MessageID: "om_missing_approval"})
+	decision := domain.Decision{
+		Kind:       domain.DecisionReply,
+		Mode:       domain.ModeApproval,
+		Relevance:  domain.RelevanceAssistantRequest,
+		Confidence: 1,
+		Risk:       domain.RiskLow,
+		Reason:     "persisted approval",
+		ReplyText:  "approved draft",
+	}
+	result, err := controller.Handle(context.Background(), item, decision)
+	if err == nil {
+		t.Fatalf("recovered approval sent without exact action: result=%+v", result)
+	}
+	if m.replies != 0 || m.botReplies != 0 {
+		t.Fatalf("reply sent without exact approval: messenger=%+v", m)
 	}
 }
