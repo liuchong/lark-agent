@@ -7,10 +7,27 @@ Two live failures established reusable implementation rules.
 - A prompt that mentions a turn budget is not sufficient enforcement.
 - Once a coding run has digest-backed production evidence, tell the model to
   answer if the requested fields are covered.
-- On the immediately following model turn, expose only `submit_decision`.
-  Reject any model-emitted non-terminal call without execution and keep a
-  bounded repair turn. Waiting until the final two turns still allows long,
-  unrelated investigations after the answer is already known.
+- Treat search and code-index sources as candidate locations, not authoritative
+  reads. They must not trigger convergence before `read_workspace` has actually
+  returned the production file.
+- Enforce the same distinction at the terminal verifier. A definite coding
+  reply must cite at least one production source from an authoritative read;
+  prompt guidance and convergence logic alone do not stop a model from
+  submitting a search-only guess.
+- Do not infer insufficient evidence from free-form reply substrings. Require a
+  structured evidence status, and canonicalize insufficient coding replies so
+  an unknown phrase cannot carry an unsupported definite inference.
+- A canonical insufficient reply is not a substitute for investigation. Require
+  at least one successful workspace/code evidence tool before accepting it;
+  Lark-history reads alone do not count.
+- Apply evidence gates to every terminal branch. For code-fact questions,
+  require `reply` and reject `ignore`, `record`, `notify`, and
+  `request_approval` so no terminal type can bypass authoritative reads or
+  turn an answerable prompt into silence.
+- After an authoritative production read, expose only `submit_decision` on the
+  immediately following model turn. Reject any model-emitted non-terminal call
+  without execution and keep a bounded repair turn. Waiting until the final two
+  turns still allows long, unrelated investigations after the answer is known.
 - Do not require production call-site reachability when the user only asks for
   a named function's direct behavior.
 

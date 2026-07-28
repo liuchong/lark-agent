@@ -127,7 +127,7 @@ func TestAgentLoopRejectsPlainTextWithoutSubmit(t *testing.T) {
 	}
 }
 
-func TestAgentLoopAllowsEvidenceBackedNotifyForDirectOwnerMention(t *testing.T) {
+func TestAgentLoopRejectsNotifyForDelegatedCodingQuestion(t *testing.T) {
 	model := &scriptedModel{responses: []*schema.Message{
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("call_context", "get_lark_context", `{
 			"chat_id":"oc_backend",
@@ -140,10 +140,29 @@ func TestAgentLoopAllowsEvidenceBackedNotifyForDirectOwnerMention(t *testing.T) 
 			"reason":"same-chat evidence is insufficient for a safe sender-facing answer",
 			"owner_action":"confirm backend rate limiting"
 		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall(
+			"search",
+			"search_code_symbols",
+			`{"query":"rate limiting","max_results":5}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("call_reply", "submit_decision", `{
+			"decision":"reply",
+			"relevance_confidence":0.92,
+			"reply_confidence":0.9,
+			"risk":"low",
+			"evidence_status":"insufficient",
+			"reply_text":"目前没有足够代码证据确认这个接口如何防高频攻击。",
+			"reason":"bounded code search produced no authoritative production read"
+		}`)}),
 	}}
+	searchCalls := 0
 	registry, err := agenttools.NewRegistry(
 		testTool("get_lark_context", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
 			return agenttools.Execution{Content: `{"messages":[{"content":"no implementation detail"}]}`}, nil
+		}),
+		testTool("search_code_symbols", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			searchCalls++
+			return agenttools.Execution{Content: `{"matches":[]}`}, nil
 		}),
 		SubmitDecisionDefinition(),
 	)
@@ -165,10 +184,10 @@ func TestAgentLoopAllowsEvidenceBackedNotifyForDirectOwnerMention(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Kind != domain.DecisionNotify || model.calls != 2 {
-		t.Fatalf("decision=%+v calls=%d", decision, model.calls)
+	if decision.Kind != domain.DecisionReply || model.calls != 4 || searchCalls != 1 {
+		t.Fatalf("decision=%+v calls=%d search_calls=%d", decision, model.calls, searchCalls)
 	}
-	if len(trajectory) < 2 {
+	if len(trajectory) < 2 || !trajectoryContains(trajectory, "coding question cannot finish as notify") {
 		t.Fatalf("trajectory=%+v", trajectory)
 	}
 }
@@ -199,16 +218,27 @@ func TestAgentLoopRecoversPlainTextAfterRejectedTerminalDecision(t *testing.T) {
 			"owner_action":"confirm backend rate limiting"
 		}`)}),
 		{Role: schema.Assistant, Content: "我先收到这个问题了，会让Owner确认。"},
+		schema.AssistantMessage("", []schema.ToolCall{toolCall(
+			"search",
+			"search_code_symbols",
+			`{"query":"rate limiting","max_results":5}`,
+		)}),
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("call_reply", "submit_decision", `{
 			"decision":"reply",
 			"relevance_confidence":0.95,
 			"reply_confidence":0.9,
 			"risk":"low",
+			"evidence_status":"insufficient",
 			"reply_text":"目前没有足够代码证据确认线上是否已有独立限频，需要继续检查生产实现。",
 			"reason":"owner request receives a truthful answer"
 		}`)}),
 	}}
-	registry, err := agenttools.NewRegistry(SubmitDecisionDefinition())
+	registry, err := agenttools.NewRegistry(
+		testTool("search_code_symbols", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			return agenttools.Execution{Content: `{"matches":[]}`}, nil
+		}),
+		SubmitDecisionDefinition(),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +254,7 @@ func TestAgentLoopRecoversPlainTextAfterRejectedTerminalDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Kind != domain.DecisionReply || model.calls != 3 {
+	if decision.Kind != domain.DecisionReply || model.calls != 4 {
 		t.Fatalf("decision=%+v calls=%d", decision, model.calls)
 	}
 	if !messagesContain(model.inputs[2], "Plain assistant text is not accepted") {
@@ -250,6 +280,7 @@ func TestAgentLoopExhaustsRepeatedSourceLessWorkspaceSearches(t *testing.T) {
 			"relevance_confidence":0.94,
 			"reply_confidence":0.86,
 			"risk":"low",
+			"evidence_status":"insufficient",
 			"reply_text":"我已查了相关工作区入口，但连续三次搜索仍未找到可引用的生产实现。目前无法确认示例状态变更通知是否需要新增 示例客户端回调类型和示例通知，需要测试负责人继续核对具体入口。",
 			"owner_action":"确认示例状态变更通知是否需要新增 示例客户端回调类型和示例通知，并同步给提问人。",
 			"reason":"repeated broad workspace searches produced no source; reply with unknowns and owner confirmation boundary"
@@ -303,6 +334,7 @@ func TestAgentLoopRequiresInvestigationPlanBeforeBroadCodingSearch(t *testing.T)
 			"relevance_confidence":0.94,
 			"reply_confidence":0.86,
 			"risk":"low",
+			"evidence_status":"insufficient",
 			"reply_text":"我会先按路由和 service 查证；目前还没有足够代码证据确认是否每次直连 SampleDB。",
 			"reason":"investigation plan accepted before broad search"
 		}`)}),

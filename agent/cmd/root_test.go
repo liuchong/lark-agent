@@ -369,7 +369,8 @@ func TestAgentConfigFingerprintIncludesDecisionToolContract(t *testing.T) {
 	if contract.SubmitDecisionName != "submit_decision" ||
 		!strings.Contains(contract.SubmitDecisionDescription, "structured decision") ||
 		!strings.Contains(contract.SubmitDecisionSchema, `"decision"`) ||
-		!strings.Contains(contract.SubmitDecisionSchema, "explicitly state unknowns") {
+		!strings.Contains(contract.SubmitDecisionSchema, `"evidence_status"`) ||
+		!strings.Contains(contract.SubmitDecisionSchema, "canonical evidence-limited response") {
 		t.Fatalf("incomplete current operating contract: %+v", contract)
 	}
 }

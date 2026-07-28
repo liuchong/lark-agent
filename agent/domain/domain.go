@@ -413,19 +413,29 @@ const (
 	RiskForbidden Risk = "forbidden"
 )
 
+// EvidenceStatus records whether a reply makes a verified claim or stops at
+// an evidence-limited result.
+type EvidenceStatus string
+
+const (
+	EvidenceVerified     EvidenceStatus = "verified"
+	EvidenceInsufficient EvidenceStatus = "insufficient"
+)
+
 // Decision is an auditable routing or agent decision.
 type Decision struct {
-	Kind        DecisionKind `json:"kind" yaml:"kind"`
-	Mode        Mode         `json:"mode" yaml:"mode"`
-	Relevance   Relevance    `json:"relevance" yaml:"relevance"`
-	WorkKind    WorkKind     `json:"work_kind,omitempty" yaml:"work_kind,omitempty"`
-	Priority    int          `json:"priority,omitempty" yaml:"priority,omitempty"`
-	Confidence  float64      `json:"confidence" yaml:"confidence"`
-	Risk        Risk         `json:"risk" yaml:"risk"`
-	Reason      string       `json:"reason" yaml:"reason"`
-	ReplyText   string       `json:"reply_text,omitempty" yaml:"reply_text,omitempty"`
-	OwnerAction string       `json:"owner_action,omitempty" yaml:"owner_action,omitempty"`
-	Sources     []SourceRef  `json:"sources,omitempty" yaml:"sources,omitempty"`
+	Kind           DecisionKind   `json:"kind" yaml:"kind"`
+	Mode           Mode           `json:"mode" yaml:"mode"`
+	Relevance      Relevance      `json:"relevance" yaml:"relevance"`
+	WorkKind       WorkKind       `json:"work_kind,omitempty" yaml:"work_kind,omitempty"`
+	Priority       int            `json:"priority,omitempty" yaml:"priority,omitempty"`
+	Confidence     float64        `json:"confidence" yaml:"confidence"`
+	Risk           Risk           `json:"risk" yaml:"risk"`
+	EvidenceStatus EvidenceStatus `json:"evidence_status,omitempty" yaml:"evidence_status,omitempty"`
+	Reason         string         `json:"reason" yaml:"reason"`
+	ReplyText      string         `json:"reply_text,omitempty" yaml:"reply_text,omitempty"`
+	OwnerAction    string         `json:"owner_action,omitempty" yaml:"owner_action,omitempty"`
+	Sources        []SourceRef    `json:"sources,omitempty" yaml:"sources,omitempty"`
 }
 
 // SourceRef identifies a source that may be shown to the model or owner.

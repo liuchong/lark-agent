@@ -642,11 +642,23 @@ database evidence are code-evidence requests. Merely mentioning the configured
 Workspace or a business warehouse is not enough. Routing and runtime evidence
 validation use the same classifier.
 
-For `coding_question` work, a successful tool result containing a production
-source is the convergence boundary. The immediately following model turn
-exposes only `submit_decision`; it cannot spend more turns on Lark history,
-rules, tests, broad search, or shell commands. The model must answer from the
-verified production facts and state any remaining unknowns explicitly.
+For `coding_question` work, a successful authoritative `read_workspace` result
+containing a production source is the convergence boundary. Code-index and
+workspace-search results only locate candidates and cannot trigger convergence
+before the production file is actually read. The immediately following model
+turn exposes only `submit_decision`; it cannot spend more turns on Lark
+history, rules, tests, broad search, or shell commands. The model must answer
+from the verified production facts and state any remaining unknowns explicitly.
+A definite coding reply must declare `evidence_status=verified` and cite at
+least one production source returned by an authoritative `read_workspace`
+result in the current run. A reply that cannot make a definite claim declares
+`evidence_status=insufficient`; the runtime replaces its free-form reply text
+with a canonical evidence-limited response so an unknown marker cannot be mixed
+with an unsupported definite inference. An insufficient coding reply is only
+accepted after at least one successful workspace/code search, trace, explore,
+or read in the current run; reading Lark history alone does not count as code
+investigation. Search-only candidate sources cannot support a definite code
+claim.
 
 ## Reply Policy
 
@@ -1020,6 +1032,34 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given a coding question has read a production source that supports a useful
   answer, when the next model turn starts, then only `submit_decision` is
   available and no Lark-history, rule, test, search, or shell tool can run.
+- Given code-index or workspace search returns a candidate production path,
+  when the model has not yet read that file with `read_workspace`, then the
+  candidate source does not trigger convergence and the production read remains
+  available.
+- Given the model cites only code-index or workspace-search candidate sources,
+  when it submits a definite coding claim without an authoritative production
+  read, then the terminal decision is rejected and the bounded investigation
+  continues.
+- Given a search-only coding reply uses an ordinary requirement phrase such as
+  "需要返回", when it still makes a definite code claim, then that phrase does
+  not misclassify the reply as an explicit unknown or bypass the authoritative
+  read requirement.
+- Given exact bounded searches do not find a named symbol, when the model
+  declares `evidence_status=insufficient`, then the runtime emits the canonical
+  evidence-limited answer without inventing a production source.
+- Given an `insufficient` reply mixes an unknown phrase with an unsupported
+  definite inference, when the terminal decision is accepted, then the runtime
+  discards the free-form text and only the canonical evidence-limited answer is
+  sender-visible.
+- Given a coding question has performed no workspace/code investigation, when
+  the model immediately submits `evidence_status=insufficient`, then the
+  runtime rejects it and requires a bounded relevant code search or read before
+  accepting the canonical evidence-limited answer.
+- Given the current work is a `coding_question`, when the model attempts to
+  finish with `ignore`, `record`, `notify`, or `request_approval`, then the
+  runtime rejects that terminal path; code fact questions must finish as an
+  evidence-verified reply or a canonical evidence-limited reply and cannot
+  disappear without a sender-facing answer.
 - Given the model submits a `reply` without `reply_confidence`, when the terminal
   decision is parsed, then the decision is rejected for bounded model repair
   instead of entering approval as a zero-confidence reply.

@@ -285,10 +285,48 @@ tool policy.
 
 ### Scenario: Production evidence converges immediately
 
-Given a `coding_question` tool result contains a production source,
+Given a `coding_question` `read_workspace` result contains a production source,
 when the next model turn starts,
 then only `submit_decision` is available and any attempted history, rules,
 tests, search, or shell call is rejected without execution.
+
+Given code-index or workspace search returns a production candidate source,
+when no authoritative `read_workspace` result exists yet,
+then the candidate does not trigger terminal-only mode and the model can still
+read the production file before answering.
+
+Given a model cites only search candidate sources for a definite coding claim,
+when `submit_decision` validates the reply,
+then it rejects the decision and requires an authoritative production read
+before a definite answer can be accepted.
+
+Given a search-only definite claim contains an ordinary phrase such as
+"需要返回",
+when `submit_decision` validates the reply,
+then the phrase does not count as an explicit unknown and cannot bypass the
+authoritative-read requirement.
+
+Given exact bounded searches do not find a named symbol,
+when the reply declares `evidence_status=insufficient`,
+then the runtime emits a canonical evidence-limited answer without inventing a
+production source.
+
+Given an `insufficient` reply mixes an unknown phrase with an unsupported
+definite inference,
+when the terminal decision is accepted,
+then the runtime discards the free-form text and only the canonical
+evidence-limited answer is sender-visible.
+
+Given a coding question has performed no workspace/code investigation,
+when the model immediately submits `evidence_status=insufficient`,
+then the runtime rejects it and requires a bounded relevant code search or read
+before accepting the canonical evidence-limited answer.
+
+Given the current work is a `coding_question`,
+when the model attempts to finish with `ignore`, `record`, `notify`, or
+`request_approval`,
+then the runtime rejects that terminal path and requires a direct
+evidence-verified or canonical evidence-limited reply.
 
 ### Scenario: Missing reply confidence is repaired
 

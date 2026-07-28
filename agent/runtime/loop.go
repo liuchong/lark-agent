@@ -134,6 +134,8 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	}
 	sequence := 0
 	allowedSources := make(map[string]bool)
+	authoritativeSources := make(map[string]bool)
+	codingEvidenceReads := 0
 	for _, source := range bundle.Sources {
 		allowedSources[sourceKey(source)] = true
 	}
@@ -275,7 +277,17 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				}
 			}
 			if toolErr == nil && execution.Decision != nil {
-				if err := verifyCodingDecision(bundle, *execution.Decision, allowedSources); err != nil {
+				normalized := normalizeCodingDecision(bundle, *execution.Decision)
+				execution.Decision = &normalized
+			}
+			if toolErr == nil && execution.Decision != nil {
+				if err := verifyCodingDecision(
+					bundle,
+					*execution.Decision,
+					allowedSources,
+					authoritativeSources,
+					codingEvidenceReads,
+				); err != nil {
 					toolErr = err
 					execution.Decision = nil
 				}
@@ -297,6 +309,12 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			}
 			if toolErr == nil && execution.Decision == nil && isRelevantEvidenceTool(call.Function.Name) {
 				evidence.SuccessfulReads++
+			}
+			if toolErr == nil &&
+				execution.Decision == nil &&
+				domain.IsCodingQuestion(bundle.Event.Content) &&
+				isCodingEvidenceTool(call.Function.Name) {
+				codingEvidenceReads++
 			}
 			content := toolResultContent(execution, toolErr)
 			observation := callSignature + "\x00" + content
@@ -328,8 +346,14 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			}
 			for _, source := range execution.Sources {
 				allowedSources[sourceKey(source)] = true
+				if call.Function.Name == "read_workspace" &&
+					hasProductionSource([]domain.SourceRef{source}) {
+					authoritativeSources[sourceKey(source)] = true
+				}
 			}
-			if bundle.WorkKind == domain.WorkKindCodingQuestion && hasProductionSource(execution.Sources) {
+			if bundle.WorkKind == domain.WorkKindCodingQuestion &&
+				call.Function.Name == "read_workspace" &&
+				hasProductionSource(execution.Sources) {
 				codingEvidenceAvailable = true
 				if !codingEvidenceConvergencePrompted {
 					messages = append(messages, schema.SystemMessage(codingEvidenceConvergencePrompt()))
@@ -577,7 +601,7 @@ func SubmitDecisionDefinition() agenttools.Definition {
 					Type:     schema.String,
 					Required: true,
 					Enum:     []string{"ignore", "record", "notify", "reply", "request_approval"},
-					Desc:     "ignore only irrelevant content; record an owner-relevant update that needs no response; reply only with a useful evidence-backed response; delegated assignments and coordination requests require completed bounded read work plus a concise initial finding, not an acknowledgement or restatement; direct owner mentions may notify when no useful sender-facing response is possible without exposing private context or inventing work; assistant_request and owner_request cannot finish as notify only; request_approval only with an exact proposed reply_text for a risky response or personal commitment",
+					Desc:     "ignore only irrelevant content; record an owner-relevant update that needs no response; reply only with a useful evidence-backed response; delegated assignments and coordination requests require completed bounded read work plus a concise initial finding, not an acknowledgement or restatement; direct owner mentions may notify when no useful sender-facing response is possible without exposing private context or inventing work; assistant_request and owner_request cannot finish as notify only; coding questions must finish as reply and cannot use ignore, record, notify, or request_approval; request_approval is only for a non-coding risky response or personal commitment with an exact proposed reply_text",
 				},
 				"relevance_confidence": {Type: schema.Number, Required: true},
 				"reply_confidence": {
@@ -590,9 +614,14 @@ func SubmitDecisionDefinition() agenttools.Definition {
 					Enum:     []string{"low", "medium", "high", "forbidden"},
 					Desc:     "Use exactly one risk enum value; put all explanatory prose in reason.",
 				},
+				"evidence_status": {
+					Type: schema.String,
+					Enum: []string{"verified", "insufficient"},
+					Desc: "Required for coding replies. Use verified only after an authoritative current-run read_workspace production read; use insufficient when a definite code claim cannot be supported. Insufficient free-form reply_text is replaced by a canonical evidence-limited response.",
+				},
 				"reply_text": {
 					Type: schema.String,
-					Desc: "Exact sender-facing text. Required for reply and request_approval. For delegated work, state completed read-only work, a concise initial finding or explicit unknown, and concrete information passed to the owner; do not merely acknowledge, restate, or promise future coordination. For coding replies, keep the structure as 结论、依据、未知/下一步; cite production source_refs for definite production claims, or explicitly state unknowns when evidence is insufficient. Lark mention placeholders like @_user_1 are internal keys from the mentions mapping: do not invent them, and do not use shell to send messages. The runtime renders known mention placeholders into Lark-native mentions and adds the robot marker only when replying as the owner on the owner's behalf.",
+					Desc: "Exact sender-facing text. Required for reply and request_approval. For delegated work, state completed read-only work, a concise initial finding or explicit unknown, and concrete information passed to the owner; do not merely acknowledge, restate, or promise future coordination. For verified coding replies, keep the structure as 结论、依据、未知/下一步 and cite authoritative production source_refs. For insufficient coding replies, the runtime emits canonical evidence-limited text. Lark mention placeholders like @_user_1 are internal keys from the mentions mapping: do not invent them, and do not use shell to send messages. The runtime renders known mention placeholders into Lark-native mentions and adds the robot marker only when replying as the owner on the owner's behalf.",
 				},
 				"owner_action": {
 					Type: schema.String,
@@ -753,9 +782,22 @@ func validateTerminalDecision(bundle agentcontext.Bundle, decision domain.Decisi
 	)
 }
 
-func verifyCodingDecision(bundle agentcontext.Bundle, decision domain.Decision, allowed map[string]bool) error {
-	if !domain.IsCodingQuestion(bundle.Event.Content) || decision.Kind != domain.DecisionReply {
+func verifyCodingDecision(
+	bundle agentcontext.Bundle,
+	decision domain.Decision,
+	allowed map[string]bool,
+	authoritative map[string]bool,
+	codingEvidenceReads int,
+) error {
+	if !domain.IsCodingQuestion(bundle.Event.Content) {
 		return nil
+	}
+	if decision.Kind != domain.DecisionReply {
+		return errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"coding question cannot finish as %s; submit a verified or insufficient reply",
+			decision.Kind,
+		)
 	}
 	if strings.TrimSpace(decision.ReplyText) == "" {
 		return errs.NewInternalError(errs.SubtypeInvalidResponse, "coding reply does not answer the original question")
@@ -763,10 +805,25 @@ func verifyCodingDecision(bundle agentcontext.Bundle, decision domain.Decision, 
 	if decision.Risk == domain.RiskHigh || decision.Risk == domain.RiskForbidden {
 		return errs.NewInternalError(errs.SubtypeInvalidResponse, "coding reply with high or forbidden risk requires approval")
 	}
-	if len(decision.Sources) == 0 && !replyStatesInsufficientEvidence(decision.ReplyText) {
+	if decision.EvidenceStatus == domain.EvidenceInsufficient {
+		if codingEvidenceReads == 0 {
+			return errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"insufficient coding reply requires at least one successful workspace code investigation",
+			)
+		}
+		return nil
+	}
+	if decision.EvidenceStatus != domain.EvidenceVerified {
 		return errs.NewInternalError(
 			errs.SubtypeInvalidResponse,
-			"coding reply has no cited code evidence; cite source_refs or state the unknowns and next confirmation step",
+			"coding reply missing evidence_status; use verified or insufficient",
+		)
+	}
+	if len(decision.Sources) == 0 {
+		return errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"verified coding reply has no cited code evidence",
 		)
 	}
 	for _, source := range decision.Sources {
@@ -778,15 +835,34 @@ func verifyCodingDecision(bundle agentcontext.Bundle, decision domain.Decision, 
 			)
 		}
 	}
-	if len(decision.Sources) > 0 &&
-		!hasProductionSource(decision.Sources) &&
-		!replyStatesInsufficientEvidence(decision.ReplyText) {
+	if !hasProductionSource(decision.Sources) {
 		return errs.NewInternalError(
 			errs.SubtypeInvalidResponse,
-			"coding reply has supporting evidence only; cite production source or explicitly state that production behavior remains unverified",
+			"verified coding reply has supporting evidence only; cite production source or use evidence_status=insufficient",
 		)
 	}
-	return nil
+	for _, source := range decision.Sources {
+		if authoritative[sourceKey(source)] {
+			return nil
+		}
+	}
+	return errs.NewInternalError(
+		errs.SubtypeInvalidResponse,
+		"verified coding reply has no authoritative production read; use read_workspace before making a definite code claim",
+	)
+}
+
+const canonicalInsufficientCodingReply = "结论：当前证据不足，不能确认你询问的代码事实。\n" +
+	"依据：已完成有界的工作区代码定位，但没有取得足以支撑确定结论的生产源码证据。\n" +
+	"未知/下一步：相关符号是否存在及实际行为仍未核实，我不会据此推测。"
+
+func normalizeCodingDecision(bundle agentcontext.Bundle, decision domain.Decision) domain.Decision {
+	if domain.IsCodingQuestion(bundle.Event.Content) &&
+		decision.Kind == domain.DecisionReply &&
+		decision.EvidenceStatus == domain.EvidenceInsufficient {
+		decision.ReplyText = canonicalInsufficientCodingReply
+	}
+	return decision
 }
 
 func isRelevantEvidenceTool(name string) bool {
@@ -804,24 +880,17 @@ func isRelevantEvidenceTool(name string) bool {
 	}
 }
 
-func replyStatesInsufficientEvidence(reply string) bool {
-	for _, marker := range []string{
-		"没有足够",
-		"不能确认",
-		"无法确认",
-		"还不能确认",
-		"需要",
-		"未知",
-		"缺少",
-		"not enough",
-		"cannot confirm",
-		"unknown",
-	} {
-		if strings.Contains(strings.ToLower(reply), marker) {
-			return true
-		}
+func isCodingEvidenceTool(name string) bool {
+	switch name {
+	case "explore_workspace",
+		"search_workspace",
+		"read_workspace",
+		"search_code_symbols",
+		"trace_code_path":
+		return true
+	default:
+		return false
 	}
-	return false
 }
 
 func toolContentNoNewContext(content string) bool {
