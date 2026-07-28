@@ -150,7 +150,7 @@ func isDelegatedInvocation(bundle agentcontext.Bundle) bool {
 
 func requiresRelevantWork(content string) bool {
 	lower := strings.ToLower(content)
-	return isCodingQuestion(content) || containsAny(lower,
+	return domain.IsCodingQuestion(content) || containsAny(lower,
 		"调研", "检查", "确认", "核对", "分析", "排查", "研究", "对齐", "处理", "实现",
 		"修改", "删除", "发布", "部署", "同步", "review", "check", "investigate", "analyze",
 	)

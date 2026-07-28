@@ -98,7 +98,7 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 		if !r.cfg.DisableCodingGoal && isCodingGoal(item.Event.Content) {
 			decision.WorkKind = domain.WorkKindCodingGoal
 			decision.Priority = domain.PriorityBackground
-		} else if isCodingQuestion(item.Event.Content) {
+		} else if domain.IsCodingQuestion(item.Event.Content) {
 			decision.WorkKind = domain.WorkKindCodingQuestion
 			decision.Priority = domain.PriorityCodingQuestion
 		}
@@ -129,7 +129,7 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 		if !r.cfg.DisableCodingGoal && isCodingGoal(item.Event.Content) {
 			decision.WorkKind = domain.WorkKindCodingGoal
 			decision.Priority = domain.PriorityBackground
-		} else if isCodingQuestion(item.Event.Content) {
+		} else if domain.IsCodingQuestion(item.Event.Content) {
 			decision.WorkKind = domain.WorkKindCodingQuestion
 			decision.Priority = domain.PriorityCodingQuestion
 		}
@@ -267,17 +267,6 @@ func fastPathReply(base domain.Decision, text, reason string) domain.Decision {
 	base.ReplyText = text
 	base.Reason = appendReason(base.Reason, reason)
 	return base
-}
-
-func isCodingQuestion(content string) bool {
-	content = strings.ToLower(content)
-	keywords := []string{"代码", "接口", "sampledb", "mysql", "redis", "函数", "类", "基于代码", "为什么每次", "bug", "报错", "实现"}
-	for _, keyword := range keywords {
-		if strings.Contains(content, strings.ToLower(keyword)) {
-			return true
-		}
-	}
-	return false
 }
 
 func isCodingGoal(content string) bool {

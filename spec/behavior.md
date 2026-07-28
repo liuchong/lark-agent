@@ -605,7 +605,11 @@ and owner requests that match a fast-path command are `fast_path` work. Requests
 that need a short answer but no code evidence are `simple_question` work.
 Engineering requests that require code evidence are `coding_question` work
 unless they explicitly need durable follow-up, in which case they become
-`coding_goal` work with persisted completion and blocking conditions.
+`coding_goal` work with persisted completion and blocking conditions. Explicit
+requests for source code, production or code entry points, APIs, handlers, or
+database evidence are code-evidence requests. Merely mentioning the configured
+Workspace or a business warehouse is not enough. Routing and runtime evidence
+validation use the same classifier.
 
 ## Reply Policy
 
@@ -776,6 +780,11 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given owner asks the same coding question in private chat and in a group
   mention inside the dedupe window, when both events are ingested, then only
   one canonical investigation runs and the duplicate item links to that result.
+- Given an assistant request asks to inspect source code or a production/code
+  entry point inside the configured Workspace and report evidence,
+  when deterministic routing classifies the work, then it enters
+  `coding_question` rather than `simple_question`, so code investigation tools
+  and the evidence-backed conclusion flow are available.
 - Given a foreground coding investigation is active, when owner sends a new
   fast-path request, then the scheduler processes the fast-path item before the
   background or lower-priority coding work.

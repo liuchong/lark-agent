@@ -219,7 +219,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					l.MaxToolCalls,
 				)
 				forceDecision = true
-			} else if isCodingQuestion(bundle.Event.Content) && !investigationPlanSubmitted && call.Function.Name == "search_workspace" {
+			} else if domain.IsCodingQuestion(bundle.Event.Content) && !investigationPlanSubmitted && call.Function.Name == "search_workspace" {
 				toolErr = errs.NewInternalError(
 					errs.SubtypeInvalidResponse,
 					"coding investigation requires submit_investigation_plan before broad workspace search; name entry points, symbols, tools, and stop conditions first",
@@ -714,7 +714,7 @@ func validateTerminalDecision(bundle agentcontext.Bundle, decision domain.Decisi
 }
 
 func verifyCodingDecision(bundle agentcontext.Bundle, decision domain.Decision, allowed map[string]bool) error {
-	if !isCodingQuestion(bundle.Event.Content) || decision.Kind != domain.DecisionReply {
+	if !domain.IsCodingQuestion(bundle.Event.Content) || decision.Kind != domain.DecisionReply {
 		return nil
 	}
 	if strings.TrimSpace(decision.ReplyText) == "" {
@@ -778,32 +778,6 @@ func replyStatesInsufficientEvidence(reply string) bool {
 		"unknown",
 	} {
 		if strings.Contains(strings.ToLower(reply), marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func isCodingQuestion(content string) bool {
-	lower := strings.ToLower(content)
-	for _, marker := range []string{
-		"api",
-		"接口",
-		"代码",
-		"数据库",
-		"sampledb",
-		"redis",
-		"sdk",
-		"回调",
-		"限流",
-		"缓存",
-		"高频",
-		"endpoint",
-		"handler",
-		"service",
-		"repository",
-	} {
-		if strings.Contains(lower, marker) {
 			return true
 		}
 	}

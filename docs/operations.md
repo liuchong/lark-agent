@@ -123,6 +123,11 @@ Workspace 内的业务代码，不能执行 shell、搜索其他群、修改、�
 `reply_confidence` 低于 `policy.reply_confidence_min` 时统一进入审批，不再对直接
 @Owner 的低风险草稿使用隐藏的较低阈值。
 
+明确要求检查源码、生产入口、代码入口、API、处理函数或数据库依据的消息会进入
+`coding_question` 代码调查链路，而不是简单问答链路。单独提到 Workspace 或业务
+仓库不会触发代码调查。该链路允许受 Workspace 边界约束的代码检索和精读，并要求
+最终结论引用实际读取到的生产代码或明确写出未知项。
+
 用户身份接口若发现进程缓存的 `user_access_token` 已过期，会先重读 Keychain；
 如果没有更新的凭据，再通过官方 SDK 使用 `refresh_token` 刷新，并把轮换后的两个
 token 写回 Keychain 后重放原请求一次。若刷新凭据也过期，运行

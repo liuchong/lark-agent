@@ -203,11 +203,20 @@ and narrowed production reads in its second,
 when those reads complete,
 then a third model turn remains for `submit_decision`.
 
+Given an assistant request asks to inspect source code or a production/code
+entry point inside the configured Workspace and provide code evidence,
+when deterministic routing classifies the request,
+then it enters `coding_question` and cannot be trapped in the simple-question
+tool policy.
+
 ## Test Locations
 
 - `integration_test/lark_agent/response_quality_test.go`: end-to-end contracts
   for guarded requests, non-owner read-only execution, evidence-backed replies,
   and the anonymized regression trajectory.
+- `integration_test/lark_agent/routing_classification_test.go`: exact live
+  Workspace plus production-entry wording in assistant private chat and native
+  group mention routes to the code-investigation lane.
 - `agent/runtime/*_test.go`: terminal quality and production-source verification.
 - `agent/tools/*_test.go`: owner-only, same-chat, and side-effect registry gates.
 - `internal/lark/im_test.go`: app/bot context compaction.
