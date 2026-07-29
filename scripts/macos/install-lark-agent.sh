@@ -209,12 +209,7 @@ chmod 700 "$WRAPPER"
 } > "$CONF_FILE"
 chmod 600 "$CONF_FILE"
 
-{
-  [ -n "${OPENAI_API_KEY:-}" ] && printf 'OPENAI_API_KEY=%q\n' "$OPENAI_API_KEY"
-  [ -n "${OPENAI_BASE_URL:-}" ] && printf 'OPENAI_BASE_URL=%q\n' "$OPENAI_BASE_URL"
-  [ -n "${OPENAI_MODEL:-}" ] && printf 'OPENAI_MODEL=%q\n' "$OPENAI_MODEL"
-} > "$ENV_FILE"
-chmod 600 "$ENV_FILE"
+bash "$ROOT/scripts/macos/update-private-env.sh" "$ENV_FILE"
 
 cat > "$INFO_PLIST" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>

@@ -65,6 +65,116 @@ func TestQueueRetryCannotBypassExplicitPriorSessionResume(t *testing.T) {
 	}
 }
 
+func TestMacOSPrivateEnvUpdaterPreservesUnsetValues(t *testing.T) {
+	appSupport := filepath.Join(t.TempDir(), "Library", "Application Support", "lark-agent")
+	if err := os.MkdirAll(appSupport, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	envPath := filepath.Join(appSupport, "env")
+	original := strings.Join([]string{
+		"OPENAI_API_KEY=existing-key",
+		"OPENAI_BASE_URL=https://existing.example.test/v1",
+		"OPENAI_MODEL=existing-model",
+		"CUSTOM_PRIVATE_SETTING=preserved",
+		"",
+	}, "\n")
+	if err := os.WriteFile(envPath, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	updater := filepath.Join(repoRoot(t), "scripts", "macos", "update-private-env.sh")
+	run := func(extra ...string) []byte {
+		t.Helper()
+		command := exec.Command("bash", updater, envPath)
+		command.Env = append(withoutEnvironmentKeys(
+			os.Environ(),
+			"OPENAI_API_KEY",
+			"OPENAI_BASE_URL",
+			"OPENAI_MODEL",
+		), extra...)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("private env updater failed: %v\n%s", err, output)
+		}
+		if len(output) != 0 {
+			t.Fatalf("private env updater printed data: %q", output)
+		}
+		data, err := os.ReadFile(envPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(envPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("private env mode=%#o, want 0600", info.Mode().Perm())
+		}
+		return data
+	}
+
+	if got := run(); string(got) != original {
+		t.Fatalf("unset variables changed private env:\n%s", got)
+	}
+
+	updated := string(run("OPENAI_MODEL=updated-model"))
+	for _, want := range []string{
+		"OPENAI_API_KEY=existing-key",
+		"OPENAI_BASE_URL=https://existing.example.test/v1",
+		"OPENAI_MODEL=updated-model",
+		"CUSTOM_PRIVATE_SETTING=preserved",
+	} {
+		if !strings.Contains(updated, want) {
+			t.Fatalf("partial update missing %q:\n%s", want, updated)
+		}
+	}
+	if strings.Contains(updated, "OPENAI_MODEL=existing-model") {
+		t.Fatalf("partial update retained old model:\n%s", updated)
+	}
+
+	cleared := string(run("OPENAI_API_KEY="))
+	if strings.Contains(cleared, "OPENAI_API_KEY=") {
+		t.Fatalf("explicit empty value did not remove API key:\n%s", cleared)
+	}
+	for _, want := range []string{
+		"OPENAI_BASE_URL=https://existing.example.test/v1",
+		"OPENAI_MODEL=updated-model",
+		"CUSTOM_PRIVATE_SETTING=preserved",
+	} {
+		if !strings.Contains(cleared, want) {
+			t.Fatalf("explicit removal lost %q:\n%s", want, cleared)
+		}
+	}
+
+	newPath := filepath.Join(appSupport, "new-env")
+	command := exec.Command("bash", updater, newPath)
+	command.Env = withoutEnvironmentKeys(
+		os.Environ(),
+		"OPENAI_API_KEY",
+		"OPENAI_BASE_URL",
+		"OPENAI_MODEL",
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("new private env update failed: %v\n%s", err, output)
+	} else if len(output) != 0 {
+		t.Fatalf("new private env updater printed data: %q", output)
+	}
+	data, err := os.ReadFile(newPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("new private env is not empty: %q", data)
+	}
+	info, err := os.Stat(newPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("new private env mode=%#o, want 0600", info.Mode().Perm())
+	}
+}
+
 func TestMacOSInstallerInstallsCleanHomeWithoutLoading(t *testing.T) {
 	home := t.TempDir()
 	appSupport := filepath.Join(home, "Library", "Application Support", "lark-agent")
@@ -165,7 +275,12 @@ esac
 	}
 	command := exec.Command("bash", script)
 	command.Dir = repoRoot(t)
-	installerEnv := append(os.Environ(),
+	installerEnv := append(withoutEnvironmentKeys(
+		os.Environ(),
+		"OPENAI_API_KEY",
+		"OPENAI_BASE_URL",
+		"OPENAI_MODEL",
+	),
 		"HOME="+home,
 		"PATH="+fakeBinDir+":"+os.Getenv("PATH"),
 		"FAKE_LAUNCHCTL_STATE="+fakeLaunchctlState,
@@ -393,6 +508,16 @@ esac
 	if err := os.WriteFile(fakeLaunchctlLog, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	envPath := filepath.Join(appSupport, "env")
+	preservedEnv := []byte(strings.Join([]string{
+		"OPENAI_API_KEY=upgrade-key",
+		"OPENAI_BASE_URL=https://upgrade.example.test/v1",
+		"OPENAI_MODEL=upgrade-model",
+		"",
+	}, "\n"))
+	if err := os.WriteFile(envPath, preservedEnv, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	reinstall := exec.Command("bash", script)
 	reinstall.Dir = repoRoot(t)
 	reinstall.Env = append(append([]string{}, installerEnv...),
@@ -415,4 +540,35 @@ esac
 		strings.Contains(string(actions), "duplicate-bootstrap") {
 		t.Fatalf("unexpected reinstall launchctl order:\n%s\n%s", actions, reinstallOutput)
 	}
+	gotEnv, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotEnv) != string(preservedEnv) {
+		t.Fatalf("reinstall erased existing model environment:\n%s", gotEnv)
+	}
+	envInfo, err := os.Stat(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("reinstalled model environment mode=%#o, want 0600", envInfo.Mode().Perm())
+	}
+}
+
+func withoutEnvironmentKeys(environment []string, keys ...string) []string {
+	filtered := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		remove := false
+		for _, key := range keys {
+			if strings.HasPrefix(entry, key+"=") {
+				remove = true
+				break
+			}
+		}
+		if !remove {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }

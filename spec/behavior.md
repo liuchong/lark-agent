@@ -364,6 +364,21 @@ success rather than `load launch agent`. Given another installer already holds
 the install lock, a concurrent attempt fails before it can stop or replace the
 service.
 
+The private model environment is durable installation state. An upgrade with
+an unset `OPENAI_API_KEY`, `OPENAI_BASE_URL`, or `OPENAI_MODEL` preserves that
+key's installed value instead of treating absence from the installer's process
+environment as a request to erase it. An explicitly supplied non-empty value
+updates only that key; an explicitly supplied empty value removes only that
+key. The resulting file is replaced atomically with mode `0600`, is included in
+the existing rollback snapshot, and is never printed.
+
+Given a working installation with model credentials in its private environment,
+when an upgrade is launched from a shell that does not export any `OPENAI_*`
+variables, then the private environment remains byte-for-byte equivalent and
+the upgraded daemon remains model-configured. Given only one `OPENAI_*`
+variable is explicitly supplied, when installation succeeds, then only that
+key changes and all other private environment entries remain intact.
+
 ## Workspace Boundary
 
 The configuration must contain exactly one absolute `workspace.root`. Local
