@@ -82,7 +82,8 @@ and remove it when work finishes.
 Programming questions use a bounded coding investigation path with planning,
 code search fallback, source-backed verify, and replay transcript export.
 Simple questions use at most 3 model turns; coding questions use 20 turns,
-16 tool calls, and a 3-step no-progress stop by default. One interactive
+16 tool calls, a 3-step no-progress stop, and at most 3 terminal-only attempts
+after forced convergence by default. One interactive
 worker is reserved from the foreground pool, while CodingGoal work uses
 background workers. Time, date, ping, status, doctor, queue summary, and help
 use a deterministic fast path before any model loop.

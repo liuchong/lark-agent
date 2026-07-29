@@ -154,6 +154,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	noProgressStreak := 0
 	lastObservation := ""
 	forceDecision := false
+	terminalOnlyAttempts := 0
 	evidence := responseEvidence{}
 	for turn := 0; turn < l.MaxTurns; turn++ {
 		if err := ctx.Err(); err != nil {
@@ -167,7 +168,18 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		terminalOnly := forceDecision || codingTerminalOnly
 		turnToolInfos := visibleToolInfos
 		if terminalOnly {
+			if terminalOnlyAttempts >= maxTerminalOnlyAttempts {
+				return domain.Decision{}, trajectory, errs.NewInternalError(
+					errs.SubtypeInvalidResponse,
+					"model did not submit a terminal decision after %d attempts",
+					maxTerminalOnlyAttempts,
+				)
+			}
+			terminalOnlyAttempts++
 			turnToolInfos = submitDecisionOnly(visibleToolInfos)
+			requestMessages = append(requestMessages, schema.SystemMessage(
+				terminalOnlyPrompt(terminalOnlyAttempts, maxTerminalOnlyAttempts),
+			))
 		}
 		assistant, err := l.Model.Generate(ctx, requestMessages,
 			einomodel.WithTools(turnToolInfos),
@@ -461,6 +473,18 @@ func shouldPromptToolBudgetConvergence(rawToolBytes, maxToolBytes, totalToolByte
 
 func toolBudgetConvergencePrompt() string {
 	return "Tool output budget is near or above the configured limit. Old raw tool output has been clipped for context safety. Summarize the evidence already gathered, avoid broad repeat searches, and converge with submit_decision unless one narrow read is required to avoid a false claim."
+}
+
+const maxTerminalOnlyAttempts = 3
+
+func terminalOnlyPrompt(attempt, maxAttempts int) string {
+	return fmt.Sprintf(
+		"Only submit_decision is available now. Previous investigation tools are no longer available. "+
+			"Call submit_decision in this turn using verified facts and explicit unknowns. "+
+			"This is terminal-only attempt %d of %d.",
+		attempt,
+		maxAttempts,
+	)
 }
 
 func codingEvidenceConvergencePrompt() string {

@@ -532,6 +532,87 @@ func TestAgentLoopConvergesImmediatelyAfterCitableEvidence(t *testing.T) {
 	}
 }
 
+func TestAgentLoopTerminalOnlyPromptAllowsOneCorrection(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("read_1", "read_workspace", `{"path":"account.go"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("read_over_budget", "read_workspace", `{"path":"error.go"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("ignored_old_tool", "search_workspace", `{"query":"10005"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"relevance_confidence":0.94,
+			"reply_confidence":0.88,
+			"risk":"low",
+			"reply_text":"我核对了删号请求实现，当前能确认请求会携带账号标识；10005 的服务端含义仍需对照错误码定义，不能直接猜。",
+			"reason":"bounded investigation completed with explicit unknown"
+		}`)}),
+	}}
+	readCalls := 0
+	registry, err := agenttools.NewRegistry(
+		testTool("read_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			readCalls++
+			return agenttools.Execution{Content: "delete account request"}, nil
+		}),
+		testTool("search_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			t.Fatal("terminal-only old tool was executed")
+			return agenttools.Execution{}, nil
+		}),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, _, err := (AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 20, MaxToolCalls: 1,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{MessageID: "om_terminal_correction", Content: "@Owner 看看删号 10005"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply || model.calls != 4 || readCalls != 1 {
+		t.Fatalf("decision=%+v modelCalls=%d readCalls=%d", decision, model.calls, readCalls)
+	}
+	for _, inputIndex := range []int{2, 3} {
+		if !messagesContain(model.inputs[inputIndex], "Only submit_decision is available now") {
+			t.Fatalf("model input %d missing terminal-only system prompt: %+v", inputIndex, model.inputs[inputIndex])
+		}
+	}
+}
+
+func TestAgentLoopStopsAfterThreeIgnoredTerminalOnlyAttempts(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("read_1", "read_workspace", `{"path":"account.go"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("read_over_budget", "read_workspace", `{"path":"error.go"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("ignored_1", "search_workspace", `{"query":"10005 one"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("ignored_2", "search_workspace", `{"query":"10005 two"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("ignored_3", "search_workspace", `{"query":"10005 three"}`)}),
+	}}
+	registry, err := agenttools.NewRegistry(
+		testTool("read_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			return agenttools.Execution{Content: "delete account request"}, nil
+		}),
+		testTool("search_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			t.Fatal("terminal-only old tool was executed")
+			return agenttools.Execution{}, nil
+		}),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = (AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 20, MaxToolCalls: 1,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{MessageID: "om_terminal_failure", Content: "@Owner 看看删号 10005"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "terminal decision after 3 attempts") {
+		t.Fatalf("err=%v", err)
+	}
+	if model.calls != 5 {
+		t.Fatalf("model calls=%d", model.calls)
+	}
+}
+
 func TestCompactMessagesPreservesRecentTurnsWithinBudget(t *testing.T) {
 	messages := []*schema.Message{
 		schema.SystemMessage("system"),

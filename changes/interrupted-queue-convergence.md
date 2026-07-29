@@ -45,6 +45,18 @@ cancelled.
   explicit `queue resume`.
 - Rejection cancels the action and work and blocks an associated coding goal.
 
+### Forced decision convergence
+
+- Once tool, repeated-call, no-progress, or citable-evidence gates require a
+  terminal decision, subsequent model requests expose only `submit_decision`
+  and include an explicit system instruction that earlier tools are no longer
+  available.
+- The model gets at most three terminal-only attempts. If it still emits plain
+  text or calls an unavailable investigation tool, the run fails immediately
+  instead of consuming the remaining general turn budget.
+- A failed forced-decision run uses the existing bounded retry/dead-letter
+  policy; it does not fabricate a reply or external action.
+
 ### Installation and defaults
 
 This change adds no configuration and changes no automatic replay policy.
@@ -72,6 +84,12 @@ destructive migration.
   ready but the work remains interrupted until an explicit resume.
 - Given invalid selector combinations or a blank reason, when `queue cancel`
   runs, then it fails without changing state.
+- Given a model reaches a forced-decision gate, when it calls an old
+  investigation tool once and then submits a valid decision, then the old tool
+  is not executed and the decision completes.
+- Given a model repeatedly ignores terminal-only instructions, when three
+  terminal-only attempts are exhausted, then the run fails before the general
+  turn limit and no reply or action is fabricated.
 
 ## Tests and fixtures
 

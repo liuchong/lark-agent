@@ -62,6 +62,9 @@ lark-agent config show
 提交结论”三个模型轮次。
 `tool_policy.coding_max_tool_calls` 默认为 `16`，只有成功执行的调查工具才消耗这项
 额度；参数或策略校验失败仍受模型轮次和无进展上限约束，但不会挤掉后续生产代码读取。
+一旦工具额度、无进展或证据充分条件要求提交结论，后续只允许
+`submit_decision`，最多给模型 3 次强制收尾机会；仍调用旧工具会立即结束该次运行，
+不会继续消耗剩余通用轮次。
 
 配置不保存官方 Lark 凭据，也没有模型密钥字段。Lark app secret 放在 macOS
 Keychain；用户 access token 和 refresh token 可选，只用于用户身份轮询和代回复。

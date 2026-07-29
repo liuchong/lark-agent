@@ -1089,6 +1089,7 @@ func TestBehaviorSpecDocumentsCodingAssistanceContract(t *testing.T) {
 		"`queue resume`",
 		"`queue cancel`",
 		"`operator_cancel`",
+		"three terminal-only model attempts",
 		"never blindly repeated",
 		"private offline notice",
 		"private online notice",
