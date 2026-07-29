@@ -11,6 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/liuchong/lark-agent/agent/domain"
+	agentlocale "github.com/liuchong/lark-agent/agent/locale"
 	errs "github.com/liuchong/lark-agent/internal/apperr"
 	"github.com/liuchong/lark-agent/internal/fsx"
 )
@@ -44,6 +45,7 @@ type AgentConfig struct {
 	MaxToolOutput      int           `json:"max_tool_output_bytes" yaml:"max_tool_output_bytes"`
 	MaxTotalToolOutput int           `json:"max_total_tool_output_bytes" yaml:"max_total_tool_output_bytes"`
 	MaxContextBytes    int           `json:"max_context_bytes" yaml:"max_context_bytes"`
+	ContextCompaction  float64       `json:"context_compaction_ratio" yaml:"context_compaction_ratio"`
 	LoopTimeout        time.Duration `json:"loop_timeout" yaml:"loop_timeout"`
 	MaxRepeatedCalls   int           `json:"max_repeated_calls" yaml:"max_repeated_calls"`
 	ShellTimeout       time.Duration `json:"shell_timeout" yaml:"shell_timeout"`
@@ -161,7 +163,10 @@ func DefaultPaths(home string) Paths {
 
 // OwnerConfig identifies the human owner.
 type OwnerConfig struct {
-	OpenID string `json:"open_id" yaml:"open_id"`
+	OpenID            string               `json:"open_id" yaml:"open_id"`
+	Name              string               `json:"name,omitempty" yaml:"name,omitempty"`
+	PreferredLanguage agentlocale.Language `json:"preferred_language" yaml:"preferred_language"`
+	FallbackLanguage  agentlocale.Language `json:"fallback_language" yaml:"fallback_language"`
 }
 
 // AssistantConfig identifies bot-facing request entry points.
@@ -233,6 +238,10 @@ func Default() Config {
 			MaxAnnotations:       50,
 			MaxReviews:           50,
 		},
+		Owner: OwnerConfig{
+			PreferredLanguage: agentlocale.LanguageAuto,
+			FallbackLanguage:  agentlocale.LanguageChinese,
+		},
 		Assistant: AssistantConfig{
 			Names:       []string{"Lark Agent", "lark-agent", "机器人", "Agent"},
 			ReplyScope:  domain.ReplyScopeAllGroups,
@@ -248,6 +257,7 @@ func Default() Config {
 			MaxToolOutput:      32 * 1024,
 			MaxTotalToolOutput: 128 * 1024,
 			MaxContextBytes:    64 * 1024,
+			ContextCompaction:  0.80,
 			LoopTimeout:        2 * time.Hour,
 			MaxRepeatedCalls:   3,
 			ShellTimeout:       2 * time.Minute,
@@ -368,6 +378,23 @@ func (c Config) Validate() error {
 	if c.Owner.OpenID == "" {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "owner.open_id is required").WithField("owner.open_id")
 	}
+	if strings.TrimSpace(c.Owner.Name) == "" {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "owner.name is required").WithField("owner.name")
+	}
+	if _, err := agentlocale.ParsePreferred(string(c.Owner.PreferredLanguage)); err != nil {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"invalid owner.preferred_language: %s",
+			c.Owner.PreferredLanguage,
+		).WithField("owner.preferred_language").WithCause(err)
+	}
+	if _, err := agentlocale.ParseConcrete(string(c.Owner.FallbackLanguage)); err != nil {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"invalid owner.fallback_language: %s",
+			c.Owner.FallbackLanguage,
+		).WithField("owner.fallback_language").WithCause(err)
+	}
 	if _, err := domain.ParseMode(string(c.Policy.Mode)); err != nil {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "invalid policy.mode: %s", c.Policy.Mode).
 			WithField("policy.mode").
@@ -423,6 +450,12 @@ func (c Config) Validate() error {
 	}
 	if c.Agent.MaxContextBytes < 32*1024 {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "agent.max_context_bytes must be at least 32768").WithField("agent.max_context_bytes")
+	}
+	if c.Agent.ContextCompaction < 0.5 || c.Agent.ContextCompaction > 0.95 {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"agent.context_compaction_ratio must be between 0.5 and 0.95",
+		).WithField("agent.context_compaction_ratio")
 	}
 	if c.Agent.LoopTimeout <= 0 {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "agent.loop_timeout must be positive").WithField("agent.loop_timeout")

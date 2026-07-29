@@ -830,3 +830,134 @@ func TestLifecycleActionsFenceCompletedAndUncertainWrites(t *testing.T) {
 		t.Fatalf("uncertain=%d want=1", uncertain)
 	}
 }
+
+func TestConvergeInterruptedWorkResumesSafeWaitsForApprovalAndTerminalizesUncertain(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := []domain.NormalizedEvent{
+		{MessageID: "om_safe_recovery", Content: "read current code"},
+		{MessageID: "om_waiting_approval", Content: "send exact approved reply"},
+		{MessageID: "om_uncertain_action", Content: "run external action"},
+	}
+	for _, event := range events {
+		if _, err := first.EnqueueEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := first.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byMessage := make(map[string]domain.WorkItem, len(items))
+	for _, item := range items {
+		byMessage[item.Event.MessageID] = item
+	}
+	waiting := byMessage["om_waiting_approval"]
+	if _, err := first.RequestReplyApproval(
+		context.Background(),
+		waiting.DedupKey,
+		"已完成前期核对",
+		"需要本人批准",
+		"确认是否发送",
+		domain.RelevanceDirectMention,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.db.Exec(
+		`UPDATE work_items SET status = ? WHERE id = ?`,
+		domain.StatusAwaitingApproval,
+		waiting.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	uncertain := byMessage["om_uncertain_action"]
+	if _, _, _, err := first.BeginShellAction(
+		context.Background(),
+		uncertain.DedupKey,
+		"go test ./...",
+		".",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = current.Close() })
+	ready, err := current.MarkCurrentSessionReady(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := current.ConvergeInterruptedWork(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Resumed != 1 || report.WaitingOwner != 1 ||
+		report.Terminalized != 1 || report.Uncertain != 1 ||
+		len(report.Notices) != 2 {
+		t.Fatalf("report=%+v", report)
+	}
+	items, err = current.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := make(map[string]domain.WorkItem, len(items))
+	for _, item := range items {
+		statuses[item.Event.MessageID] = item
+	}
+	if safe := statuses["om_safe_recovery"]; safe.Status != domain.StatusReceived ||
+		safe.SessionID != ready.ID {
+		t.Fatalf("safe=%+v ready=%+v", safe, ready)
+	}
+	if waiting := statuses["om_waiting_approval"]; waiting.Status != domain.StatusAwaitingApproval {
+		t.Fatalf("waiting=%+v", waiting)
+	}
+	if uncertain := statuses["om_uncertain_action"]; uncertain.Status != domain.StatusDeadLetter {
+		t.Fatalf("uncertain=%+v", uncertain)
+	}
+	interrupted, _, err := current.RecoverySummary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if interrupted != 0 {
+		t.Fatalf("interrupted=%d", interrupted)
+	}
+}
+
+func TestOwnerResolutionNotificationIsDurableAndIdempotent(t *testing.T) {
+	store := openStore(t)
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{MessageID: "om_resolution"}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := store.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := items[0]
+	id, key, send, err := store.BeginOwnerResolutionNotification(
+		context.Background(),
+		item.ID,
+		"需要核对外部动作结果",
+	)
+	if err != nil || !send || id == 0 || key == "" || len(key) > 50 {
+		t.Fatalf("id=%d key=%q send=%v err=%v", id, key, send, err)
+	}
+	if err := store.CompleteOwnerResolutionNotification(context.Background(), id, ""); err != nil {
+		t.Fatal(err)
+	}
+	sameID, sameKey, send, err := store.BeginOwnerResolutionNotification(
+		context.Background(),
+		item.ID,
+		"需要核对外部动作结果",
+	)
+	if err != nil || send || sameID != id || sameKey != key {
+		t.Fatalf("id=%d key=%q send=%v err=%v", sameID, sameKey, send, err)
+	}
+}

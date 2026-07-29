@@ -56,9 +56,9 @@ cannot hold the whole Lark assistant hostage:
   results when a call is outside the current work kind or permission policy.
 - State and recovery track work kind, priority, online session, lease, run
   status, tool progress, final action, and duplicate links. Restart recovery
-  snapshots stale work at its last durable stage and pauses it before new work
-  is claimed. It never silently turns an interrupted message back into runnable
-  work.
+  snapshots stale work at its last durable stage before startup convergence.
+  Safe work is explicitly reassigned to the new ready session; uncertain
+  external actions are terminalized and never replayed.
 
 This harness boundary is product behavior, not an implementation detail. The
 model may propose a next step; the harness decides whether that step is allowed,
@@ -200,22 +200,25 @@ path outside the configured workspace are refused before evidence tools run.
 The refusal is concise and does not disclose the requested environment detail.
 
 A successful delegated `reply` to another sender is a compound user-visible
-outcome: first the user-identity reply is sent to the original Lark message,
-then the bot privately tells the owner that it replied and summarizes the
-remaining owner action. A group message that natively mentions the assistant,
+outcome: before the sender-facing reply is sent, the bot durably records and
+delivers a private owner notice containing the exact intended reply and any
+remaining owner action. Only after that notice is confirmed does the
+user-identity path send the intelligent-assistant reply to the original Lark
+message. This ordering makes the sender-facing statement that the named owner
+was notified truthful. A group message that natively mentions the assistant,
 or a private owner request addressed to the assistant, is instead replied to
-directly with bot identity and does not send a post-reply owner notice. The
-private notice must not claim a reply was sent when the
-group reply failed, was blocked, was cancelled, or is still awaiting approval.
+directly with bot identity and does not send a delegated owner notice. The
+private notice describes the intended reply, not a reply that has already been
+sent, so it remains truthful if the sender-facing reply later fails.
 Standalone `notify` means no
 sender-facing reply could safely be sent; it is not a substitute for this
-post-reply owner notice.
+delegated owner notice.
 
 Reply approval preserves this invocation identity together with the exact
 draft. Approving a held assistant request or private owner request still sends
-that draft with bot identity and does not create a delegated post-reply owner
-notice. Approving a delegated owner mention still sends with user identity and
-then creates the owner notice. Approval may authorize the exact content and
+that draft with bot identity and does not create a delegated owner notice.
+Approving a delegated owner mention first delivers the owner notice and then
+sends the exact draft with user identity. Approval may authorize the content and
 commitment, but it never changes who the original request addressed.
 For an approval written by an older version before relevance was embedded in
 the action request, the daemon restores relevance from the work item's durable
@@ -241,10 +244,13 @@ used when another sender mentions the owner and the agent is acting as the
 owner's delegate. Reaction cleanup is audited and retried without resending an
 already completed reply.
 
-The post-reply owner notice is a separate durable action with a stable Lark
-idempotency key. If it fails after the group reply succeeds, retry resumes only
-that private notice from its persisted decision; it must not rerun the model or
-send the group reply again.
+The delegated owner notice is a separate durable action with a stable Lark
+idempotency key. New work completes that private notice before the
+sender-facing reply starts. A known notice failure retries only the notice and
+does not send the sender-facing reply. If a process interruption makes the
+notice result uncertain, it is not replayed. Compatibility recovery treats an
+older post-reply notice as finish-only work only when a completed durable reply
+action proves that the sender-facing reply already succeeded.
 
 The structured decision separates `reply_text` from `owner_action`.
 `reply_text` is the exact sender-facing message. `owner_action` is the concise
@@ -341,12 +347,16 @@ command but does not trap the service in an un-stoppable state. A crash cannot
 send or fabricate an intentional-offline notice.
 
 After configuration, state opening, interrupted-work snapshotting, intake
-session creation, and scheduler configuration succeed, every new process
-session sends one idempotent bot private message that the agent is online before
-workers may claim new work. This includes
-manual start, restart, upgrade, and successful recovery after an unexpected
-crash. The notice reports interrupted and uncertain-action counts and states
-that they were not replayed automatically. Lifecycle idempotency keys must be
+session creation, scheduler configuration, and startup convergence succeed,
+every new process session sends one idempotent bot private message that the
+agent is online before workers may claim new work. This includes manual start,
+restart, upgrade, and successful recovery after an unexpected crash. Startup
+automatically readmits interrupted work that is safe to recompute, leaves exact
+approval/input work in an actionable waiting state with one private owner
+instruction, and terminalizes externally uncertain work with one private
+reconciliation summary. The notice reports the resulting resumed,
+owner-action, terminalized, and uncertain counts instead of leaving an
+unactionable interrupted total. Lifecycle idempotency keys must be
 stable for one transition, distinct between online and offline transitions, and
 no longer than the public Lark message API's 50-character `uuid` limit. The
 controller derives a 128-bit digest from the durable transition/session ID
@@ -484,13 +494,18 @@ definite claim about production implementation requires at least one production
 source; otherwise the reply must explicitly state that production behavior
 remains unverified.
 
-Tool and context budgets must fail soft for coding investigations. When a run
+Tool and context budgets must fail soft for coding investigations. Before every
+model request, the runtime reports current, total, and remaining model turns
+plus current, maximum, and remaining model-visible context bytes. When a run
 approaches the total tool-output budget, context budget, or model-turn budget,
-the runtime summarizes old evidence, drops obsolete raw tool output from the
-model-visible context, and asks the model to converge. It must not discard the
-whole work item solely because a bounded investigation produced too much raw
-output. Repeated Lark-context reads that return no new target-message context
-are treated as no-progress tool calls and force convergence.
+the runtime deterministically replaces old model/tool exchanges with one
+structured checkpoint, drops obsolete raw output, and asks the model to
+converge. The checkpoint preserves the original task, permissions, verified
+source references, external-action receipts, explicit unknowns, and newest
+messages. It must not discard the whole work item solely because a bounded
+investigation produced too much raw output or restart broad investigation after
+compaction. Repeated Lark-context reads that return no new target-message
+context are treated as no-progress tool calls and force convergence.
 
 Before a coding reply is sent, a verify gate checks three properties:
 completeness (the answer addresses the original question), correctness (the
@@ -620,22 +635,25 @@ fails. A failed item is stored as `retry_wait` with the failure reason, retry
 count, next attempt time, and owning online session. It may retry with bounded
 backoff only while that same daemon session remains online.
 
-At startup, every non-terminal item owned by an earlier session is changed to
-`interrupted`, not `received`. Recovery stores the latest durable model step,
-tool call, decision, reply action, and owner-notification action as an
-interruption snapshot. Received-but-unclaimed and retry-waiting work from the
-earlier session is also paused, so restart cannot create a delayed unsolicited
-reply. A missing lease timestamp is evidence of interruption, not permission to
-run automatically.
+At startup, every non-terminal item owned by an earlier session is first changed
+to `interrupted`. Recovery stores the latest durable model step, tool call,
+decision, reply action, and owner-notification action as an interruption
+snapshot. After the new session is ready, a convergence pass classifies every
+interruption. Work with no uncertain external action is reassigned to the new
+session and safely recomputed. Exact unsent approvals remain unchanged and
+produce one idempotent owner instruction. Work with an action that was executing
+at interruption is never replayed; it becomes terminal with one idempotent
+reconciliation summary. A missing lease timestamp permits neither a blind side
+effect replay nor indefinite passive suspension.
 
 Leases are work-kind specific and are refreshed while long runs make progress.
 Fast-path and simple work have short leases. Coding questions and background
 goals may have longer leases, but the lease must be compatible with their
 configured loop timeout and must not leave the queue looking permanently stuck.
 If the process dies and no heartbeat updates the lease, recovery marks the
-latest run abandoned, snapshots the last durable stage, and pauses the work
-item. The next session can inspect it but cannot claim it until the owner
-explicitly resumes that exact item.
+latest run abandoned and snapshots the last durable stage. The next ready
+session automatically readmits safe recomputable work. It does not readmit an
+executing or result-uncertain side effect.
 Every claim receives a unique lease token. Heartbeat, retry, completion, Goal
 creation, and sender/owner side effects validate that exact token; an expired
 worker cannot mutate or send for a newer claim.
@@ -662,16 +680,18 @@ An approval for work owned by an older session is assigned only when the newest
 active online session is `ready`; that session owns the work before it becomes
 `received`. If the newest active session is still starting, or no active
 session exists, the exact action becomes `ready` but the work remains
-`interrupted` until an explicit `queue resume`. Approval never creates
-apparently runnable work owned by a stopped or superseded session.
+`interrupted`. Startup convergence assigns it only after a ready session
+exists. Approval never creates apparently runnable work owned by a stopped or
+superseded session.
 
 Operators use `queue inspect --work-id <id>` or
 `queue inspect --message-id <id>` to
 see whether a message was suppressed, queued, running, interrupted, replied, or
 completed, including the exact last durable stage and any uncertain external
-action. `queue resume` is the only normal path that makes interrupted or
-offline-backlog work claimable in a later session. Replaying an already terminal
-item requires an additional explicit force flag.
+action. `queue resume` remains the explicit operator path for a selected
+terminal, blocked, or manually paused item. Safe startup recovery does not
+require it. Replaying an already terminal item requires an additional explicit
+force flag.
 After an operator audits historical interrupted work, `queue cancel` can
 durably close exact work/message IDs or all interrupted work except explicit
 `--keep-work-id` selections. Every cancellation requires an operator reason,
@@ -691,12 +711,13 @@ or blocked external action. It must never make prior-session, processing,
 interrupted, terminal, or uncertain-action work claimable.
 
 Each model run, assistant message, tool invocation, tool result, final
-decision, and external action is durably recorded. On explicit resume, old
-read-only evidence is audit history rather than current truth. Interrupted
-read-only tools may be selected again by a new run. An interrupted shell or IM
-send is marked uncertain and is never blindly repeated; recovery first
-reconciles observable state. If it cannot prove whether the side effect
-happened, the item remains paused until the owner resolves that uncertainty.
+decision, and external action is durably recorded. On automatic or explicit
+resume, old read-only evidence is audit history rather than current truth.
+Interrupted read-only tools may be selected again by a new run. An interrupted
+shell or IM send is marked uncertain and is never blindly repeated; recovery
+first reconciles observable state. If it cannot prove whether the side effect
+happened, the item becomes terminal and the owner receives one exact
+reconciliation instruction instead of an indefinitely paused queue tail.
 
 The default multi-step investigation budget is 150 model turns with a two-hour
 elapsed-time ceiling. Model turns and persisted audit steps are different:
@@ -705,8 +726,10 @@ multiple audit steps. Operators may configure up to 300 model turns, but the
 elapsed-time, repeated-call, context, tool-output, and shell-time limits remain
 independent finite boundaries. The initial system prompt states the configured
 model-turn ceiling, and every model request includes its current one-based turn,
-total turn budget, and remaining turns so the model can plan and converge before
-the runtime limit is reached.
+total turn budget, remaining turns, model-visible context use, context limit,
+remaining context, and whether automatic compaction occurred. At 80% of either
+finite budget the instruction becomes urgent and narrows work to the evidence
+needed for a terminal decision.
 When evidence, tool-call, repeated-call, or no-progress gates force a terminal
 decision, each later request exposes only `submit_decision` and adds a direct
 system instruction that previous investigation tools are unavailable. At most
@@ -714,20 +737,22 @@ three terminal-only model attempts are allowed. Repeated plain text or calls to
 unavailable tools fail the run with `model_non_convergence` immediately after
 that bound instead of burning the remaining general turn budget. This
 deterministic protocol failure moves the exact leased work directly to dead
-letter with its reason and audit history. Network, rate-limit, and other
-retryable failures retain the existing bounded retry policy. The runtime never
-fabricates a reply or external action.
+letter with its reason and audit history, then sends one durable localized owner
+summary with the work/message identifier and next inspection action. Retry
+exhaustion uses the same resolution-notice contract. Network, rate-limit, and
+other retryable failures retain the existing bounded retry policy. The runtime
+never fabricates a reply or external action.
 
 Provider rate limits honor `Retry-After` when present and otherwise use bounded
 exponential backoff from 15 seconds to 15 minutes. A configurable retry ceiling
 moves permanently failing work to dead letter instead of retrying forever.
 
 Runs carry model and agent-configuration fingerprints for diagnosis. A changed
-runtime may report which failed, ignored, dead-letter, or legacy items were
-produced by an older contract, but it never requeues them automatically.
-Re-evaluation after an upgrade is an explicit owner action through
-`queue resume`; completed outward replies remain protected by the same
-idempotency and reconciliation rules.
+runtime may safely re-evaluate non-terminal interrupted work under the current
+contract, while completed, ignored, cancelled, and dead-letter history remains
+terminal unless the owner explicitly uses `queue resume --force-terminal`.
+Completed outward replies remain protected by the same idempotency and
+reconciliation rules.
 
 ## Routing
 
@@ -753,7 +778,7 @@ private partner must match the configured assistant. Replies to
 `assistant_request` and `owner_request` messages answer the sender's own prompt,
 so they do not wait for the owner, do not run the "owner already replied"
 cancellation check, do not add the delegated `🤖` marker, and do not create a
-post-reply owner notice. Non-owner messages can trigger a sender-facing
+delegated owner notice. Non-owner messages can trigger a sender-facing
 response only by natively mentioning the configured human owner in a group
 allowed by `policy.reply_scope`; that path is the read-only delegated-owner
 workflow.
@@ -789,6 +814,23 @@ claim.
 
 ## Reply Policy
 
+The owner profile contains a concrete display name and language policy.
+Configured language takes priority; `auto` infers Chinese or English from the
+bounded current conversation and then uses the configured fallback. All
+outward explanatory prose in one message uses that resolved language. Internal
+model reasoning is never pasted into owner notices. Sender-facing replies,
+their owner notices, and terminal summaries for the same work item use the
+same resolved language. Lifecycle messages with no bounded conversation use
+the configured fallback.
+
+For delegated direct mentions and human private messages, the sent body is
+deterministically wrapped as an intelligent-assistant response and states that
+the concrete owner name was notified. It never calls the owner a generic
+"user". Owner-originated assistant requests do not receive this delegated
+wrapper. The owner notice is durably completed before this wrapped reply is
+sent; a known notification failure blocks the sender-facing reply, and an
+interrupted notification with an uncertain result is never replayed.
+
 Before replying as the owner, the runtime must:
 
 1. build a source-backed draft;
@@ -820,8 +862,8 @@ primary validation group, but it does not restrict delegated replies while
 users, model relevance and risk checks, confidence and approval policy, the
 owner wait window, withdrawn-message and owner-already-replied checks, or
 idempotent sending. Changing reply scope never replays completed, ignored, or
-interrupted historical work; operators must inspect and explicitly resume an
-individual work item.
+terminal historical work. Safe non-terminal interrupted work follows startup
+convergence independently of a scope change.
 
 The configured `policy.reply_confidence_min` applies uniformly. Direct owner
 mentions and assistant-facing requests do not receive a hidden lower confidence
@@ -913,7 +955,7 @@ The multi-step loop is accepted by these executable BDD scenarios:
   natively mentions the assistant in a group that does not match
   `--chat-query`, when routing runs, then the request enters model or fast-path
   work and a reply uses bot identity without an owner-delegation marker or
-  post-reply owner notice.
+  delegated owner notice.
 - Given a non-owner natively mentions the assistant in any group, regardless of
   `assistant.reply_scope`, when real-time or polling intake evaluates it, then
   the request is ignored before queueing, model work, working reactions, or any
@@ -1093,12 +1135,12 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given an assistant group request or private owner request is held for
   approval, when the exact draft is approved and resumed without another model
   call, then the persisted assistant/owner-request relevance selects bot
-  identity, no delegated robot prefix is added, and no post-reply owner notice
+  identity, no delegated robot prefix is added, and no delegated owner notice
   is created.
 - Given a delegated owner mention is held for approval, when its exact draft is
   approved and resumed, then the persisted direct-mention relevance selects
-  user identity, adds the delegated robot prefix, and creates the post-reply
-  owner notice only after the sender-facing reply succeeds.
+  user identity, completes the delegated owner notice, and only then sends the
+  sender-facing reply with the delegated robot prefix.
 - Given an ordinary auto-mode reply has no current or legacy approved draft,
   when the reply controller checks for a reusable approval, then the storage
   layer returns "not found" without requiring a persisted legacy relevance and
@@ -1172,6 +1214,18 @@ The multi-step loop is accepted by these executable BDD scenarios:
   model can complete a bounded relevant read, then it replies with the checked
   facts, explicit unknowns, and concrete information passed to the owner rather
   than merely acknowledging or restating the request.
+- Given a delegated reply is ready, when it is rendered for Lark, then it names
+  the intelligent assistant, includes useful completed work, and says that the
+  configured owner name was notified.
+- Given the configured language is Chinese, when a model reason or provider
+  error is English, then owner and lifecycle messages use a Chinese summary and
+  do not paste the English paragraph.
+- Given language is automatic and the bounded conversation is predominantly
+  Chinese, when a reply or owner notice is rendered, then its explanatory prose
+  is Chinese; an inconclusive conversation uses the configured fallback.
+- Given the owner name is unavailable, when delegated rendering is attempted,
+  then the action fails explicitly with a configuration instruction and never
+  substitutes the generic word "user".
 - Given a direct owner question and bounded evidence cannot support a useful
   sender-facing response without exposing private context or inventing work,
   when it chooses a terminal action, then it may record or notify instead of
@@ -1293,9 +1347,10 @@ The multi-step loop is accepted by these executable BDD scenarios:
   executes and is audited; given approval is enabled and the command is risky,
   then it waits durably and resumes only after owner approval.
 - Given the daemon crashes during a read-only tool, when it restarts, then the
-  work item is interrupted at that tool stage and remains paused until explicit
-  resume; given it crashes during shell or IM execution, then the action
-  becomes uncertain and is not automatically repeated.
+  work item is interrupted at that tool stage and startup convergence readmits
+  it with current evidence; given it crashes during shell or IM execution, then
+  the action becomes uncertain, is not repeated, and the work is terminalized
+  with an owner reconciliation notice.
 - Given retrying or dead-letter work whose latest failed run used an older model
   or agent configuration, when the upgraded daemon starts, then it is reported
   but not requeued; a completed reply is not re-evaluated.
@@ -1310,8 +1365,9 @@ The multi-step loop is accepted by these executable BDD scenarios:
   on a subprocess stdin lifecycle; when the daemon stops, context cancellation
   stops intake without replaying already observed events.
 - Given a prior-session work item was received, retrying, processing, or
-  executing, when the daemon starts, then it becomes `interrupted` with its last
-  durable model/tool/action stage and workers cannot claim it.
+  executing, when the daemon starts, then it first becomes `interrupted` with
+  its last durable model/tool/action stage; after ready, startup convergence
+  readmits only the safe items.
 - Given the owner runs `queue inspect` for a message, when state is returned,
   then it states whether the message was observed, admitted, replied,
   interrupted, or suppressed and includes any uncertain external action.
@@ -1331,14 +1387,15 @@ The multi-step loop is accepted by these executable BDD scenarios:
   ready, when the owner approves the exact action, then its work is assigned to
   the newer session as received; given the newest session is still starting or
   no session is active, the approved action remains ready while the work stays
-  interrupted until explicit resume.
+  interrupted until the next ready startup convergence assigns it.
 - Given user-token polling was unavailable and the owner later authorizes it,
   when the owner runs `queue backfill` with a bounded chat and time range, then
   only matching @Owner messages are recorded through normal intake and the
   normal poll cursor is not advanced.
 - Given a reply send was in flight when the process stopped, when recovery
-  cannot prove whether Lark accepted it, then the action remains uncertain and
-  no reply or owner notice is resent automatically.
+  cannot prove whether Lark accepted it, then the action remains uncertain, the
+  reply is not resent, and one separately fenced reconciliation notice is
+  attempted.
 - Given tool budget, no-progress, or citable evidence forces a terminal
   decision, when the model calls an earlier investigation tool and then submits
   a valid decision, then the earlier call is rejected without execution and
@@ -1348,10 +1405,10 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given the user intentionally stops or restarts the service, when control
   begins, then the bot sends one idempotent private offline notice before
   `launchctl` unloads it; an unexpected crash sends no false offline notice.
-- Given configuration, recovery snapshot, intake creation, and
-  workers are ready, when any new daemon process session comes online, then the
-  bot sends one idempotent private online notice with interrupted and uncertain
-  counts, including after crash recovery.
+- Given configuration, recovery snapshot, intake creation, and startup
+  convergence are ready, when any new daemon process session comes online, then
+  the bot sends one idempotent private online notice with resumed,
+  waiting-owner, terminalized, and uncertain counts.
 - Given a reply decision, when policy blocks, awaits approval, sends, or finds
   the owner already replied, then the durable action status records that exact
   outcome and no generic fallback text is sent.

@@ -21,7 +21,8 @@ func TestHelpExposesStandaloneRecoveryCommands(t *testing.T) {
 		"doctor",
 		"queue",
 		"auth",
-		"不会自动回放",
+		"安全工作会自动续跑",
+		"外部动作绝不重放",
 	} {
 		if !strings.Contains(text, fragment) {
 			t.Fatalf("help missing %q:\n%s", fragment, text)
@@ -36,6 +37,14 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		want []string
 	}{
 		{
+			args: []string{"init", "--help"},
+			want: []string{
+				"--owner-name",
+				"--preferred-language",
+				"--fallback-language",
+			},
+		},
+		{
 			args: []string{"doctor", "--help"},
 			want: []string{"--lark-only", "Lark SDK", "credentials"},
 		},
@@ -49,7 +58,13 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		},
 		{
 			args: []string{"queue", "resume", "--help"},
-			want: []string{"--work-id", "--message-id", "--force-terminal", "never replayed", "不会自动回放"},
+			want: []string{
+				"--work-id",
+				"--message-id",
+				"--force-terminal",
+				"Safe cross-restart work is already re-evaluated automatically",
+				"结果不确定",
+			},
 		},
 		{
 			args: []string{"queue", "backfill", "--help"},
@@ -117,7 +132,9 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 	for _, want := range []string{
 		"official Go SDK",
 		"com.liuchong.lark-agent",
-		"旧模型草稿、审批和外部动作不会自动回放",
+		"安全的只读",
+		"结果不确定的外部动作绝不重放",
+		"owner.preferred_language",
 		"assistant.reply_scope",
 		"policy.reply_scope",
 		"policy.private_reply_scope",

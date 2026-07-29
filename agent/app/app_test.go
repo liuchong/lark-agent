@@ -834,7 +834,7 @@ func TestDaemonExecutesNotifyDecision(t *testing.T) {
 	}
 }
 
-func TestDaemonRepliesBeforeNotifyingOwnerOfRemainingAction(t *testing.T) {
+func TestDaemonNotifiesOwnerBeforeDelegatedReply(t *testing.T) {
 	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID: "om_reply_then_notify",
 		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
@@ -860,7 +860,7 @@ func TestDaemonRepliesBeforeNotifyingOwnerOfRemainingAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 2 || events[0] != "reply" || events[1] != "notify" {
+	if len(events) != 2 || events[0] != "notify" || events[1] != "reply" {
 		t.Fatalf("action order=%v", events)
 	}
 	if !result.Processed || notifier.decision.OwnerAction != decision.OwnerAction {

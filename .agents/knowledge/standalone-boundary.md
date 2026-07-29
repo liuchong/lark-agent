@@ -22,7 +22,11 @@ Standalone local ownership:
 - logs: `~/Library/Logs/lark-agent`;
 - LaunchAgent: `com.liuchong.lark-agent`;
 - no old command-line tool directory is read or migrated;
-- cross-session work is inspected and resumed explicitly, never auto-replayed.
+- cross-session read-only/model work is automatically readmitted only after a
+  ready session classifies it as safe to recompute;
+- executing or result-uncertain external actions are never auto-replayed; they
+  are terminalized with one durable owner reconciliation notice;
+- terminal history is only replayed through an explicit owner command.
 
 Repository rewrite and runtime transport changes must preserve these invariants
 in specifications, tests, help, documentation, installation, and live evidence.

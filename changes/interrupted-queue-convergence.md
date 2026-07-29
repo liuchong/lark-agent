@@ -1,5 +1,10 @@
 # Interrupted queue convergence
 
+> Historical design note: automatic safe startup convergence and durable owner
+> resolution notices now supersede the explicit-only recovery behavior in this
+> change. See `changes/work-convergence-context-language.md` and
+> `spec/behavior.md`.
+
 ## Goal
 
 Operators can finish a bounded audit of interrupted work instead of leaving

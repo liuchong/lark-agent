@@ -12,8 +12,9 @@
   配置群；处理期间添加键盘工作表情，结束后删除。
 - 非 Owner 私聊机器人或直接 @机器人时保持静默；用户身份可见的真人私聊，以及
   群里直接 @Owner 的消息，才可能触发只读的智能代回复。
-- 他人在任意用户可见群里直接 @Owner 时，Agent 默认可按策略用 Owner 身份回复；
-  回复成功后再由机器人私聊 Owner 说明已经回复以及仍需处理的事项。可以通过
+- 他人在任意用户可见群里直接 @Owner 时，Agent 默认可按策略通过 Owner 的用户
+  身份发送，但正文会明确标注“智能助手”，说明已完成的前期工作，并写明已经通知
+  Owner 的具体姓名；随后机器人再私聊 Owner 说明仍需处理的事项。可以通过
   `policy.reply_scope` 改回仅允许配置群。
 - 代回复先进入 `policy.owner_wait`（默认 3 分钟）的持久等待。到期后按语义判断
   每一条具体消息是否确实在向 Owner 提出尚未处理的问题或请求。对方只是在回答
@@ -33,8 +34,13 @@
 - GitHub Actions 可以用同一个 Lark 应用身份把可信的工作流结果发进指定群。Action
   只通过 HTTP 发送一次消息，不启动第二个 WebSocket 监听；常驻 Agent 验证被引用的
   机器人消息及其 HMAC 签名后，才允许模型按该引用读取有界、只读的 GitHub 事实。
-- 所有消息、语义判断、模型步骤和外部动作都写入 SQLite 账本。纯等待消息可在重启
-  后重新读取 Lark 再判断；旧模型草稿、审批和外部动作不会自动回放。
+- 所有消息、语义判断、模型步骤和外部动作都写入 SQLite 账本。重启后，安全的只读
+  或模型工作会自动续跑；待批准草稿会保留并私聊 Owner 精确操作方式；执行中断且
+  结果不确定的外部动作绝不重放，而是收口为死信并发送核对指令。
+- 每次模型调用都会收到当前/总计/剩余轮次和上下文容量。接近任一上限时，旧证据会
+  压缩成保留来源与动作回执的检查点，模型必须尽快提交结论。
+- 对外语言优先使用 `owner.preferred_language`；`auto` 会按当前 Lark 会话判断，
+  判断不清时使用 `owner.fallback_language`。一条消息不会混用中英文解释性正文。
 
 ## 要求
 
@@ -56,7 +62,9 @@ go build -o ./lark-agent ./cmd/lark-agent
 ./lark-agent init \
   --workspace /absolute/path/to/workspace \
   --app-id cli_xxx \
-  --owner-open-id ou_xxx
+  --owner-open-id ou_xxx \
+  --owner-name "姓名" \
+  --preferred-language zh-CN
 ./lark-agent auth login < /path/to/private-lark-credentials.json
 ./lark-agent doctor --lark-only
 ```
@@ -99,10 +107,10 @@ lark-agent queue cancel --all-interrupted --keep-work-id 456 --reason "audited s
 lark-agent github auth status
 ```
 
-离线积压和中断工作只有在指定 work ID 或 message ID 后才可恢复。已经完成、忽略、
-取消或进入死信的终态工作还必须明确加 `--force-terminal`。结果不确定的外部动作
-不会自动重发。审核后确认无用的历史工作使用 `queue cancel` 做可审计取消；命令保留
-全部历史记录，不发送 Lark 消息，也不会取消正在执行或结果不确定的动作。
+安全的中断工作会在新会话 ready 后自动续跑。`queue resume` 用于经过人工核对的
+手动暂停、离线补录或终态工作；已经完成、忽略、取消或进入死信的终态工作还必须
+明确加 `--force-terminal`。结果不确定的外部动作不会自动重发。审核后确认无用的
+历史工作使用 `queue cancel` 做可审计取消；命令保留全部历史记录。
 
 ## GitHub 与 Lark
 

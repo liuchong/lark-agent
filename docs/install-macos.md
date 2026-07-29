@@ -25,7 +25,9 @@ go build -o ./lark-agent ./cmd/lark-agent
 ./lark-agent init \
   --workspace /absolute/path/to/workspace \
   --app-id cli_xxx \
-  --owner-open-id ou_xxx
+  --owner-open-id ou_xxx \
+  --owner-name "姓名" \
+  --preferred-language zh-CN
 ./lark-agent auth login < /path/to/private-lark-credentials.json
 ./lark-agent github auth login < /path/to/private-github-token.json
 ./lark-agent doctor --lark-only
@@ -69,6 +71,10 @@ go build -o ./lark-agent ./cmd/lark-agent
 ```yaml
 assistant:
   reply_scope: all_groups
+owner:
+  name: 姓名
+  preferred_language: zh-CN
+  fallback_language: zh-CN
 policy:
   reply_scope: all_groups
   private_reply_scope: all_private
@@ -89,6 +95,7 @@ Owner 发给其他真人的普通私聊消息不会进入代回复队列。
 ```yaml
 agent:
   max_context_bytes: 65536
+  context_compaction_ratio: 0.80
 fast_path:
   simple_max_turns: 3
 tool_policy:

@@ -13,8 +13,10 @@ import (
 	"github.com/liuchong/lark-agent/agent/config"
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
+	agentlocale "github.com/liuchong/lark-agent/agent/locale"
 	"github.com/liuchong/lark-agent/agent/replymatch"
 	"github.com/liuchong/lark-agent/agent/storage"
+	agenttools "github.com/liuchong/lark-agent/agent/tools"
 	serviceim "github.com/liuchong/lark-agent/internal/lark"
 )
 
@@ -343,6 +345,7 @@ func TestAuthStatusReportsMissingUserTokenSeparately(t *testing.T) {
 	cfg.Lark.AppID = "cli_a"
 	cfg.Lark.KeychainService = "lark-agent-test-" + strings.ReplaceAll(t.Name(), "/", "-")
 	cfg.Owner.OpenID = "ou_owner"
+	cfg.Owner.Name = "测试负责人"
 	cfg.Assistant.OpenIDs = []string{"ou_bot"}
 	cfg.Workspace.Root = t.TempDir()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
@@ -581,6 +584,7 @@ func TestConfiguredLivePollerPersistsRouterPriority(t *testing.T) {
 	cfg := config.Default()
 	cfg.Workspace.Root = t.TempDir()
 	cfg.Owner.OpenID = "owner"
+	cfg.Owner.Name = "Owner"
 	cfg.Assistant.OpenIDs = []string{"assistant"}
 	cfg.Assistant.Names = []string{"Agent"}
 	r := newAgentRouter(cfg, store)
@@ -618,6 +622,7 @@ func TestLiveOptionsWithoutUserTokenDoNotExposeUserContextTools(t *testing.T) {
 	cfg.Lark.AppID = "cli_a"
 	cfg.Lark.KeychainService = "lark-agent-test-" + strings.ReplaceAll(t.Name(), "/", "-")
 	cfg.Owner.OpenID = "ou_owner"
+	cfg.Owner.Name = "测试负责人"
 	cfg.Assistant.OpenIDs = []string{"ou_bot"}
 	cfg.Assistant.Names = []string{"Assistant Bot"}
 	options, realtimeRunner, _, info, err := buildLiveOptions(
@@ -873,15 +878,17 @@ func TestQueueExposesExplicitInspectAndResumeCommands(t *testing.T) {
 	}
 }
 
-func TestOwnerNotificationTextUsesConcretePostReplyAction(t *testing.T) {
+func TestOwnerNotificationTextUsesConcretePreReplyAction(t *testing.T) {
 	item := domain.NewWorkItem(domain.NormalizedEvent{MessageID: "om_coordination"})
 	text := ownerNotificationText(item, domain.Decision{
 		Kind:        domain.DecisionReply,
 		Reason:      "direct_mention",
+		ReplyText:   "我已完成接口契约核对，当前还需要示例状态变更。",
 		OwnerAction: "确认示例状态变更通知契约并同步 示例客户端回调",
-	})
+	}, "测试负责人", "zh-CN")
 	for _, want := range []string{
-		"已回复原消息 om_coordination",
+		"已收到消息 om_coordination 的代回复请求",
+		"我已完成接口契约核对",
 		"仍需你处理",
 		"确认示例状态变更通知契约并同步 示例客户端回调",
 	} {
@@ -891,5 +898,95 @@ func TestOwnerNotificationTextUsesConcretePostReplyAction(t *testing.T) {
 	}
 	if strings.Contains(text, "direct_mention") {
 		t.Fatalf("notification leaked internal reason: %s", text)
+	}
+}
+
+func TestOwnerNotificationTextDoesNotPasteEnglishModelReason(t *testing.T) {
+	item := domain.NewWorkItem(domain.NormalizedEvent{MessageID: "om_missing_context"})
+	text := ownerNotificationText(item, domain.Decision{
+		Kind:   domain.DecisionNotify,
+		Reason: "This is a direct mention but the referenced context is not readable, so no evidence-backed response is possible.",
+	}, "测试负责人", "zh-CN")
+	for _, want := range []string{"测试负责人", "om_missing_context", "上下文"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("notification missing %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "This is a direct mention") {
+		t.Fatalf("notification leaked English model reason: %s", text)
+	}
+}
+
+type capturingOwnerMessenger struct {
+	notification string
+}
+
+func (m *capturingOwnerMessenger) ReplyAsUser(
+	context.Context,
+	agenttools.ReplyRequest,
+) (agenttools.ReplyResult, error) {
+	return agenttools.ReplyResult{}, nil
+}
+
+func (m *capturingOwnerMessenger) NotifyOwner(
+	_ context.Context,
+	request agenttools.NotifyRequest,
+) error {
+	m.notification = request.Text
+	return nil
+}
+
+func TestAutoOwnerNoticeUsesResolvedDecisionLanguage(t *testing.T) {
+	messenger := &capturingOwnerMessenger{}
+	notifier := liveOwnerNotifier{
+		messenger: messenger,
+		ownerName: "Liu Chong",
+		preferred: agentlocale.LanguageAuto,
+		fallback:  agentlocale.LanguageChinese,
+	}
+	err := notifier.HandleNotification(
+		context.Background(),
+		domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_english",
+			Content:   "Please verify the API contract.",
+		}),
+		domain.Decision{
+			Kind:        domain.DecisionReply,
+			Language:    string(agentlocale.LanguageEnglish),
+			ReplyText:   "I verified the public API contract and found one unresolved permission.",
+			OwnerAction: "Confirm whether that permission should be enabled.",
+		},
+		"owner-notice-test",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Liu Chong", "will send this reply", "I verified"} {
+		if !strings.Contains(messenger.notification, want) {
+			t.Fatalf("notification missing %q: %s", want, messenger.notification)
+		}
+	}
+	if strings.Contains(messenger.notification, "智能助手") {
+		t.Fatalf("notification mixed languages: %s", messenger.notification)
+	}
+}
+
+func TestRecoveryNoticeUsesMessageResolvedLanguage(t *testing.T) {
+	text := recoveryConvergenceText(
+		storage.RecoveryConvergenceNotice{
+			WorkItemID: 42,
+			MessageID:  "om_english_recovery",
+			Kind:       "uncertain_external_action",
+		},
+		config.OwnerConfig{Name: "Liu Chong"},
+		agentlocale.LanguageEnglish,
+	)
+	for _, want := range []string{"Liu Chong", "was terminalized", "was not replayed"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("recovery notice missing %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "已收口") {
+		t.Fatalf("recovery notice mixed languages: %s", text)
 	}
 }

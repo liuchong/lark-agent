@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/domain"
 	"github.com/liuchong/lark-agent/agent/feedback"
 	"github.com/liuchong/lark-agent/agent/lifecycle"
+	agentlocale "github.com/liuchong/lark-agent/agent/locale"
 	"github.com/liuchong/lark-agent/agent/memory"
 	"github.com/liuchong/lark-agent/agent/policy"
 	"github.com/liuchong/lark-agent/agent/poll"
@@ -87,12 +89,12 @@ after forced convergence by default. One interactive
 worker is reserved from the foreground pool, while CodingGoal work uses
 background workers. Time, date, ping, status, doctor, queue summary, and help
 use a deterministic fast path before any model loop.
-Messages received while the service is offline and work that already entered
-model, approval, or action stages are never replayed automatically. Pristine
-owner-wait items may be freshly re-read after restart. Use queue inspect to see
-the last durable stage and queue resume to continue one exact interrupted
-message. After audit, use queue cancel with a required reason to durably close
-stale work without deleting history or sending a message. 跨重启任务不会自动回放旧草稿或外部动作。
+After restart, safe read-only and model work is automatically re-evaluated in
+the new ready session. Exact approval waits are preserved and privately
+reported. An interrupted external action is never replayed: it is terminalized
+with an exact reconciliation instruction. Use queue inspect for durable
+evidence and queue resume only for an explicitly reviewed terminal or manually
+paused item. 安全工作会自动续跑，结果不确定的外部动作绝不重放。
 Intentional shutdown and every successfully ready session are reported through
 the assistant bot's private chat.
 
@@ -480,6 +482,7 @@ func loadGitHubNotifyConfig(path string) (config.Config, error) {
 		).WithField("lark.base_url")
 	}
 	cfg.Owner.OpenID = "github-action-sender"
+	cfg.Owner.Name = "GitHub Action"
 	cfg.Workspace.Root = workspaceRoot
 	cfg.GitHub.Enabled = true
 	cfg.GitHub.APIBaseURL = firstNonEmpty(os.Getenv("GITHUB_API_URL"), cfg.GitHub.APIBaseURL)
@@ -534,7 +537,7 @@ func mergeAuthLoginInput(existing serviceim.Credentials, input authLoginInput) (
 }
 
 func newInitCommand(out io.Writer, configPath *string) *cobra.Command {
-	var workspaceRoot, appID, owner string
+	var workspaceRoot, appID, owner, ownerName, preferredLanguage, fallbackLanguage string
 	cmd := &cobra.Command{
 		Use:   "init --workspace <absolute-dir>",
 		Short: "Initialize lark-agent config",
@@ -546,6 +549,9 @@ func newInitCommand(out io.Writer, configPath *string) *cobra.Command {
 			cfg := config.Default()
 			cfg.Lark.AppID = appID
 			cfg.Owner.OpenID = owner
+			cfg.Owner.Name = strings.TrimSpace(ownerName)
+			cfg.Owner.PreferredLanguage = agentlocale.Language(preferredLanguage)
+			cfg.Owner.FallbackLanguage = agentlocale.Language(fallbackLanguage)
 			cfg.Workspace.Root = scope.ConfiguredRoot()
 			path := resolveConfigPath(*configPath)
 			if err := config.Save(path, cfg); err != nil {
@@ -561,6 +567,20 @@ func newInitCommand(out io.Writer, configPath *string) *cobra.Command {
 	cmd.Flags().StringVar(&workspaceRoot, "workspace", "", "absolute workspace root; required")
 	cmd.Flags().StringVar(&appID, "app-id", "", "Lark app_id used by the public Go SDK")
 	cmd.Flags().StringVar(&owner, "owner-open-id", "", "owner open_id")
+	cmd.Flags().StringVar(&ownerName, "owner-name", "", "owner display name used in delegated assistant replies")
+	cmd.Flags().StringVar(
+		&preferredLanguage,
+		"preferred-language",
+		string(agentlocale.LanguageAuto),
+		"outward language: auto, zh-CN, or en-US",
+	)
+	cmd.Flags().StringVar(
+		&fallbackLanguage,
+		"fallback-language",
+		string(agentlocale.LanguageChinese),
+		"fallback outward language: zh-CN or en-US",
+	)
+	_ = cmd.MarkFlagRequired("owner-name")
 	return cmd
 }
 
@@ -689,9 +709,10 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 	cmd := &cobra.Command{
 		Use:   "daemon",
 		Short: "Run or manage the daemon",
-		Long: "Run or manage the standalone daemon. Cross-restart work is " +
-			"recorded as interrupted and will not be replayed automatically. " +
-			"跨重启任务不会自动回放。",
+		Long: "Run or manage the standalone daemon. Safe interrupted work is " +
+			"automatically re-evaluated after a ready restart; result-uncertain " +
+			"external actions are terminalized and never replayed. " +
+			"安全工作自动续跑，结果不确定的外部动作绝不重放。",
 	}
 	var once, live, dryRun, includePrivate bool
 	var chatQuery string
@@ -741,7 +762,14 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 			daemonApp := app.NewDaemon(store, agentRouter, options...)
 			var lifecycleController *lifecycle.Controller
 			if live && !dryRun && liveMessenger != nil && !once {
-				lifecycleController = lifecycle.NewDurableController(liveMessenger, store)
+				lifecycleController = lifecycle.NewDurableController(
+					liveMessenger,
+					store,
+					lifecycle.Options{
+						Language:  string(resolveConfiguredLanguage(cfg.Owner)),
+						OwnerName: cfg.Owner.Name,
+					},
+				)
 			}
 			var pollResult any
 			if live {
@@ -755,10 +783,48 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 			if err != nil {
 				return err
 			}
-			if lifecycleController != nil {
-				summary, err := lifecycleRecoverySummary(cmd.Context(), store)
+			recoveryReport, err := store.ConvergeInterruptedWork(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if liveMessenger != nil {
+				pendingNotices, err := store.ListPendingOwnerResolutionNotifications(cmd.Context())
 				if err != nil {
 					return err
+				}
+				for _, pending := range pendingNotices {
+					if err := sendOwnerResolutionText(
+						cmd.Context(),
+						store,
+						liveMessenger,
+						pending.WorkItemID,
+						pending.Text,
+					); err != nil {
+						writeError(cmd.ErrOrStderr(), err)
+					}
+				}
+				for _, notice := range recoveryReport.Notices {
+					if err := notifyRecoveryConvergence(
+						cmd.Context(),
+						store,
+						liveMessenger,
+						notice,
+						cfg.Owner,
+					); err != nil {
+						writeError(cmd.ErrOrStderr(), err)
+					}
+				}
+			}
+			if lifecycleController != nil {
+				_, remainingUncertain, err := store.RecoverySummary(cmd.Context())
+				if err != nil {
+					return err
+				}
+				summary := lifecycle.Summary{
+					Resumed:      recoveryReport.Resumed,
+					WaitingOwner: recoveryReport.WaitingOwner,
+					Terminalized: recoveryReport.Terminalized,
+					Uncertain:    recoveryReport.Uncertain + remainingUncertain,
 				}
 				if err := lifecycleController.NotifyOnline(
 					cmd.Context(),
@@ -916,7 +982,128 @@ func lifecycleRecoverySummary(
 	if err != nil {
 		return lifecycle.Summary{}, err
 	}
-	return lifecycle.Summary{Interrupted: interrupted, Uncertain: uncertain}, nil
+	return lifecycle.Summary{
+		Paused:    interrupted,
+		Uncertain: uncertain,
+	}, nil
+}
+
+func notifyRecoveryConvergence(
+	ctx context.Context,
+	store *storage.Store,
+	messenger agenttools.Messenger,
+	notice storage.RecoveryConvergenceNotice,
+	owner config.OwnerConfig,
+) error {
+	item, err := store.GetWorkItem(ctx, notice.WorkItemID)
+	if err != nil {
+		return err
+	}
+	language := agentlocale.Resolve(
+		owner.PreferredLanguage,
+		owner.FallbackLanguage,
+		item.Event.Content,
+	)
+	text := recoveryConvergenceText(notice, owner, language)
+	return sendOwnerResolutionText(ctx, store, messenger, notice.WorkItemID, text)
+}
+
+func sendOwnerResolutionText(
+	ctx context.Context,
+	store *storage.Store,
+	messenger agenttools.Messenger,
+	workItemID int64,
+	text string,
+) error {
+	actionID, key, send, err := store.BeginOwnerResolutionNotification(
+		ctx,
+		workItemID,
+		text,
+	)
+	if err != nil || !send {
+		return err
+	}
+	sendErr := (agenttools.NotifyOwnerTool{Messenger: messenger}).Execute(ctx, agenttools.NotifyRequest{
+		Text:           text,
+		IdempotencyKey: key,
+	})
+	errorText := ""
+	if sendErr != nil {
+		errorText = sendErr.Error()
+	}
+	if completeErr := store.CompleteOwnerResolutionNotification(
+		context.WithoutCancel(ctx),
+		actionID,
+		errorText,
+	); completeErr != nil {
+		if sendErr != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"send and record recovery resolution notice",
+			).WithCause(errors.Join(sendErr, completeErr))
+		}
+		return completeErr
+	}
+	return sendErr
+}
+
+func recoveryConvergenceText(
+	notice storage.RecoveryConvergenceNotice,
+	owner config.OwnerConfig,
+	language agentlocale.Language,
+) string {
+	name := strings.TrimSpace(owner.Name)
+	if name == "" {
+		if language == agentlocale.LanguageEnglish {
+			name = "Owner"
+		} else {
+			name = "负责人"
+		}
+	}
+	if language == agentlocale.LanguageEnglish {
+		if notice.Kind == "approval_required" {
+			command := "`lark-agent approval list`"
+			if notice.ActionID > 0 {
+				command = fmt.Sprintf("`lark-agent approval approve %d`", notice.ActionID)
+			}
+			return fmt.Sprintf(
+				"%s, work #%d for message %s is waiting for your exact approval. The original draft was preserved. Review it with `lark-agent queue inspect --work-id %d`, then run %s if it is correct.",
+				name,
+				notice.WorkItemID,
+				notice.MessageID,
+				notice.WorkItemID,
+				command,
+			)
+		}
+		return fmt.Sprintf(
+			"%s, work #%d for message %s was terminalized because an external action was interrupted with an uncertain result. It was not replayed. Reconcile it with `lark-agent queue inspect --work-id %d`.",
+			name,
+			notice.WorkItemID,
+			notice.MessageID,
+			notice.WorkItemID,
+		)
+	}
+	if notice.Kind == "approval_required" {
+		command := "`lark-agent approval list`"
+		if notice.ActionID > 0 {
+			command = fmt.Sprintf("`lark-agent approval approve %d`", notice.ActionID)
+		}
+		return fmt.Sprintf(
+			"%s，工作 #%d（消息 %s）仍在等待你的明确批准，原草稿已保留。先执行 `lark-agent queue inspect --work-id %d` 核对；确认无误后执行 %s。",
+			name,
+			notice.WorkItemID,
+			notice.MessageID,
+			notice.WorkItemID,
+			command,
+		)
+	}
+	return fmt.Sprintf(
+		"%s，工作 #%d（消息 %s）已收口：中断时有外部动作正在执行，结果无法确认，因此没有重放。请执行 `lark-agent queue inspect --work-id %d` 核对外部结果。",
+		name,
+		notice.WorkItemID,
+		notice.MessageID,
+		notice.WorkItemID,
+	)
 }
 
 func notifyLifecycleOffline(
@@ -1211,7 +1398,10 @@ func buildLiveOptions(
 			Rules:  ruleSet,
 			Memory: memory.NewStore(),
 			User: agentcontext.UserProfile{
-				OpenID: cfg.Owner.OpenID,
+				OpenID:            cfg.Owner.OpenID,
+				Name:              cfg.Owner.Name,
+				PreferredLanguage: string(cfg.Owner.PreferredLanguage),
+				FallbackLanguage:  string(cfg.Owner.FallbackLanguage),
 			},
 		},
 		includeLarkContext: userContextEnabled,
@@ -1293,6 +1483,7 @@ func buildLiveOptions(
 			MaxToolBytes:      cfg.Agent.MaxToolOutput,
 			MaxTotalBytes:     cfg.Agent.MaxTotalToolOutput,
 			MaxContextBytes:   cfg.Agent.MaxContextBytes,
+			ContextCompaction: cfg.Agent.ContextCompaction,
 			MaxElapsed:        cfg.Agent.LoopTimeout,
 			MaxRepeatedCalls:  cfg.Agent.MaxRepeatedCalls,
 			MaxToolCalls:      cfg.ToolPolicy.CodingMaxToolCalls,
@@ -1335,7 +1526,23 @@ func buildLiveOptions(
 		}, threadState)
 		options = append(options,
 			app.WithReplyHandler(reply.NewController(gate, imSvc, store)),
-			app.WithNotificationHandler(liveOwnerNotifier{messenger: imSvc}),
+			app.WithDecisionPresenter(agentlocale.DelegatedPresenter{
+				OwnerOpenID: cfg.Owner.OpenID,
+				OwnerName:   cfg.Owner.Name,
+				Preferred:   cfg.Owner.PreferredLanguage,
+				Fallback:    cfg.Owner.FallbackLanguage,
+			}),
+			app.WithNotificationHandler(liveOwnerNotifier{
+				messenger: imSvc,
+				ownerName: cfg.Owner.Name,
+				preferred: cfg.Owner.PreferredLanguage,
+				fallback:  cfg.Owner.FallbackLanguage,
+			}),
+			app.WithTerminalFailureHandler(liveTerminalFailureHandler{
+				store:     store,
+				messenger: imSvc,
+				owner:     cfg.Owner,
+			}),
 			app.WithOwnerActivityHandler(feedback.NewController(imSvc, store)),
 		)
 	}
@@ -1726,6 +1933,57 @@ type larkToolContext struct {
 
 type liveOwnerNotifier struct {
 	messenger agenttools.Messenger
+	ownerName string
+	preferred agentlocale.Language
+	fallback  agentlocale.Language
+}
+
+type liveTerminalFailureHandler struct {
+	store     *storage.Store
+	messenger agenttools.Messenger
+	owner     config.OwnerConfig
+}
+
+func (h liveTerminalFailureHandler) HandleTerminalFailure(
+	ctx context.Context,
+	item domain.WorkItem,
+	runErr error,
+) error {
+	language := agentlocale.Resolve(
+		h.owner.PreferredLanguage,
+		h.owner.FallbackLanguage,
+		item.Event.Content,
+	)
+	name := strings.TrimSpace(h.owner.Name)
+	if name == "" {
+		if language == agentlocale.LanguageEnglish {
+			name = "Owner"
+		} else {
+			name = "负责人"
+		}
+	}
+	reason := agentlocale.LocalizedReason(language, runErr.Error())
+	var text string
+	if language == agentlocale.LanguageEnglish {
+		text = fmt.Sprintf(
+			"%s, work #%d for message %s has stopped after bounded retries: %s. Completed evidence and failure history were preserved. Inspect it with `lark-agent queue inspect --work-id %d`; only use `queue resume --force-terminal` after reviewing side effects.",
+			name,
+			item.ID,
+			item.Event.MessageID,
+			reason,
+			item.ID,
+		)
+	} else {
+		text = fmt.Sprintf(
+			"%s，工作 #%d（消息 %s）在有界重试后已停止：%s。已完成的证据和失败记录均已保留。请执行 `lark-agent queue inspect --work-id %d` 查看；核对外部动作后，确需重做时再使用 `queue resume --force-terminal`。",
+			name,
+			item.ID,
+			item.Event.MessageID,
+			reason,
+			item.ID,
+		)
+	}
+	return sendOwnerResolutionText(ctx, h.store, h.messenger, item.ID, text)
 }
 
 func (n liveOwnerNotifier) HandleNotification(
@@ -1734,25 +1992,77 @@ func (n liveOwnerNotifier) HandleNotification(
 	decision domain.Decision,
 	idempotencyKey string,
 ) error {
+	language := agentlocale.Language(decision.Language)
+	if language != agentlocale.LanguageChinese && language != agentlocale.LanguageEnglish {
+		language = agentlocale.Resolve(
+			n.preferred,
+			n.fallback,
+			item.Event.Content,
+			decision.ReplyText,
+		)
+	}
 	return (agenttools.NotifyOwnerTool{Messenger: n.messenger}).Execute(ctx, agenttools.NotifyRequest{
-		Text:           ownerNotificationText(item, decision),
+		Text:           ownerNotificationText(item, decision, n.ownerName, string(language)),
 		IdempotencyKey: idempotencyKey,
 	})
 }
 
-func ownerNotificationText(item domain.WorkItem, decision domain.Decision) string {
+func ownerNotificationText(item domain.WorkItem, decision domain.Decision, ownerName, language string) string {
+	resolved := agentlocale.Language(language)
+	if resolved != agentlocale.LanguageEnglish {
+		resolved = agentlocale.LanguageChinese
+	}
+	ownerName = strings.TrimSpace(ownerName)
+	if ownerName == "" {
+		if resolved == agentlocale.LanguageEnglish {
+			ownerName = "Owner"
+		} else {
+			ownerName = "负责人"
+		}
+	}
 	if decision.Kind == domain.DecisionReply {
 		ownerAction := strings.TrimSpace(decision.OwnerAction)
-		if ownerAction == "" {
-			ownerAction = "请查看 Agent 回复并确认是否还需要后续处理"
+		if ownerAction == "" || agentlocale.ValidateProse(ownerAction, resolved) != nil {
+			if resolved == agentlocale.LanguageEnglish {
+				ownerAction = "Please review the assistant reply and decide whether follow-up is needed."
+			} else {
+				ownerAction = "请查看智能助手的回复，并确认是否还需要后续处理"
+			}
+		}
+		if resolved == agentlocale.LanguageEnglish {
+			return fmt.Sprintf(
+				"%s, the intelligent assistant received a delegated request for message %s and will send this reply:\n\n%s\n\nYour next action: %s",
+				ownerName,
+				item.Event.MessageID,
+				decision.ReplyText,
+				ownerAction,
+			)
 		}
 		return fmt.Sprintf(
-			"Agent 已回复原消息 %s。仍需你处理：%s。可在 Lark 中查看或撤回。",
+			"%s，智能助手已收到消息 %s 的代回复请求，并将发送以下答复：\n\n%s\n\n仍需你处理：%s。",
+			ownerName,
 			item.Event.MessageID,
+			decision.ReplyText,
 			ownerAction,
 		)
 	}
-	return fmt.Sprintf("消息 %s 需要你关注：%s", item.Event.MessageID, decision.Reason)
+	reason := agentlocale.LocalizedReason(resolved, decision.Reason)
+	if resolved == agentlocale.LanguageEnglish {
+		return fmt.Sprintf(
+			"%s, message %s needs your attention: %s Inspect with `lark-agent queue inspect --message-id %s`.",
+			ownerName,
+			item.Event.MessageID,
+			reason,
+			item.Event.MessageID,
+		)
+	}
+	return fmt.Sprintf(
+		"%s，消息 %s 需要你关注：%s。可执行 `lark-agent queue inspect --message-id %s` 查看已完成的检查和下一步。",
+		ownerName,
+		item.Event.MessageID,
+		reason,
+		item.Event.MessageID,
+	)
 }
 
 func (p larkToolContext) RecentMessages(
@@ -1873,6 +2183,7 @@ func (b *conversationBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, 
 			if err := b.applyStoredGitHubReference(&builder, item.Event); err != nil {
 				return agentcontext.Bundle{}, err
 			}
+			resolveBuilderUser(&builder, item.Event)
 			return builder.Build(item)
 		}
 		normalized := normalizeToolMessages(messages)
@@ -1913,7 +2224,29 @@ func (b *conversationBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, 
 	} else if err := b.applyStoredGitHubReference(&builder, item.Event); err != nil {
 		return agentcontext.Bundle{}, err
 	}
+	resolveBuilderUser(&builder, item.Event)
 	return builder.Build(item)
+}
+
+func resolveBuilderUser(builder *agentcontext.Builder, event domain.NormalizedEvent) {
+	if strings.TrimSpace(builder.User.Name) == "" {
+		for _, mention := range event.Mentions {
+			if mention.OpenID == builder.User.OpenID && strings.TrimSpace(mention.Name) != "" {
+				builder.User.Name = strings.TrimSpace(mention.Name)
+				break
+			}
+		}
+	}
+	samples := make([]string, 0, len(builder.Conversation)+1)
+	samples = append(samples, event.Content)
+	for _, message := range builder.Conversation {
+		samples = append(samples, message.Content)
+	}
+	builder.User.Language = string(agentlocale.Resolve(
+		agentlocale.Language(builder.User.PreferredLanguage),
+		agentlocale.Language(builder.User.FallbackLanguage),
+		samples...,
+	))
 }
 
 func (b *conversationBuilder) applyStoredGitHubReference(
@@ -2036,6 +2369,17 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func resolveConfiguredLanguage(owner config.OwnerConfig) agentlocale.Language {
+	if owner.PreferredLanguage == agentlocale.LanguageChinese ||
+		owner.PreferredLanguage == agentlocale.LanguageEnglish {
+		return owner.PreferredLanguage
+	}
+	if owner.FallbackLanguage == agentlocale.LanguageEnglish {
+		return agentlocale.LanguageEnglish
+	}
+	return agentlocale.LanguageChinese
+}
+
 func newModeCommand(out io.Writer, configPath *string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "mode auto|approval|paused",
@@ -2068,8 +2412,9 @@ func newQueueCommand(out io.Writer, configPath, statePath *string) *cobra.Comman
 	cmd := &cobra.Command{
 		Use:   "queue",
 		Short: "Inspect or repair the durable queue",
-		Long: "Inspect or explicitly repair the durable queue. Cross-restart work " +
-			"is never replayed automatically. 跨重启任务不会自动回放。",
+		Long: "Inspect or explicitly repair the durable queue. Ready startup " +
+			"automatically re-evaluates safe interrupted work, while uncertain " +
+			"external actions remain terminal and are never replayed.",
 	}
 	cmd.AddCommand(&cobra.Command{
 		Use:   "list",
@@ -2206,11 +2551,12 @@ func newQueueResumeCommand(out io.Writer, statePath *string) *cobra.Command {
 	var forceTerminal bool
 	cmd := &cobra.Command{
 		Use:   "resume",
-		Short: "Explicitly resume one interrupted or offline message",
+		Short: "Explicitly resume one reviewed paused, terminal, or offline message",
 		Long: "Explicitly admit one exact offline message or interrupted work item. " +
-			"Cross-restart work is never replayed without this command. " +
+			"Safe cross-restart work is already re-evaluated automatically. " +
+			"Result-uncertain external actions are never replayed automatically. " +
 			"Completed, ignored, cancelled, or dead-letter work additionally requires --force-terminal. " +
-			"跨重启任务不会自动回放。",
+			"结果不确定的外部动作不会自动重放；仅在核对外部结果后，才可显式恢复终态工作。",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := storage.OpenInspection(resolveStatePath(*statePath))
 			if err != nil {

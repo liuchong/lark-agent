@@ -6,7 +6,9 @@
 lark-agent init \
   --workspace /absolute/path/to/workspace \
   --app-id cli_xxx \
-  --owner-open-id ou_xxx
+  --owner-open-id ou_xxx \
+  --owner-name "姓名" \
+  --preferred-language zh-CN
 lark-agent auth login < /path/to/private-lark-credentials.json
 lark-agent config show
 ```
@@ -36,6 +38,11 @@ lark-agent config show
 - `github.max_files`、`max_patch_bytes`、`max_annotations`、`max_reviews`：
   单次模型读取的硬上限。
 - `owner.open_id`：唯一 Owner 的 open ID。
+- `owner.name`：必填。智能助手代回复和私聊通知中使用的具体姓名。缺失时配置校验
+  直接失败，代回复不会用“用户”或“负责人”代替。
+- `owner.preferred_language`：`auto`、`zh-CN` 或 `en-US`。配置为具体语言时优先
+  使用；`auto` 按当前消息和有界同会话上下文判断。
+- `owner.fallback_language`：自动判断不明确时使用的 `zh-CN` 或 `en-US`。
 - `assistant.open_ids`、`assistant.names`：Owner 私聊和群 @机器人的识别身份。
 - `assistant.owner_direct.enabled`：是否接受 Owner 直接发给机器人的请求。
 - `assistant.reply_scope`：Owner 群内 @机器人范围。`all_groups` 是默认值，允许
@@ -56,8 +63,10 @@ lark-agent config show
 - `scheduler.*`：不同工作通道的 lease 和 worker 数量。
 - `agent.*`、`tool_policy.*`、`goal.*`：模型轮次、工具输出、无进展和长任务上限。
 
-默认 `agent.max_context_bytes` 为 `65536`，初始业务上下文进一步限制在约
-48 KiB；规则、代码和技能按需读取，避免把大目录和历史消息一次性塞给模型。
+默认 `agent.max_context_bytes` 为 `65536`，
+`agent.context_compaction_ratio` 为 `0.80`。每次模型调用都会收到轮次和上下文的
+当前值、总上限和剩余值；达到软阈值后，旧工具结果会压缩成保留来源、动作回执和
+明确未知项的结构化检查点。初始业务上下文进一步限制在约 48 KiB。
 `fast_path.simple_max_turns` 默认为 `3`，给需要证据的简单请求保留“检索、精读、
 提交结论”三个模型轮次。
 `tool_policy.coding_max_tool_calls` 默认为 `16`，只有成功执行的调查工具才消耗这项
@@ -137,6 +146,11 @@ lark-agent mode paused
 assistant:
   reply_scope: all_groups
 
+owner:
+  name: 姓名
+  preferred_language: zh-CN
+  fallback_language: zh-CN
+
 policy:
   reply_scope: all_groups
   private_reply_scope: all_private
@@ -176,7 +190,8 @@ policy:
 此模式必须同时为 daemon 提供 `--chat-query`。`--chat-query` 负责发现并标记允许群；
 机器人范围在启动时用机器人身份把查询解析成具体群 ID；查询不到任何机器人可见群时
 启动会明确失败。在 `all_groups` 模式下，查询只保留群发现和验收用途，不会限制其他
-群里的正常 `@机器人` 或 `@Owner`。切换范围不会自动重放历史终态或中断工作。
+群里的正常 `@机器人` 或 `@Owner`。切换范围不会重放历史终态；安全中断工作仍按
+启动收敛规则自动续跑。
 
 ## Workspace
 

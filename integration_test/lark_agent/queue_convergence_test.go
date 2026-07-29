@@ -34,6 +34,23 @@ func (nonConvergentDecider) Decide(context.Context, agentcontext.Bundle) (domain
 	)
 }
 
+type terminalFailureCapture struct {
+	calls int
+	item  domain.WorkItem
+	err   error
+}
+
+func (c *terminalFailureCapture) HandleTerminalFailure(
+	_ context.Context,
+	item domain.WorkItem,
+	err error,
+) error {
+	c.calls++
+	c.item = item
+	c.err = err
+	return nil
+}
+
 func TestQueueCancellationAndCrossSessionApprovalRoundTrip(t *testing.T) {
 	bin := buildAgentBinary(t)
 	statePath := filepath.Join(t.TempDir(), "state.db")
@@ -150,11 +167,13 @@ func TestModelNonConvergenceMovesLeasedWorkDirectlyToDeadLetter(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	terminal := &terminalFailureCapture{}
 	daemon := app.NewDaemon(
 		store,
 		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
 		app.WithContextBuilder(convergenceContextBuilder{}),
 		app.WithDecider(nonConvergentDecider{}),
+		app.WithTerminalFailureHandler(terminal),
 	)
 	if _, err := daemon.RunOnce(context.Background()); err == nil {
 		t.Fatal("non-convergent model run unexpectedly succeeded")
@@ -166,5 +185,9 @@ func TestModelNonConvergenceMovesLeasedWorkDirectlyToDeadLetter(t *testing.T) {
 	if len(items) != 1 || items[0].Status != domain.StatusDeadLetter ||
 		items[0].RetryCount != 1 {
 		t.Fatalf("items=%+v", items)
+	}
+	if terminal.calls != 1 || terminal.item.ID != items[0].ID ||
+		terminal.err == nil {
+		t.Fatalf("terminal failure capture=%+v", terminal)
 	}
 }

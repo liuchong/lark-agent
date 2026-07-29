@@ -57,11 +57,12 @@ confidence, a bounded context cutoff, and a result. They never grant tools or
 change sender-derived authority.
 
 Opening the database for an operator command does not create or stop a daemon
-session. On startup, unfinished work from older sessions becomes `interrupted`
-and cannot be claimed. `queue resume` is the only cross-session admission path.
-Waiting delegated candidates that have no model run, approval, or action may be
-freshly re-evaluated after restart. This is re-observation of current Lark
-state, not replay of a draft or action.
+session. On startup, unfinished work from older sessions first becomes
+`interrupted`. After the new session is ready, one transaction readmits safe
+read-only/model work, restores exact approval waits with an owner instruction,
+and terminalizes result-uncertain external actions with a reconciliation
+instruction. This is re-observation of current evidence, not replay of an
+uncertain action.
 
 ## Process lifecycle
 
@@ -69,8 +70,8 @@ A daemon process creates an online session in `starting`, completes SDK,
 Keychain, model, storage, intake, and scheduler preflight, then moves it to `ready`.
 Only then are workers allowed to claim new work. Graceful stop pauses unfinished
 current-session work, sends the durable offline notice, and records `stopped`.
-Work belonging to an older session is interrupted and remains paused until the
-owner explicitly resumes the exact item.
+The next ready session runs startup convergence before ordinary workers claim
+work.
 
 ## Installation
 

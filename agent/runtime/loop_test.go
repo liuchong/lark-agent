@@ -209,6 +209,20 @@ func TestTerminalDecisionRejectsAssistantNotifyWhenOwnerIsAlsoMentioned(t *testi
 	}
 }
 
+func TestTerminalDecisionRejectsNotifyOnlyForDelegatedPrivateMessage(t *testing.T) {
+	err := validateTerminalDecision(agentcontext.Bundle{
+		WorkKind: domain.WorkKindDirectMention,
+		User:     agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event: domain.NormalizedEvent{
+			ChatType: "p2p",
+			SenderID: "ou_teammate",
+		},
+	}, domain.Decision{Kind: domain.DecisionNotify})
+	if err == nil || !strings.Contains(err.Error(), "delegated work cannot finish") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestAgentLoopRecoversPlainTextAfterRejectedTerminalDecision(t *testing.T) {
 	model := &scriptedModel{responses: []*schema.Message{
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("call_notify", "submit_decision", `{
@@ -618,25 +632,61 @@ func TestAgentLoopStopsAfterThreeIgnoredTerminalOnlyAttempts(t *testing.T) {
 	}
 }
 
-func TestCompactMessagesPreservesRecentTurnsWithinBudget(t *testing.T) {
+func TestCompactMessagesCreatesEvidenceCheckpointWithinBudget(t *testing.T) {
 	messages := []*schema.Message{
 		schema.SystemMessage("system"),
 		schema.UserMessage(strings.Repeat("初始上下文", 2000)),
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("old", "read_workspace", `{"path":"old.go"}`)}),
-		schema.ToolMessage(strings.Repeat("旧工具结果", 2000), "old"),
+		schema.ToolMessage(
+			`{"ok":true,"content":"`+strings.Repeat("旧工具结果", 2000)+`","sources":[{"relative_path":"agent/runtime/loop.go","digest":"sha256:abc","kind":"production"}],"receipt":{"action":"read"}}`,
+			"old",
+			schema.WithToolName("read_workspace"),
+		),
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("recent", "search_workspace", `{"query":"recent"}`)}),
 		schema.ToolMessage("recent evidence", "recent"),
 	}
-	compacted := compactMessages(messages, 12*1024)
-	if messageBytes(compacted) > 12*1024 {
-		t.Fatalf("compacted bytes=%d", messageBytes(compacted))
+	result := compactMessages(messages, 12*1024, 0.80)
+	if messageBytes(result.Messages) > 12*1024 {
+		t.Fatalf("compacted bytes=%d", messageBytes(result.Messages))
 	}
-	if compacted[len(compacted)-1].Content != "recent evidence" {
-		t.Fatalf("recent result changed: %q", compacted[len(compacted)-1].Content)
+	if !result.Compacted || result.ReplacedMessages == 0 {
+		t.Fatalf("result=%+v", result)
 	}
-	for _, message := range compacted {
+	if result.Messages[len(result.Messages)-1].Content != "recent evidence" {
+		t.Fatalf("recent result changed: %q", result.Messages[len(result.Messages)-1].Content)
+	}
+	var checkpoint string
+	for _, message := range result.Messages {
+		if strings.Contains(message.Content, "context_checkpoint") {
+			checkpoint = message.Content
+		}
 		if !utf8.ValidString(message.Content) {
 			t.Fatal("compaction produced invalid UTF-8")
+		}
+	}
+	for _, want := range []string{"agent/runtime/loop.go", "sha256:abc", "read_workspace"} {
+		if !strings.Contains(checkpoint, want) {
+			t.Fatalf("checkpoint missing %q: %s", want, checkpoint)
+		}
+	}
+}
+
+func TestModelBudgetPromptIncludesTurnAndContextUrgency(t *testing.T) {
+	got := modelRunProgressPrompt(runBudget{
+		CurrentTurn:      121,
+		MaxTurns:         150,
+		ContextBytes:     54_400,
+		MaxContextBytes:  65_536,
+		Compacted:        true,
+		ReplacedMessages: 8,
+	})
+	for _, want := range []string{
+		"121", "150", "29",
+		"54400", "65536", "11136",
+		"83%", "8", "urgent",
+	} {
+		if !strings.Contains(strings.ToLower(got), strings.ToLower(want)) {
+			t.Fatalf("budget prompt missing %q: %s", want, got)
 		}
 	}
 }

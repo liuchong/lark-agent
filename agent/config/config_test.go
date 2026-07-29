@@ -7,12 +7,21 @@ import (
 	"time"
 
 	"github.com/liuchong/lark-agent/agent/domain"
+	agentlocale "github.com/liuchong/lark-agent/agent/locale"
 )
 
 func TestDefaultConfigRequiresWorkspace(t *testing.T) {
 	cfg := Default()
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("Validate accepted missing workspace")
+	}
+}
+
+func TestConfigRequiresConcreteOwnerName(t *testing.T) {
+	cfg := validConfigForTest(t)
+	cfg.Owner.Name = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "owner.name") {
+		t.Fatalf("missing owner name error=%v", err)
 	}
 }
 
@@ -70,6 +79,13 @@ func TestDefaultHarnessConfig(t *testing.T) {
 	}
 	if cfg.Agent.MaxContextBytes != 64*1024 {
 		t.Fatalf("max context bytes=%d, want %d", cfg.Agent.MaxContextBytes, 64*1024)
+	}
+	if cfg.Agent.ContextCompaction != 0.80 {
+		t.Fatalf("context compaction ratio=%v", cfg.Agent.ContextCompaction)
+	}
+	if cfg.Owner.PreferredLanguage != agentlocale.LanguageAuto ||
+		cfg.Owner.FallbackLanguage != agentlocale.LanguageChinese {
+		t.Fatalf("owner language defaults=%+v", cfg.Owner)
 	}
 	if !cfg.Goal.Enabled || cfg.Goal.MaxActive <= 0 || cfg.Goal.MaxInvestigationTurns <= 0 {
 		t.Fatalf("goal defaults=%+v", cfg.Goal)
@@ -229,6 +245,7 @@ func validConfigForTest(t *testing.T) Config {
 	cfg := Default()
 	cfg.Lark.AppID = "cli_test"
 	cfg.Owner.OpenID = "ou_owner"
+	cfg.Owner.Name = "测试负责人"
 	cfg.Workspace.Root = t.TempDir()
 	return cfg
 }

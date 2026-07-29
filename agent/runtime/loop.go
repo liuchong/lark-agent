@@ -12,6 +12,7 @@ import (
 
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
+	agentlocale "github.com/liuchong/lark-agent/agent/locale"
 	agenttools "github.com/liuchong/lark-agent/agent/tools"
 	"github.com/liuchong/lark-agent/internal/apperr"
 )
@@ -24,6 +25,7 @@ type AgentLoop struct {
 	MaxToolBytes      int
 	MaxTotalBytes     int
 	MaxContextBytes   int
+	ContextCompaction float64
 	MaxElapsed        time.Duration
 	MaxRepeatedCalls  int
 	MaxToolCalls      int
@@ -85,6 +87,9 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	}
 	if l.MaxContextBytes <= 0 {
 		l.MaxContextBytes = 64 * 1024
+	}
+	if l.ContextCompaction < 0.5 || l.ContextCompaction > 0.95 {
+		l.ContextCompaction = 0.80
 	}
 	if l.MaxElapsed <= 0 {
 		l.MaxElapsed = 10 * time.Minute
@@ -160,9 +165,22 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		if err := ctx.Err(); err != nil {
 			return domain.Decision{}, trajectory, err
 		}
-		messages = compactMessages(messages, l.MaxContextBytes)
+		compaction := compactMessages(messages, l.MaxContextBytes, l.ContextCompaction)
+		messages = compaction.Messages
 		requestMessages := append([]*schema.Message(nil), messages...)
-		requestMessages = append(requestMessages, schema.SystemMessage(modelTurnProgressPrompt(turn+1, l.MaxTurns)))
+		budget := runBudget{
+			CurrentTurn:      turn + 1,
+			MaxTurns:         l.MaxTurns,
+			ContextBytes:     messageBytes(messages),
+			MaxContextBytes:  l.MaxContextBytes,
+			Compacted:        compaction.Compacted,
+			ReplacedMessages: compaction.ReplacedMessages,
+			TargetLanguage:   resolvedBundleLanguage(bundle),
+		}
+		requestMessages = append(requestMessages, schema.SystemMessage(modelRunProgressPrompt(budget)))
+		if budget.RemainingTurns() == 0 {
+			forceDecision = true
+		}
 		codingTerminalOnly := bundle.WorkKind == domain.WorkKindCodingQuestion &&
 			codingEvidenceAvailable
 		terminalOnly := forceDecision || codingTerminalOnly
@@ -276,6 +294,10 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				if toolErr == nil && call.Function.Name != "submit_decision" {
 					toolCalls++
 				}
+			}
+			if toolErr == nil && execution.Decision != nil {
+				normalized := normalizeDecisionLanguage(bundle, *execution.Decision)
+				execution.Decision = &normalized
 			}
 			if toolErr == nil && execution.Decision != nil {
 				if err := validateTerminalDecision(bundle, *execution.Decision); err != nil {
@@ -461,6 +483,68 @@ func modelTurnProgressPrompt(currentTurn, maxTurns int) string {
 	)
 }
 
+type runBudget struct {
+	CurrentTurn      int
+	MaxTurns         int
+	ContextBytes     int
+	MaxContextBytes  int
+	Compacted        bool
+	ReplacedMessages int
+	TargetLanguage   agentlocale.Language
+}
+
+func (b runBudget) RemainingTurns() int {
+	remaining := b.MaxTurns - b.CurrentTurn
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func modelRunProgressPrompt(budget runBudget) string {
+	remainingBytes := budget.MaxContextBytes - budget.ContextBytes
+	if remainingBytes < 0 {
+		remainingBytes = 0
+	}
+	percent := 0
+	if budget.MaxContextBytes > 0 {
+		percent = budget.ContextBytes * 100 / budget.MaxContextBytes
+	}
+	urgency := "normal"
+	if percent >= 80 || budget.RemainingTurns()*5 <= budget.MaxTurns {
+		urgency = "urgent"
+	}
+	return fmt.Sprintf(
+		"%s Context budget: %d of %d bytes used (%d%%), %d bytes remaining. "+
+			"Automatic compaction: %t; replaced old messages: %d. Urgency: %s. "+
+			"Required outward language: %s; use that language for all explanatory prose. "+
+			"When urgency is urgent, stop broad investigation, preserve explicit unknowns, "+
+			"and converge on submit_decision.",
+		modelTurnProgressPrompt(budget.CurrentTurn, budget.MaxTurns),
+		budget.ContextBytes,
+		budget.MaxContextBytes,
+		percent,
+		remainingBytes,
+		budget.Compacted,
+		budget.ReplacedMessages,
+		urgency,
+		budget.TargetLanguage,
+	)
+}
+
+func resolvedBundleLanguage(bundle agentcontext.Bundle) agentlocale.Language {
+	language := agentlocale.Language(bundle.User.Language)
+	if language == agentlocale.LanguageChinese || language == agentlocale.LanguageEnglish {
+		return language
+	}
+	return agentlocale.Resolve(
+		agentlocale.Language(bundle.User.PreferredLanguage),
+		agentlocale.Language(bundle.User.FallbackLanguage),
+		bundle.Event.Content,
+		conversationText(bundle.Conversation),
+	)
+}
+
 func shouldPromptToolBudgetConvergence(rawToolBytes, maxToolBytes, totalToolBytes, maxTotalBytes int) bool {
 	if maxToolBytes > 0 && rawToolBytes > maxToolBytes {
 		return true
@@ -500,37 +584,142 @@ func submitDecisionOnly(infos []*schema.ToolInfo) []*schema.ToolInfo {
 	return infos
 }
 
-func compactMessages(messages []*schema.Message, maxBytes int) []*schema.Message {
-	if maxBytes <= 0 || messageBytes(messages) <= maxBytes {
-		return messages
+type compactionResult struct {
+	Messages         []*schema.Message
+	BeforeBytes      int
+	AfterBytes       int
+	Compacted        bool
+	ReplacedMessages int
+}
+
+func compactMessages(messages []*schema.Message, maxBytes int, ratio float64) compactionResult {
+	before := messageBytes(messages)
+	result := compactionResult{
+		Messages:    messages,
+		BeforeBytes: before,
+		AfterBytes:  before,
 	}
-	compacted := append([]*schema.Message(nil), messages...)
-	protectedFrom := len(compacted) - 4
+	if maxBytes <= 0 {
+		return result
+	}
+	if ratio < 0.5 || ratio > 0.95 {
+		ratio = 0.80
+	}
+	target := int(float64(maxBytes) * ratio)
+	if before <= target {
+		return result
+	}
+	protectedFrom := len(messages) - 2
 	if protectedFrom < 2 {
 		protectedFrom = 2
 	}
-	for i := 2; i < protectedFrom; i++ {
-		if compacted[i] == nil || compacted[i].Role != schema.Tool || len(compacted[i].Content) <= 1024 {
+	compacted := make([]*schema.Message, 0, len(messages))
+	if len(messages) > 0 {
+		compacted = append(compacted, cloneMessageWithContentLimit(messages[0], maxBytes/8))
+	}
+	if len(messages) > 1 {
+		compacted = append(compacted, cloneMessageWithContentLimit(messages[1], maxBytes/3))
+	}
+	if protectedFrom > 2 {
+		checkpoint := buildContextCheckpoint(messages[2:protectedFrom], maxBytes/4)
+		if checkpoint != "" {
+			compacted = append(compacted, schema.SystemMessage(checkpoint))
+		}
+	}
+	for i := protectedFrom; i < len(messages); i++ {
+		compacted = append(compacted, cloneMessageWithContentLimit(messages[i], maxBytes/6))
+	}
+	for messageBytes(compacted) > maxBytes {
+		changed := false
+		for i := 1; i < len(compacted) && messageBytes(compacted) > maxBytes; i++ {
+			if compacted[i] == nil || len(compacted[i].Content) <= 512 {
+				continue
+			}
+			compacted[i] = cloneMessageWithContentLimit(compacted[i], len(compacted[i].Content)*3/4)
+			changed = true
+		}
+		if !changed {
+			break
+		}
+	}
+	result.Messages = compacted
+	result.AfterBytes = messageBytes(compacted)
+	result.Compacted = true
+	result.ReplacedMessages = max(0, protectedFrom-2)
+	return result
+}
+
+func cloneMessageWithContentLimit(message *schema.Message, limit int) *schema.Message {
+	if message == nil {
+		return nil
+	}
+	clone := *message
+	clone.Content = clipMiddle(clone.Content, limit)
+	clone.ReasoningContent = clipMiddle(clone.ReasoningContent, limit/2)
+	return &clone
+}
+
+func buildContextCheckpoint(messages []*schema.Message, maxBytes int) string {
+	type entry struct {
+		Role      schema.RoleType `json:"role"`
+		Tool      string          `json:"tool,omitempty"`
+		Arguments string          `json:"arguments,omitempty"`
+		Evidence  json.RawMessage `json:"evidence,omitempty"`
+		Excerpt   string          `json:"excerpt,omitempty"`
+	}
+	entries := make([]entry, 0, len(messages))
+	for _, message := range messages {
+		if message == nil {
 			continue
 		}
-		clone := *compacted[i]
-		clone.Content = clipMiddle(clone.Content, 1024)
-		compacted[i] = &clone
-	}
-	for i := 1; i < len(compacted) && messageBytes(compacted) > maxBytes; i++ {
-		if compacted[i] == nil || len(compacted[i].Content) <= 1024 {
-			continue
+		item := entry{Role: message.Role, Tool: message.ToolName}
+		if len(message.ToolCalls) > 0 {
+			item.Tool = message.ToolCalls[0].Function.Name
+			item.Arguments = clipMiddle(message.ToolCalls[0].Function.Arguments, 256)
 		}
-		clone := *compacted[i]
-		over := messageBytes(compacted) - maxBytes
-		target := len(clone.Content) - over
-		if target < 1024 {
-			target = 1024
+		if message.Role == schema.Tool && json.Valid([]byte(message.Content)) {
+			var raw map[string]json.RawMessage
+			if json.Unmarshal([]byte(message.Content), &raw) == nil {
+				preserved := map[string]json.RawMessage{}
+				for _, key := range []string{"ok", "sources", "receipt", "error", "truncated"} {
+					if value, ok := raw[key]; ok {
+						preserved[key] = value
+					}
+				}
+				item.Evidence, _ = json.Marshal(preserved)
+				if content, ok := raw["content"]; ok {
+					var value string
+					if json.Unmarshal(content, &value) == nil {
+						item.Excerpt = clipMiddle(value, 384)
+					}
+				}
+			}
+		} else {
+			item.Excerpt = clipMiddle(message.Content, 384)
 		}
-		clone.Content = clipMiddle(clone.Content, target)
-		compacted[i] = &clone
+		entries = append(entries, item)
 	}
-	return compacted
+	data, _ := json.Marshal(map[string]any{
+		"context_checkpoint": true,
+		"instruction":        "This is compacted prior evidence. Preserve receipts and explicit unknowns; do not restart broad investigation solely because raw text was removed.",
+		"entries":            entries,
+	})
+	if maxBytes <= 0 || len(data) <= maxBytes {
+		return string(data)
+	}
+	target := maxBytes / 2
+	for target > 64 {
+		bounded, _ := json.Marshal(map[string]any{
+			"context_checkpoint": true,
+			"instruction":        "Compacted prior evidence; preserve receipts and explicit unknowns.",
+			"compacted_entries":  clipMiddle(string(data), target),
+		})
+		if len(bounded) <= maxBytes {
+			return string(bounded)
+		}
+		target = target * 3 / 4
+	}
+	return `{"context_checkpoint":true,"instruction":"Prior evidence was compacted; do not restart broad investigation."}`
 }
 
 func messageBytes(messages []*schema.Message) int {
@@ -795,16 +984,52 @@ func validateDecisionSources(decision domain.Decision, allowed map[string]bool) 
 }
 
 func validateTerminalDecision(bundle agentcontext.Bundle, decision domain.Decision) error {
+	if decision.Kind == domain.DecisionReply || decision.Kind == domain.DecisionRequestApproval {
+		language := agentlocale.Language(decision.Language)
+		if language != agentlocale.LanguageChinese && language != agentlocale.LanguageEnglish {
+			return errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"terminal reply is missing a resolved output language",
+			)
+		}
+		if err := agentlocale.ValidateProse(decision.ReplyText, language); err != nil {
+			return err
+		}
+	}
 	if decision.Kind != domain.DecisionNotify {
 		return nil
 	}
-	if bundle.WorkKind == domain.WorkKindDirectMention {
-		return nil
+	if isDelegatedInvocation(bundle) {
+		if domain.IsCodingQuestion(bundle.Event.Content) {
+			return errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"coding question cannot finish as notify; delegated work requires a useful sender-facing reply with completed checks and explicit unknowns",
+			)
+		}
+		return errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"delegated work cannot finish as owner notification only; submit a useful sender-facing reply with completed checks and explicit unknowns",
+		)
 	}
 	return errs.NewInternalError(
 		errs.SubtypeInvalidResponse,
 		"assistant_request and owner_request cannot finish as notify only; submit a useful reply or request_approval with exact reply_text",
 	)
+}
+
+func normalizeDecisionLanguage(bundle agentcontext.Bundle, decision domain.Decision) domain.Decision {
+	language := resolvedBundleLanguage(bundle)
+	decision.Language = string(language)
+	return decision
+}
+
+func conversationText(events []domain.NormalizedEvent) string {
+	var text strings.Builder
+	for _, event := range events {
+		text.WriteString(event.Content)
+		text.WriteByte('\n')
+	}
+	return text.String()
 }
 
 func verifyCodingDecision(

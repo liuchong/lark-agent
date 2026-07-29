@@ -27,7 +27,7 @@ Reusable verified rules:
   unfinished work, send the durable offline notice, then stop the session.
 - A generic retry command must not become a second recovery path. It may only
   accelerate current-session `retry_wait` work with no executing or blocked
-  action; prior-session, interrupted, processing, and terminal work remains
-  behind exact inspect/resume gates.
+  action. Ready startup owns safe cross-session readmission; terminal work
+  remains behind exact inspect/resume gates.
 - SQLite schema migration runs inside the owned state database. It must be
   bounded by the store connection and must not imply historical data import.

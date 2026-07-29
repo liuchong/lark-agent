@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -800,7 +801,7 @@ func (s *Store) RecoverySummary(ctx context.Context) (int, int, error) {
 			"count interrupted work",
 		).WithCause(err)
 	}
-	var uncertainWork, uncertainLifecycle int
+	var uncertainWork, uncertainLifecycle, uncertainResolution int
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(DISTINCT work_item_id) FROM work_interruptions
 		 WHERE action_status = ? AND resumed_at IS NULL`,
@@ -818,7 +819,394 @@ func (s *Store) RecoverySummary(ctx context.Context) (int, int, error) {
 			"count uncertain lifecycle actions",
 		).WithCause(err)
 	}
-	return interrupted, uncertainWork + uncertainLifecycle, nil
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM action_attempts
+		 WHERE kind = 'owner_resolution' AND status = ?`,
+		domain.ActionExecuting,
+	).Scan(&uncertainResolution); err != nil {
+		return 0, 0, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"count uncertain owner resolution notifications",
+		).WithCause(err)
+	}
+	return interrupted, uncertainWork + uncertainLifecycle + uncertainResolution, nil
+}
+
+// RecoveryConvergenceNotice describes one exact owner action produced by
+// startup recovery.
+type RecoveryConvergenceNotice struct {
+	WorkItemID int64  `json:"work_item_id" yaml:"work_item_id"`
+	ActionID   int64  `json:"action_id,omitempty" yaml:"action_id,omitempty"`
+	MessageID  string `json:"message_id" yaml:"message_id"`
+	Kind       string `json:"kind" yaml:"kind"`
+	Reason     string `json:"reason" yaml:"reason"`
+}
+
+// RecoveryConvergenceReport records how every interrupted item was advanced.
+type RecoveryConvergenceReport struct {
+	Resumed      int                         `json:"resumed" yaml:"resumed"`
+	WaitingOwner int                         `json:"waiting_owner" yaml:"waiting_owner"`
+	Terminalized int                         `json:"terminalized" yaml:"terminalized"`
+	Uncertain    int                         `json:"uncertain" yaml:"uncertain"`
+	Notices      []RecoveryConvergenceNotice `json:"notices,omitempty" yaml:"notices,omitempty"`
+}
+
+// ConvergeInterruptedWork readmits safe work, preserves exact approval waits,
+// and terminalizes result-uncertain external actions without replaying them.
+func (s *Store) ConvergeInterruptedWork(ctx context.Context) (RecoveryConvergenceReport, error) {
+	if s.session.Status != domain.OnlineSessionReady {
+		return RecoveryConvergenceReport{}, errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"startup convergence requires a ready online session",
+		)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return RecoveryConvergenceReport{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin interrupted work convergence",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	rows, err := tx.QueryContext(ctx,
+		`SELECT w.id, w.event_json,
+			EXISTS(
+				SELECT 1 FROM work_interruptions i
+				WHERE i.work_item_id = w.id
+				  AND i.action_status = ?
+				  AND i.resumed_at IS NULL
+			),
+			EXISTS(
+				SELECT 1 FROM action_attempts a
+				WHERE a.work_item_id = w.id AND a.status = ?
+			),
+			COALESCE((
+				SELECT MAX(a.id) FROM action_attempts a
+				WHERE a.work_item_id = w.id AND a.status = ?
+			), 0),
+			EXISTS(
+				SELECT 1 FROM action_attempts a
+				WHERE a.work_item_id = w.id AND a.status = ?
+			)
+		 FROM work_items w
+		 WHERE w.status = ?
+		 ORDER BY w.id`,
+		domain.ActionExecuting,
+		domain.ActionAwaitingApproval,
+		domain.ActionAwaitingApproval,
+		domain.ActionReady,
+		domain.StatusInterrupted,
+	)
+	if err != nil {
+		return RecoveryConvergenceReport{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"list interrupted work for convergence",
+		).WithCause(err)
+	}
+	type candidate struct {
+		id        int64
+		event     domain.NormalizedEvent
+		uncertain bool
+		awaiting  bool
+		actionID  int64
+		ready     bool
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var item candidate
+		var eventJSON string
+		if err := rows.Scan(
+			&item.id,
+			&eventJSON,
+			&item.uncertain,
+			&item.awaiting,
+			&item.actionID,
+			&item.ready,
+		); err != nil {
+			_ = rows.Close()
+			return RecoveryConvergenceReport{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"scan interrupted work for convergence",
+			).WithCause(err)
+		}
+		if err := json.Unmarshal([]byte(eventJSON), &item.event); err != nil {
+			_ = rows.Close()
+			return RecoveryConvergenceReport{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"decode interrupted work event",
+			).WithCause(err)
+		}
+		candidates = append(candidates, item)
+	}
+	if err := rows.Close(); err != nil {
+		return RecoveryConvergenceReport{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"close interrupted convergence rows",
+		).WithCause(err)
+	}
+	report := RecoveryConvergenceReport{}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, item := range candidates {
+		switch {
+		case item.uncertain:
+			reason := "external action result is uncertain after process interruption; action was not replayed"
+			decisionJSON, _ := json.Marshal(domain.Decision{
+				Kind:   domain.DecisionRecord,
+				Reason: reason,
+			})
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE work_items
+				 SET status = ?, session_id = ?, decision_json = ?,
+				     lease_by = NULL, lease_time = NULL, next_attempt_at = NULL,
+				     updated_at = ?
+				 WHERE id = ? AND status = ?`,
+				domain.StatusDeadLetter,
+				s.session.ID,
+				string(decisionJSON),
+				now,
+				item.id,
+				domain.StatusInterrupted,
+			); err != nil {
+				return RecoveryConvergenceReport{}, errs.NewInternalError(
+					errs.SubtypeStorage,
+					"terminalize uncertain interrupted work",
+				).WithCause(err)
+			}
+			metadata, _ := json.Marshal(map[string]any{
+				"recovery":         true,
+				"external_action":  "uncertain",
+				"automatic_replay": false,
+			})
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO dead_letters(work_item_id, reason, metadata_json, created_at)
+				 VALUES (?, ?, ?, ?)
+				 ON CONFLICT(work_item_id) DO UPDATE SET
+				    reason = excluded.reason,
+				    metadata_json = excluded.metadata_json,
+				    created_at = excluded.created_at`,
+				item.id,
+				reason,
+				string(metadata),
+				now,
+			); err != nil {
+				return RecoveryConvergenceReport{}, errs.NewInternalError(
+					errs.SubtypeStorage,
+					"record uncertain recovery dead letter",
+				).WithCause(err)
+			}
+			report.Terminalized++
+			report.Uncertain++
+			report.Notices = append(report.Notices, RecoveryConvergenceNotice{
+				WorkItemID: item.id,
+				MessageID:  item.event.MessageID,
+				Kind:       "uncertain_external_action",
+				Reason:     reason,
+			})
+		case item.awaiting && !item.ready:
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE work_items
+				 SET status = ?, session_id = ?, lease_by = NULL, lease_time = NULL,
+				     next_attempt_at = NULL, updated_at = ?
+				 WHERE id = ? AND status = ?`,
+				domain.StatusAwaitingApproval,
+				s.session.ID,
+				now,
+				item.id,
+				domain.StatusInterrupted,
+			); err != nil {
+				return RecoveryConvergenceReport{}, errs.NewInternalError(
+					errs.SubtypeStorage,
+					"restore interrupted approval wait",
+				).WithCause(err)
+			}
+			report.WaitingOwner++
+			report.Notices = append(report.Notices, RecoveryConvergenceNotice{
+				WorkItemID: item.id,
+				ActionID:   item.actionID,
+				MessageID:  item.event.MessageID,
+				Kind:       "approval_required",
+				Reason:     "exact approval is still required",
+			})
+		default:
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE work_items
+				 SET status = ?, session_id = ?, decision_json = NULL,
+				     lease_by = NULL, lease_time = NULL, next_attempt_at = NULL,
+				     updated_at = ?
+				 WHERE id = ? AND status = ?`,
+				domain.StatusReceived,
+				s.session.ID,
+				now,
+				item.id,
+				domain.StatusInterrupted,
+			); err != nil {
+				return RecoveryConvergenceReport{}, errs.NewInternalError(
+					errs.SubtypeStorage,
+					"readmit safe interrupted work",
+				).WithCause(err)
+			}
+			report.Resumed++
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE work_interruptions SET resumed_at = ?
+			 WHERE work_item_id = ? AND resumed_at IS NULL`,
+			now,
+			item.id,
+		); err != nil {
+			return RecoveryConvergenceReport{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"close converged interruption snapshot",
+			).WithCause(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return RecoveryConvergenceReport{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit interrupted work convergence",
+		).WithCause(err)
+	}
+	return report, nil
+}
+
+// BeginOwnerResolutionNotification persists one exact owner resolution message
+// before Lark send.
+func (s *Store) BeginOwnerResolutionNotification(
+	ctx context.Context,
+	workItemID int64,
+	text string,
+) (int64, string, bool, error) {
+	text = strings.TrimSpace(text)
+	if workItemID <= 0 || text == "" {
+		return 0, "", false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"owner resolution notification requires work_item_id and text",
+		)
+	}
+	digest := sha256.Sum256([]byte(text))
+	key := fmt.Sprintf("owner-resolution:%d:%x", workItemID, digest[:8])
+	requestJSON, _ := json.Marshal(map[string]string{"text": text})
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO action_attempts(
+			work_item_id, kind, idempotency_key, status, request_json, created_at, updated_at
+		 ) VALUES (?, 'owner_resolution', ?, ?, ?, ?, ?)`,
+		workItemID,
+		key,
+		domain.ActionExecuting,
+		string(requestJSON),
+		now,
+		now,
+	)
+	if err != nil {
+		return 0, "", false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin owner resolution notification",
+		).WithCause(err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 1 {
+		id, err := lastInsertID(result)
+		return id, key, true, err
+	}
+	var actionID int64
+	var status domain.ActionStatus
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT id, status FROM action_attempts WHERE idempotency_key = ?`,
+		key,
+	).Scan(&actionID, &status); err != nil {
+		return 0, "", false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read owner resolution notification",
+		).WithCause(err)
+	}
+	if status == domain.ActionBlocked {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE action_attempts
+			 SET status = ?, request_json = ?, error = NULL, updated_at = ?
+			 WHERE id = ? AND status = ?`,
+			domain.ActionExecuting,
+			string(requestJSON),
+			now,
+			actionID,
+			domain.ActionBlocked,
+		); err != nil {
+			return 0, "", false, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"retry owner resolution notification",
+			).WithCause(err)
+		}
+		return actionID, key, true, nil
+	}
+	return actionID, key, false, nil
+}
+
+// CompleteOwnerResolutionNotification records the exact private send outcome.
+func (s *Store) CompleteOwnerResolutionNotification(
+	ctx context.Context,
+	actionID int64,
+	errorText string,
+) error {
+	return s.CompleteShellApproval(ctx, actionID, "", errorText)
+}
+
+// PendingOwnerResolutionNotification is one previously failed private summary
+// that may be retried on a later ready startup.
+type PendingOwnerResolutionNotification struct {
+	WorkItemID int64  `json:"work_item_id" yaml:"work_item_id"`
+	Text       string `json:"text" yaml:"text"`
+}
+
+// ListPendingOwnerResolutionNotifications returns known failed sends only.
+// Executing sends remain uncertain and are never blindly replayed.
+func (s *Store) ListPendingOwnerResolutionNotifications(
+	ctx context.Context,
+) ([]PendingOwnerResolutionNotification, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT work_item_id, request_json
+		 FROM action_attempts
+		 WHERE kind = 'owner_resolution' AND status = ?
+		 ORDER BY id`,
+		domain.ActionBlocked,
+	)
+	if err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"list pending owner resolution notifications",
+		).WithCause(err)
+	}
+	defer rows.Close() //nolint:errcheck // iteration reports row errors below
+	var out []PendingOwnerResolutionNotification
+	for rows.Next() {
+		var item PendingOwnerResolutionNotification
+		var requestJSON string
+		if err := rows.Scan(&item.WorkItemID, &requestJSON); err != nil {
+			return nil, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"scan pending owner resolution notification",
+			).WithCause(err)
+		}
+		var request map[string]string
+		if err := json.Unmarshal([]byte(requestJSON), &request); err != nil {
+			return nil, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"decode pending owner resolution notification",
+			).WithCause(err)
+		}
+		item.Text = strings.TrimSpace(request["text"])
+		if item.Text == "" {
+			return nil, errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"pending owner resolution notification has no text",
+			)
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"iterate pending owner resolution notifications",
+		).WithCause(err)
+	}
+	return out, nil
 }
 
 func interruptionSnapshot(
@@ -1363,6 +1751,11 @@ func (s *Store) getWorkItem(ctx context.Context, id int64) (domain.WorkItem, err
 		).WithParam("work_item_id")
 	}
 	return item, err
+}
+
+// GetWorkItem returns one current durable work item.
+func (s *Store) GetWorkItem(ctx context.Context, id int64) (domain.WorkItem, error) {
+	return s.getWorkItem(ctx, id)
 }
 
 func (s *Store) findReceiptByWork(

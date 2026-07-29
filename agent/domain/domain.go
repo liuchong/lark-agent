@@ -548,6 +548,7 @@ type Decision struct {
 	Reason         string         `json:"reason" yaml:"reason"`
 	ReplyText      string         `json:"reply_text,omitempty" yaml:"reply_text,omitempty"`
 	OwnerAction    string         `json:"owner_action,omitempty" yaml:"owner_action,omitempty"`
+	Language       string         `json:"language,omitempty" yaml:"language,omitempty"`
 	Sources        []SourceRef    `json:"sources,omitempty" yaml:"sources,omitempty"`
 }
 

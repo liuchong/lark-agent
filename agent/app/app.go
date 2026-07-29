@@ -47,6 +47,10 @@ type schedulingStore interface {
 	ValidateLease(id int64, leaseToken string) error
 }
 
+type workItemReader interface {
+	GetWorkItem(context.Context, int64) (domain.WorkItem, error)
+}
+
 type laneQueue interface {
 	ClaimNextForLane(worker string, lane domain.SchedulerLane) (domain.WorkItem, bool, error)
 }
@@ -94,6 +98,18 @@ type NotificationHandler interface {
 	HandleNotification(context.Context, domain.WorkItem, domain.Decision, string) error
 }
 
+// TerminalFailureHandler sends one durable owner resolution summary after a
+// work item actually reaches dead letter.
+type TerminalFailureHandler interface {
+	HandleTerminalFailure(context.Context, domain.WorkItem, error) error
+}
+
+// DecisionPresenter renders deterministic identity/language text before the
+// exact reply draft is persisted or sent.
+type DecisionPresenter interface {
+	Present(domain.WorkItem, domain.Decision) (domain.Decision, error)
+}
+
 // Poller ingests user-visible live messages.
 type Poller interface {
 	Poll(context.Context) (poll.Result, error)
@@ -128,6 +144,8 @@ type Daemon struct {
 	decider              Decider
 	replier              ReplyHandler
 	notifier             NotificationHandler
+	terminalFailure      TerminalFailureHandler
+	presenter            DecisionPresenter
 	activity             OwnerActivityHandler
 	poller               Poller
 	workLeases           map[domain.WorkKind]time.Duration
@@ -223,6 +241,16 @@ func WithReplyHandler(handler ReplyHandler) Option {
 // WithNotificationHandler wires real owner notifications.
 func WithNotificationHandler(handler NotificationHandler) Option {
 	return func(d *Daemon) { d.notifier = handler }
+}
+
+// WithTerminalFailureHandler wires durable owner summaries for dead letters.
+func WithTerminalFailureHandler(handler TerminalFailureHandler) Option {
+	return func(d *Daemon) { d.terminalFailure = handler }
+}
+
+// WithDecisionPresenter wires deterministic outward reply presentation.
+func WithDecisionPresenter(presenter DecisionPresenter) Option {
+	return func(d *Daemon) { d.presenter = presenter }
 }
 
 // WithOwnerActivityHandler wires transient owner-request feedback.
@@ -538,6 +566,30 @@ func (d *Daemon) finishDecision(ctx context.Context, item domain.WorkItem, decis
 		d.markRetry(item, err)
 		return Result{}, err
 	}
+	if (decision.Kind == domain.DecisionReply || decision.Kind == domain.DecisionRequestApproval) &&
+		d.presenter != nil {
+		presented, err := d.presenter.Present(item, decision)
+		if err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+		decision = presented
+	}
+	ownerNotified := false
+	if decision.Kind == domain.DecisionReply &&
+		!isAssistantFacingRequest(decision.Relevance) &&
+		d.notifier != nil {
+		if notifications, ok := d.queue.(postReplyNotificationStore); ok {
+			if err := d.ensureOwnerNotification(ctx, item, decision, notifications); err != nil {
+				d.markRetry(item, err)
+				return Result{}, err
+			}
+		} else if err := d.notifier.HandleNotification(ctx, item, decision, ""); err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+		ownerNotified = true
+	}
 	if decision.Kind == domain.DecisionReply || decision.Kind == domain.DecisionRequestApproval {
 		if err := d.ensureLease(ctx, item); err != nil {
 			d.markRetry(item, err)
@@ -568,7 +620,8 @@ func (d *Daemon) finishDecision(ctx context.Context, item domain.WorkItem, decis
 	}
 	if decision.Kind == domain.DecisionReply &&
 		!isAssistantFacingRequest(decision.Relevance) &&
-		d.notifier != nil {
+		d.notifier != nil &&
+		!ownerNotified {
 		if notifications, ok := d.queue.(postReplyNotificationStore); ok {
 			return d.finishPostReplyNotification(ctx, item, decision, notifications)
 		}
@@ -605,36 +658,44 @@ func (d *Daemon) finishPostReplyNotification(
 	decision domain.Decision,
 	notifications postReplyNotificationStore,
 ) (Result, error) {
-	actionID, key, completed, err := notifications.BeginPostReplyNotification(ctx, item.DedupKey, decision)
-	if err != nil {
+	if err := d.ensureOwnerNotification(ctx, item, decision, notifications); err != nil {
 		d.markRetry(item, err)
 		return Result{}, err
-	}
-	if !completed {
-		if d.notifier == nil {
-			err := errs.NewInternalError(errs.SubtypeUnknown, "post-reply owner notifier is not configured")
-			_ = notifications.CompletePostReplyNotification(context.WithoutCancel(ctx), actionID, err.Error())
-			d.markRetry(item, err)
-			return Result{}, err
-		}
-		if err := d.ensureLease(ctx, item); err != nil {
-			d.markRetry(item, err)
-			return Result{}, err
-		}
-		if err := d.notifier.HandleNotification(ctx, item, decision, key); err != nil {
-			_ = notifications.CompletePostReplyNotification(context.WithoutCancel(ctx), actionID, err.Error())
-			d.markRetry(item, err)
-			return Result{}, err
-		}
-		if err := notifications.CompletePostReplyNotification(ctx, actionID, ""); err != nil {
-			d.markRetry(item, err)
-			return Result{}, err
-		}
 	}
 	if err := d.complete(item, decision); err != nil {
 		return Result{}, err
 	}
 	return Result{Processed: true, Decision: decision}, nil
+}
+
+func (d *Daemon) ensureOwnerNotification(
+	ctx context.Context,
+	item domain.WorkItem,
+	decision domain.Decision,
+	notifications postReplyNotificationStore,
+) error {
+	actionID, key, completed, err := notifications.BeginPostReplyNotification(ctx, item.DedupKey, decision)
+	if err != nil {
+		return err
+	}
+	if !completed {
+		if d.notifier == nil {
+			err := errs.NewInternalError(errs.SubtypeUnknown, "post-reply owner notifier is not configured")
+			_ = notifications.CompletePostReplyNotification(context.WithoutCancel(ctx), actionID, err.Error())
+			return err
+		}
+		if err := d.ensureLease(ctx, item); err != nil {
+			return err
+		}
+		if err := d.notifier.HandleNotification(ctx, item, decision, key); err != nil {
+			_ = notifications.CompletePostReplyNotification(context.WithoutCancel(ctx), actionID, err.Error())
+			return err
+		}
+		if err := notifications.CompletePostReplyNotification(ctx, actionID, ""); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (d *Daemon) complete(item domain.WorkItem, decision domain.Decision) error {
@@ -650,11 +711,13 @@ func (d *Daemon) markRetry(item domain.WorkItem, runErr error) {
 		if item.LeaseBy != "" {
 			if q, ok := d.queue.(fencedDeadLetterMarker); ok {
 				_ = q.MarkDeadLetterClaim(item.ID, item.LeaseBy, runErr.Error())
+				d.notifyTerminalFailure(item, runErr)
 				return
 			}
 		}
 		if q, ok := d.queue.(deadLetterMarker); ok {
 			_ = q.MarkDeadLetter(item.ID, runErr.Error())
+			d.notifyTerminalFailure(item, runErr)
 			return
 		}
 	}
@@ -665,18 +728,38 @@ func (d *Daemon) markRetry(item domain.WorkItem, runErr error) {
 			minimumDelay = retryAfter.RetryAfter()
 		}
 		_ = q.MarkRetryClaim(item.ID, item.LeaseBy, runErr.Error(), minimumDelay)
+		d.notifyTerminalFailure(item, runErr)
 		return
 	}
 	var retryAfter interface{ RetryAfter() time.Duration }
 	if errors.As(runErr, &retryAfter) {
 		if q, ok := d.queue.(delayedRetryMarker); ok {
 			_ = q.MarkRetryAfter(item.ID, runErr.Error(), retryAfter.RetryAfter())
+			d.notifyTerminalFailure(item, runErr)
 			return
 		}
 	}
 	if q, ok := d.queue.(retryMarker); ok {
 		_ = q.MarkRetry(item.ID, runErr.Error())
+		d.notifyTerminalFailure(item, runErr)
 	}
+}
+
+func (d *Daemon) notifyTerminalFailure(item domain.WorkItem, runErr error) {
+	if d.terminalFailure == nil {
+		return
+	}
+	reader, ok := d.queue.(workItemReader)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	current, err := reader.GetWorkItem(ctx, item.ID)
+	if err != nil || current.Status != domain.StatusDeadLetter {
+		return
+	}
+	_ = d.terminalFailure.HandleTerminalFailure(ctx, current, runErr)
 }
 
 func appendReason(reason, actionReason string) string {

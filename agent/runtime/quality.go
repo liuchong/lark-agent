@@ -8,6 +8,7 @@ import (
 
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
+	agentlocale "github.com/liuchong/lark-agent/agent/locale"
 	"github.com/liuchong/lark-agent/internal/apperr"
 )
 
@@ -27,6 +28,13 @@ func guardedRequestDecision(bundle agentcontext.Bundle) (domain.Decision, bool) 
 	case bundle.User.OpenID != "" && bundle.Event.SenderID == bundle.User.OpenID:
 		relevance = domain.RelevanceOwnerRequest
 	}
+	language := resolvedBundleLanguage(bundle)
+	replyText := "这个请求涉及工作环境或工作目录之外的信息，我不能处理。请改成具体业务问题，并把范围限定在已配置的工作目录内。"
+	reason := "request asks for out-of-workspace or descriptive environment reconnaissance"
+	if language == agentlocale.LanguageEnglish {
+		replyText = "I cannot handle requests for work-environment details or paths outside the configured workspace. Please ask a concrete business question scoped to the configured workspace."
+		reason = "request is outside the configured business workspace boundary"
+	}
 	return domain.Decision{
 		Kind:       domain.DecisionReply,
 		Relevance:  relevance,
@@ -34,8 +42,9 @@ func guardedRequestDecision(bundle agentcontext.Bundle) (domain.Decision, bool) 
 		Priority:   bundle.Priority,
 		Confidence: 1,
 		Risk:       domain.RiskLow,
-		Reason:     "request asks for out-of-workspace or descriptive environment reconnaissance",
-		ReplyText:  "这个请求涉及工作环境或工作目录之外的信息，我不能处理。请改成具体业务问题，并把范围限定在已配置的工作目录内。",
+		Reason:     reason,
+		ReplyText:  replyText,
+		Language:   string(language),
 	}, true
 }
 
@@ -142,10 +151,14 @@ func validateResponseQuality(bundle agentcontext.Bundle, decision domain.Decisio
 }
 
 func isDelegatedInvocation(bundle agentcontext.Bundle) bool {
-	if !bundle.Event.MentionsUser(bundle.User.OpenID) {
+	if bundle.User.OpenID != "" && bundle.Event.SenderID == bundle.User.OpenID {
 		return false
 	}
-	return bundle.User.OpenID == "" || bundle.Event.SenderID != bundle.User.OpenID
+	if bundle.Event.MentionsUser(bundle.User.OpenID) {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(bundle.Event.ChatType), "p2p") &&
+		strings.TrimSpace(bundle.Event.SenderID) != ""
 }
 
 func requiresRelevantWork(content string) bool {

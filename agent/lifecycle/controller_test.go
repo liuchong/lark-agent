@@ -23,8 +23,8 @@ func (m *recordingMessenger) NotifyOwner(_ context.Context, request tools.Notify
 
 func TestControllerSendsIdempotentLifecycleNotices(t *testing.T) {
 	messenger := &recordingMessenger{}
-	controller := NewController(messenger)
-	summary := Summary{Interrupted: 3, Uncertain: 1}
+	controller := NewController(messenger, Options{Language: "zh-CN", OwnerName: "测试负责人"})
+	summary := Summary{Resumed: 3, WaitingOwner: 2, Terminalized: 1, Uncertain: 1}
 	transitionID := "session-" + strings.Repeat("a", 32)
 
 	if err := controller.NotifyOffline(context.Background(), transitionID, summary); err != nil {
@@ -50,17 +50,20 @@ func TestControllerSendsIdempotentLifecycleNotices(t *testing.T) {
 	}
 	for i, want := range []string{"正在离线", "已上线"} {
 		text := messenger.requests[i].Text
-		for _, fragment := range []string{want, "3", "1", "不会自动回放"} {
+		for _, fragment := range []string{want, "3", "2", "1", "测试负责人"} {
 			if !strings.Contains(text, fragment) {
 				t.Fatalf("notice %d missing %q: %s", i, fragment, text)
 			}
+		}
+		if strings.Contains(text, "Agent") {
+			t.Fatalf("notice mixes English product prose: %s", text)
 		}
 	}
 }
 
 func TestControllerLifecycleIdempotencyKeyIsStable(t *testing.T) {
 	messenger := &recordingMessenger{}
-	controller := NewController(messenger)
+	controller := NewController(messenger, Options{Language: "zh-CN", OwnerName: "测试负责人"})
 	sessionID := "session-" + strings.Repeat("b", 32)
 
 	if err := controller.NotifyOnline(context.Background(), sessionID, Summary{}); err != nil {
@@ -75,7 +78,7 @@ func TestControllerLifecycleIdempotencyKeyIsStable(t *testing.T) {
 }
 
 func TestControllerRejectsMissingTransitionIdentity(t *testing.T) {
-	controller := NewController(&recordingMessenger{})
+	controller := NewController(&recordingMessenger{}, Options{Language: "zh-CN", OwnerName: "测试负责人"})
 	if err := controller.NotifyOnline(context.Background(), "", Summary{}); err == nil {
 		t.Fatal("missing session id must fail")
 	}

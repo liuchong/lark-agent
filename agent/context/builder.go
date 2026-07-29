@@ -164,10 +164,13 @@ func clipUTF8Bytes(value string, maxBytes int) string {
 
 // UserProfile is owner context supplied by configuration or Lark profile APIs.
 type UserProfile struct {
-	OpenID   string   `json:"open_id" yaml:"open_id"`
-	Name     string   `json:"name" yaml:"name"`
-	Title    string   `json:"title" yaml:"title"`
-	Projects []string `json:"projects" yaml:"projects"`
+	OpenID            string   `json:"open_id" yaml:"open_id"`
+	Name              string   `json:"name" yaml:"name"`
+	Language          string   `json:"language" yaml:"language"`
+	PreferredLanguage string   `json:"preferred_language" yaml:"preferred_language"`
+	FallbackLanguage  string   `json:"fallback_language" yaml:"fallback_language"`
+	Title             string   `json:"title" yaml:"title"`
+	Projects          []string `json:"projects" yaml:"projects"`
 }
 
 // ToolSpec is one model-visible capability in the initial environment.

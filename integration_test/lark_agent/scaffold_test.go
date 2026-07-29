@@ -616,7 +616,7 @@ func TestLegacyApprovedAssistantReplyResumesWithBotIdentity(t *testing.T) {
 	testApprovedReplyOutcome(t, domain.RelevanceAssistantRequest, true, "ou_owner", false)
 }
 
-func TestApprovedDelegatedReplyResumesWithUserIdentityThenNotifiesOwner(t *testing.T) {
+func TestApprovedDelegatedReplyNotifiesOwnerThenResumesWithUserIdentity(t *testing.T) {
 	testApprovedReplyOutcome(t, domain.RelevanceDirectMention, false, "ou_requester", false)
 }
 
@@ -749,7 +749,7 @@ func testApprovedReplyOutcome(
 		wantMessageID = "om_user_reply"
 		if messenger.userReplies != 1 || messenger.botReplies != 0 ||
 			notifier.calls != 1 || !strings.HasPrefix(messenger.replyText, "🤖") ||
-			strings.Join(messenger.events, ",") != "user_reply,notify" {
+			strings.Join(messenger.events, ",") != "notify,user_reply" {
 			t.Fatalf("delegated result=%+v messenger=%+v notifier=%+v", result, messenger, notifier)
 		}
 	}
@@ -1306,7 +1306,7 @@ func TestDaemonInstallAppPreviewDoesNotWrite(t *testing.T) {
 	cfg := filepath.Join(t.TempDir(), "config.yaml")
 	state := filepath.Join(t.TempDir(), "state.db")
 	root := t.TempDir()
-	code, _, stderr := runAgentWithEnv(t, []string{"HOME=" + home}, bin, "--config", cfg, "init", "--workspace", root, "--app-id", "cli_test", "--owner-open-id", "ou_owner")
+	code, _, stderr := runAgentWithEnv(t, []string{"HOME=" + home}, bin, "--config", cfg, "init", "--workspace", root, "--app-id", "cli_test", "--owner-open-id", "ou_owner", "--owner-name", "测试负责人")
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
 	}
@@ -1333,7 +1333,7 @@ func TestDaemonRunRejectsNonPositivePollInterval(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.db")
 	code, _, stderr := runAgent(t, bin,
 		"--config", cfgPath,
-		"init", "--workspace", root, "--app-id", "cli_test", "--owner-open-id", "ou_owner")
+		"init", "--workspace", root, "--app-id", "cli_test", "--owner-open-id", "ou_owner", "--owner-name", "测试负责人")
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
 	}
@@ -1354,7 +1354,7 @@ func TestInitWritesDeepAgentTurnBudget(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "agent.yaml")
 	code, _, stderr := runAgent(t, bin,
 		"--config", cfgPath,
-		"init", "--workspace", t.TempDir(), "--app-id", "cli_test", "--owner-open-id", "ou_owner")
+		"init", "--workspace", t.TempDir(), "--app-id", "cli_test", "--owner-open-id", "ou_owner", "--owner-name", "测试负责人")
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
 	}
@@ -1510,7 +1510,7 @@ func TestInvalidAssistantReplyScopeFailsAtConfigLoad(t *testing.T) {
 		"init",
 		"--workspace", workspace,
 		"--app-id", "cli_test",
-		"--owner-open-id", "ou_owner",
+		"--owner-open-id", "ou_owner", "--owner-name", "测试负责人",
 	)
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
@@ -1547,7 +1547,7 @@ func TestInvalidDelegatedReplyScopeFailsAtConfigLoad(t *testing.T) {
 		"init",
 		"--workspace", workspace,
 		"--app-id", "cli_test",
-		"--owner-open-id", "ou_owner",
+		"--owner-open-id", "ou_owner", "--owner-name", "测试负责人",
 	)
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
@@ -1589,7 +1589,7 @@ func TestConfiguredGroupsScopeWithoutChatQueryFailsLiveStartup(t *testing.T) {
 		"init",
 		"--workspace", workspace,
 		"--app-id", "cli_test",
-		"--owner-open-id", "ou_owner",
+		"--owner-open-id", "ou_owner", "--owner-name", "测试负责人",
 	)
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
@@ -1630,7 +1630,7 @@ func TestConfiguredAssistantScopeWithoutChatQueryFailsLiveStartup(t *testing.T) 
 		"init",
 		"--workspace", workspace,
 		"--app-id", "cli_test",
-		"--owner-open-id", "ou_owner",
+		"--owner-open-id", "ou_owner", "--owner-name", "测试负责人",
 	)
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
@@ -1666,7 +1666,7 @@ func TestDoctorReportsAssistantOwnerDirect(t *testing.T) {
 	if err := os.Mkdir(workspace, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	code, _, stderr := runAgent(t, bin, "--config", configPath, "init", "--workspace", workspace, "--app-id", "cli_test", "--owner-open-id", "ou_owner")
+	code, _, stderr := runAgent(t, bin, "--config", configPath, "init", "--workspace", workspace, "--app-id", "cli_test", "--owner-open-id", "ou_owner", "--owner-name", "测试负责人")
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
 	}
@@ -1702,7 +1702,15 @@ func TestDoctorReportsAssistantOwnerDirect(t *testing.T) {
 
 func TestInitRequiresAbsoluteWorkspace(t *testing.T) {
 	bin := buildAgentBinary(t)
-	code, _, stderr := runAgent(t, bin, "init", "--workspace", "relative/path")
+	code, _, stderr := runAgent(
+		t,
+		bin,
+		"init",
+		"--workspace",
+		"relative/path",
+		"--owner-name",
+		"测试负责人",
+	)
 	if code != 2 {
 		t.Fatalf("exit=%d stderr=%s", code, stderr)
 	}
@@ -1750,7 +1758,7 @@ func TestDaemonRunUsesExplicitStatePath(t *testing.T) {
 	cfg := filepath.Join(t.TempDir(), "config.yaml")
 	state := filepath.Join(t.TempDir(), "agent-state.db")
 
-	code, stdout, stderr := runAgent(t, bin, "--config", cfg, "init", "--workspace", root, "--app-id", "cli_test", "--owner-open-id", "ou_owner")
+	code, stdout, stderr := runAgent(t, bin, "--config", cfg, "init", "--workspace", root, "--app-id", "cli_test", "--owner-open-id", "ou_owner", "--owner-name", "测试负责人")
 	if code != 0 {
 		t.Fatalf("init exit=%d stdout=%s stderr=%s", code, stdout, stderr)
 	}

@@ -1831,8 +1831,9 @@ func (s *Store) CompleteReplyApproval(ctx context.Context, actionID int64, messa
 	return s.CompleteShellApproval(ctx, actionID, string(response), errorText)
 }
 
-// BeginPostReplyNotification starts or resumes the durable owner notification
-// that follows a successful sender-facing reply.
+// BeginPostReplyNotification starts or resumes the durable owner notification.
+// New delegated replies complete this notice before the sender-facing send;
+// rows created by older versions may still represent a post-reply notice.
 func (s *Store) BeginPostReplyNotification(
 	ctx context.Context,
 	dedupKey string,
@@ -1904,8 +1905,10 @@ func (s *Store) BeginPostReplyNotification(
 	return actionID, key, false, nil
 }
 
-// ReadyPostReplyNotification returns a post-reply owner notification that can
-// finish the work item without rerunning the model or sender-facing reply.
+// ReadyPostReplyNotification returns an owner notification that can finish the
+// work item without rerunning the model or sender-facing reply. A completed
+// reply action is required so a pre-reply notice cannot accidentally skip the
+// sender-facing send after restart.
 func (s *Store) ReadyPostReplyNotification(workItemID int64) (int64, string, domain.Decision, bool, error) {
 	var actionID int64
 	var key string
@@ -1914,8 +1917,17 @@ func (s *Store) ReadyPostReplyNotification(workItemID int64) (int64, string, dom
 		`SELECT id, idempotency_key, COALESCE(request_json, '')
 		 FROM action_attempts
 		 WHERE work_item_id = ? AND kind = 'owner_notification' AND status IN (?, ?, ?)
+		   AND EXISTS(
+				SELECT 1 FROM action_attempts reply
+				WHERE reply.work_item_id = action_attempts.work_item_id
+				  AND reply.kind = 'reply' AND reply.status = ?
+		   )
 		 ORDER BY id LIMIT 1`,
-		workItemID, domain.ActionExecuting, domain.ActionBlocked, domain.ActionCompleted,
+		workItemID,
+		domain.ActionExecuting,
+		domain.ActionBlocked,
+		domain.ActionCompleted,
+		domain.ActionCompleted,
 	).Scan(&actionID, &key, &requestJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, "", domain.Decision{}, false, nil

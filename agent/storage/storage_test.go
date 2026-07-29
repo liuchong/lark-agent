@@ -1328,6 +1328,22 @@ func TestPostReplyNotificationRecoversWithoutReplyReplay(t *testing.T) {
 		OwnerAction: "确认后端示例状态变更通知契约",
 		Reason:      "coordination handoff",
 	}
+	replyActionID, _, _, completedReply, err := store.BeginReplyAction(
+		context.Background(),
+		item.DedupKey,
+		decision.ReplyText,
+	)
+	if err != nil || completedReply {
+		t.Fatalf("reply action id=%d completed=%v err=%v", replyActionID, completedReply, err)
+	}
+	if err := store.CompleteReplyAction(
+		context.Background(),
+		replyActionID,
+		"om_sent_reply",
+		"",
+	); err != nil {
+		t.Fatal(err)
+	}
 	actionID, key, completed, err := store.BeginPostReplyNotification(
 		context.Background(), item.DedupKey, decision,
 	)
@@ -1359,6 +1375,38 @@ func TestPostReplyNotificationRecoversWithoutReplyReplay(t *testing.T) {
 	_, _, completed, err = store.BeginPostReplyNotification(context.Background(), item.DedupKey, decision)
 	if err != nil || !completed {
 		t.Fatalf("completed=%v err=%v", completed, err)
+	}
+}
+
+func TestCompletedPreReplyNoticeDoesNotSkipUnsentSenderReply(t *testing.T) {
+	store := openStore(t)
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_pre_reply_notice",
+		Content:   "coordinate",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	actionID, _, completed, err := store.BeginPostReplyNotification(
+		context.Background(),
+		item.DedupKey,
+		domain.Decision{
+			Kind:      domain.DecisionReply,
+			ReplyText: "智能助手准备发送的答复",
+		},
+	)
+	if err != nil || completed {
+		t.Fatalf("actionID=%d completed=%v err=%v", actionID, completed, err)
+	}
+	if err := store.CompletePostReplyNotification(context.Background(), actionID, ""); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, found, err := store.ReadyPostReplyNotification(item.ID)
+	if err != nil || found {
+		t.Fatalf("found=%v err=%v", found, err)
 	}
 }
 

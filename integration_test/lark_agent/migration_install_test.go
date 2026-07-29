@@ -259,6 +259,7 @@ esac
 	cfg := config.Default()
 	cfg.Lark.AppID = "cli_test"
 	cfg.Owner.OpenID = "ou_owner"
+	cfg.Owner.Name = "测试负责人"
 	cfg.Workspace.Root = t.TempDir()
 	if err := config.Save(configPath, cfg); err != nil {
 		t.Fatal(err)
