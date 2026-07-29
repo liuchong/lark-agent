@@ -15,6 +15,7 @@ import (
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
 	agenttools "github.com/liuchong/lark-agent/agent/tools"
+	errs "github.com/liuchong/lark-agent/internal/apperr"
 )
 
 type scriptedModel struct {
@@ -607,6 +608,10 @@ func TestAgentLoopStopsAfterThreeIgnoredTerminalOnlyAttempts(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "terminal decision after 3 attempts") {
 		t.Fatalf("err=%v", err)
+	}
+	problem, ok := errs.ProblemOf(err)
+	if !ok || problem.Subtype != errs.SubtypeModelNonConvergence {
+		t.Fatalf("problem=%+v", problem)
 	}
 	if model.calls != 5 {
 		t.Fatalf("model calls=%d", model.calls)

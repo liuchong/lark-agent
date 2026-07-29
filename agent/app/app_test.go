@@ -15,20 +15,23 @@ import (
 	"github.com/liuchong/lark-agent/agent/replymatch"
 	"github.com/liuchong/lark-agent/agent/router"
 	"github.com/liuchong/lark-agent/agent/tools"
+	errs "github.com/liuchong/lark-agent/internal/apperr"
 )
 
 type fakeQueue struct {
-	item      domain.WorkItem
-	ok        bool
-	done      bool
-	retried   bool
-	completed domain.Decision
-	approved  *domain.Decision
-	goal      *domain.CodingGoal
-	goalUsed  int
-	leaseErr  error
-	deferred  bool
-	deferFor  time.Duration
+	item       domain.WorkItem
+	ok         bool
+	done       bool
+	retried    bool
+	completed  domain.Decision
+	approved   *domain.Decision
+	goal       *domain.CodingGoal
+	goalUsed   int
+	leaseErr   error
+	deferred   bool
+	deferFor   time.Duration
+	deadLetter bool
+	deadReason string
 }
 
 func (f *fakeQueue) UpdateWorkItemSchedulingClaim(
@@ -76,6 +79,12 @@ func (f *fakeQueue) Complete(_ int64, decision domain.Decision) error {
 
 func (f *fakeQueue) MarkRetry(int64, string) error {
 	f.retried = true
+	return nil
+}
+
+func (f *fakeQueue) MarkDeadLetter(_ int64, reason string) error {
+	f.deadLetter = true
+	f.deadReason = reason
 	return nil
 }
 
@@ -338,12 +347,39 @@ type fakeDecider struct {
 	called   bool
 	decision domain.Decision
 	bundle   agentcontext.Bundle
+	err      error
 }
 
 func (d *fakeDecider) Decide(_ context.Context, bundle agentcontext.Bundle) (domain.Decision, error) {
 	d.called = true
 	d.bundle = bundle
-	return d.decision, nil
+	return d.decision, d.err
+}
+
+func TestDaemonDeadLettersModelNonConvergenceWithoutRetry(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_non_convergent",
+		Content:   "@Owner 看看删号报 10005",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	q.item.ID = 42
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(&fakeDecider{err: errs.NewInternalError(
+			errs.SubtypeModelNonConvergence,
+			"model did not submit a terminal decision after 3 attempts",
+		)}),
+	)
+	_, err := daemon.RunOnce(context.Background())
+	if err == nil {
+		t.Fatal("non-convergent model run unexpectedly succeeded")
+	}
+	if !q.deadLetter || q.retried ||
+		!strings.Contains(q.deadReason, "terminal decision after 3 attempts") {
+		t.Fatalf("queue=%+v", q)
+	}
 }
 
 type fakeReplyHandler struct {

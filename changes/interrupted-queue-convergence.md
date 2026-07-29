@@ -52,10 +52,13 @@ cancelled.
   and include an explicit system instruction that earlier tools are no longer
   available.
 - The model gets at most three terminal-only attempts. If it still emits plain
-  text or calls an unavailable investigation tool, the run fails immediately
-  instead of consuming the remaining general turn budget.
-- A failed forced-decision run uses the existing bounded retry/dead-letter
-  policy; it does not fabricate a reply or external action.
+  text or calls an unavailable investigation tool, the run fails with the
+  explicit `model_non_convergence` subtype instead of consuming the remaining
+  general turn budget.
+- `model_non_convergence` moves the exact leased work directly to dead letter
+  with its reason and audit history. Network, rate-limit, and other retryable
+  failures retain the existing bounded retry policy.
+- No failed convergence path fabricates a reply or external action.
 
 ### Installation and defaults
 
@@ -89,7 +92,8 @@ destructive migration.
   is not executed and the decision completes.
 - Given a model repeatedly ignores terminal-only instructions, when three
   terminal-only attempts are exhausted, then the run fails before the general
-  turn limit and no reply or action is fabricated.
+  turn limit, the leased work moves directly to dead letter, and no reply or
+  action is fabricated.
 
 ## Tests and fixtures
 

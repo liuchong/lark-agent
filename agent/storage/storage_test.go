@@ -1016,6 +1016,46 @@ func TestRetryLimitDeadLettersAndRuntimeUpgradeRequeues(t *testing.T) {
 	}
 }
 
+func TestMarkDeadLetterClaimFencesLeaseAndPreservesReason(t *testing.T) {
+	store := openStore(t)
+	event := domain.NormalizedEvent{
+		MessageID: "om_model_non_convergence",
+		Content:   "@Owner 看看删号报 10005",
+	}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	reason := "model did not submit a terminal decision after 3 attempts"
+	if err := store.MarkDeadLetterClaim(item.ID, "wrong-lease", reason); err == nil {
+		t.Fatal("wrong lease moved work to dead letter")
+	}
+	if err := store.MarkDeadLetterClaim(item.ID, item.LeaseBy, reason); err != nil {
+		t.Fatal(err)
+	}
+	items, err := store.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Status != domain.StatusDeadLetter ||
+		items[0].RetryCount != 1 {
+		t.Fatalf("items=%+v", items)
+	}
+	var storedReason string
+	if err := store.db.QueryRow(
+		`SELECT reason FROM dead_letters WHERE work_item_id = ?`,
+		item.ID,
+	).Scan(&storedReason); err != nil {
+		t.Fatal(err)
+	}
+	if storedReason != reason {
+		t.Fatalf("stored reason=%q", storedReason)
+	}
+}
+
 func TestMarkRetryAfterHonorsProviderWindowWithinCeiling(t *testing.T) {
 	store := openStore(t)
 	event := domain.NormalizedEvent{MessageID: "om_retry_after", Content: "rate limited"}

@@ -711,9 +711,12 @@ When evidence, tool-call, repeated-call, or no-progress gates force a terminal
 decision, each later request exposes only `submit_decision` and adds a direct
 system instruction that previous investigation tools are unavailable. At most
 three terminal-only model attempts are allowed. Repeated plain text or calls to
-unavailable tools fail the run immediately after that bound instead of burning
-the remaining general turn budget. Existing retry/dead-letter policy handles
-the failure; the runtime never fabricates a reply or external action.
+unavailable tools fail the run with `model_non_convergence` immediately after
+that bound instead of burning the remaining general turn budget. This
+deterministic protocol failure moves the exact leased work directly to dead
+letter with its reason and audit history. Network, rate-limit, and other
+retryable failures retain the existing bounded retry policy. The runtime never
+fabricates a reply or external action.
 
 Provider rate limits honor `Retry-After` when present and otherwise use bounded
 exponential backoff from 15 seconds to 15 minutes. A configurable retry ceiling
@@ -1340,8 +1343,8 @@ The multi-step loop is accepted by these executable BDD scenarios:
   decision, when the model calls an earlier investigation tool and then submits
   a valid decision, then the earlier call is rejected without execution and
   the decision completes; when the model ignores terminal-only instructions
-  for three attempts, then the run fails before the general turn limit without
-  fabricating a reply or action.
+  for three attempts, then the run fails before the general turn limit, moves
+  directly to dead letter, and does not fabricate a reply or action.
 - Given the user intentionally stops or restarts the service, when control
   begins, then the bot sends one idempotent private offline notice before
   `launchctl` unloads it; an unexpected crash sends no false offline notice.

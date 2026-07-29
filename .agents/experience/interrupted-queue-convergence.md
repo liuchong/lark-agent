@@ -16,5 +16,8 @@ bulk.
   older ready record.
 - A forced terminal decision needs its own small hard attempt bound. Hiding old
   tools is insufficient when a provider still emits calls to them.
+- Repeated terminal-only protocol refusal is permanent for that run and must
+  dead-letter immediately; treating it as transport retry just creates a
+  shorter loop.
 - Lifecycle interrupted counts should converge through explicit resume or
   audited cancellation, never physical deletion.

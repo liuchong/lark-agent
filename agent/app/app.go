@@ -29,6 +29,14 @@ type delayedRetryMarker interface {
 	MarkRetryAfter(id int64, reason string, minimumDelay time.Duration) error
 }
 
+type deadLetterMarker interface {
+	MarkDeadLetter(id int64, reason string) error
+}
+
+type fencedDeadLetterMarker interface {
+	MarkDeadLetterClaim(id int64, leaseToken, reason string) error
+}
+
 type waitingUserDeferrer interface {
 	DeferWaitingUserClaim(id int64, leaseToken, reason string, delay time.Duration) error
 }
@@ -637,6 +645,19 @@ func (d *Daemon) complete(item domain.WorkItem, decision domain.Decision) error 
 }
 
 func (d *Daemon) markRetry(item domain.WorkItem, runErr error) {
+	if problem, ok := errs.ProblemOf(runErr); ok &&
+		problem.Subtype == errs.SubtypeModelNonConvergence {
+		if item.LeaseBy != "" {
+			if q, ok := d.queue.(fencedDeadLetterMarker); ok {
+				_ = q.MarkDeadLetterClaim(item.ID, item.LeaseBy, runErr.Error())
+				return
+			}
+		}
+		if q, ok := d.queue.(deadLetterMarker); ok {
+			_ = q.MarkDeadLetter(item.ID, runErr.Error())
+			return
+		}
+	}
 	if q, ok := d.queue.(fencedRetryMarker); ok && item.LeaseBy != "" {
 		minimumDelay := time.Duration(0)
 		var retryAfter interface{ RetryAfter() time.Duration }

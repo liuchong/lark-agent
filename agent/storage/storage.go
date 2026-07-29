@@ -3171,6 +3171,142 @@ func (s *Store) MarkRetryClaim(id int64, leaseToken, reason string, minimumDelay
 	return s.markRetryAfter(id, leaseToken, reason, minimumDelay)
 }
 
+// MarkDeadLetter records a deterministic permanent failure without retrying.
+func (s *Store) MarkDeadLetter(id int64, reason string) error {
+	return s.markDeadLetter(id, "", reason)
+}
+
+// MarkDeadLetterClaim records a permanent failure only for the exact lease.
+func (s *Store) MarkDeadLetterClaim(id int64, leaseToken, reason string) error {
+	if strings.TrimSpace(leaseToken) == "" {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"dead-letter lease token is required",
+		).WithParam("lease_token")
+	}
+	return s.markDeadLetter(id, leaseToken, reason)
+}
+
+func (s *Store) markDeadLetter(id int64, leaseToken, reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"dead-letter reason is required",
+		).WithParam("reason")
+	}
+	data, err := json.Marshal(domain.Decision{
+		Kind:   domain.DecisionRecord,
+		Reason: reason,
+	})
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"marshal dead-letter decision",
+		).WithCause(err)
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin permanent dead-letter transition",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	query := `SELECT retry_count FROM work_items WHERE id = ?`
+	args := []any{id}
+	if leaseToken != "" {
+		query += ` AND status = ? AND lease_by = ?`
+		args = append(args, domain.StatusProcessing, leaseToken)
+	}
+	var retryCount int
+	if err := tx.QueryRow(query, args...).Scan(&retryCount); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"work item lease was lost",
+			)
+		}
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read permanent dead-letter work",
+		).WithCause(err)
+	}
+	retryCount++
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	update := `UPDATE work_items
+		SET status = ?, decision_json = ?, lease_by = NULL, lease_time = NULL,
+		    retry_count = ?, next_attempt_at = NULL, updated_at = ?
+		WHERE id = ?`
+	updateArgs := []any{
+		domain.StatusDeadLetter,
+		string(data),
+		retryCount,
+		now,
+		id,
+	}
+	if leaseToken != "" {
+		update += ` AND status = ? AND lease_by = ?`
+		updateArgs = append(updateArgs, domain.StatusProcessing, leaseToken)
+	}
+	result, err := tx.Exec(update, updateArgs...)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"move permanent failure to dead letter",
+		).WithCause(err)
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"work item lease was lost",
+		)
+	}
+	metadata, err := json.Marshal(map[string]any{
+		"retry_count": retryCount,
+		"permanent":   true,
+	})
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"marshal permanent dead-letter metadata",
+		).WithCause(err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO dead_letters(work_item_id, reason, metadata_json, created_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(work_item_id) DO UPDATE SET reason = excluded.reason,
+		 metadata_json = excluded.metadata_json, created_at = excluded.created_at`,
+		id,
+		reason,
+		string(metadata),
+		now,
+	); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"record permanent dead-letter reason",
+		).WithCause(err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE coding_goals SET status = ?, updated_at = ? WHERE work_item_id = ?`,
+		domain.CodingGoalBlocked,
+		now,
+		id,
+	); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"block permanent dead-letter coding goal",
+		).WithCause(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit permanent dead-letter transition",
+		).WithCause(err)
+	}
+	return nil
+}
+
 // DeferWaitingUserClaim releases an exact processing lease back to the
 // semantic owner-reply waiting state.
 func (s *Store) DeferWaitingUserClaim(

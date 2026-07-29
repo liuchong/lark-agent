@@ -170,7 +170,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		if terminalOnly {
 			if terminalOnlyAttempts >= maxTerminalOnlyAttempts {
 				return domain.Decision{}, trajectory, errs.NewInternalError(
-					errs.SubtypeInvalidResponse,
+					errs.SubtypeModelNonConvergence,
 					"model did not submit a terminal decision after %d attempts",
 					maxTerminalOnlyAttempts,
 				)

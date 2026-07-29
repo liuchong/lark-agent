@@ -7,9 +7,32 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/liuchong/lark-agent/agent/app"
+	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
+	"github.com/liuchong/lark-agent/agent/router"
 	"github.com/liuchong/lark-agent/agent/storage"
+	errs "github.com/liuchong/lark-agent/internal/apperr"
 )
+
+type convergenceContextBuilder struct{}
+
+func (convergenceContextBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, error) {
+	return agentcontext.Bundle{
+		Event:    item.Event,
+		WorkKind: item.WorkKind,
+		User:     agentcontext.UserProfile{OpenID: "ou_owner"},
+	}, nil
+}
+
+type nonConvergentDecider struct{}
+
+func (nonConvergentDecider) Decide(context.Context, agentcontext.Bundle) (domain.Decision, error) {
+	return domain.Decision{}, errs.NewInternalError(
+		errs.SubtypeModelNonConvergence,
+		"model did not submit a terminal decision after 3 attempts",
+	)
+}
 
 func TestQueueCancellationAndCrossSessionApprovalRoundTrip(t *testing.T) {
 	bin := buildAgentBinary(t)
@@ -109,5 +132,39 @@ func TestQueueCancellationAndCrossSessionApprovalRoundTrip(t *testing.T) {
 				t.Fatalf("approved item=%+v ready=%+v", item, ready)
 			}
 		}
+	}
+}
+
+func TestModelNonConvergenceMovesLeasedWorkDirectlyToDeadLetter(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	store, err := storage.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_integration_non_convergence",
+		SenderID:  "ou_teammate",
+		Content:   "@Owner 看看删号报 10005",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	daemon := app.NewDaemon(
+		store,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		app.WithContextBuilder(convergenceContextBuilder{}),
+		app.WithDecider(nonConvergentDecider{}),
+	)
+	if _, err := daemon.RunOnce(context.Background()); err == nil {
+		t.Fatal("non-convergent model run unexpectedly succeeded")
+	}
+	items, err := store.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Status != domain.StatusDeadLetter ||
+		items[0].RetryCount != 1 {
+		t.Fatalf("items=%+v", items)
 	}
 }

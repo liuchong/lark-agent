@@ -19,17 +19,18 @@ const (
 )
 
 const (
-	SubtypeInvalidArgument    Subtype = "invalid_argument"
-	SubtypeFailedPrecondition Subtype = "failed_precondition"
-	SubtypeInvalidResponse    Subtype = "invalid_response"
-	SubtypeFileIO             Subtype = "file_io"
-	SubtypeStorage            Subtype = "storage"
-	SubtypeUnknown            Subtype = "unknown"
-	SubtypeNetworkTransport   Subtype = "network_transport"
-	SubtypeMissingScope       Subtype = "missing_scope"
-	SubtypeInvalidConfig      Subtype = "invalid_config"
-	SubtypeNotConfigured      Subtype = "not_configured"
-	SubtypeServerError        Subtype = "server_error"
+	SubtypeInvalidArgument     Subtype = "invalid_argument"
+	SubtypeFailedPrecondition  Subtype = "failed_precondition"
+	SubtypeInvalidResponse     Subtype = "invalid_response"
+	SubtypeFileIO              Subtype = "file_io"
+	SubtypeStorage             Subtype = "storage"
+	SubtypeUnknown             Subtype = "unknown"
+	SubtypeNetworkTransport    Subtype = "network_transport"
+	SubtypeMissingScope        Subtype = "missing_scope"
+	SubtypeInvalidConfig       Subtype = "invalid_config"
+	SubtypeNotConfigured       Subtype = "not_configured"
+	SubtypeServerError         Subtype = "server_error"
+	SubtypeModelNonConvergence Subtype = "model_non_convergence"
 )
 
 type Problem struct {

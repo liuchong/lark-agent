@@ -91,6 +91,9 @@ lark-agent queue backfill --chat-id oc_xxx --since 2026-07-25T08:00:00+08:00 --u
 `queue retry` 只用于加速当前在线会话中处于 `retry_wait` 的普通瞬时失败，并且
 该工作不能有关联的执行中或结果不确定外部动作。它不能恢复处理中、中断、终态
 或其他会话的工作；这些情况必须先 inspect，再按上面的精确 resume 流程处理。
+模型在强制收尾阶段连续 3 次拒绝提交结构化结论属于确定性
+`model_non_convergence`，会直接进入死信而不自动重试。需要先检查该 run 的步骤和
+证据，再决定是否用 `queue resume --force-terminal` 显式重做。
 
 ## 审批
 
