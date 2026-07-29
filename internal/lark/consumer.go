@@ -49,17 +49,22 @@ func (c Consumer) Consume(ctx context.Context, handle func(EventEnvelope) error)
 		}
 		return nil
 	}
-	handler := dispatcher.NewEventDispatcher("", "").
-		OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
-			return handleEvent(projectMessageEvent(event))
-		})
+	sdkLogger := newCredentialSafeSDKLogger()
+	handler := dispatcher.NewEventDispatcher("", "")
+	handler.Config.Logger = sdkLogger
+	handler.OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
+		return handleEvent(projectMessageEvent(event))
+	})
 	registerSDKEventHandler(handler, "message", legacyMessageHandler{handle: func(event *legacyMessageEvent) error {
 		return handleEvent(projectLegacyMessageEvent(event))
 	}})
 	for _, eventType := range ignoredRealtimeEventTypes {
 		registerSDKEventHandler(handler, eventType, ignoredEventHandler{})
 	}
-	options := []ws.ClientOption{ws.WithEventHandler(handler)}
+	options := []ws.ClientOption{
+		ws.WithEventHandler(handler),
+		ws.WithLogger(sdkLogger),
+	}
 	if c.BaseURL != "" {
 		options = append(options, ws.WithDomain(c.BaseURL))
 	}

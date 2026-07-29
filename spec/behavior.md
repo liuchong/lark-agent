@@ -276,6 +276,19 @@ before replaying the original request exactly once. Refresh failure remains a
 typed authorization error; the client never loops indefinitely or logs token
 values.
 
+All official Lark SDK clients use the agent's credential-safe logger.
+Credential-bearing debug and informational SDK output is suppressed because
+the WebSocket SDK includes its full connection URL in normal connection
+messages. The dispatcher's fixed credential-free ready line may remain.
+Warning and error output remains available only after redacting credential
+query parameters and JSON credential fields. App secrets, access keys, tickets,
+and tokens must never appear in daemon stdout or stderr.
+
+Given the SDK bootstrap endpoint returns a WebSocket URL containing unique
+`access_key` and `ticket` values, when the production realtime consumer
+connects, disconnects, warns, or fails, then captured daemon logs contain
+neither value and still retain non-secret warning/error context.
+
 ## User-Visible Modes
 
 - `auto`: the default mode. The agent may autonomously ignore, record, notify,

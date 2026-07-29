@@ -57,7 +57,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		return nil, errs.NewConfigError(errs.SubtypeNotConfigured, "lark app secret is not configured").
 			WithHint("run `lark-agent auth login` to store credentials in Keychain")
 	}
-	options := []sdklark.ClientOptionFunc{}
+	options := []sdklark.ClientOptionFunc{
+		sdklark.WithLogger(newCredentialSafeSDKLogger()),
+	}
 	if cfg.BaseURL != "" {
 		options = append(options, sdklark.WithOpenBaseUrl(cfg.BaseURL))
 	}

@@ -12,6 +12,11 @@ lark-agent daemon restart
 LaunchAgent label 是 `com.liuchong.lark-agent`。日志位于
 `~/Library/Logs/lark-agent/`。
 
+官方 Lark SDK 中可能携带连接凭据的调试和普通信息日志会被抑制；事件分发器固定的
+无凭据 ready 提示可以保留，警告与错误会在凭据字段脱敏后保留。日志中不得出现
+WebSocket `access_key`、`ticket`、token 或 app secret；诊断连接问题时使用结构化
+生命周期状态、`doctor` 和不含凭据的错误原因，不要恢复 SDK 默认详细日志。
+
 正常启动会先完成 SDK/Keychain、配置、状态库、接收入口和调度器初始化，再把在线会话
 标记为 ready，并由机器人私聊 Owner 上线通知。正常停止会先暂停当前未完成工作，
 发送离线通知，再结束在线会话。异常崩溃不会伪造离线通知。
