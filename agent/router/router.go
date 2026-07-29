@@ -18,6 +18,7 @@ type Config struct {
 	OwnerDirect         bool
 	Mode                domain.Mode
 	ReplyScope          domain.ReplyScope
+	PrivateReplyScope   domain.PrivateReplyScope
 	AllowChats          []string
 	BlockChats          []string
 	BlockUsers          []string
@@ -46,6 +47,9 @@ func New(cfg Config) *Router {
 	}
 	if cfg.ReplyScope == "" {
 		cfg.ReplyScope = domain.ReplyScopeAllGroups
+	}
+	if cfg.PrivateReplyScope == "" {
+		cfg.PrivateReplyScope = domain.PrivateReplyScopeAll
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -152,6 +156,19 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 		decision.Reason = "direct_mention"
 		return decision, nil
 	}
+	if r.inboundHumanPrivateMessage(item.Event) {
+		if r.cfg.PrivateReplyScope == domain.PrivateReplyScopeDisabled {
+			decision.Reason = "private_reply_disabled"
+			return decision, nil
+		}
+		decision.Kind = domain.DecisionNotify
+		decision.Relevance = domain.RelevancePrivateMessage
+		decision.WorkKind = domain.WorkKindDirectMention
+		decision.Priority = domain.PriorityDirectMention
+		decision.Confidence = 1
+		decision.Reason = "private_message"
+		return decision, nil
+	}
 	if inferredRelevant(item.Event.Content, r.cfg.Sensitivity) {
 		decision.Kind = domain.DecisionRecord
 		decision.Relevance = domain.RelevanceInferred
@@ -162,6 +179,29 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 		return decision, nil
 	}
 	return decision, nil
+}
+
+func (r *Router) inboundHumanPrivateMessage(event domain.NormalizedEvent) bool {
+	if !isPrivateChat(event.ChatType) ||
+		strings.TrimSpace(event.SenderID) == "" ||
+		event.SenderID == r.cfg.OwnerOpenID {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(event.SenderType)) {
+	case "app", "bot":
+		return false
+	default:
+		return true
+	}
+}
+
+func isPrivateChat(chatType string) bool {
+	switch strings.ToLower(strings.TrimSpace(chatType)) {
+	case "p2p", "private":
+		return true
+	default:
+		return false
+	}
 }
 
 func groupScopeAllows(scope domain.ReplyScope, event domain.NormalizedEvent) bool {

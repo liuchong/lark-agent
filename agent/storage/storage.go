@@ -16,6 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/liuchong/lark-agent/agent/domain"
+	"github.com/liuchong/lark-agent/agent/replymatch"
 	"github.com/liuchong/lark-agent/internal/apperr"
 	vfs "github.com/liuchong/lark-agent/internal/fsx"
 )
@@ -354,6 +355,21 @@ func (s *Store) migrate() error {
 			)`,
 			`CREATE INDEX IF NOT EXISTS idx_external_references_key
 			 ON external_references(provider, external_key)`,
+		}},
+		{version: 10, statements: []string{
+			`CREATE TABLE IF NOT EXISTS owner_reply_resolutions (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				work_item_id INTEGER NOT NULL REFERENCES work_items(id),
+				target_message_id TEXT NOT NULL,
+				result TEXT NOT NULL,
+				matched_owner_message_ids_json TEXT NOT NULL,
+				confidence REAL NOT NULL,
+				reason TEXT NOT NULL,
+				context_cutoff TEXT NOT NULL,
+				evaluated_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_owner_reply_resolutions_work_item
+			 ON owner_reply_resolutions(work_item_id, evaluated_at DESC, id DESC)`,
 		}},
 	}
 	for _, migration := range migrations {
@@ -2386,7 +2402,13 @@ func (s *Store) ClaimNextForLane(worker string, lane domain.SchedulerLane) (doma
 	now := time.Now().UTC()
 	nowRaw := now.Format(time.RFC3339Nano)
 	laneClause := ""
-	args := []any{domain.StatusReceived, domain.StatusReady, domain.StatusRetryWait, nowRaw}
+	args := []any{
+		domain.StatusReceived,
+		domain.StatusReady,
+		domain.StatusRetryWait,
+		domain.StatusWaitingUser,
+		nowRaw,
+	}
 	switch lane {
 	case domain.SchedulerLaneInteractive:
 		laneClause = ` AND work_kind IN (?, ?)`
@@ -2399,10 +2421,8 @@ func (s *Store) ClaimNextForLane(worker string, lane domain.SchedulerLane) (doma
 		args = append(args, domain.WorkKindCodingGoal)
 	}
 	query := workItemSelect + `
-		 WHERE (
-			status IN (?, ?)
-		    OR (status = ? AND (next_attempt_at IS NULL OR next_attempt_at = '' OR next_attempt_at <= ?))
-		 )` + laneClause + `
+		 WHERE status IN (?, ?, ?, ?)
+		   AND (next_attempt_at IS NULL OR next_attempt_at = '' OR next_attempt_at <= ?)` + laneClause + `
 		 ORDER BY priority DESC, id
 		 LIMIT 1`
 	row := tx.QueryRowContext(context.Background(),
@@ -2416,8 +2436,9 @@ func (s *Store) ClaimNextForLane(worker string, lane domain.SchedulerLane) (doma
 	}
 	res, err := tx.ExecContext(context.Background(),
 		`UPDATE work_items SET status = ?, lease_by = ?, lease_time = ?, updated_at = ?
-		 WHERE id = ? AND status IN (?, ?, ?)`,
-		domain.StatusProcessing, leaseToken, nowRaw, nowRaw, item.ID, domain.StatusReceived, domain.StatusReady, domain.StatusRetryWait)
+		 WHERE id = ? AND status IN (?, ?, ?, ?)`,
+		domain.StatusProcessing, leaseToken, nowRaw, nowRaw, item.ID,
+		domain.StatusReceived, domain.StatusReady, domain.StatusRetryWait, domain.StatusWaitingUser)
 	if err != nil {
 		return domain.WorkItem{}, false, errs.NewInternalError(errs.SubtypeStorage, "lease work item").WithCause(err)
 	}
@@ -2870,6 +2891,154 @@ func (s *Store) ListWorkItems() ([]domain.WorkItem, error) {
 	return out, nil
 }
 
+// ListPendingDelegatedWork returns only active direct/private delegated targets
+// from one exact chat for multi-target semantic matching.
+func (s *Store) ListPendingDelegatedWork(chatID string) ([]domain.WorkItem, error) {
+	if strings.TrimSpace(chatID) == "" {
+		return nil, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"chat_id is required",
+		).WithParam("chat_id")
+	}
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		workItemSelect+` WHERE status IN (?, ?) AND work_kind = ? ORDER BY id`,
+		domain.StatusWaitingUser,
+		domain.StatusProcessing,
+		domain.WorkKindDirectMention,
+	)
+	if err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"list pending delegated work",
+		).WithCause(err)
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+	var out []domain.WorkItem
+	for rows.Next() {
+		item, scanErr := scanWorkItem(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if item.Event.ChatID == chatID {
+			out = append(out, item)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"iterate pending delegated work",
+		).WithCause(err)
+	}
+	return out, nil
+}
+
+// RecordOwnerReplyResolution appends one immutable semantic-resolution audit.
+func (s *Store) RecordOwnerReplyResolution(
+	workItemID int64,
+	resolution replymatch.Resolution,
+) error {
+	matchedJSON, err := json.Marshal(resolution.MatchedOwnerMessageIDs)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"encode matched owner messages",
+		).WithCause(err)
+	}
+	if resolution.ContextCutoff.IsZero() {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"semantic resolution context cutoff is required",
+		).WithParam("context_cutoff")
+	}
+	_, err = s.db.ExecContext(
+		context.Background(),
+		`INSERT INTO owner_reply_resolutions(
+			work_item_id, target_message_id, result,
+			matched_owner_message_ids_json, confidence, reason,
+			context_cutoff, evaluated_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		workItemID,
+		resolution.TargetMessageID,
+		resolution.Result,
+		string(matchedJSON),
+		resolution.Confidence,
+		resolution.Reason,
+		resolution.ContextCutoff.UTC().Format(time.RFC3339Nano),
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"record semantic owner-reply resolution",
+		).WithCause(err)
+	}
+	return nil
+}
+
+// ListOwnerReplyResolutions returns immutable semantic audits oldest first.
+func (s *Store) ListOwnerReplyResolutions(
+	workItemID int64,
+) ([]replymatch.Resolution, error) {
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		`SELECT target_message_id, result, matched_owner_message_ids_json,
+		        confidence, reason, context_cutoff
+		 FROM owner_reply_resolutions
+		 WHERE work_item_id = ?
+		 ORDER BY evaluated_at, id`,
+		workItemID,
+	)
+	if err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"list semantic owner-reply resolutions",
+		).WithCause(err)
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+	var out []replymatch.Resolution
+	for rows.Next() {
+		var resolution replymatch.Resolution
+		var resultRaw, matchedRaw, cutoffRaw string
+		if err := rows.Scan(
+			&resolution.TargetMessageID,
+			&resultRaw,
+			&matchedRaw,
+			&resolution.Confidence,
+			&resolution.Reason,
+			&cutoffRaw,
+		); err != nil {
+			return nil, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"scan semantic owner-reply resolution",
+			).WithCause(err)
+		}
+		resolution.Result = replymatch.Result(resultRaw)
+		if err := json.Unmarshal(
+			[]byte(matchedRaw),
+			&resolution.MatchedOwnerMessageIDs,
+		); err != nil {
+			return nil, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"decode matched owner messages",
+			).WithCause(err)
+		}
+		resolution.ContextCutoff, _ = time.Parse(time.RFC3339Nano, cutoffRaw)
+		out = append(out, resolution)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"iterate semantic owner-reply resolutions",
+		).WithCause(err)
+	}
+	return out, nil
+}
+
 // Complete marks a work item completed, ignored, or cancelled according to its
 // decision and persists the decision snapshot.
 func (s *Store) Complete(id int64, decision domain.Decision) error {
@@ -2958,6 +3127,66 @@ func (s *Store) MarkRetry(id int64, reason string) error {
 // MarkRetryClaim releases work only if the exact lease token still owns it.
 func (s *Store) MarkRetryClaim(id int64, leaseToken, reason string, minimumDelay time.Duration) error {
 	return s.markRetryAfter(id, leaseToken, reason, minimumDelay)
+}
+
+// DeferWaitingUserClaim releases an exact processing lease back to the
+// semantic owner-reply waiting state.
+func (s *Store) DeferWaitingUserClaim(
+	id int64,
+	leaseToken string,
+	reason string,
+	delay time.Duration,
+) error {
+	if delay <= 0 {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"delegated reply retry delay must be positive",
+		).WithParam("delay")
+	}
+	now := time.Now().UTC()
+	decisionJSON, err := json.Marshal(domain.Decision{
+		Kind:   domain.DecisionRecord,
+		Reason: reason,
+	})
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"encode delegated reply defer reason",
+		).WithCause(err)
+	}
+	result, err := s.db.Exec(
+		`UPDATE work_items
+		 SET status = ?, decision_json = ?, lease_by = NULL, lease_time = NULL,
+		     retry_count = retry_count + 1, next_attempt_at = ?, updated_at = ?
+		 WHERE id = ? AND status = ? AND lease_by = ?`,
+		domain.StatusWaitingUser,
+		string(decisionJSON),
+		now.Add(delay).Format(time.RFC3339Nano),
+		now.Format(time.RFC3339Nano),
+		id,
+		domain.StatusProcessing,
+		leaseToken,
+	)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"defer delegated reply",
+		).WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read delegated reply defer result",
+		).WithCause(err)
+	}
+	if affected != 1 {
+		return errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"delegated reply lease is no longer current",
+		)
+	}
+	return nil
 }
 
 // MarkRetryAfter honors a provider retry window while preserving the bounded

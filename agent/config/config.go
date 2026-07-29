@@ -187,15 +187,18 @@ type ModelConfig struct {
 
 // PolicyConfig controls routing and reply behavior.
 type PolicyConfig struct {
-	Mode               domain.Mode        `json:"mode" yaml:"mode"`
-	ReplyScope         domain.ReplyScope  `json:"reply_scope" yaml:"reply_scope"`
-	Sensitivity        domain.Sensitivity `json:"sensitivity" yaml:"sensitivity"`
-	OwnerWait          time.Duration      `json:"owner_wait" yaml:"owner_wait"`
-	MentionPoll        time.Duration      `json:"mention_poll" yaml:"mention_poll"`
-	ReplyConfidenceMin float64            `json:"reply_confidence_min" yaml:"reply_confidence_min"`
-	AllowChats         []string           `json:"allow_chats,omitempty" yaml:"allow_chats,omitempty"`
-	BlockChats         []string           `json:"block_chats,omitempty" yaml:"block_chats,omitempty"`
-	BlockUsers         []string           `json:"block_users,omitempty" yaml:"block_users,omitempty"`
+	Mode                    domain.Mode              `json:"mode" yaml:"mode"`
+	ReplyScope              domain.ReplyScope        `json:"reply_scope" yaml:"reply_scope"`
+	PrivateReplyScope       domain.PrivateReplyScope `json:"private_reply_scope" yaml:"private_reply_scope"`
+	Sensitivity             domain.Sensitivity       `json:"sensitivity" yaml:"sensitivity"`
+	OwnerWait               time.Duration            `json:"owner_wait" yaml:"owner_wait"`
+	OwnerReplyConfidenceMin float64                  `json:"owner_reply_confidence_min" yaml:"owner_reply_confidence_min"`
+	OwnerReplyRetry         time.Duration            `json:"owner_reply_retry" yaml:"owner_reply_retry"`
+	MentionPoll             time.Duration            `json:"mention_poll" yaml:"mention_poll"`
+	ReplyConfidenceMin      float64                  `json:"reply_confidence_min" yaml:"reply_confidence_min"`
+	AllowChats              []string                 `json:"allow_chats,omitempty" yaml:"allow_chats,omitempty"`
+	BlockChats              []string                 `json:"block_chats,omitempty" yaml:"block_chats,omitempty"`
+	BlockUsers              []string                 `json:"block_users,omitempty" yaml:"block_users,omitempty"`
 }
 
 // WorkspaceConfig defines the single local context boundary.
@@ -284,12 +287,15 @@ func Default() Config {
 		Goal:  GoalConfig{Enabled: true, MaxActive: 3, MaxInvestigationTurns: 150},
 		State: StateConfig{AllowReset: false},
 		Policy: PolicyConfig{
-			Mode:               domain.ModeAuto,
-			ReplyScope:         domain.ReplyScopeAllGroups,
-			Sensitivity:        domain.SensitivityNormal,
-			OwnerWait:          60 * time.Second,
-			MentionPoll:        30 * time.Second,
-			ReplyConfidenceMin: 0.85,
+			Mode:                    domain.ModeAuto,
+			ReplyScope:              domain.ReplyScopeAllGroups,
+			PrivateReplyScope:       domain.PrivateReplyScopeAll,
+			Sensitivity:             domain.SensitivityNormal,
+			OwnerWait:               3 * time.Minute,
+			OwnerReplyConfidenceMin: 0.85,
+			OwnerReplyRetry:         30 * time.Second,
+			MentionPoll:             30 * time.Second,
+			ReplyConfidenceMin:      0.85,
 		},
 		Workspace: WorkspaceConfig{
 			Excludes: []string{".git", ".env*", "node_modules", "vendor", "dist", "build", "*.pem", "*.key"},
@@ -372,6 +378,11 @@ func (c Config) Validate() error {
 			WithField("policy.reply_scope").
 			WithCause(err)
 	}
+	if _, err := domain.ParsePrivateReplyScope(string(c.Policy.PrivateReplyScope)); err != nil {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "invalid policy.private_reply_scope: %s", c.Policy.PrivateReplyScope).
+			WithField("policy.private_reply_scope").
+			WithCause(err)
+	}
 	if _, err := domain.ParseReplyScope(string(c.Assistant.ReplyScope)); err != nil {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "invalid assistant.reply_scope: %s", c.Assistant.ReplyScope).
 			WithField("assistant.reply_scope").
@@ -379,6 +390,18 @@ func (c Config) Validate() error {
 	}
 	if c.Policy.OwnerWait <= 0 {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "policy.owner_wait must be positive").WithField("policy.owner_wait")
+	}
+	if c.Policy.OwnerReplyConfidenceMin <= 0 || c.Policy.OwnerReplyConfidenceMin > 1 {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"policy.owner_reply_confidence_min must be greater than 0 and at most 1",
+		).WithField("policy.owner_reply_confidence_min")
+	}
+	if c.Policy.OwnerReplyRetry <= 0 {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"policy.owner_reply_retry must be positive",
+		).WithField("policy.owner_reply_retry")
 	}
 	if c.Policy.MentionPoll <= 0 {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "policy.mention_poll must be positive").WithField("policy.mention_poll")

@@ -530,6 +530,129 @@ func TestListRecentMessagesUsesUserIdentity(t *testing.T) {
 	}
 }
 
+func TestGetSemanticReplyContextPaginatesThroughTargetAndLaterDiscussion(t *testing.T) {
+	base := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
+	caller := &routingCaller{call: func(req APIRequest) (interface{}, error) {
+		switch req.Path {
+		case "/open-apis/im/v1/messages/mget":
+			return map[string]any{"data": map[string]any{"items": []any{
+				map[string]any{
+					"message_id": "om_target", "chat_id": "oc_group",
+					"content":     `{"text":"发布日期是哪天？"}`,
+					"create_time": base.Format(time.RFC3339),
+				},
+			}}}, nil
+		case "/open-apis/im/v1/messages":
+			if req.Params["page_token"] == "page_2" {
+				return map[string]any{"data": map[string]any{"items": []any{
+					map[string]any{
+						"message_id": "om_target", "chat_id": "oc_group",
+						"content":     `{"text":"发布日期是哪天？"}`,
+						"create_time": base.Format(time.RFC3339),
+					},
+				}}}, nil
+			}
+			return map[string]any{"data": map[string]any{
+				"has_more": true, "page_token": "page_2",
+				"items": []any{
+					map[string]any{
+						"message_id": "om_owner", "chat_id": "oc_group",
+						"sender":      map[string]any{"id": map[string]any{"open_id": "ou_owner"}},
+						"content":     `{"text":"我先确认一下发布计划。"}`,
+						"create_time": base.Add(time.Minute).Format(time.RFC3339),
+					},
+				},
+			}}, nil
+		default:
+			t.Fatalf("unexpected request=%s %s", req.Method, req.Path)
+			return nil, nil
+		}
+	}}
+
+	result, err := NewService(caller, "ou_owner").GetSemanticReplyContext(
+		context.Background(),
+		SemanticReplyContextRequest{
+			ChatID:          "oc_group",
+			TargetMessageID: "om_target",
+			Since:           base,
+			MaxMessages:     10,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Withdrawn || result.Incomplete || len(result.Messages) != 2 ||
+		result.Messages[0].MessageID != "om_target" ||
+		result.Messages[1].MessageID != "om_owner" {
+		t.Fatalf("result=%+v", result)
+	}
+	if result.ContextCutoff.Before(base.Add(time.Minute)) {
+		t.Fatalf("context cutoff=%s", result.ContextCutoff)
+	}
+}
+
+func TestGetSemanticReplyContextMarksBoundedWindowIncomplete(t *testing.T) {
+	base := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
+	caller := &routingCaller{call: func(req APIRequest) (interface{}, error) {
+		if req.Path == "/open-apis/im/v1/messages/mget" {
+			return map[string]any{"data": map[string]any{"items": []any{
+				map[string]any{
+					"message_id": "om_target", "chat_id": "oc_group",
+					"create_time": base.Format(time.RFC3339),
+				},
+			}}}, nil
+		}
+		return map[string]any{"data": map[string]any{
+			"has_more": true, "page_token": "more",
+			"items": []any{
+				map[string]any{
+					"message_id": "om_new", "chat_id": "oc_group",
+					"create_time": base.Add(time.Minute).Format(time.RFC3339),
+				},
+			},
+		}}, nil
+	}}
+
+	result, err := NewService(caller, "ou_owner").GetSemanticReplyContext(
+		context.Background(),
+		SemanticReplyContextRequest{
+			ChatID:          "oc_group",
+			TargetMessageID: "om_target",
+			Since:           base,
+			MaxMessages:     1,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Incomplete || result.Withdrawn {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestGetSemanticReplyContextTreatsMissingExactTargetAsWithdrawn(t *testing.T) {
+	caller := &routingCaller{call: func(req APIRequest) (interface{}, error) {
+		if req.Path != "/open-apis/im/v1/messages/mget" {
+			t.Fatalf("unexpected request=%s %s", req.Method, req.Path)
+		}
+		return map[string]any{"data": map[string]any{"items": []any{}}}, nil
+	}}
+
+	result, err := NewService(caller, "ou_owner").GetSemanticReplyContext(
+		context.Background(),
+		SemanticReplyContextRequest{
+			ChatID:          "oc_group",
+			TargetMessageID: "om_missing",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Withdrawn || result.Incomplete || len(result.Messages) != 0 {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
 func TestGetMessageContextFindsOwnerReply(t *testing.T) {
 	after := time.Date(2026, 7, 23, 2, 0, 0, 0, time.UTC)
 	caller := &fakeCaller{

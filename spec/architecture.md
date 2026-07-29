@@ -49,9 +49,19 @@ provider and Lark message ID. They store canonical reference data and sender
 identity, not GitHub credentials or an unbounded GitHub snapshot. The model
 receives a reference only after same-chat relation and current-app verification.
 
+Delegated group mentions and inbound human P2P messages are stored as
+`waiting_user` work with a durable earliest execution time. Semantic owner-reply
+resolution is a separate tool-free model boundary with strict typed output.
+Resolution audits bind one target work item to validated owner message IDs,
+confidence, a bounded context cutoff, and a result. They never grant tools or
+change sender-derived authority.
+
 Opening the database for an operator command does not create or stop a daemon
 session. On startup, unfinished work from older sessions becomes `interrupted`
 and cannot be claimed. `queue resume` is the only cross-session admission path.
+Waiting delegated candidates that have no model run, approval, or action may be
+freshly re-evaluated after restart. This is re-observation of current Lark
+state, not replay of a draft or action.
 
 ## Process lifecycle
 

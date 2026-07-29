@@ -27,6 +27,46 @@ func TestMentionedOwnerAlwaysRoutes(t *testing.T) {
 	}
 }
 
+func TestInboundHumanPrivateMessageRoutesAsDelegatedReply(t *testing.T) {
+	r := New(Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:     "om_private_human",
+		ChatID:        "oc_private_human",
+		ChatType:      "p2p",
+		ChatPartnerID: "ou_sender",
+		SenderID:      "ou_sender",
+		SenderType:    "user",
+		Content:       "这个方案今天能确认吗？",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionNotify ||
+		decision.Relevance != domain.RelevancePrivateMessage ||
+		decision.WorkKind != domain.WorkKindDirectMention ||
+		decision.Priority != domain.PriorityDirectMention {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestBotPrivateMessageDoesNotBecomeDelegatedReply(t *testing.T) {
+	r := New(Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:  "om_private_bot",
+		ChatID:     "oc_private_bot",
+		ChatType:   "p2p",
+		SenderID:   "cli_bot",
+		SenderType: "app",
+		Content:    "automated notification",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionIgnore {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
 func TestOwnerMentioningAssistantInGroupRoutesAsAssistantRequest(t *testing.T) {
 	r := New(Config{
 		OwnerOpenID:      "ou_owner",

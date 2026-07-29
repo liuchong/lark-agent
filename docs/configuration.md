@@ -48,6 +48,10 @@ lark-agent config show
 - `policy.reply_scope`：群内代回复范围。`all_groups` 是默认值，允许任意可见群里的
   直接 `@Owner` 进入其余回复门禁；`configured_groups` 只允许 daemon
   `--chat-query` 发现的群，并要求启动参数提供非空群关键词。
+- `policy.private_reply_scope`：真人私聊代回复范围，默认 `all_private`；设为
+  `disabled` 时关闭。
+- `policy.owner_wait`、`owner_reply_confidence_min`、`owner_reply_retry`：
+  本人优先回复窗口、语义判断最低置信度和不确定结果的重试间隔。
 - `policy.allow_chats`、`block_chats`、`block_users`：确定性的会话和用户边界。
 - `scheduler.*`：不同工作通道的 lease 和 worker 数量。
 - `agent.*`、`tool_policy.*`、`goal.*`：模型轮次、工具输出、无进展和长任务上限。
@@ -131,18 +135,28 @@ assistant:
 
 policy:
   reply_scope: all_groups
+  private_reply_scope: all_private
+  owner_wait: 3m
+  owner_reply_confidence_min: 0.85
+  owner_reply_retry: 30s
 ```
 
-这两个字段相互独立：
+这些字段相互独立：
 
 - `assistant.reply_scope` 控制 Owner 在群里 `@机器人` 后，机器人是否接收并用
   机器人身份回答。
 - `policy.reply_scope` 控制任意真人在群里 `@Owner` 后，Agent 是否可以用 Owner
   身份代回复。
+- `policy.private_reply_scope` 控制用户身份可见的真人私聊是否进入代回复；
+  `all_private` 启用，`disabled` 关闭。
+- `policy.owner_wait` 是本人优先回复窗口。等待由 SQLite 队列承担，不占用工作线程；
+  到期后才读取同一会话并逐条做语义判断。
+- `policy.owner_reply_confidence_min` 是“本人已回答/尚未回答”的最低可信度；
+  `policy.owner_reply_retry` 是判断不清、上下文不完整或模型异常后的静默重试间隔。
 
 它们只放开“群范围”这一道门。黑名单、模型相关性与风险判断、置信度和审批模式、
-撤回检查与幂等发送仍然生效。Owner 等待和“Owner 已回复”检查只适用于代回复，
-不适用于直接发给机器人的问题。
+撤回检查与幂等发送仍然生效。Owner 等待和语义复核只适用于代回复，不适用于直接
+发给机器人的问题。发送前会再次读取最新消息；晚到的本人回复会取消发送。
 
 需要重新限制到验收群时改为：
 

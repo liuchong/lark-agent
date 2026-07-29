@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/liuchong/lark-agent/agent/domain"
@@ -218,7 +219,7 @@ func (s *Store) recordIntake(
 			receipt.WorkItemID == 0 {
 			return s.admitBackfillReceipt(ctx, receipt, item)
 		}
-		return s.recordDuplicateIntake(ctx, event, receipt)
+		return s.recordDuplicateIntake(ctx, item, receipt)
 	}
 	eventJSON, err := json.Marshal(event)
 	if err != nil {
@@ -259,10 +260,11 @@ func (s *Store) recordIntake(
 		result, insertErr := tx.ExecContext(ctx,
 			`INSERT OR IGNORE INTO work_items(
 				dedup_key, status, work_kind, priority, session_id, event_json,
-				created_at, updated_at
-			 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				next_attempt_at, created_at, updated_at
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			item.DedupKey, item.Status, item.WorkKind, item.Priority, s.session.ID,
-			string(eventJSON), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+			string(eventJSON), nullableTime(item.NextAttemptAt),
+			now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
 		if insertErr != nil {
 			return domain.IntakeReceipt{}, errs.NewInternalError(
 				errs.SubtypeStorage,
@@ -342,10 +344,11 @@ func (s *Store) admitBackfillReceipt(
 	result, err := tx.ExecContext(ctx,
 		`INSERT OR IGNORE INTO work_items(
 			dedup_key, status, work_kind, priority, session_id, event_json,
-			created_at, updated_at
-		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			next_attempt_at, created_at, updated_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		item.DedupKey, item.Status, item.WorkKind, item.Priority, s.session.ID,
-		string(eventJSON), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+		string(eventJSON), nullableTime(item.NextAttemptAt),
+		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
 	if err != nil {
 		return domain.IntakeReceipt{}, errs.NewInternalError(
 			errs.SubtypeStorage,
@@ -395,9 +398,10 @@ func (s *Store) admitBackfillReceipt(
 
 func (s *Store) recordDuplicateIntake(
 	ctx context.Context,
-	event domain.NormalizedEvent,
+	item domain.WorkItem,
 	existing domain.IntakeReceipt,
 ) (domain.IntakeReceipt, error) {
+	event := item.Event
 	eventJSON, err := json.Marshal(event)
 	if err != nil {
 		return domain.IntakeReceipt{}, errs.NewInternalError(
@@ -417,7 +421,15 @@ func (s *Store) recordDuplicateIntake(
 		Reason:         "message or event was already observed",
 		WorkItemID:     existing.WorkItemID,
 	}
-	result, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.IntakeReceipt{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin duplicate intake",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	result, err := tx.ExecContext(ctx,
 		`INSERT INTO intake_receipts(
 			message_id, event_id, source, session_id, event_json, event_created_at,
 			observed_at, disposition, reason, work_item_id
@@ -435,6 +447,55 @@ func (s *Store) recordDuplicateIntake(
 	receipt.ID, err = lastInsertID(result)
 	if err != nil {
 		return domain.IntakeReceipt{}, err
+	}
+	if existing.WorkItemID != 0 {
+		var statusRaw, existingJSON string
+		if err := tx.QueryRowContext(
+			ctx,
+			`SELECT status, event_json FROM work_items WHERE id = ?`,
+			existing.WorkItemID,
+		).Scan(&statusRaw, &existingJSON); err != nil {
+			return domain.IntakeReceipt{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"read duplicate waiting work",
+			).WithCause(err)
+		}
+		var existingEvent domain.NormalizedEvent
+		if err := json.Unmarshal([]byte(existingJSON), &existingEvent); err != nil {
+			return domain.IntakeReceipt{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"decode duplicate waiting work",
+			).WithCause(err)
+		}
+		newerEdit := !event.UpdatedAt.IsZero() &&
+			(existingEvent.UpdatedAt.IsZero() || event.UpdatedAt.After(existingEvent.UpdatedAt))
+		hydratesEmpty := strings.TrimSpace(existingEvent.Content) == "" &&
+			strings.TrimSpace(event.Content) != ""
+		if domain.WorkItemStatus(statusRaw) == domain.StatusWaitingUser &&
+			(newerEdit || hydratesEmpty) {
+			if _, err := tx.ExecContext(
+				ctx,
+				`UPDATE work_items
+				 SET event_json = ?, next_attempt_at = ?, updated_at = ?
+				 WHERE id = ? AND status = ?`,
+				string(eventJSON),
+				nullableTime(item.NextAttemptAt),
+				receipt.ObservedAt.Format(time.RFC3339Nano),
+				existing.WorkItemID,
+				domain.StatusWaitingUser,
+			); err != nil {
+				return domain.IntakeReceipt{}, errs.NewInternalError(
+					errs.SubtypeStorage,
+					"update edited waiting work",
+				).WithCause(err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.IntakeReceipt{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit duplicate intake",
+		).WithCause(err)
 	}
 	return receipt, nil
 }
@@ -483,18 +544,69 @@ func (s *Store) interruptSessionWork(
 	reason string,
 	currentSession bool,
 ) (int, error) {
+	if !currentSession {
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := s.db.ExecContext(
+			ctx,
+			`UPDATE work_items
+			 SET session_id = ?, decision_json = NULL, lease_by = NULL,
+			     lease_time = NULL, updated_at = ?
+			 WHERE status = ?
+			   AND COALESCE(session_id, '') <> ?
+			   AND NOT EXISTS (
+				SELECT 1 FROM agent_runs
+				WHERE agent_runs.work_item_id = work_items.id
+			   )
+			   AND NOT EXISTS (
+				SELECT 1 FROM action_attempts
+				WHERE action_attempts.work_item_id = work_items.id
+			   )`,
+			s.session.ID,
+			now,
+			domain.StatusWaitingUser,
+			s.session.ID,
+		); err != nil {
+			return 0, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"readmit pristine waiting work",
+			).WithCause(err)
+		}
+	}
 	query := `SELECT id, COALESCE(session_id, '') FROM work_items
-		 WHERE status IN (?, ?, ?, ?, ?, ?, ?, ?)
-		   AND COALESCE(session_id, '') <> ?`
+	 WHERE status IN (?, ?, ?, ?, ?, ?, ?, ?)
+	   AND COALESCE(session_id, '') <> ?
+	   AND NOT (
+		status = ?
+		AND NOT EXISTS (
+			SELECT 1 FROM agent_runs
+			WHERE agent_runs.work_item_id = work_items.id
+		)
+		AND NOT EXISTS (
+			SELECT 1 FROM action_attempts
+			WHERE action_attempts.work_item_id = work_items.id
+		)
+	   )`
 	if currentSession {
 		query = `SELECT id, COALESCE(session_id, '') FROM work_items
 		 WHERE status IN (?, ?, ?, ?, ?, ?, ?, ?)
-		   AND COALESCE(session_id, '') = ?`
+		   AND COALESCE(session_id, '') = ?
+		   AND NOT (
+			status = ?
+			AND NOT EXISTS (
+				SELECT 1 FROM agent_runs
+				WHERE agent_runs.work_item_id = work_items.id
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM action_attempts
+				WHERE action_attempts.work_item_id = work_items.id
+			)
+		   )`
 	}
 	rows, err := s.db.QueryContext(ctx, query,
 		domain.StatusReceived, domain.StatusRouted, domain.StatusWaitingUser,
 		domain.StatusReady, domain.StatusProcessing, domain.StatusAwaitingApproval,
-		domain.StatusExecuting, domain.StatusRetryWait, s.session.ID)
+		domain.StatusExecuting, domain.StatusRetryWait, s.session.ID,
+		domain.StatusWaitingUser)
 	if err != nil {
 		return 0, errs.NewInternalError(
 			errs.SubtypeStorage,

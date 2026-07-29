@@ -114,8 +114,10 @@ The model has two explicit Lark roles. An `assistant_request` answers the
 configured owner when that owner natively mentions the assistant in an allowed
 group, using bot identity. A `direct_mention` acts on behalf of the configured
 human owner when another human mentions that owner, using the delegated-reply
-policy. A private `owner_request` answers the configured owner's own assistant
-prompt using bot identity. Non-owner private messages and non-owner native
+policy. An inbound human P2P message to the owner is a `private_message` and
+uses that same delegated-reply identity and policy. A private `owner_request`
+answers the configured owner's own assistant prompt using bot identity.
+Non-owner private messages addressed to the assistant and non-owner native
 assistant mentions are ignored before model work. A direct owner mention is
 addressed to this personal-assistant
 workflow even when it is a status update, coordination request, commitment, or
@@ -127,6 +129,35 @@ coordination need, `reply` sends a source-backed response, and
 `request_approval` holds an exact risky or uncertain action. App/bot messages
 in conversation context are evidence only and never redefine the role selected
 by the router.
+
+Every allowed `direct_mention` and `private_message` first becomes durable
+`waiting_user` work. It is not claimable until the trusted message creation or
+latest edit time plus `policy.owner_wait`, whose default is three minutes.
+Waiting does not hold a worker, lease, or completed reply draft.
+
+At the deadline, a tool-free semantic resolver reads a paginated, bounded
+same-chat window containing the target, related pending targets, intervening
+discussion, and owner-authored messages after the target. It evaluates each
+target independently. Reply/thread relations, adjacency, and the mere presence
+of a later owner message are evidence but do not prove that the owner answered
+the target. A high-confidence semantic answer cancels only the matched target;
+a high-confidence unanswered result admits only that target to the delegated
+agent loop. Ambiguous, malformed, low-confidence, truncated, or unavailable
+resolution fails closed and retries after the configured semantic retry delay.
+
+The delegated agent context includes bounded post-target discussion so its
+response reflects what happened during the grace period. The semantic result
+is retained in the audit ledger. Immediately before a reply action is persisted, the runtime reads
+messages newer than the prior semantic cutoff and re-runs semantic resolution
+when owner content changed. A newly matched owner answer cancels the reply;
+ambiguity delays it. Lark does not expose a compare-and-send primitive, so this
+last read minimizes but cannot eliminate the interval before the send call.
+
+`policy.reply_scope` independently selects all groups or configured groups for
+`@Owner`. `policy.private_reply_scope` selects all inbound human P2P messages or
+disables that entry point. Existing allow/block chat and user lists apply to
+both. Bot/app messages, owner-authored messages, and non-owner messages to the
+assistant remain outside delegated intake.
 
 A quoted app/bot message may carry a GitHub reference, but the reference is
 usable only after code verifies that the message sender is the configured

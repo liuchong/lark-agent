@@ -34,7 +34,8 @@ inspect 会显示接收回执、工作项、最近模型步骤、最近外部动
 
 ## 显式恢复
 
-跨重启任务不会自动回放。只恢复一条明确消息：
+纯等待且没有模型或动作记录的代回复消息会在新会话重新读取 Lark 后继续。其他跨重启
+任务不会自动回放；只恢复一条明确消息：
 
 ```bash
 lark-agent queue resume --work-id 123
@@ -117,8 +118,14 @@ Owner 私聊 Assistant Bot 发送“在吗”或简单问候时走本地快速�
 `policy.reply_scope: all_groups` 允许所有可见群进入其余门禁；改为
 `configured_groups` 后只允许 daemon `--chat-query` 发现的群。运行
 `lark-agent doctor` 可在 `reply_scopes.assistant_mentions` 和
-`reply_scopes.owner_mentions` 分别确认实际值。两个范围相互独立，范围变化不会自动
-重放旧消息。
+`reply_scopes.owner_mentions` 分别确认实际值。用户身份可见的真人私聊由
+`reply_scopes.private_messages` 显示，生产安装应为 `all_private`。
+
+群 @Owner 和真人私聊先进入 3 分钟持久等待，再按同一会话语义逐条判断 Owner
+是否已回答。`doctor.delegated_reply` 显示等待时长、最低置信度和不确定重试间隔。
+发送前还会重新读取一次；读取失败、上下文不全、低置信度或非法模型输出都不会发送。
+纯等待消息可在重启后重新读取并判断，已进入模型、审批或外部动作的旧工作不会自动
+重放。
 
 ## GitHub 通知与追问
 
@@ -153,9 +160,9 @@ GitHub API 不可用、限流、拒绝或返回不一致对象时，回复必须
 `https://open.larksuite.com`。仓库工作流只检出默认分支的 Action 实现，不检出触发
 run 的 PR 头，不下载 artifacts，不执行外部贡献代码。
 
-非 Owner 只有群内直接 `@Owner` 的代回复请求会进入运行，并且只按只读权限执行：
-只能读取来源群的有界上下文和配置 Workspace 内的业务代码，不能执行 shell、搜索
-其他群、修改、删除、提交或部署。
+非 Owner 只有群内直接 `@Owner` 或发给 Owner 的真人私聊代回复请求会进入运行，
+并且只按只读权限执行：只能读取来源会话的有界上下文和配置 Workspace 内的业务代码，
+不能执行 shell、搜索其他会话、修改、删除、提交或部署。
 要求读取工作目录外路径，或询问凭据、环境变量、用户目录、进程、网络和主机清单时，
 系统会在模型和工具调查前直接拒绝。
 

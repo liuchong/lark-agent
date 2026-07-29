@@ -12,6 +12,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/policy"
 	"github.com/liuchong/lark-agent/agent/poll"
 	"github.com/liuchong/lark-agent/agent/reply"
+	"github.com/liuchong/lark-agent/agent/replymatch"
 	"github.com/liuchong/lark-agent/agent/router"
 	"github.com/liuchong/lark-agent/agent/tools"
 )
@@ -26,6 +27,8 @@ type fakeQueue struct {
 	goal      *domain.CodingGoal
 	goalUsed  int
 	leaseErr  error
+	deferred  bool
+	deferFor  time.Duration
 }
 
 func (f *fakeQueue) UpdateWorkItemSchedulingClaim(
@@ -76,6 +79,23 @@ func (f *fakeQueue) MarkRetry(int64, string) error {
 	return nil
 }
 
+func (f *fakeQueue) DeferWaitingUserClaim(_ int64, _ string, _ string, delay time.Duration) error {
+	f.deferred = true
+	f.deferFor = delay
+	return nil
+}
+
+type fakeReplyResolver struct {
+	resolution replymatch.Resolution
+	err        error
+	calls      int
+}
+
+func (r *fakeReplyResolver) Resolve(context.Context, domain.WorkItem) (replymatch.Resolution, error) {
+	r.calls++
+	return r.resolution, r.err
+}
+
 func TestDaemonRunOnceRoutesItem(t *testing.T) {
 	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID: "om_1",
@@ -88,6 +108,129 @@ func TestDaemonRunOnceRoutesItem(t *testing.T) {
 	}
 	if !result.Processed || !q.done || result.Decision.Relevance != domain.RelevanceDirectMention {
 		t.Fatalf("result=%+v queue=%+v", result, q)
+	}
+}
+
+func TestDaemonSemanticOwnerAnswerSkipsMainReplyModel(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_target",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID:        "om_target",
+		Result:                 replymatch.ResultAnswered,
+		MatchedOwnerMessageIDs: []string{"om_owner_answer"},
+		Confidence:             0.98,
+	}}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolver.calls != 1 || decider.called || !q.done ||
+		result.Decision.Kind != domain.DecisionIgnore ||
+		result.Decision.Reason != "owner_semantically_replied" {
+		t.Fatalf("result=%+v queue=%+v resolver=%+v decider=%+v", result, q, resolver, decider)
+	}
+}
+
+func TestDaemonAmbiguousOwnerReplyDefersWithoutMainModel(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_target",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_target",
+		Result:          replymatch.ResultAmbiguous,
+		Confidence:      0.7,
+		Reason:          "owner discussion is ambiguous",
+	}}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithDelegatedReplyResolver(resolver, 0.85, 45*time.Second),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || resolver.calls != 1 || decider.called ||
+		!q.deferred || q.deferFor != 45*time.Second || q.done {
+		t.Fatalf("result=%+v queue=%+v resolver=%+v decider=%+v", result, q, resolver, decider)
+	}
+}
+
+func TestDaemonWithdrawnDelegatedTargetCancelsWithoutMainModel(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_target",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_target",
+		Result:          replymatch.ResultWithdrawn,
+		Confidence:      1,
+		Reason:          "target message was withdrawn",
+	}}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decider.called || !q.done || result.Decision.Kind != domain.DecisionIgnore ||
+		result.Decision.Reason != "message_withdrawn" {
+		t.Fatalf("result=%+v queue=%+v decider=%+v", result, q, decider)
+	}
+}
+
+func TestDaemonHonorsLongerSemanticRetryDeadline(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_target",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_target",
+		Result:          replymatch.ResultAmbiguous,
+		Confidence:      0,
+		Reason:          "target was edited inside the owner wait window",
+		RetryAfter:      2 * time.Minute,
+	}}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+
+	if _, err := daemon.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !q.deferred || q.deferFor != 2*time.Minute {
+		t.Fatalf("queue=%+v", q)
 	}
 }
 

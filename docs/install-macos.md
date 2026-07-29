@@ -51,7 +51,8 @@ go build -o ./lark-agent ./cmd/lark-agent
 
 - `CONFIG_PATH`、`STATE_PATH`：覆盖独立目标路径。
 - `CHAT_QUERY`：发现并标记配置群和验收群的关键词，默认“Test Group”。默认
-  `assistant.reply_scope: all_groups` 和 `policy.reply_scope: all_groups` 时不会据此
+  `assistant.reply_scope: all_groups`、`policy.reply_scope: all_groups` 和
+  `policy.private_reply_scope: all_private` 时不会据此
   限制其他群；任一字段设为 `configured_groups` 时，该字段对应的群范围由它限制。
 - `POLL_INTERVAL`：轮询间隔，默认 `10s`。
 - `INSTALL_LOAD=0`：只安装，不加载，供隔离验证使用。
@@ -66,11 +67,15 @@ assistant:
   reply_scope: all_groups
 policy:
   reply_scope: all_groups
+  private_reply_scope: all_private
+  owner_wait: 3m
+  owner_reply_confidence_min: 0.85
+  owner_reply_retry: 30s
 ```
 
 前者控制 Owner 可在哪些群里 `@机器人`，后者控制其他人可在哪些群里 `@Owner`
-后触发智能代回复。非 Owner 私聊机器人或直接 `@机器人` 始终静默；两种群范围
-配置不会互相代替。
+后触发智能代回复。用户身份可见的真人私聊由 `private_reply_scope` 单独控制。
+非 Owner 私聊机器人或直接 `@机器人` 始终静默；这些范围配置不会互相代替。
 
 建议同时使用当前默认调查预算：
 

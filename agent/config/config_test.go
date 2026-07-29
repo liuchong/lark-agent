@@ -109,6 +109,33 @@ func TestDefaultReplyScopeAllowsAllGroups(t *testing.T) {
 	if cfg.Policy.ReplyScope != domain.ReplyScopeAllGroups {
 		t.Fatalf("default delegated reply scope=%q, want %q", cfg.Policy.ReplyScope, domain.ReplyScopeAllGroups)
 	}
+	if cfg.Policy.PrivateReplyScope != domain.PrivateReplyScopeAll {
+		t.Fatalf(
+			"default private reply scope=%q, want %q",
+			cfg.Policy.PrivateReplyScope,
+			domain.PrivateReplyScopeAll,
+		)
+	}
+	if cfg.Policy.OwnerWait != 3*time.Minute ||
+		cfg.Policy.OwnerReplyConfidenceMin != 0.85 ||
+		cfg.Policy.OwnerReplyRetry != 30*time.Second {
+		t.Fatalf("semantic delegated reply defaults=%+v", cfg.Policy)
+	}
+}
+
+func TestValidateRejectsInvalidSemanticOwnerReplyPolicy(t *testing.T) {
+	cfg := validConfigForTest(t)
+	cfg.Policy.OwnerReplyConfidenceMin = 1.1
+	if err := cfg.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "policy.owner_reply_confidence_min") {
+		t.Fatalf("confidence error=%v", err)
+	}
+	cfg = validConfigForTest(t)
+	cfg.Policy.OwnerReplyRetry = 0
+	if err := cfg.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "policy.owner_reply_retry") {
+		t.Fatalf("retry error=%v", err)
+	}
 }
 
 func TestGitHubConfigIsDisabledByDefaultAndBoundedWhenEnabled(t *testing.T) {

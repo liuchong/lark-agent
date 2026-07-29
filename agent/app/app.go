@@ -10,6 +10,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/domain"
 	"github.com/liuchong/lark-agent/agent/poll"
 	"github.com/liuchong/lark-agent/agent/reply"
+	"github.com/liuchong/lark-agent/agent/replymatch"
 	"github.com/liuchong/lark-agent/agent/router"
 	"github.com/liuchong/lark-agent/internal/apperr"
 )
@@ -26,6 +27,10 @@ type retryMarker interface {
 
 type delayedRetryMarker interface {
 	MarkRetryAfter(id int64, reason string, minimumDelay time.Duration) error
+}
+
+type waitingUserDeferrer interface {
+	DeferWaitingUserClaim(id int64, leaseToken, reason string, delay time.Duration) error
 }
 
 type schedulingStore interface {
@@ -86,6 +91,12 @@ type Poller interface {
 	Poll(context.Context) (poll.Result, error)
 }
 
+// DelegatedReplyResolver decides whether the owner already answered one exact
+// delegated target using bounded same-chat context.
+type DelegatedReplyResolver interface {
+	Resolve(context.Context, domain.WorkItem) (replymatch.Resolution, error)
+}
+
 // OwnerActivityHandler provides transient feedback for owner-initiated work.
 type OwnerActivityHandler interface {
 	Begin(context.Context, domain.WorkItem) (string, error)
@@ -101,19 +112,22 @@ type Option func(*Daemon)
 
 // Daemon processes queued work items.
 type Daemon struct {
-	queue        Queue
-	router       *router.Router
-	worker       string
-	leaseMaxAge  time.Duration
-	builder      ContextBuilder
-	decider      Decider
-	replier      ReplyHandler
-	notifier     NotificationHandler
-	activity     OwnerActivityHandler
-	poller       Poller
-	workLeases   map[domain.WorkKind]time.Duration
-	lane         domain.SchedulerLane
-	goalMaxTurns int
+	queue                Queue
+	router               *router.Router
+	worker               string
+	leaseMaxAge          time.Duration
+	builder              ContextBuilder
+	decider              Decider
+	replier              ReplyHandler
+	notifier             NotificationHandler
+	activity             OwnerActivityHandler
+	poller               Poller
+	workLeases           map[domain.WorkKind]time.Duration
+	lane                 domain.SchedulerLane
+	goalMaxTurns         int
+	replyResolver        DelegatedReplyResolver
+	replyConfidenceMin   float64
+	replyResolutionRetry time.Duration
 }
 
 // WithCodingGoalMaxTurns bounds durable background investigations.
@@ -121,6 +135,24 @@ func WithCodingGoalMaxTurns(maxTurns int) Option {
 	return func(d *Daemon) {
 		if maxTurns > 0 {
 			d.goalMaxTurns = maxTurns
+		}
+	}
+}
+
+// WithDelegatedReplyResolver wires the semantic owner-answer check that runs
+// before delegated work is admitted to the main reply model.
+func WithDelegatedReplyResolver(
+	resolver DelegatedReplyResolver,
+	confidenceMin float64,
+	retryDelay time.Duration,
+) Option {
+	return func(d *Daemon) {
+		d.replyResolver = resolver
+		if confidenceMin > 0 && confidenceMin <= 1 {
+			d.replyConfidenceMin = confidenceMin
+		}
+		if retryDelay > 0 {
+			d.replyResolutionRetry = retryDelay
 		}
 	}
 }
@@ -143,6 +175,7 @@ func NewDaemon(queue Queue, r *router.Router, opts ...Option) *Daemon {
 	d := &Daemon{
 		queue: queue, router: r, worker: "lark-agent",
 		leaseMaxAge: 5 * time.Minute, lane: domain.SchedulerLaneAny,
+		replyConfidenceMin: 0.85, replyResolutionRetry: 30 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(d)
@@ -300,6 +333,44 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 		defer stopHeartbeat()
 		ctx = runCtx
 	}
+	if isDelegatedReply(decision.Relevance) && d.replyResolver != nil {
+		resolution, resolveErr := d.replyResolver.Resolve(ctx, item)
+		if resolveErr != nil {
+			return d.deferDelegatedReply(
+				item,
+				decision,
+				"owner_reply_resolution_failed",
+				d.replyResolutionRetry,
+			)
+		}
+		if resolution.Confidence < d.replyConfidenceMin ||
+			resolution.Result == replymatch.ResultAmbiguous {
+			delay := d.replyResolutionRetry
+			if resolution.RetryAfter > delay {
+				delay = resolution.RetryAfter
+			}
+			return d.deferDelegatedReply(item, decision, "owner_reply_ambiguous", delay)
+		}
+		switch resolution.Result {
+		case replymatch.ResultAnswered:
+			decision.Kind = domain.DecisionIgnore
+			decision.Reason = "owner_semantically_replied"
+			return d.finishDecision(ctx, item, decision)
+		case replymatch.ResultWithdrawn:
+			decision.Kind = domain.DecisionIgnore
+			decision.Reason = "message_withdrawn"
+			return d.finishDecision(ctx, item, decision)
+		case replymatch.ResultUnanswered:
+			// Continue into the ordinary read-only delegated reply workflow.
+		default:
+			return d.deferDelegatedReply(
+				item,
+				decision,
+				"owner_reply_resolution_invalid",
+				d.replyResolutionRetry,
+			)
+		}
+	}
 	if isAssistantFacingRequest(decision.Relevance) && d.activity != nil {
 		token, activityErr := d.activity.Begin(ctx, item)
 		if activityErr == nil && token != "" {
@@ -367,6 +438,46 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 		return Result{}, err
 	}
 	return d.finishDecision(ctx, item, decision)
+}
+
+func (d *Daemon) deferDelegatedReply(
+	item domain.WorkItem,
+	route domain.Decision,
+	reason string,
+	delay time.Duration,
+) (Result, error) {
+	deferrer, ok := d.queue.(waitingUserDeferrer)
+	if !ok {
+		err := errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"queue does not support deferred delegated replies",
+		)
+		d.markRetry(item, err)
+		return Result{}, err
+	}
+	if err := deferrer.DeferWaitingUserClaim(
+		item.ID,
+		item.LeaseBy,
+		reason,
+		delay,
+	); err != nil {
+		return Result{}, err
+	}
+	return Result{
+		Processed: true,
+		Decision: domain.Decision{
+			Kind:      domain.DecisionRecord,
+			Relevance: route.Relevance,
+			WorkKind:  route.WorkKind,
+			Priority:  route.Priority,
+			Reason:    reason,
+		},
+	}, nil
+}
+
+func isDelegatedReply(relevance domain.Relevance) bool {
+	return relevance == domain.RelevanceDirectMention ||
+		relevance == domain.RelevancePrivateMessage
 }
 
 func (d *Daemon) startLeaseHeartbeat(

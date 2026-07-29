@@ -47,6 +47,25 @@ func ParseReplyScope(raw string) (ReplyScope, error) {
 	}
 }
 
+// PrivateReplyScope controls whether inbound human P2P messages may enter the
+// delegated owner-reply workflow.
+type PrivateReplyScope string
+
+const (
+	PrivateReplyScopeAll      PrivateReplyScope = "all_private"
+	PrivateReplyScopeDisabled PrivateReplyScope = "disabled"
+)
+
+// ParsePrivateReplyScope validates a user-visible private reply scope.
+func ParsePrivateReplyScope(raw string) (PrivateReplyScope, error) {
+	switch PrivateReplyScope(raw) {
+	case PrivateReplyScopeAll, PrivateReplyScopeDisabled:
+		return PrivateReplyScope(raw), nil
+	default:
+		return "", fmt.Errorf("unsupported private reply scope %q", raw)
+	}
+}
+
 // Sensitivity controls how eagerly non-mention messages are considered.
 type Sensitivity string
 
@@ -90,6 +109,7 @@ type NormalizedEvent struct {
 	Content          string      `json:"content,omitempty" yaml:"content,omitempty"`
 	Mentions         []Mention   `json:"mentions,omitempty" yaml:"mentions,omitempty"`
 	CreatedAt        time.Time   `json:"created_at,omitempty" yaml:"created_at,omitempty"`
+	UpdatedAt        time.Time   `json:"updated_at,omitempty" yaml:"updated_at,omitempty"`
 	RawDigest        string      `json:"raw_digest,omitempty" yaml:"raw_digest,omitempty"`
 	WorkspaceID      string      `json:"workspace_id,omitempty" yaml:"workspace_id,omitempty"`
 	InTestScope      bool        `json:"in_test_scope,omitempty" yaml:"in_test_scope,omitempty"`
@@ -490,6 +510,7 @@ type Relevance string
 const (
 	RelevanceNone             Relevance = "none"
 	RelevanceDirectMention    Relevance = "direct_mention"
+	RelevancePrivateMessage   Relevance = "private_message"
 	RelevanceInferred         Relevance = "inferred"
 	RelevanceOwnerRequest     Relevance = "owner_request"
 	RelevanceAssistantRequest Relevance = "assistant_request"

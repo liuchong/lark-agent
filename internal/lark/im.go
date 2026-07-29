@@ -101,6 +101,24 @@ type ListRecentMessagesResult struct {
 	PageToken string
 }
 
+// SemanticReplyContextRequest asks for one bounded same-chat window that
+// includes the exact delegated target and messages observed after it.
+type SemanticReplyContextRequest struct {
+	ChatID          string
+	TargetMessageID string
+	Since           time.Time
+	MaxMessages     int
+}
+
+// SemanticReplyContext is the conservative input to semantic owner-answer
+// matching. Incomplete or withdrawn contexts must not authorize a reply.
+type SemanticReplyContext struct {
+	Messages      []Message
+	ContextCutoff time.Time
+	Incomplete    bool
+	Withdrawn     bool
+}
+
 // ContextMode describes how messages were selected around the target.
 type ContextMode = domain.ContextMode
 
@@ -380,6 +398,103 @@ func (s *Service) GetMessages(ctx context.Context, messageIDs []string) ([]Messa
 		}
 	}
 	return messages, nil
+}
+
+// GetSemanticReplyContext reads the exact target and paginates the same chat
+// from newest to oldest until the target-time boundary is covered.
+func (s *Service) GetSemanticReplyContext(
+	ctx context.Context,
+	req SemanticReplyContextRequest,
+) (SemanticReplyContext, error) {
+	if strings.TrimSpace(req.ChatID) == "" {
+		return SemanticReplyContext{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"chat_id is required",
+		).WithParam("chat_id")
+	}
+	if strings.TrimSpace(req.TargetMessageID) == "" {
+		return SemanticReplyContext{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"target_message_id is required",
+		).WithParam("target_message_id")
+	}
+	targets, err := s.GetMessages(ctx, []string{req.TargetMessageID})
+	if err != nil {
+		return SemanticReplyContext{}, err
+	}
+	if len(targets) == 0 {
+		return SemanticReplyContext{
+			ContextCutoff: time.Now().UTC(),
+			Withdrawn:     true,
+		}, nil
+	}
+	target := targets[0]
+	if target.ChatID != req.ChatID {
+		return SemanticReplyContext{
+			ContextCutoff: time.Now().UTC(),
+			Incomplete:    true,
+		}, nil
+	}
+	since := req.Since
+	if targetTime := parseMessageTime(target.CreateTime); since.IsZero() ||
+		(!targetTime.IsZero() && targetTime.Before(since)) {
+		since = targetTime
+	}
+	maxMessages := clamp(req.MaxMessages, 1, 200, 100)
+	byID := map[string]Message{target.MessageID: target}
+	pageToken := ""
+	incomplete := false
+	for {
+		page, pageErr := s.ListRecentMessages(ctx, ListRecentMessagesRequest{
+			ChatID:    req.ChatID,
+			PageSize:  min(50, maxMessages),
+			PageToken: pageToken,
+		})
+		if pageErr != nil {
+			return SemanticReplyContext{}, pageErr
+		}
+		reachedBoundary := false
+		for _, message := range page.Items {
+			if message.ChatID != req.ChatID {
+				continue
+			}
+			createdAt := parseMessageTime(message.CreateTime)
+			if !since.IsZero() && !createdAt.IsZero() && createdAt.Before(since) {
+				reachedBoundary = true
+				continue
+			}
+			byID[message.MessageID] = message
+			if len(byID) > maxMessages {
+				incomplete = true
+				break
+			}
+			if message.MessageID == req.TargetMessageID ||
+				(!since.IsZero() && !createdAt.IsZero() && !createdAt.After(since)) {
+				reachedBoundary = true
+			}
+		}
+		if incomplete || reachedBoundary || !page.HasMore {
+			break
+		}
+		if page.PageToken == "" || page.PageToken == pageToken {
+			incomplete = true
+			break
+		}
+		pageToken = page.PageToken
+	}
+	messages := make([]Message, 0, min(len(byID), maxMessages))
+	for _, message := range byID {
+		messages = append(messages, message)
+	}
+	sortMessagesChronologically(messages)
+	if len(messages) > maxMessages {
+		messages = messages[len(messages)-maxMessages:]
+	}
+	return SemanticReplyContext{
+		Messages:      messages,
+		ContextCutoff: time.Now().UTC(),
+		Incomplete:    incomplete,
+	}, nil
 }
 
 // ListThreadMessages reads one chronological page from a thread as the user.

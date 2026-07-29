@@ -56,6 +56,7 @@ type Config struct {
 	IncludePrivate             bool
 	PageSize                   int
 	IndexLookback              time.Duration
+	OwnerWait                  time.Duration
 	Now                        func() time.Time
 	Classify                   func(context.Context, domain.WorkItem) (domain.Decision, error)
 }
@@ -212,6 +213,7 @@ func (p *Poller) Backfill(ctx context.Context, req BackfillRequest) (BackfillRes
 			}
 			item.WorkKind = decision.WorkKind
 			item.Priority = decision.Priority
+			p.applyDelegatedWait(&item, decision)
 		}
 		receipt, err := p.store.RecordBackfillWorkIntake(ctx, item)
 		if err != nil {
@@ -393,6 +395,7 @@ func (p *Poller) Poll(ctx context.Context) (Result, error) {
 			}
 			item.WorkKind = decision.WorkKind
 			item.Priority = decision.Priority
+			p.applyDelegatedWait(&item, decision)
 		}
 		receipt, err := p.store.RecordWorkIntake(ctx, item)
 		if err != nil {
@@ -406,6 +409,27 @@ func (p *Poller) Poll(ctx context.Context) (Result, error) {
 		return result, err
 	}
 	return result, nil
+}
+
+func (p *Poller) applyDelegatedWait(item *domain.WorkItem, decision domain.Decision) {
+	if item == nil ||
+		(decision.Relevance != domain.RelevanceDirectMention &&
+			decision.Relevance != domain.RelevancePrivateMessage) {
+		return
+	}
+	wait := p.cfg.OwnerWait
+	if wait <= 0 {
+		wait = 3 * time.Minute
+	}
+	start := item.Event.CreatedAt
+	if item.Event.UpdatedAt.After(start) {
+		start = item.Event.UpdatedAt
+	}
+	if start.IsZero() {
+		start = p.currentTime().UTC()
+	}
+	item.Status = domain.StatusWaitingUser
+	item.NextAttemptAt = start.Add(wait)
 }
 
 func (p *Poller) nonOwnerAssistantMention(event domain.NormalizedEvent) bool {
@@ -694,6 +718,7 @@ func (p *Poller) eventFromMessage(msg serviceim.Message, mentionedOwner bool) do
 		Content:          msg.Content,
 		Mentions:         mentions,
 		CreatedAt:        parseMessageTime(msg.CreateTime),
+		UpdatedAt:        parseMessageTime(msg.UpdateTime),
 		RawDigest:        digestMessage(msg),
 		InTestScope:      chat.ChatID != "",
 		InAssistantScope: p.assistantChatIDs[msg.ChatID],

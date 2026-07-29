@@ -61,7 +61,14 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		},
 		{
 			args: []string{"daemon", "run", "--help"},
-			want: []string{"--chat-query", "configured and validation groups", "Non-owner requests are read-only", "environment reconnaissance"},
+			want: []string{
+				"--chat-query",
+				"configured and validation groups",
+				"Non-owner requests are read-only",
+				"environment reconnaissance",
+				"all inbound human private messages",
+				"three-minute semantic owner-answer window",
+			},
 		},
 		{
 			args: []string{"github", "notify", "--help"},
@@ -110,10 +117,13 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 	for _, want := range []string{
 		"official Go SDK",
 		"com.liuchong.lark-agent",
-		"跨重启工作不会自动回放",
+		"旧模型草稿、审批和外部动作不会自动回放",
 		"assistant.reply_scope",
 		"policy.reply_scope",
+		"policy.private_reply_scope",
+		"policy.owner_wait",
 		"all_groups",
+		"all_private",
 		"非 Owner 私聊机器人或直接 @机器人时保持静默",
 	} {
 		if !strings.Contains(string(readme), want) {

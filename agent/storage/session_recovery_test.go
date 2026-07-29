@@ -276,6 +276,81 @@ func TestRecordIntakeSeparatesOfflineBacklogFromCurrentDelayedDelivery(t *testin
 	}
 }
 
+func TestRestartReadmitsOnlyPristineWaitingUserWork(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := first.CurrentSession().StartedAt.Add(time.Second)
+	for _, messageID := range []string{"om_wait_pristine", "om_wait_with_run"} {
+		item := domain.NewWorkItem(domain.NormalizedEvent{
+			Source:    domain.SourcePoll,
+			EventID:   "poll:" + messageID,
+			MessageID: messageID,
+			ChatID:    "oc_group",
+			CreatedAt: createdAt,
+		})
+		item.Status = domain.StatusWaitingUser
+		item.WorkKind = domain.WorkKindDirectMention
+		item.NextAttemptAt = time.Now().UTC().Add(-time.Second)
+		if _, err := first.RecordWorkIntake(context.Background(), item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := first.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		if item.Event.MessageID != "om_wait_with_run" {
+			continue
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := first.db.Exec(
+			`INSERT INTO agent_runs(
+				id, work_item_id, dedup_key, status, started_at
+			 ) VALUES ('run-waiting', ?, ?, ?, ?)`,
+			item.ID,
+			item.DedupKey,
+			domain.AgentRunCompleted,
+			now,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	items, err = second.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := map[string]domain.WorkItemStatus{}
+	sessions := map[string]string{}
+	for _, item := range items {
+		statuses[item.Event.MessageID] = item.Status
+		sessions[item.Event.MessageID] = item.SessionID
+	}
+	if statuses["om_wait_pristine"] != domain.StatusWaitingUser ||
+		sessions["om_wait_pristine"] != second.CurrentSession().ID {
+		t.Fatalf("pristine waiting item was not readmitted: items=%+v", items)
+	}
+	if statuses["om_wait_with_run"] != domain.StatusInterrupted {
+		t.Fatalf("model-started waiting item was replayable: items=%+v", items)
+	}
+	claimed, ok, err := second.ClaimNext("new-worker")
+	if err != nil || !ok || claimed.Event.MessageID != "om_wait_pristine" {
+		t.Fatalf("claim item=%+v ok=%v err=%v", claimed, ok, err)
+	}
+}
+
 func TestExistingCompletedMessageAddsDuplicateReceiptWithoutReplay(t *testing.T) {
 	store := openStore(t)
 	event := domain.NormalizedEvent{

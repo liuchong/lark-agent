@@ -3,7 +3,6 @@ package policy
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/liuchong/lark-agent/agent/domain"
 )
@@ -303,61 +302,5 @@ func TestOwnerRequestBypassesConfiguredGroupsReplyLimit(t *testing.T) {
 	}
 	if action.Status != domain.ActionReady {
 		t.Fatalf("action=%+v", action)
-	}
-}
-
-func TestOwnerWaitRunsBeforeFinalStateCheck(t *testing.T) {
-	waited := false
-	state := &fakeThreadState{}
-	gate := NewReplyGate(Config{
-		Mode:      domain.ModeAuto,
-		OwnerWait: time.Second,
-		Sleeper: func(context.Context, time.Duration) error {
-			waited = true
-			state.ownerReplied = true
-			return nil
-		},
-	}, state)
-	action, err := gate.Prepare(context.Background(), domain.WorkItem{}, domain.Decision{
-		Kind:       domain.DecisionReply,
-		Confidence: 0.99,
-		Risk:       domain.RiskLow,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !waited || action.Status != domain.ActionCancelled || action.CancelReason != "owner_already_replied" {
-		t.Fatalf("waited=%v action=%+v", waited, action)
-	}
-}
-
-func TestInteractiveOwnerRequestsDoNotWait(t *testing.T) {
-	for _, kind := range []domain.WorkKind{domain.WorkKindFastPath, domain.WorkKindSimpleQuestion} {
-		waited := false
-		gate := NewReplyGate(Config{
-			Mode:        domain.ModeAuto,
-			OwnerOpenID: "ou_owner",
-			OwnerWait:   time.Minute,
-			Sleeper: func(context.Context, time.Duration) error {
-				waited = true
-				return nil
-			},
-		}, fakeThreadState{})
-		action, err := gate.Prepare(context.Background(), domain.WorkItem{
-			Event: domain.NormalizedEvent{SenderID: "ou_owner"},
-		}, domain.Decision{
-			Kind:       domain.DecisionReply,
-			Relevance:  domain.RelevanceOwnerRequest,
-			WorkKind:   kind,
-			Confidence: 1,
-			Risk:       domain.RiskLow,
-			ReplyText:  "reply",
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if waited || action.Status != domain.ActionReady {
-			t.Fatalf("kind=%s waited=%v action=%+v", kind, waited, action)
-		}
 	}
 }

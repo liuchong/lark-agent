@@ -28,6 +28,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/poll"
 	"github.com/liuchong/lark-agent/agent/realtime"
 	"github.com/liuchong/lark-agent/agent/reply"
+	"github.com/liuchong/lark-agent/agent/replymatch"
 	"github.com/liuchong/lark-agent/agent/router"
 	"github.com/liuchong/lark-agent/agent/rules"
 	agentruntime "github.com/liuchong/lark-agent/agent/runtime"
@@ -70,11 +71,14 @@ work to an Eino-based agent loop, and can reply as the owner in auto mode.
 Only the configured owner can mention the assistant bot in an allowed group to
 ask a question or request an operation; that path replies with bot identity.
 The configured owner can also privately message the assistant. Non-owner bot
-private messages and direct assistant mentions stay silent; non-owners can only
-trigger a reply by mentioning the human owner. Assistant mentions and owner
-mentions have independent all-groups or configured-groups scopes. Direct
-assistant requests add a keyboard working reaction before work starts and
-remove it when work finishes.
+private messages and direct assistant mentions stay silent. Human messages in
+the owner's private chats and group messages that mention the human owner may
+enter delegated reply after a three-minute semantic owner-answer window.
+Assistant mentions and owner mentions have independent all-groups or
+configured-groups scopes. Private delegated messages have an independent
+all-private or disabled scope and still honor user and chat block lists.
+Direct assistant requests add a keyboard working reaction before work starts
+and remove it when work finishes.
 Programming questions use a bounded coding investigation path with planning,
 code search fallback, source-backed verify, and replay transcript export.
 Simple questions use at most 3 model turns; coding questions use 20 turns,
@@ -82,10 +86,11 @@ Simple questions use at most 3 model turns; coding questions use 20 turns,
 worker is reserved from the foreground pool, while CodingGoal work uses
 background workers. Time, date, ping, status, doctor, queue summary, and help
 use a deterministic fast path before any model loop.
-Messages received while the service is offline and work interrupted by a
-restart are recorded but never replayed automatically. Use queue inspect to
-see the last durable stage and queue resume to continue one exact message.
-跨重启任务不会自动回放；必须先检查，再显式恢复某一条消息。
+Messages received while the service is offline and work that already entered
+model, approval, or action stages are never replayed automatically. Pristine
+owner-wait items may be freshly re-read after restart. Use queue inspect to see
+the last durable stage and queue resume to continue one exact interrupted
+message. 跨重启任务不会自动回放旧草稿或外部动作。
 Intentional shutdown and every successfully ready session are reported through
 the assistant bot's private chat.
 
@@ -694,7 +699,8 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 		Short: "Run daemon in the foreground",
 		Long: "Run the daemon in the foreground. Non-owner requests are read-only and confined to " +
 			"same-chat plus configured-workspace evidence; environment reconnaissance and paths outside " +
-			"the workspace are refused.",
+			"the workspace are refused. Allowed group owner mentions and all inbound human private messages " +
+			"use a durable three-minute semantic owner-answer window before reply work.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(resolveConfigPath(*configPath))
 			if err != nil {
@@ -1229,6 +1235,7 @@ func buildLiveOptions(
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	baseURL := firstNonEmpty(os.Getenv("OPENAI_BASE_URL"), cfg.Model.BaseURL)
 	model := firstNonEmpty(os.Getenv("OPENAI_MODEL"), cfg.Model.Name)
+	var delegatedResolver app.DelegatedReplyResolver
 	if apiKey != "" && model != "" {
 		modelFingerprint := model + "@" + baseURL
 		configFingerprint, err := agentConfigFingerprint(cfg)
@@ -1264,6 +1271,19 @@ func buildLiveOptions(
 			Model:   model,
 			Timeout: cfg.Model.Timeout,
 		}
+		if userContextEnabled {
+			delegatedResolver = &liveDelegatedReplyResolver{
+				contexts:  imSvc,
+				store:     store,
+				matcher:   replymatch.New(modelAdapter, cfg.Owner.OpenID),
+				ownerWait: cfg.Policy.OwnerWait,
+			}
+			options = append(options, app.WithDelegatedReplyResolver(
+				delegatedResolver,
+				cfg.Policy.OwnerReplyConfidenceMin,
+				cfg.Policy.OwnerReplyRetry,
+			))
+		}
 		options = append(options, app.WithDecider(agentruntime.LoopDecisionAgent{Loop: agentruntime.AgentLoop{
 			Model:             modelAdapter,
 			Tools:             registry,
@@ -1287,10 +1307,20 @@ func buildLiveOptions(
 		info["agent_tools"] = len(registry.Infos())
 		info["runtime_fingerprint"] = modelFingerprint + ":" + configFingerprint
 	}
+	if userContextEnabled && delegatedResolver == nil {
+		delegatedResolver = unavailableDelegatedReplyResolver{}
+		options = append(options, app.WithDelegatedReplyResolver(
+			delegatedResolver,
+			cfg.Policy.OwnerReplyConfidenceMin,
+			cfg.Policy.OwnerReplyRetry,
+		))
+	}
+	info["semantic_delegated_replies"] = delegatedResolver != nil
 	if !dryRun {
-		threadState := liveThreadState{}
-		if userContextEnabled {
-			threadState.svc = imSvc
+		threadState := &liveThreadState{
+			resolver:      delegatedResolver,
+			confidenceMin: cfg.Policy.OwnerReplyConfidenceMin,
+			resolutions:   make(map[string]replymatch.Resolution),
 		}
 		gate := policy.NewReplyGate(policy.Config{
 			Mode:                cfg.Policy.Mode,
@@ -1298,7 +1328,6 @@ func buildLiveOptions(
 			ReplyScope:          cfg.Policy.ReplyScope,
 			AssistantReplyScope: cfg.Assistant.ReplyScope,
 			ReplyConfidenceMin:  cfg.Policy.ReplyConfidenceMin,
-			OwnerWait:           cfg.Policy.OwnerWait,
 			BlockChats:          cfg.Policy.BlockChats,
 			BlockUsers:          cfg.Policy.BlockUsers,
 		}, threadState)
@@ -1390,6 +1419,7 @@ func newConfiguredLivePoller(
 		IncludePrivate:             includePrivate,
 		PageSize:                   20,
 		IndexLookback:              cfg.Scheduler.PollIndexLookback,
+		OwnerWait:                  cfg.Policy.OwnerWait,
 		Classify:                   agentRouter.Route,
 	})
 }
@@ -1413,6 +1443,7 @@ func newAgentRouter(cfg config.Config, store *storage.Store) *router.Router {
 		OwnerDirect:         cfg.Assistant.OwnerDirect.Enabled,
 		Mode:                cfg.Policy.Mode,
 		ReplyScope:          cfg.Policy.ReplyScope,
+		PrivateReplyScope:   cfg.Policy.PrivateReplyScope,
 		AllowChats:          cfg.Policy.AllowChats,
 		BlockChats:          cfg.Policy.BlockChats,
 		BlockUsers:          cfg.Policy.BlockUsers,
@@ -1527,6 +1558,163 @@ type conversationBuilder struct {
 	base                agentcontext.Builder
 }
 
+type semanticReplyContextReader interface {
+	GetSemanticReplyContext(
+		context.Context,
+		serviceim.SemanticReplyContextRequest,
+	) (serviceim.SemanticReplyContext, error)
+}
+
+type semanticReplyStore interface {
+	ListPendingDelegatedWork(string) ([]domain.WorkItem, error)
+	RecordOwnerReplyResolution(int64, replymatch.Resolution) error
+}
+
+type semanticReplyMatcher interface {
+	Resolve(context.Context, replymatch.Request) (replymatch.Resolution, error)
+}
+
+type unavailableDelegatedReplyResolver struct{}
+
+func (unavailableDelegatedReplyResolver) Resolve(
+	context.Context,
+	domain.WorkItem,
+) (replymatch.Resolution, error) {
+	return replymatch.Resolution{}, errs.NewInternalError(
+		errs.SubtypeFailedPrecondition,
+		"semantic delegated reply model is unavailable",
+	)
+}
+
+type liveDelegatedReplyResolver struct {
+	contexts    semanticReplyContextReader
+	store       semanticReplyStore
+	matcher     semanticReplyMatcher
+	maxMessages int
+	ownerWait   time.Duration
+}
+
+func (r liveDelegatedReplyResolver) Resolve(
+	ctx context.Context,
+	item domain.WorkItem,
+) (replymatch.Resolution, error) {
+	pending, err := r.store.ListPendingDelegatedWork(item.Event.ChatID)
+	if err != nil {
+		return replymatch.Resolution{}, err
+	}
+	since := item.Event.CreatedAt
+	for _, candidate := range pending {
+		if candidate.Event.CreatedAt.IsZero() {
+			continue
+		}
+		if since.IsZero() || candidate.Event.CreatedAt.Before(since) {
+			since = candidate.Event.CreatedAt
+		}
+	}
+	maxMessages := r.maxMessages
+	if maxMessages <= 0 {
+		maxMessages = 100
+	}
+	larkContext, err := r.contexts.GetSemanticReplyContext(
+		ctx,
+		serviceim.SemanticReplyContextRequest{
+			ChatID:          item.Event.ChatID,
+			TargetMessageID: item.Event.MessageID,
+			Since:           since,
+			MaxMessages:     maxMessages,
+		},
+	)
+	if err != nil {
+		return replymatch.Resolution{}, err
+	}
+	if larkContext.Withdrawn {
+		resolution := replymatch.Resolution{
+			TargetMessageID: item.Event.MessageID,
+			Result:          replymatch.ResultWithdrawn,
+			Confidence:      1,
+			Reason:          "target message was withdrawn",
+			ContextCutoff:   larkContext.ContextCutoff,
+		}
+		if err := r.store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
+			return replymatch.Resolution{}, err
+		}
+		return resolution, nil
+	}
+
+	messages := normalizeToolMessages(larkContext.Messages)
+	latest := make(map[string]domain.NormalizedEvent, len(messages))
+	for _, message := range messages {
+		latest[message.MessageID] = message
+	}
+	target := item
+	if event, ok := latest[item.Event.MessageID]; ok {
+		target.Event = event
+	}
+	for index := range pending {
+		if event, ok := latest[pending[index].Event.MessageID]; ok {
+			pending[index].Event = event
+		}
+	}
+	ownerWait := r.ownerWait
+	if ownerWait <= 0 {
+		ownerWait = 3 * time.Minute
+	}
+	if !target.Event.UpdatedAt.IsZero() &&
+		target.Event.UpdatedAt.After(target.Event.CreatedAt) {
+		deadline := target.Event.UpdatedAt.Add(ownerWait)
+		cutoff := larkContext.ContextCutoff
+		if cutoff.IsZero() {
+			cutoff = time.Now().UTC()
+		}
+		if deadline.After(cutoff) {
+			resolution := replymatch.Resolution{
+				TargetMessageID: item.Event.MessageID,
+				Result:          replymatch.ResultAmbiguous,
+				Reason:          "target was edited inside the owner wait window",
+				ContextCutoff:   cutoff,
+				RetryAfter:      deadline.Sub(cutoff),
+			}
+			if err := r.store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
+				return replymatch.Resolution{}, err
+			}
+			return resolution, nil
+		}
+	}
+	if larkContext.Incomplete {
+		resolution := replymatch.Resolution{
+			TargetMessageID: item.Event.MessageID,
+			Result:          replymatch.ResultAmbiguous,
+			Reason:          "same-chat context is incomplete",
+			ContextCutoff:   larkContext.ContextCutoff,
+		}
+		if err := r.store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
+			return replymatch.Resolution{}, err
+		}
+		return resolution, nil
+	}
+	resolution, err := r.matcher.Resolve(ctx, replymatch.Request{
+		Target:        target,
+		Pending:       pending,
+		Messages:      messages,
+		ContextCutoff: larkContext.ContextCutoff,
+	})
+	if err != nil {
+		resolution = replymatch.Resolution{
+			TargetMessageID: item.Event.MessageID,
+			Result:          replymatch.ResultAmbiguous,
+			Reason:          "semantic owner-reply evaluation failed",
+			ContextCutoff:   larkContext.ContextCutoff,
+		}
+	}
+	if resolution.ContextCutoff.IsZero() {
+		resolution.ContextCutoff = larkContext.ContextCutoff
+	}
+	if err := r.store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
+		return replymatch.Resolution{}, err
+	}
+	return resolution, nil
+}
+
 type larkToolContext struct {
 	svc *serviceim.Service
 }
@@ -1611,6 +1799,7 @@ func normalizeToolMessages(messages []serviceim.Message) []domain.NormalizedEven
 			Content:          message.Content,
 			Mentions:         message.Mentions,
 			CreatedAt:        normalizeServiceMessageTime(message.CreateTime),
+			UpdatedAt:        normalizeServiceMessageTime(message.UpdateTime),
 			RawDigest:        fmt.Sprintf("sha256:%x", sum[:]),
 		})
 	}
@@ -1632,15 +1821,41 @@ func (b *conversationBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, 
 	if b.includeLarkContext && b.svc != nil && item.Event.ChatID != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		messageContext, err := b.svc.GetMessageContext(ctx, serviceim.MessageContextRequest{
-			ChatID:           item.Event.ChatID,
-			MessageID:        item.Event.MessageID,
-			RootMessageID:    item.Event.RootMessageID,
-			ReplyToMessageID: item.Event.ReplyToMessageID,
-			ThreadID:         item.Event.ThreadID,
-			CreatedAt:        item.Event.CreatedAt,
-			Limit:            30,
-		})
+		var messages []serviceim.Message
+		var selection domain.ContextSelection
+		var err error
+		if item.WorkKind == domain.WorkKindDirectMention {
+			var semanticContext serviceim.SemanticReplyContext
+			semanticContext, err = b.svc.GetSemanticReplyContext(
+				ctx,
+				serviceim.SemanticReplyContextRequest{
+					ChatID:          item.Event.ChatID,
+					TargetMessageID: item.Event.MessageID,
+					Since:           item.Event.CreatedAt,
+					MaxMessages:     100,
+				},
+			)
+			messages = semanticContext.Messages
+			selection = domain.ContextSelection{
+				Mode:            domain.ContextModeAdjacent,
+				AnchorMessageID: item.Event.MessageID,
+				Incomplete:      semanticContext.Incomplete || semanticContext.Withdrawn,
+				Reason:          "delegated_post_target_window",
+			}
+		} else {
+			var messageContext serviceim.MessageContext
+			messageContext, err = b.svc.GetMessageContext(ctx, serviceim.MessageContextRequest{
+				ChatID:           item.Event.ChatID,
+				MessageID:        item.Event.MessageID,
+				RootMessageID:    item.Event.RootMessageID,
+				ReplyToMessageID: item.Event.ReplyToMessageID,
+				ThreadID:         item.Event.ThreadID,
+				CreatedAt:        item.Event.CreatedAt,
+				Limit:            30,
+			})
+			messages = messageContext.Messages
+			selection = messageContext.Selection
+		}
 		if err != nil {
 			builder.ContextSelection = domain.ContextSelection{
 				Mode:             domain.ContextModeAdjacent,
@@ -1655,8 +1870,17 @@ func (b *conversationBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, 
 			}
 			return builder.Build(item)
 		}
-		builder.Conversation = append(builder.Conversation, normalizeToolMessages(messageContext.Messages)...)
-		builder.ContextSelection = messageContext.Selection
+		normalized := normalizeToolMessages(messages)
+		builder.Conversation = append(builder.Conversation, normalized...)
+		builder.ContextSelection = selection
+		if item.WorkKind == domain.WorkKindDirectMention {
+			for _, event := range normalized {
+				if event.MessageID == item.Event.MessageID {
+					item.Event = event
+					break
+				}
+			}
+		}
 		if b.githubEnabled {
 			verified, ok, err := agentcontext.ResolveGitHubReference(
 				item.Event,
@@ -1721,27 +1945,80 @@ func (b *conversationBuilder) applyStoredGitHubReference(
 }
 
 type liveThreadState struct {
-	svc *serviceim.Service
+	resolver      app.DelegatedReplyResolver
+	confidenceMin float64
+	mu            sync.Mutex
+	resolutions   map[string]replymatch.Resolution
 }
 
-func (s liveThreadState) OwnerAlreadyReplied(ctx context.Context, item domain.WorkItem) (bool, error) {
-	if s.svc == nil || item.Event.ChatID == "" {
+func (s *liveThreadState) OwnerAlreadyReplied(
+	ctx context.Context,
+	item domain.WorkItem,
+) (bool, error) {
+	if s == nil || s.resolver == nil || item.WorkKind != domain.WorkKindDirectMention {
 		return false, nil
 	}
-	messageContext, err := s.svc.GetMessageContext(ctx, serviceim.MessageContextRequest{
-		ChatID:    item.Event.ChatID,
-		MessageID: item.Event.MessageID,
-		Limit:     20,
-		After:     item.Event.CreatedAt,
-	})
+	key := semanticThreadStateKey(item)
+	s.mu.Lock()
+	resolution, ok := s.resolutions[key]
+	if ok {
+		delete(s.resolutions, key)
+	}
+	s.mu.Unlock()
+	if !ok {
+		var err error
+		resolution, err = s.resolve(ctx, item)
+		if err != nil {
+			return false, err
+		}
+	}
+	return resolution.Result == replymatch.ResultAnswered, nil
+}
+
+func (s *liveThreadState) MessageWithdrawn(
+	ctx context.Context,
+	item domain.WorkItem,
+) (bool, error) {
+	if s == nil || s.resolver == nil || item.WorkKind != domain.WorkKindDirectMention {
+		return false, nil
+	}
+	resolution, err := s.resolve(ctx, item)
 	if err != nil {
 		return false, err
 	}
-	return messageContext.OwnerReplied, nil
+	if resolution.Result == replymatch.ResultWithdrawn {
+		return true, nil
+	}
+	key := semanticThreadStateKey(item)
+	s.mu.Lock()
+	s.resolutions[key] = resolution
+	s.mu.Unlock()
+	return false, nil
 }
 
-func (s liveThreadState) MessageWithdrawn(context.Context, domain.WorkItem) (bool, error) {
-	return false, nil
+func (s *liveThreadState) resolve(
+	ctx context.Context,
+	item domain.WorkItem,
+) (replymatch.Resolution, error) {
+	resolution, err := s.resolver.Resolve(ctx, item)
+	if err != nil {
+		return replymatch.Resolution{}, err
+	}
+	if resolution.Confidence < s.confidenceMin ||
+		resolution.Result == replymatch.ResultAmbiguous {
+		return replymatch.Resolution{}, errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"final semantic owner-reply state is ambiguous",
+		)
+	}
+	return resolution, nil
+}
+
+func semanticThreadStateKey(item domain.WorkItem) string {
+	if item.ID != 0 {
+		return strconv.FormatInt(item.ID, 10)
+	}
+	return item.DedupKey
 }
 
 func firstNonEmpty(values ...string) string {
@@ -2406,6 +2683,12 @@ func newDoctorCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 				"reply_scopes": map[string]any{
 					"assistant_mentions": cfg.Assistant.ReplyScope,
 					"owner_mentions":     cfg.Policy.ReplyScope,
+					"private_messages":   cfg.Policy.PrivateReplyScope,
+				},
+				"delegated_reply": map[string]any{
+					"owner_wait":            cfg.Policy.OwnerWait.String(),
+					"owner_reply_threshold": cfg.Policy.OwnerReplyConfidenceMin,
+					"ambiguous_retry":       cfg.Policy.OwnerReplyRetry.String(),
 				},
 				"reply_scope": cfg.Policy.ReplyScope,
 				"scheduler": map[string]any{

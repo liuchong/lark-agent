@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/liuchong/lark-agent/agent/domain"
+	"github.com/liuchong/lark-agent/agent/replymatch"
 )
 
 func TestOpenSerializesSQLiteAccessWithBoundedBusyWait(t *testing.T) {
@@ -62,6 +63,73 @@ func TestInboxDeduplicatesByMessageID(t *testing.T) {
 	}
 	if len(items) != 1 {
 		t.Fatalf("items=%d", len(items))
+	}
+}
+
+func TestPendingDelegatedWorkAndSemanticResolutionAudit(t *testing.T) {
+	store := openStore(t)
+	for _, event := range []domain.NormalizedEvent{
+		{MessageID: "om_a", ChatID: "oc_group", Content: "发布日期？"},
+		{MessageID: "om_b", ChatID: "oc_group", Content: "负责人？"},
+		{MessageID: "om_other", ChatID: "oc_other", Content: "另一个群"},
+	} {
+		if _, err := store.EnqueueEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := store.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		if err := store.UpdateWorkItemScheduling(
+			item.ID,
+			domain.WorkKindDirectMention,
+			domain.PriorityDirectMention,
+			time.Minute,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.Exec(
+			`UPDATE work_items SET status = ? WHERE id = ?`,
+			domain.StatusWaitingUser,
+			item.ID,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pending, err := store.ListPendingDelegatedWork("oc_group")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 || pending[0].Event.MessageID != "om_a" ||
+		pending[1].Event.MessageID != "om_b" {
+		t.Fatalf("pending=%+v", pending)
+	}
+
+	cutoff := time.Date(2026, 7, 29, 3, 0, 0, 0, time.UTC)
+	resolution := replymatch.Resolution{
+		TargetMessageID:        "om_a",
+		Result:                 replymatch.ResultAnswered,
+		MatchedOwnerMessageIDs: []string{"om_owner"},
+		Confidence:             0.97,
+		Reason:                 "owner supplied the requested date",
+		ContextCutoff:          cutoff,
+	}
+	if err := store.RecordOwnerReplyResolution(pending[0].ID, resolution); err != nil {
+		t.Fatal(err)
+	}
+	audits, err := store.ListOwnerReplyResolutions(pending[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) != 1 || audits[0].TargetMessageID != "om_a" ||
+		audits[0].Result != replymatch.ResultAnswered ||
+		len(audits[0].MatchedOwnerMessageIDs) != 1 ||
+		audits[0].MatchedOwnerMessageIDs[0] != "om_owner" ||
+		!audits[0].ContextCutoff.Equal(cutoff) {
+		t.Fatalf("audits=%+v", audits)
 	}
 }
 

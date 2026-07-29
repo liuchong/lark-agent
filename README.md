@@ -10,13 +10,16 @@
 - 只有 Owner 可以私聊“Assistant Bot”或在允许的群里直接 @机器人提问、要求执行
   操作，机器人用机器人身份回答。可以通过 `assistant.reply_scope` 选择所有群或仅
   配置群；处理期间添加键盘工作表情，结束后删除。
-- 非 Owner 私聊机器人或直接 @机器人时保持静默；非 Owner 只有在群里直接 @Owner
-  时，才可能触发只读的智能代回复。
+- 非 Owner 私聊机器人或直接 @机器人时保持静默；用户身份可见的真人私聊，以及
+  群里直接 @Owner 的消息，才可能触发只读的智能代回复。
 - 他人在任意用户可见群里直接 @Owner 时，Agent 默认可按策略用 Owner 身份回复；
   回复成功后再由机器人私聊 Owner 说明已经回复以及仍需处理的事项。可以通过
   `policy.reply_scope` 改回仅允许配置群。
-- 没有显式引用时使用同一会话内的邻近消息；有引用或 thread 时沿引用关系读取，
-  不会把其他群或私聊的内容混入上下文。
+- 代回复先进入 `policy.owner_wait`（默认 3 分钟）的持久等待。到期后按语义判断
+  Owner 是否已经回答每一条具体消息；只处理仍未回答的消息。判断不清、上下文不全
+  或模型输出异常时不会瞎答，而是按 `policy.owner_reply_retry` 延后重试。
+- 代回复会读取目标消息之后的同会话讨论和并发待回复问题，判断 Owner 的非引用回复
+  实际对应哪一条；不会把其他群或其他私聊内容混入上下文。
 - 编程问题可在配置的 Workspace 内使用有边界的代码搜索、文件读取和 shell
   工具。路径逃逸、符号链接逃逸、秘密文件和无边界搜索会被代码拒绝。
 - 非 Owner 触发的群内请求只能读取当前群上下文和 Workspace 业务证据，不能执行
@@ -27,7 +30,8 @@
 - GitHub Actions 可以用同一个 Lark 应用身份把可信的工作流结果发进指定群。Action
   只通过 HTTP 发送一次消息，不启动第二个 WebSocket 监听；常驻 Agent 验证被引用的
   机器人消息及其 HMAC 签名后，才允许模型按该引用读取有界、只读的 GitHub 事实。
-- 所有消息、模型步骤和外部动作都写入 SQLite 账本。跨重启工作不会自动回放。
+- 所有消息、语义判断、模型步骤和外部动作都写入 SQLite 账本。纯等待消息可在重启
+  后重新读取 Lark 再判断；旧模型草稿、审批和外部动作不会自动回放。
 
 ## 要求
 
@@ -73,7 +77,8 @@ export OPENAI_MODEL='model-name'
 旧目录，也不迁移历史数据。
 
 `CHAT_QUERY` 只用于发现和标记配置群与验收群。默认
-`assistant.reply_scope: all_groups` 和 `policy.reply_scope: all_groups` 时，它不会
+`assistant.reply_scope: all_groups`、`policy.reply_scope: all_groups` 和
+`policy.private_reply_scope: all_private` 时，它不会
 限制 Owner 在其他群正常 `@机器人`，也不会限制其他人在其他群 `@Owner`。真实 live
 验收仍只在本次明确授权的群和机器人私聊中发送测试消息。
 

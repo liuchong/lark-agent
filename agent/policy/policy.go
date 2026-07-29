@@ -3,7 +3,6 @@ package policy
 
 import (
 	"context"
-	"time"
 
 	"github.com/liuchong/lark-agent/agent/domain"
 )
@@ -21,10 +20,8 @@ type Config struct {
 	ReplyScope          domain.ReplyScope
 	AssistantReplyScope domain.ReplyScope
 	ReplyConfidenceMin  float64
-	OwnerWait           time.Duration
 	BlockChats          []string
 	BlockUsers          []string
-	Sleeper             func(context.Context, time.Duration) error
 }
 
 // ReplyGate prepares a reply action or blocks/cancels it.
@@ -98,26 +95,6 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 		action.Status = domain.ActionBlocked
 		action.CancelReason = "outside_assistant_reply_scope"
 		return action, nil
-	}
-	if g.cfg.OwnerWait > 0 &&
-		decision.WorkKind != domain.WorkKindFastPath &&
-		!isAssistantFacingRequest(decision.Relevance) {
-		sleep := g.cfg.Sleeper
-		if sleep == nil {
-			sleep = func(ctx context.Context, d time.Duration) error {
-				timer := time.NewTimer(d)
-				defer timer.Stop()
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-timer.C:
-					return nil
-				}
-			}
-		}
-		if err := sleep(ctx, g.cfg.OwnerWait); err != nil {
-			return action, err
-		}
 	}
 	if g.state != nil {
 		withdrawn, err := g.state.MessageWithdrawn(ctx, item)

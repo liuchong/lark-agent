@@ -13,6 +13,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/config"
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
+	"github.com/liuchong/lark-agent/agent/replymatch"
 	"github.com/liuchong/lark-agent/agent/storage"
 	serviceim "github.com/liuchong/lark-agent/internal/lark"
 )
@@ -22,6 +23,239 @@ func TestRootDoesNotExposeCopiedInternalEventBus(t *testing.T) {
 	if command, _, err := root.Find([]string{"event", "_bus"}); err == nil &&
 		command != nil && command.Name() == "_bus" {
 		t.Fatal("standalone agent must not copy the official CLI internal event bus")
+	}
+}
+
+type fakeSemanticContextReader struct {
+	result serviceim.SemanticReplyContext
+	err    error
+}
+
+func (r fakeSemanticContextReader) GetSemanticReplyContext(
+	context.Context,
+	serviceim.SemanticReplyContextRequest,
+) (serviceim.SemanticReplyContext, error) {
+	return r.result, r.err
+}
+
+type fakeSemanticReplyStore struct {
+	pending  []domain.WorkItem
+	recorded []replymatch.Resolution
+}
+
+func (s *fakeSemanticReplyStore) ListPendingDelegatedWork(string) ([]domain.WorkItem, error) {
+	return append([]domain.WorkItem(nil), s.pending...), nil
+}
+
+func (s *fakeSemanticReplyStore) RecordOwnerReplyResolution(
+	_ int64,
+	resolution replymatch.Resolution,
+) error {
+	s.recorded = append(s.recorded, resolution)
+	return nil
+}
+
+type fakeSemanticMatcher struct {
+	request replymatch.Request
+	result  replymatch.Resolution
+	calls   int
+}
+
+type fakeFinalReplyResolver struct {
+	resolution replymatch.Resolution
+	err        error
+	calls      int
+}
+
+func (r *fakeFinalReplyResolver) Resolve(
+	context.Context,
+	domain.WorkItem,
+) (replymatch.Resolution, error) {
+	r.calls++
+	return r.resolution, r.err
+}
+
+func TestLiveThreadStateUsesOneFinalSemanticReadForWithdrawnAndAnsweredChecks(t *testing.T) {
+	resolver := &fakeFinalReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_target",
+		Result:          replymatch.ResultAnswered,
+		Confidence:      0.97,
+		Reason:          "owner answered after the draft",
+	}}
+	state := &liveThreadState{
+		resolver:      resolver,
+		confidenceMin: 0.85,
+		resolutions:   make(map[string]replymatch.Resolution),
+	}
+	item := domain.NewWorkItem(domain.NormalizedEvent{MessageID: "om_target"})
+	item.ID = 11
+	item.WorkKind = domain.WorkKindDirectMention
+
+	withdrawn, err := state.MessageWithdrawn(context.Background(), item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	answered, err := state.OwnerAlreadyReplied(context.Background(), item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withdrawn || !answered || resolver.calls != 1 {
+		t.Fatalf(
+			"withdrawn=%v answered=%v resolver_calls=%d",
+			withdrawn,
+			answered,
+			resolver.calls,
+		)
+	}
+}
+
+func TestLiveThreadStateBlocksFinalSendWhenSemanticStateIsAmbiguous(t *testing.T) {
+	resolver := &fakeFinalReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_target",
+		Result:          replymatch.ResultAmbiguous,
+		Confidence:      0.4,
+		Reason:          "late discussion is ambiguous",
+	}}
+	state := &liveThreadState{
+		resolver:      resolver,
+		confidenceMin: 0.85,
+		resolutions:   make(map[string]replymatch.Resolution),
+	}
+	item := domain.NewWorkItem(domain.NormalizedEvent{MessageID: "om_target"})
+	item.WorkKind = domain.WorkKindDirectMention
+	if _, err := state.MessageWithdrawn(context.Background(), item); err == nil {
+		t.Fatal("ambiguous final state allowed send")
+	}
+}
+
+func (m *fakeSemanticMatcher) Resolve(
+	_ context.Context,
+	request replymatch.Request,
+) (replymatch.Resolution, error) {
+	m.calls++
+	m.request = request
+	return m.result, nil
+}
+
+func TestLiveDelegatedReplyResolverUsesLatestLarkContextAndAllPendingTargets(t *testing.T) {
+	base := time.Date(2026, 7, 29, 4, 0, 0, 0, time.UTC)
+	target := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_target", ChatID: "oc_group", Content: "旧内容", CreatedAt: base,
+	})
+	target.ID = 7
+	other := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_other", ChatID: "oc_group", Content: "另一个问题",
+		CreatedAt: base.Add(time.Second),
+	})
+	store := &fakeSemanticReplyStore{pending: []domain.WorkItem{target, other}}
+	matcher := &fakeSemanticMatcher{result: replymatch.Resolution{
+		TargetMessageID: "om_target",
+		Result:          replymatch.ResultUnanswered,
+		Confidence:      0.96,
+		Reason:          "owner discussion did not answer the exact target",
+	}}
+	cutoff := base.Add(3 * time.Minute)
+	resolver := liveDelegatedReplyResolver{
+		contexts: fakeSemanticContextReader{result: serviceim.SemanticReplyContext{
+			Messages: []serviceim.Message{
+				{
+					MessageID: "om_target", ChatID: "oc_group", Content: "编辑后的内容",
+					CreateTime: base.Format(time.RFC3339),
+				},
+				{
+					MessageID: "om_owner", ChatID: "oc_group", SenderOpenID: "ou_owner",
+					Content: "我在确认另一个事项", CreateTime: base.Add(time.Minute).Format(time.RFC3339),
+				},
+			},
+			ContextCutoff: cutoff,
+		}},
+		store:   store,
+		matcher: matcher,
+	}
+
+	result, err := resolver.Resolve(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Result != replymatch.ResultUnanswered || matcher.calls != 1 ||
+		len(matcher.request.Pending) != 2 ||
+		matcher.request.Target.Event.Content != "编辑后的内容" ||
+		len(store.recorded) != 1 ||
+		!store.recorded[0].ContextCutoff.Equal(cutoff) {
+		t.Fatalf(
+			"result=%+v matcher=%+v request=%+v recorded=%+v",
+			result,
+			matcher,
+			matcher.request,
+			store.recorded,
+		)
+	}
+}
+
+func TestLiveDelegatedReplyResolverCancelsWithdrawnTargetWithoutModel(t *testing.T) {
+	target := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_missing", ChatID: "oc_group",
+	})
+	target.ID = 8
+	store := &fakeSemanticReplyStore{}
+	matcher := &fakeSemanticMatcher{}
+	resolver := liveDelegatedReplyResolver{
+		contexts: fakeSemanticContextReader{result: serviceim.SemanticReplyContext{
+			Withdrawn:     true,
+			ContextCutoff: time.Now().UTC(),
+		}},
+		store:   store,
+		matcher: matcher,
+	}
+
+	result, err := resolver.Resolve(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Result != replymatch.ResultWithdrawn || matcher.calls != 0 ||
+		len(store.recorded) != 1 {
+		t.Fatalf("result=%+v matcher_calls=%d recorded=%+v", result, matcher.calls, store.recorded)
+	}
+}
+
+func TestLiveDelegatedReplyResolverWaitsThreeMinutesAfterTargetEdit(t *testing.T) {
+	base := time.Date(2026, 7, 29, 4, 0, 0, 0, time.UTC)
+	target := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_edited", ChatID: "oc_group", Content: "旧问题", CreatedAt: base,
+	})
+	target.ID = 9
+	store := &fakeSemanticReplyStore{pending: []domain.WorkItem{target}}
+	matcher := &fakeSemanticMatcher{}
+	editedAt := base.Add(2 * time.Minute)
+	cutoff := editedAt.Add(30 * time.Second)
+	resolver := liveDelegatedReplyResolver{
+		contexts: fakeSemanticContextReader{result: serviceim.SemanticReplyContext{
+			Messages: []serviceim.Message{{
+				MessageID: "om_edited", ChatID: "oc_group", Content: "编辑后的问题",
+				CreateTime: base.Format(time.RFC3339),
+				UpdateTime: editedAt.Format(time.RFC3339),
+			}},
+			ContextCutoff: cutoff,
+		}},
+		store:     store,
+		matcher:   matcher,
+		ownerWait: 3 * time.Minute,
+	}
+
+	result, err := resolver.Resolve(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Result != replymatch.ResultAmbiguous ||
+		result.RetryAfter != 150*time.Second ||
+		matcher.calls != 0 ||
+		len(store.recorded) != 1 {
+		t.Fatalf(
+			"result=%+v matcher_calls=%d recorded=%+v",
+			result,
+			matcher.calls,
+			store.recorded,
+		)
 	}
 }
 
@@ -169,6 +403,69 @@ type failingMessageContextCaller struct{}
 
 func (failingMessageContextCaller) CallAPI(context.Context, serviceim.APIRequest) (any, error) {
 	return nil, errors.New("Authentication token expired. Please request a new one.")
+}
+
+type delegatedContextCaller struct {
+	base time.Time
+}
+
+func (c delegatedContextCaller) CallAPI(
+	_ context.Context,
+	req serviceim.APIRequest,
+) (any, error) {
+	switch req.Path {
+	case "/open-apis/im/v1/messages/mget":
+		return map[string]any{"data": map[string]any{"items": []any{
+			map[string]any{
+				"message_id": "om_target", "chat_id": "oc_group",
+				"content":     `{"text":"编辑后的提问"}`,
+				"create_time": c.base.Format(time.RFC3339),
+			},
+		}}}, nil
+	case "/open-apis/im/v1/messages":
+		return map[string]any{"data": map[string]any{"items": []any{
+			map[string]any{
+				"message_id": "om_owner_context", "chat_id": "oc_group",
+				"sender":      map[string]any{"id": map[string]any{"open_id": "ou_owner"}},
+				"content":     `{"text":"这条讨论没有回答具体问题"}`,
+				"create_time": c.base.Add(time.Minute).Format(time.RFC3339),
+			},
+			map[string]any{
+				"message_id": "om_target", "chat_id": "oc_group",
+				"content":     `{"text":"编辑后的提问"}`,
+				"create_time": c.base.Format(time.RFC3339),
+			},
+		}}}, nil
+	default:
+		return nil, errors.New("unexpected Lark API path: " + req.Path)
+	}
+}
+
+func TestConversationBuilderIncludesPostTargetDiscussionForDelegatedReply(t *testing.T) {
+	base := time.Date(2026, 7, 29, 5, 0, 0, 0, time.UTC)
+	builder := &conversationBuilder{
+		svc:                serviceim.NewService(delegatedContextCaller{base: base}, "ou_owner"),
+		includeLarkContext: true,
+		base:               agentcontext.Builder{},
+	}
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_target",
+		ChatID:    "oc_group",
+		Content:   "旧提问",
+		CreatedAt: base,
+	})
+	item.WorkKind = domain.WorkKindDirectMention
+
+	bundle, err := builder.Build(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundle.Event.Content != "编辑后的提问" ||
+		len(bundle.Conversation) != 2 ||
+		bundle.Conversation[1].MessageID != "om_owner_context" ||
+		bundle.ContextSelection.Reason != "delegated_post_target_window" {
+		t.Fatalf("bundle=%+v", bundle)
+	}
 }
 
 func TestConversationBuilderContinuesWhenLarkHistoryIsUnavailable(t *testing.T) {
