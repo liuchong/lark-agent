@@ -289,7 +289,7 @@ func TestConfiguredGroupsReplyScopesRequireChatQuery(t *testing.T) {
 	if err := validateLiveReplyScopes(
 		domain.ReplyScopeConfiguredGroups,
 		domain.ReplyScopeConfiguredGroups,
-		"龙虾群",
+		"Acceptance Group",
 	); err != nil {
 		t.Fatalf("configured groups with query rejected: %v", err)
 	}
@@ -306,8 +306,8 @@ func TestConfiguredAssistantChatsResolveEveryPageWithBotIdentity(t *testing.T) {
 	caller := &chatSearchCaller{responses: map[string]map[string]any{
 		"": {
 			"items": []any{map[string]any{"meta_data": map[string]any{
-				"chat_id": "oc_lobster",
-				"name":    "龙虾群🦞",
+				"chat_id": "oc_acceptance",
+				"name":    "Acceptance Group",
 			}}},
 			"has_more":   true,
 			"page_token": "next",
@@ -315,19 +315,19 @@ func TestConfiguredAssistantChatsResolveEveryPageWithBotIdentity(t *testing.T) {
 		"next": {
 			"items": []any{map[string]any{"meta_data": map[string]any{
 				"chat_id": "oc_second",
-				"name":    "第二个配置群",
+				"name":    "Second Configured Group",
 			}}},
 		},
 	}}
 	chatIDs, err := discoverConfiguredAssistantChats(
 		context.Background(),
 		serviceim.NewService(caller, "ou_owner"),
-		"龙虾群",
+		"Acceptance Group",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(chatIDs) != 2 || chatIDs[0] != "oc_lobster" || chatIDs[1] != "oc_second" {
+	if len(chatIDs) != 2 || chatIDs[0] != "oc_acceptance" || chatIDs[1] != "oc_second" {
 		t.Fatalf("chat IDs=%v", chatIDs)
 	}
 	if len(caller.requests) != 2 ||

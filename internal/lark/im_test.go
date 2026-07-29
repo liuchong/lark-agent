@@ -336,7 +336,7 @@ func TestSearchChatsUsesRequestedBotIdentity(t *testing.T) {
 	}}
 	svc := NewService(caller, "ou_owner")
 	if _, err := svc.SearchChats(context.Background(), SearchChatsRequest{
-		Query: "龙虾群",
+		Query: "Acceptance Group",
 		As:    IdentityBot,
 	}); err != nil {
 		t.Fatal(err)

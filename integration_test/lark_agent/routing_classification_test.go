@@ -17,7 +17,7 @@ func TestWorkspaceProductionEntryInvestigationRoutesAsCodingQuestion(t *testing.
 	r := router.New(router.Config{
 		OwnerOpenID:      ownerID,
 		AssistantOpenIDs: []string{botID},
-		AssistantNames:   []string{"测试负责人的智能助手"},
+		AssistantNames:   []string{"Owner Assistant"},
 	})
 
 	tests := []struct {
@@ -42,7 +42,7 @@ func TestWorkspaceProductionEntryInvestigationRoutesAsCodingQuestion(t *testing.
 				ChatID:    "oc_group",
 				ChatType:  "group",
 				SenderID:  ownerID,
-				Mentions:  []domain.Mention{{OpenID: botID, Name: "测试负责人的智能助手"}},
+				Mentions:  []domain.Mention{{OpenID: botID, Name: "Owner Assistant"}},
 				Content:   "@_user_1 " + prompt,
 			},
 		},
@@ -70,7 +70,7 @@ func TestWorkspaceBusinessInvestigationStaysSimpleQuestion(t *testing.T) {
 	r := router.New(router.Config{
 		OwnerOpenID:      ownerID,
 		AssistantOpenIDs: []string{botID},
-		AssistantNames:   []string{"测试负责人的智能助手"},
+		AssistantNames:   []string{"Owner Assistant"},
 	})
 	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID:     "om_business",

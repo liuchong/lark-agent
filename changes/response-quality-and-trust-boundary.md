@@ -376,6 +376,6 @@ Only the enforced owner/non-owner boundary is user-visible.
 
 Stop when focused red/green tests, all `integration_test/`, `go test -race
 ./...`, `go vet ./...`, lint, module-boundary checks, independent review, commit,
-installation, and bounded international Lark validation in only “测试负责人的智能助手”
-and “龙虾群🦞” have completed. Do not send validation messages to Backend Dev
-Team or Example Group.
+installation, and bounded international Lark validation in only the explicitly
+authorized assistant P2P and acceptance group have completed. Do not send
+validation messages to any other chat.
