@@ -1981,10 +1981,8 @@ func (s *Store) DecideAction(id int64, approve bool) error {
 	}
 	defer tx.Rollback() //nolint:errcheck
 	actionStatus := domain.ActionReady
-	workStatus := domain.StatusReceived
 	if !approve {
 		actionStatus = domain.ActionCancelled
-		workStatus = domain.StatusCancelled
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	var workItemID int64
@@ -2000,11 +1998,55 @@ func (s *Store) DecideAction(id int64, approve bool) error {
 		}
 		return errs.NewInternalError(errs.SubtypeStorage, "update approval decision").WithCause(err)
 	}
-	if _, err := tx.Exec(
-		`UPDATE work_items SET status = ?, lease_by = NULL, lease_time = NULL,
-		        next_attempt_at = NULL, updated_at = ? WHERE id = ?`,
-		workStatus, now, workItemID); err != nil {
-		return errs.NewInternalError(errs.SubtypeStorage, "update approved work item").WithCause(err)
+	if approve {
+		var sessionID, sessionStatus string
+		sessionErr := tx.QueryRow(
+			`SELECT id, status FROM online_sessions
+			 WHERE status IN (?, ?)
+			 ORDER BY started_at DESC, id DESC LIMIT 1`,
+			domain.OnlineSessionStarting,
+			domain.OnlineSessionReady,
+		).Scan(&sessionID, &sessionStatus)
+		switch {
+		case sessionErr == nil && domain.OnlineSessionStatus(sessionStatus) == domain.OnlineSessionReady:
+			if _, err := tx.Exec(
+				`UPDATE work_items
+				 SET status = ?, session_id = ?, lease_by = NULL, lease_time = NULL,
+				     next_attempt_at = NULL, updated_at = ?
+				 WHERE id = ?`,
+				domain.StatusReceived, sessionID, now, workItemID,
+			); err != nil {
+				return errs.NewInternalError(errs.SubtypeStorage, "assign approved work to ready session").WithCause(err)
+			}
+			if _, err := tx.Exec(
+				`UPDATE work_interruptions SET resumed_at = ?
+				 WHERE work_item_id = ? AND resumed_at IS NULL`,
+				now, workItemID,
+			); err != nil {
+				return errs.NewInternalError(errs.SubtypeStorage, "close approved work interruption").WithCause(err)
+			}
+		case errors.Is(sessionErr, sql.ErrNoRows),
+			sessionErr == nil && domain.OnlineSessionStatus(sessionStatus) == domain.OnlineSessionStarting:
+			if _, err := tx.Exec(
+				`UPDATE work_items
+				 SET status = ?, lease_by = NULL, lease_time = NULL,
+				     next_attempt_at = NULL, updated_at = ?
+				 WHERE id = ?`,
+				domain.StatusInterrupted, now, workItemID,
+			); err != nil {
+				return errs.NewInternalError(errs.SubtypeStorage, "pause approved work without ready session").WithCause(err)
+			}
+		default:
+			return errs.NewInternalError(errs.SubtypeStorage, "locate ready session for approval").WithCause(sessionErr)
+		}
+	} else {
+		if _, err := tx.Exec(
+			`UPDATE work_items SET status = ?, lease_by = NULL, lease_time = NULL,
+			        next_attempt_at = NULL, updated_at = ? WHERE id = ?`,
+			domain.StatusCancelled, now, workItemID,
+		); err != nil {
+			return errs.NewInternalError(errs.SubtypeStorage, "cancel rejected work item").WithCause(err)
+		}
 	}
 	goalStatus := domain.CodingGoalActive
 	if !approve {

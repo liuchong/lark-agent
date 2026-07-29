@@ -90,7 +90,8 @@ Messages received while the service is offline and work that already entered
 model, approval, or action stages are never replayed automatically. Pristine
 owner-wait items may be freshly re-read after restart. Use queue inspect to see
 the last durable stage and queue resume to continue one exact interrupted
-message. 跨重启任务不会自动回放旧草稿或外部动作。
+message. After audit, use queue cancel with a required reason to durably close
+stale work without deleting history or sending a message. 跨重启任务不会自动回放旧草稿或外部动作。
 Intentional shutdown and every successfully ready session are reported through
 the assistant bot's private chat.
 
@@ -2106,13 +2107,66 @@ func newQueueCommand(out io.Writer, configPath, statePath *string) *cobra.Comman
 	cmd.AddCommand(newQueueBackfillCommand(out, configPath, statePath))
 	cmd.AddCommand(newQueueRetryCommand(out, statePath))
 	cmd.AddCommand(newQueueExportCommand(out, statePath))
-	cmd.AddCommand(&cobra.Command{
+	cmd.AddCommand(newQueueCancelCommand(out, statePath))
+	return cmd
+}
+
+func newQueueCancelCommand(out io.Writer, statePath *string) *cobra.Command {
+	var workItemIDs []int64
+	var messageIDs []string
+	var allInterrupted bool
+	var keepWorkItemIDs []int64
+	var reason string
+	cmd := &cobra.Command{
 		Use:   "cancel",
-		Short: "cancel queued work",
+		Short: "Durably cancel audited queue work",
+		Long: "Durably cancel exact work/message IDs, or all interrupted work except " +
+			"explicitly kept IDs. The command requires an audit reason, never deletes " +
+			"history, never sends a Lark message, and fails atomically for running or " +
+			"result-uncertain actions.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return writeData(out, map[string]any{"action": "cancel", "changed": 0})
+			if strings.TrimSpace(reason) == "" {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"queue cancel requires --reason",
+				).WithParam("--reason")
+			}
+			hasExact := len(workItemIDs) > 0 || len(messageIDs) > 0
+			if allInterrupted == hasExact {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"queue cancel requires either exact ids or --all-interrupted",
+				)
+			}
+			if !allInterrupted && len(keepWorkItemIDs) > 0 {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"--keep-work-id requires --all-interrupted",
+				).WithParam("--keep-work-id")
+			}
+			store, err := storage.OpenInspection(resolveStatePath(*statePath))
+			if err != nil {
+				return err
+			}
+			defer store.Close() //nolint:errcheck // bounded queue repair command
+			result, err := store.CancelWork(cmd.Context(), domain.CancelWorkRequest{
+				WorkItemIDs:     workItemIDs,
+				MessageIDs:      messageIDs,
+				AllInterrupted:  allInterrupted,
+				KeepWorkItemIDs: keepWorkItemIDs,
+				Reason:          reason,
+			})
+			if err != nil {
+				return err
+			}
+			return writeData(out, result)
 		},
-	})
+	}
+	cmd.Flags().Int64SliceVar(&workItemIDs, "work-id", nil, "exact durable work item id; repeat for multiple items")
+	cmd.Flags().StringSliceVar(&messageIDs, "message-id", nil, "exact Lark message id; repeat for multiple messages")
+	cmd.Flags().BoolVar(&allInterrupted, "all-interrupted", false, "cancel every interrupted item except kept work ids")
+	cmd.Flags().Int64SliceVar(&keepWorkItemIDs, "keep-work-id", nil, "interrupted work id to keep; requires --all-interrupted")
+	cmd.Flags().StringVar(&reason, "reason", "", "required operator audit reason")
 	return cmd
 }
 

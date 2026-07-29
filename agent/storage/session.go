@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -1068,6 +1070,287 @@ func (s *Store) ResumeWork(
 		).WithCause(err)
 	}
 	return s.InspectWork(ctx, domain.WorkInspectionQuery{WorkItemID: item.ID})
+}
+
+// CancelWork durably closes operator-audited queue items without deleting
+// their receipts, runs, steps, decisions, actions, or interruption history.
+func (s *Store) CancelWork(
+	ctx context.Context,
+	request domain.CancelWorkRequest,
+) (domain.CancelWorkResult, error) {
+	reason := strings.TrimSpace(request.Reason)
+	hasExact := len(request.WorkItemIDs) > 0 || len(request.MessageIDs) > 0
+	switch {
+	case reason == "":
+		return domain.CancelWorkResult{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"queue cancellation requires a reason",
+		).WithParam("reason")
+	case request.AllInterrupted && hasExact:
+		return domain.CancelWorkResult{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"all-interrupted cannot be combined with exact work or message ids",
+		)
+	case !request.AllInterrupted && !hasExact:
+		return domain.CancelWorkResult{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"queue cancellation requires exact ids or all-interrupted",
+		)
+	case !request.AllInterrupted && len(request.KeepWorkItemIDs) > 0:
+		return domain.CancelWorkResult{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"keep-work-id requires all-interrupted",
+		)
+	}
+	for _, id := range append(append([]int64{}, request.WorkItemIDs...), request.KeepWorkItemIDs...) {
+		if id <= 0 {
+			return domain.CancelWorkResult{}, errs.NewValidationError(
+				errs.SubtypeInvalidArgument,
+				"work ids must be positive",
+			).WithParam("work_item_id")
+		}
+	}
+	for _, messageID := range request.MessageIDs {
+		if strings.TrimSpace(messageID) == "" {
+			return domain.CancelWorkResult{}, errs.NewValidationError(
+				errs.SubtypeInvalidArgument,
+				"message ids must not be blank",
+			).WithParam("message_id")
+		}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.CancelWorkResult{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin queue cancellation",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE work_items SET updated_at = updated_at WHERE id = -1`); err != nil {
+		return domain.CancelWorkResult{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"acquire queue cancellation write lock",
+		).WithCause(err)
+	}
+
+	selected := make(map[int64]struct{})
+	if request.AllInterrupted {
+		kept := make(map[int64]struct{}, len(request.KeepWorkItemIDs))
+		for _, id := range request.KeepWorkItemIDs {
+			kept[id] = struct{}{}
+		}
+		rows, err := tx.QueryContext(ctx,
+			`SELECT id FROM work_items WHERE status = ? ORDER BY id`,
+			domain.StatusInterrupted,
+		)
+		if err != nil {
+			return domain.CancelWorkResult{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"list interrupted work for cancellation",
+			).WithCause(err)
+		}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return domain.CancelWorkResult{}, errs.NewInternalError(
+					errs.SubtypeStorage,
+					"scan interrupted work for cancellation",
+				).WithCause(err)
+			}
+			if _, keep := kept[id]; !keep {
+				selected[id] = struct{}{}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return domain.CancelWorkResult{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"iterate interrupted work cancellation list",
+			).WithCause(err)
+		}
+		if err := rows.Close(); err != nil {
+			return domain.CancelWorkResult{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"close interrupted work cancellation list",
+			).WithCause(err)
+		}
+	} else {
+		for _, id := range request.WorkItemIDs {
+			selected[id] = struct{}{}
+		}
+		for _, rawMessageID := range request.MessageIDs {
+			messageID := strings.TrimSpace(rawMessageID)
+			var id int64
+			err := tx.QueryRowContext(ctx,
+				`SELECT work_item_id FROM intake_receipts
+				 WHERE message_id = ? AND work_item_id IS NOT NULL
+				 ORDER BY observed_at DESC, id DESC LIMIT 1`,
+				messageID,
+			).Scan(&id)
+			if errors.Is(err, sql.ErrNoRows) {
+				return domain.CancelWorkResult{}, errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"message has no durable work item",
+				).WithParam("message_id")
+			}
+			if err != nil {
+				return domain.CancelWorkResult{}, errs.NewInternalError(
+					errs.SubtypeStorage,
+					"resolve cancellation message id",
+				).WithCause(err)
+			}
+			selected[id] = struct{}{}
+		}
+	}
+
+	ids := make([]int64, 0, len(selected))
+	for id := range selected {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		var status string
+		if err := tx.QueryRowContext(ctx,
+			`SELECT status FROM work_items WHERE id = ?`, id,
+		).Scan(&status); errors.Is(err, sql.ErrNoRows) {
+			return domain.CancelWorkResult{}, errs.NewValidationError(
+				errs.SubtypeInvalidArgument,
+				"work item was not found",
+			).WithParam("work_item_id")
+		} else if err != nil {
+			return domain.CancelWorkResult{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"read work selected for cancellation",
+			).WithCause(err)
+		}
+		if !isCancellationSafeStatus(domain.WorkItemStatus(status)) {
+			return domain.CancelWorkResult{}, errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"work item %d is not safely cancellable from status %s",
+				id,
+				status,
+			)
+		}
+		var executingActions, uncertainInterruptions int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT
+				(SELECT COUNT(*) FROM action_attempts
+				 WHERE work_item_id = ? AND status = ?),
+				(SELECT COUNT(*) FROM work_interruptions
+				 WHERE work_item_id = ? AND resumed_at IS NULL AND action_status = ?)`,
+			id, domain.ActionExecuting, id, domain.ActionExecuting,
+		).Scan(&executingActions, &uncertainInterruptions); err != nil {
+			return domain.CancelWorkResult{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"check cancellation action safety",
+			).WithCause(err)
+		}
+		if executingActions > 0 || uncertainInterruptions > 0 {
+			return domain.CancelWorkResult{}, errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"work item %d has an executing or result-uncertain external action",
+				id,
+			)
+		}
+	}
+
+	now := time.Now().UTC()
+	nowRaw := now.Format(time.RFC3339Nano)
+	requestJSON, err := json.Marshal(map[string]string{"reason": reason})
+	if err != nil {
+		return domain.CancelWorkResult{}, errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"encode queue cancellation audit",
+		).WithCause(err)
+	}
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE action_attempts
+			 SET status = ?, error = ?, updated_at = ?
+			 WHERE work_item_id = ? AND status IN (?, ?)`,
+			domain.ActionCancelled, "operator cancelled: "+reason, nowRaw, id,
+			domain.ActionAwaitingApproval, domain.ActionReady,
+		); err != nil {
+			return domain.CancelWorkResult{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"cancel unsent work actions",
+			).WithCause(err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE work_items
+			 SET status = ?, lease_by = NULL, lease_time = NULL,
+			     next_attempt_at = NULL, updated_at = ?
+			 WHERE id = ?`,
+			domain.StatusCancelled, nowRaw, id,
+		); err != nil {
+			return domain.CancelWorkResult{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"cancel durable work item",
+			).WithCause(err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE coding_goals SET status = ?, updated_at = ?
+			 WHERE work_item_id = ?`,
+			domain.CodingGoalBlocked, nowRaw, id,
+		); err != nil {
+			return domain.CancelWorkResult{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"block cancelled coding goal",
+			).WithCause(err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE work_interruptions SET resumed_at = ?
+			 WHERE work_item_id = ? AND resumed_at IS NULL`,
+			nowRaw, id,
+		); err != nil {
+			return domain.CancelWorkResult{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"close cancelled work interruption",
+			).WithCause(err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO action_attempts(
+				work_item_id, kind, idempotency_key, status, request_json,
+				created_at, updated_at
+			 ) VALUES (?, 'operator_cancel', ?, ?, ?, ?, ?)`,
+			id, fmt.Sprintf("operator_cancel:%d:%s", id, nowRaw),
+			domain.ActionCompleted, string(requestJSON), nowRaw, nowRaw,
+		); err != nil {
+			return domain.CancelWorkResult{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"record queue cancellation audit",
+			).WithCause(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.CancelWorkResult{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit queue cancellation",
+		).WithCause(err)
+	}
+	return domain.CancelWorkResult{
+		Changed:              len(ids),
+		CancelledWorkItemIDs: ids,
+		Reason:               reason,
+	}, nil
+}
+
+func isCancellationSafeStatus(status domain.WorkItemStatus) bool {
+	switch status {
+	case domain.StatusReceived,
+		domain.StatusRouted,
+		domain.StatusWaitingUser,
+		domain.StatusReady,
+		domain.StatusAwaitingApproval,
+		domain.StatusRetryWait,
+		domain.StatusInterrupted:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Store) getWorkItem(ctx context.Context, id int64) (domain.WorkItem, error) {

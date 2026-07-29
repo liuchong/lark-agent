@@ -94,12 +94,15 @@ lark-agent mode auto
 lark-agent queue summary
 lark-agent queue inspect --message-id om_xxx
 lark-agent queue resume --message-id om_xxx
+lark-agent queue cancel --work-id 123 --reason "superseded"
+lark-agent queue cancel --all-interrupted --keep-work-id 456 --reason "audited stale work"
 lark-agent github auth status
 ```
 
 离线积压和中断工作只有在指定 work ID 或 message ID 后才可恢复。已经完成、忽略、
 取消或进入死信的终态工作还必须明确加 `--force-terminal`。结果不确定的外部动作
-不会自动重发。
+不会自动重发。审核后确认无用的历史工作使用 `queue cancel` 做可审计取消；命令保留
+全部历史记录，不发送 Lark 消息，也不会取消正在执行或结果不确定的动作。
 
 ## GitHub 与 Lark
 

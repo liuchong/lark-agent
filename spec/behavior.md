@@ -658,6 +658,12 @@ bounded SQLite interval and then atomically update the exact action and work
 item. They must not establish a stale read snapshot before requesting the write
 lock, because a normal concurrent daemon write must not make an operator
 decision fail with a snapshot-upgrade error.
+An approval for work owned by an older session is assigned only when the newest
+active online session is `ready`; that session owns the work before it becomes
+`received`. If the newest active session is still starting, or no active
+session exists, the exact action becomes `ready` but the work remains
+`interrupted` until an explicit `queue resume`. Approval never creates
+apparently runnable work owned by a stopped or superseded session.
 
 Operators use `queue inspect --work-id <id>` or
 `queue inspect --message-id <id>` to
@@ -666,6 +672,16 @@ completed, including the exact last durable stage and any uncertain external
 action. `queue resume` is the only normal path that makes interrupted or
 offline-backlog work claimable in a later session. Replaying an already terminal
 item requires an additional explicit force flag.
+After an operator audits historical interrupted work, `queue cancel` can
+durably close exact work/message IDs or all interrupted work except explicit
+`--keep-work-id` selections. Every cancellation requires an operator reason,
+preserves receipts, runs, steps, decisions, and action history, and appends a
+completed `operator_cancel` audit action. It also cancels unsent approval/ready
+actions and closes unresolved interruption snapshots. The command is atomic
+and fails without mutation if any selected item is running, already terminal,
+has an executing action, or has an unresolved interruption that observed an
+executing external action. It never sends Lark messages or physically deletes
+history.
 Messages that were never observed because user-token polling was not configured
 have no queue receipt; for those, operators use `queue backfill --chat-query
 <query> --since <time> --until <time>` to create bounded intake records first.
@@ -1292,6 +1308,20 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given the owner explicitly resumes one interrupted or offline-backlog
   message, when the current session claims it, then a new run uses current
   evidence while preserving the prior audit timeline.
+- Given an operator has audited interrupted historical work, when
+  `queue cancel --all-interrupted` includes explicit kept work IDs and a
+  non-empty reason, then every other safe interrupted item becomes cancelled,
+  unsent approvals are cancelled, unresolved interruption snapshots are
+  closed, and a durable operator-reason action is recorded without deleting
+  history or sending a message.
+- Given any selected cancellation item is running or has an executing or
+  result-uncertain external action, when cancellation is requested, then the
+  whole batch fails without changing any selected work.
+- Given an approval belongs to an older session and a newer daemon session is
+  ready, when the owner approves the exact action, then its work is assigned to
+  the newer session as received; given the newest session is still starting or
+  no session is active, the approved action remains ready while the work stays
+  interrupted until explicit resume.
 - Given user-token polling was unavailable and the owner later authorizes it,
   when the owner runs `queue backfill` with a bounded chat and time range, then
   only matching @Owner messages are recorded through normal intake and the

@@ -56,6 +56,25 @@ lark-agent queue resume --work-id 123 --force-terminal
 中断时正在执行的 shell、回复、Owner 通知或生命周期通知属于结果不确定的外部
 动作。系统不会自动重发；Owner 必须先根据飞书和本地审计证据确认实际结果。
 
+## 审核后取消
+
+确认历史工作已经过期、被后续讨论取代、错误入队或只是验收样例后，做可审计取消：
+
+```bash
+lark-agent queue cancel --work-id 123 --reason "superseded by later discussion"
+lark-agent queue cancel --message-id om_xxx --reason "misclassified owner message"
+lark-agent queue cancel --all-interrupted \
+  --keep-work-id 4387 \
+  --keep-work-id 4670 \
+  --reason "audited stale, superseded, or test work"
+```
+
+`--all-interrupted` 只选择当前中断项，`--keep-work-id` 保留审核后仍要继续的工作。
+命令原子执行：任一选中项正在处理、正在执行外部动作或外部动作结果不确定时，整批
+不改变。成功取消会保留消息回执、模型步骤、原决定和动作历史，取消尚未发送的审批
+草稿，关闭中断记录并写入包含 `--reason` 的 `operator_cancel` 审计动作；不会删除
+数据库记录，也不会发送 Lark 消息。
+
 ## 授权缺失后的显式补录
 
 如果 user token 曾经缺失，用户身份轮询无法读取群里 @Owner 的消息，这些消息没有
@@ -86,6 +105,9 @@ lark-agent approval reject ACTION_ID
 常驻 daemon 正在短暂写入状态库时，审批命令会在 SQLite 的 5 秒有界等待内取得写锁
 并原子更新动作与工作项；不会因为先建立旧读快照再升级写事务而失败。写锁超过等待
 上限仍会明确报错，失败时不得假定审批已经生效。
+旧会话草稿获批时，只有最新活动会话已经 ready，工作才会迁移到该会话继续处理。
+最新会话仍在 starting 或没有活动会话时，草稿保持 ready、工作保持 interrupted，
+需要服务 ready 后再对该 work ID 执行 `queue resume`。
 审批记录同时保存原请求的回复身份：`@机器人` 和 Owner 私聊草稿获批后仍由机器人
 回复；他人 `@Owner` 的代回复草稿获批后仍由用户身份回复。批准正文不会改变原消息
 是发给机器人还是发给 Owner 的事实。升级前创建的旧审批会从工作项原始决策恢复该

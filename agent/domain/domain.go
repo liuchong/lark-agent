@@ -682,6 +682,22 @@ type ResumeWorkRequest struct {
 	ForceTerminal bool   `json:"force_terminal,omitempty" yaml:"force_terminal,omitempty"`
 }
 
+// CancelWorkRequest selects audited queue work for durable cancellation.
+type CancelWorkRequest struct {
+	WorkItemIDs     []int64  `json:"work_item_ids,omitempty" yaml:"work_item_ids,omitempty"`
+	MessageIDs      []string `json:"message_ids,omitempty" yaml:"message_ids,omitempty"`
+	AllInterrupted  bool     `json:"all_interrupted,omitempty" yaml:"all_interrupted,omitempty"`
+	KeepWorkItemIDs []int64  `json:"keep_work_item_ids,omitempty" yaml:"keep_work_item_ids,omitempty"`
+	Reason          string   `json:"reason" yaml:"reason"`
+}
+
+// CancelWorkResult reports the exact durable work closed by an operator.
+type CancelWorkResult struct {
+	Changed              int     `json:"changed" yaml:"changed"`
+	CancelledWorkItemIDs []int64 `json:"cancelled_work_item_ids" yaml:"cancelled_work_item_ids"`
+	Reason               string  `json:"reason" yaml:"reason"`
+}
+
 // WorkInspectionState gives direct answers for the durable lifecycle facts
 // most useful to operators and automation.
 type WorkInspectionState struct {

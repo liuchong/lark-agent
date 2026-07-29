@@ -638,6 +638,9 @@ func testApprovedReplyOutcome(
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
+	if _, err := store.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	mentions := []domain.Mention{{OpenID: "ou_owner", Name: "测试负责人"}}
 	if relevance == domain.RelevanceAssistantRequest {
 		mentions = []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}}
@@ -1084,6 +1087,8 @@ func TestBehaviorSpecDocumentsCodingAssistanceContract(t *testing.T) {
 		"`interrupted`",
 		"`queue inspect --work-id <id>`",
 		"`queue resume`",
+		"`queue cancel`",
+		"`operator_cancel`",
 		"never blindly repeated",
 		"private offline notice",
 		"private online notice",
@@ -1143,6 +1148,9 @@ func TestApprovalCommandRoundTrip(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "state.db")
 	store, err := storage.Open(state)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkCurrentSessionReady(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	event := domain.NormalizedEvent{MessageID: "om_integration_approval", Content: "run formatter"}

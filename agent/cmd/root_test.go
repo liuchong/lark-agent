@@ -779,9 +779,90 @@ func TestQueueSummaryCommandReportsFastPathLane(t *testing.T) {
 	}
 }
 
+func TestQueueCancelRequiresReasonAndCancelsInterruptedExceptKept(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	first, err := storage.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, messageID := range []string{"om_cmd_cancel", "om_cmd_keep"} {
+		if _, err := first.EnqueueEvent(domain.NormalizedEvent{
+			MessageID: messageID,
+			Content:   messageID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := first.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cancelID, keepID int64
+	for _, item := range items {
+		switch item.Event.MessageID {
+		case "om_cmd_cancel":
+			cancelID = item.ID
+		case "om_cmd_keep":
+			keepID = item.ID
+		}
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	current, err := storage.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = current.Close() })
+
+	var out, errOut bytes.Buffer
+	code := Execute(strings.NewReader(""), &out, &errOut, []string{
+		"--state", statePath, "queue", "cancel", "--all-interrupted",
+	})
+	if code == 0 || !strings.Contains(errOut.String(), "--reason") {
+		t.Fatalf("missing reason code=%d stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Execute(strings.NewReader(""), &out, &errOut, []string{
+		"--state", statePath, "queue", "cancel", "--all-interrupted",
+		"--keep-work-id", strconv.FormatInt(keepID, 10),
+		"--reason", "audited stale command fixture",
+	})
+	if code != 0 {
+		t.Fatalf("cancel code=%d stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), `"changed":1`) ||
+		!strings.Contains(out.String(), strconv.FormatInt(cancelID, 10)) {
+		t.Fatalf("cancel output=%s", out.String())
+	}
+	items, err = current.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		switch item.ID {
+		case cancelID:
+			if item.Status != domain.StatusCancelled {
+				t.Fatalf("cancelled item=%+v", item)
+			}
+		case keepID:
+			if item.Status != domain.StatusInterrupted {
+				t.Fatalf("kept item=%+v", item)
+			}
+		}
+	}
+}
+
 func TestQueueExposesExplicitInspectAndResumeCommands(t *testing.T) {
 	root := NewRootCommand(strings.NewReader(""), &bytes.Buffer{})
-	for _, path := range [][]string{{"queue", "inspect"}, {"queue", "resume"}, {"queue", "backfill"}} {
+	for _, path := range [][]string{
+		{"queue", "inspect"},
+		{"queue", "resume"},
+		{"queue", "backfill"},
+		{"queue", "cancel"},
+	} {
 		command, _, err := root.Find(path)
 		if err != nil {
 			t.Fatalf("find %v: %v", path, err)

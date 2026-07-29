@@ -897,6 +897,9 @@ func TestDecideActionWaitsForConcurrentWriterWithoutSnapshotFailure(t *testing.T
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = daemonStore.Close() })
+			if _, err := daemonStore.MarkCurrentSessionReady(context.Background()); err != nil {
+				t.Fatal(err)
+			}
 			operatorStore, err := OpenInspection(statePath)
 			if err != nil {
 				t.Fatal(err)
