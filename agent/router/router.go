@@ -143,6 +143,10 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 		}
 		return decision, nil
 	}
+	if item.Event.SenderID == r.cfg.OwnerOpenID {
+		decision.Reason = "owner_message_without_assistant_invocation"
+		return decision, nil
+	}
 	if item.Event.MentionsUser(r.cfg.OwnerOpenID) {
 		if !groupScopeAllows(r.cfg.ReplyScope, item.Event) {
 			decision.Reason = "outside_reply_scope"

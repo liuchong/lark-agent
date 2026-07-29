@@ -211,6 +211,9 @@ func (p *Poller) Backfill(ctx context.Context, req BackfillRequest) (BackfillRes
 			if err != nil {
 				return result, err
 			}
+			if discardBeforeIntake(decision) {
+				continue
+			}
 			item.WorkKind = decision.WorkKind
 			item.Priority = decision.Priority
 			p.applyDelegatedWait(&item, decision)
@@ -393,6 +396,9 @@ func (p *Poller) Poll(ctx context.Context) (Result, error) {
 			if err != nil {
 				return result, err
 			}
+			if discardBeforeIntake(decision) {
+				continue
+			}
 			item.WorkKind = decision.WorkKind
 			item.Priority = decision.Priority
 			p.applyDelegatedWait(&item, decision)
@@ -409,6 +415,11 @@ func (p *Poller) Poll(ctx context.Context) (Result, error) {
 		return result, err
 	}
 	return result, nil
+}
+
+func discardBeforeIntake(decision domain.Decision) bool {
+	return decision.Kind == domain.DecisionIgnore &&
+		decision.Reason == "owner_message_without_assistant_invocation"
 }
 
 func (p *Poller) applyDelegatedWait(item *domain.WorkItem, decision domain.Decision) {

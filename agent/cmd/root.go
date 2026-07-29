@@ -1598,6 +1598,10 @@ func (r liveDelegatedReplyResolver) Resolve(
 	ctx context.Context,
 	item domain.WorkItem,
 ) (replymatch.Resolution, error) {
+	ownerWait := r.ownerWait
+	if ownerWait <= 0 {
+		ownerWait = 3 * time.Minute
+	}
 	pending, err := r.store.ListPendingDelegatedWork(item.Event.ChatID)
 	if err != nil {
 		return replymatch.Resolution{}, err
@@ -1610,6 +1614,9 @@ func (r liveDelegatedReplyResolver) Resolve(
 		if since.IsZero() || candidate.Event.CreatedAt.Before(since) {
 			since = candidate.Event.CreatedAt
 		}
+	}
+	if !since.IsZero() {
+		since = since.Add(-ownerWait)
 	}
 	maxMessages := r.maxMessages
 	if maxMessages <= 0 {
@@ -1654,10 +1661,6 @@ func (r liveDelegatedReplyResolver) Resolve(
 		if event, ok := latest[pending[index].Event.MessageID]; ok {
 			pending[index].Event = event
 		}
-	}
-	ownerWait := r.ownerWait
-	if ownerWait <= 0 {
-		ownerWait = 3 * time.Minute
 	}
 	if !target.Event.UpdatedAt.IsZero() &&
 		target.Event.UpdatedAt.After(target.Event.CreatedAt) {
@@ -1972,7 +1975,8 @@ func (s *liveThreadState) OwnerAlreadyReplied(
 			return false, err
 		}
 	}
-	return resolution.Result == replymatch.ResultAnswered, nil
+	return resolution.Result == replymatch.ResultAnswered ||
+		resolution.Result == replymatch.ResultNoReplyNeeded, nil
 }
 
 func (s *liveThreadState) MessageWithdrawn(

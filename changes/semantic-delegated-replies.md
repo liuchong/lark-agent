@@ -3,10 +3,11 @@
 ## Goal
 
 The delegated-reply workflow covers every allowed group message that mentions
-the configured owner and every inbound human private message to the owner. It
-waits three minutes before doing reply work, then uses same-chat semantics to
-decide which pending requests the owner actually answered. Only requests that
-remain unanswered may enter the read-only reply workflow.
+the configured owner and evaluates every inbound human private message to the
+owner as a semantic candidate. It waits three minutes before doing reply work,
+then uses same-chat semantics to decide which messages need an owner response
+and which pending requests the owner actually handled. Only requests that still
+need a response may enter the read-only reply workflow.
 
 ## Directly Applicable Rules
 
@@ -33,29 +34,39 @@ Every delegated candidate is a normal durable `WorkItem` with:
 - one or more immutable semantic-resolution audit rows.
 
 Each resolution row records the target work item, result
-`answered|unanswered|ambiguous`, matched owner message IDs, confidence,
-context cutoff, reason, and evaluation time. It contains message IDs and
-digests, not credentials or unbounded message bodies.
+`answered|unanswered|no_reply_needed|ambiguous`, matched owner message IDs,
+confidence, context cutoff, reason, and evaluation time. It contains message
+IDs and digests, not credentials or unbounded message bodies.
 
 ### Decision Rules
 
-1. Bot/app messages, owner-authored messages, blocked senders/chats, and
-   non-owner messages sent directly to the assistant bot do not become
-   delegated candidates.
+1. Bot/app messages, owner-authored non-assistant messages, blocked
+   senders/chats, and non-owner messages sent directly to the assistant bot do
+   not become delegated candidates. Polling drops an owner-authored
+   non-assistant message before durable intake, so later lexical relevance
+   inference cannot re-admit it.
 2. An allowed group `@Owner` or inbound human P2P message enters
    `waiting_user`. Assistant-facing owner requests remain immediate.
 3. Waiting work is not claimable before `next_attempt_at`; no worker, lease, or
    main reply-model call is held during the grace period.
 4. At the deadline, the resolver reads a bounded, paginated same-chat window
-   containing the target, related pending targets, intervening discussion, and
-   owner-authored messages after the target.
+   containing one owner-wait interval before the earliest pending target, the
+   target, related pending targets, intervening discussion, and owner-authored
+   messages after the target. This pre-target slice lets the resolver
+   distinguish a new request from an answer to a question initiated by the
+   owner.
 5. Reply/thread relations and adjacency are evidence, not a terminal answer.
-   The resolver must decide whether owner content substantively answers the
-   exact target.
+   The resolver must decide whether owner content substantively handles the
+   exact target. For an ordinary private message without explicit `@Owner`, it
+   also decides whether the message reasonably requires any response.
 6. A high-confidence `answered` result cancels only that target. A
-   high-confidence `unanswered` result admits only that target to reply work.
-   `ambiguous`, malformed, unavailable, or low-confidence results fail closed
-   and return the target to `waiting_user` for a bounded retry.
+   high-confidence `no_reply_needed` result cancels an answer to an
+   owner-initiated question, acknowledgement, reaction, or ordinary
+   conversational continuation that adds no new request. Explicit group
+   `@Owner` work cannot use this result. A high-confidence `unanswered` result
+   admits only that target to reply work. `ambiguous`, malformed, unavailable,
+   or low-confidence results fail closed and return the target to
+   `waiting_user` for a bounded retry.
 7. The main reply context includes post-target discussion, while the verified
    semantic-resolution record remains in the audit ledger. The reply must still satisfy the existing useful-work,
    evidence, commitment, and non-owner read-only gates.
@@ -69,6 +80,7 @@ digests, not credentials or unbounded message bodies.
 `received -> waiting_user -> processing`
 
 - `answered -> cancelled(owner_semantically_replied)`
+- `no_reply_needed -> cancelled(delegated_reply_not_needed)`
 - `unanswered -> routed/model -> reply|record|notify|approval`
 - `ambiguous/error -> waiting_user(next semantic retry)`
 - `withdrawn -> cancelled(message_withdrawn)`
@@ -119,11 +131,35 @@ when less than three minutes have elapsed,
 then the item remains `waiting_user`,
 and neither semantic nor reply model is called.
 
-### Scenario: Every inbound human private message is eligible
+### Scenario: Every inbound human private message is evaluated
 
 Given an inbound human P2P message to the owner that is not the assistant chat,
 when private reply scope is `all_private`,
-then it follows the delegated waiting and reply path.
+then it follows the delegated waiting and semantic-evaluation path, and only an
+outstanding response need may continue to reply work.
+
+### Scenario: Owner-authored human private message never becomes delegated work
+
+Given the owner asks another human a question in private chat,
+when user-token polling sees that outgoing message,
+then it is discarded before durable intake,
+and inferred relevance cannot send a reply to the owner's own message.
+
+### Scenario: Answer to owner-led discussion needs no synthetic reply
+
+Given another human answers an owner-initiated private-chat question without a
+new request and the owner continues the same discussion,
+when the semantic deadline is evaluated,
+then the resolver returns `no_reply_needed`,
+and no reply-model call or sender-facing reply occurs.
+
+### Scenario: Genuine unanswered private request remains eligible
+
+Given another human privately asks a new question or makes a request that the
+owner has not handled,
+when the semantic deadline is evaluated,
+then the resolver returns `unanswered` and the read-only delegated workflow may
+continue.
 
 ### Scenario: Non-owner assistant invocation stays silent
 

@@ -114,9 +114,13 @@ The model has two explicit Lark roles. An `assistant_request` answers the
 configured owner when that owner natively mentions the assistant in an allowed
 group, using bot identity. A `direct_mention` acts on behalf of the configured
 human owner when another human mentions that owner, using the delegated-reply
-policy. An inbound human P2P message to the owner is a `private_message` and
-uses that same delegated-reply identity and policy. A private `owner_request`
-answers the configured owner's own assistant prompt using bot identity.
+policy. An inbound human P2P message to the owner is a `private_message`
+candidate and uses that same delegated-reply identity and policy only when the
+semantic gate finds an outstanding conversational need for an owner response.
+A private answer to an owner-initiated question, acknowledgement, reaction, or
+ordinary continuation with no new request may be `no_reply_needed`. A private
+`owner_request` answers the configured owner's own assistant prompt using bot
+identity.
 Non-owner private messages addressed to the assistant and non-owner native
 assistant mentions are ignored before model work. A direct owner mention is
 addressed to this personal-assistant
@@ -136,14 +140,22 @@ latest edit time plus `policy.owner_wait`, whose default is three minutes.
 Waiting does not hold a worker, lease, or completed reply draft.
 
 At the deadline, a tool-free semantic resolver reads a paginated, bounded
-same-chat window containing the target, related pending targets, intervening
-discussion, and owner-authored messages after the target. It evaluates each
-target independently. Reply/thread relations, adjacency, and the mere presence
-of a later owner message are evidence but do not prove that the owner answered
-the target. A high-confidence semantic answer cancels only the matched target;
-a high-confidence unanswered result admits only that target to the delegated
-agent loop. Ambiguous, malformed, low-confidence, truncated, or unavailable
-resolution fails closed and retries after the configured semantic retry delay.
+same-chat window containing a short pre-target conversation-direction window,
+the target, related pending targets, intervening discussion, and owner-authored
+messages after the target. It evaluates each target independently. Reply/thread
+relations, adjacency, and the mere presence of a later owner message are
+evidence but do not prove that the owner answered the target. For an ordinary
+private message that does not explicitly mention
+the owner, the resolver also decides whether the target reasonably calls for a
+response at all. A high-confidence semantic answer cancels only the matched
+target; a high-confidence `no_reply_needed` result cancels a private answer,
+acknowledgement, reaction, or owner-led conversational continuation without
+inventing another response. A high-confidence unanswered result admits only
+that target to the delegated agent loop. Explicit group `@Owner` messages
+cannot use `no_reply_needed`; they remain addressed owner work unless owner
+content handled them. Ambiguous, malformed, low-confidence, truncated, or
+unavailable resolution fails closed and retries after the configured semantic
+retry delay.
 
 The delegated agent context includes bounded post-target discussion so its
 response reflects what happened during the grace period. The semantic result
@@ -154,10 +166,13 @@ ambiguity delays it. Lark does not expose a compare-and-send primitive, so this
 last read minimizes but cannot eliminate the interval before the send call.
 
 `policy.reply_scope` independently selects all groups or configured groups for
-`@Owner`. `policy.private_reply_scope` selects all inbound human P2P messages or
-disables that entry point. Existing allow/block chat and user lists apply to
-both. Bot/app messages, owner-authored messages, and non-owner messages to the
-assistant remain outside delegated intake.
+`@Owner`. `policy.private_reply_scope` selects all inbound human P2P messages as
+semantic candidates or disables that entry point. Existing allow/block chat
+and user lists apply to both. Bot/app messages, owner-authored messages that do
+not invoke the assistant, and non-owner messages to the assistant remain
+outside delegated intake. Polling must discard an owner-authored non-assistant
+message before durable work intake; later lexical relevance inference cannot
+re-admit it.
 
 A quoted app/bot message may carry a GitHub reference, but the reference is
 usable only after code verifies that the message sender is the configured
@@ -899,6 +914,23 @@ The multi-step loop is accepted by these executable BDD scenarios:
   assistant in a group, or writes the assistant name in group text without a
   native mention, when intake or routing runs, then the runtime remains silent
   and ignores it before queueing or any model call.
+- Given the configured owner sends an ordinary message or question to another
+  human in a private chat, when user-token polling observes it, then the
+  message is discarded before durable work intake and cannot fall through to
+  inferred relevance, model work, or a reply to the owner's own message.
+- Given another human answers a question initiated by the owner in private
+  chat and does not add a new question or request, while the owner continues
+  the same conversation, when semantic delegated-reply resolution runs, then
+  it returns high-confidence `no_reply_needed` and neither the main reply model
+  nor a sender-facing reply runs.
+- Given an ordinary private message contains a new question, request,
+  invitation, or coordination need that the owner has not handled, when the
+  semantic deadline is evaluated, then it remains `unanswered` and may enter
+  the read-only delegated workflow.
+- Given a group message explicitly mentions the owner, when semantic
+  resolution runs, then `no_reply_needed` is invalid for that target; only a
+  validated owner handling, withdrawal, or the existing policy gates may
+  suppress the delegated workflow.
 - Given `policy.reply_scope` is `all_groups` and another sender directly
   mentions the owner in a group that does not match `--chat-query`, when the
   reply passes all other policy checks, then the agent may reply as the owner

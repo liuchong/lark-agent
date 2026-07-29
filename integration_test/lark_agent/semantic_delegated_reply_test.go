@@ -12,10 +12,12 @@ import (
 	"github.com/liuchong/lark-agent/agent/app"
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
+	"github.com/liuchong/lark-agent/agent/poll"
 	"github.com/liuchong/lark-agent/agent/reply"
 	"github.com/liuchong/lark-agent/agent/replymatch"
 	"github.com/liuchong/lark-agent/agent/router"
 	"github.com/liuchong/lark-agent/agent/storage"
+	serviceim "github.com/liuchong/lark-agent/internal/lark"
 )
 
 type semanticIntegrationModel struct {
@@ -92,6 +94,49 @@ func (d *semanticIntegrationDecider) Decide(
 
 type semanticIntegrationReplyHandler struct {
 	calls int
+}
+
+type ownerOutboundPrivatePollIM struct {
+	now time.Time
+}
+
+func (f ownerOutboundPrivatePollIM) SearchChats(
+	context.Context,
+	serviceim.SearchChatsRequest,
+) (serviceim.SearchChatsResult, error) {
+	return serviceim.SearchChatsResult{}, nil
+}
+
+func (f ownerOutboundPrivatePollIM) SearchMessages(
+	_ context.Context,
+	req serviceim.SearchMessagesRequest,
+) (serviceim.SearchMessagesResult, error) {
+	if req.IncludeAtMe {
+		return serviceim.SearchMessagesResult{}, nil
+	}
+	return serviceim.SearchMessagesResult{Items: []serviceim.Message{{
+		MessageID:         "om_owner_question",
+		ChatID:            "oc_human_private",
+		ChatType:          "p2p",
+		ChatPartnerOpenID: "ou_teammate",
+		SenderOpenID:      "ou_owner",
+		SenderType:        "user",
+		Content:           "感觉你要不要给这个项目配一个 UI，客户端什么的？",
+		CreateTime:        f.now.Format(time.RFC3339),
+	}}}, nil
+}
+
+func (f ownerOutboundPrivatePollIM) BatchGetChats(
+	context.Context,
+	[]string,
+) (map[string]serviceim.Chat, error) {
+	return map[string]serviceim.Chat{
+		"oc_human_private": {
+			ChatID:          "oc_human_private",
+			ChatMode:        "p2p",
+			P2PTargetOpenID: "ou_teammate",
+		},
+	}, nil
 }
 
 func (h *semanticIntegrationReplyHandler) Handle(
@@ -226,6 +271,79 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 		}
 	})
 
+	t.Run("answer to owner led private discussion needs no synthetic reply", func(t *testing.T) {
+		store := openSemanticIntegrationStore(t)
+		base := store.CurrentSession().StartedAt.Add(time.Second)
+		item := enqueueDueDelegatedItem(t, store, domain.NormalizedEvent{
+			Source:     domain.SourcePoll,
+			EventID:    "poll:om_private_answer",
+			MessageID:  "om_private_answer",
+			ChatID:     "oc_private",
+			ChatType:   "p2p",
+			SenderID:   "ou_teammate",
+			SenderType: "user",
+			Content:    "有 UI 和客户端",
+			CreatedAt:  base.Add(23 * time.Second),
+		})
+		semanticModel := &semanticIntegrationModel{response: `{
+			"target_message_id":"om_private_answer",
+			"result":"no_reply_needed",
+			"matched_owner_message_ids":["om_owner_continues"],
+			"confidence":0.98,
+			"reason":"the target answers the owner's question, adds no request, and the owner continues the discussion"
+		}`}
+		builder := &semanticIntegrationBuilder{}
+		decider := &semanticIntegrationDecider{}
+		replier := &semanticIntegrationReplyHandler{}
+		daemon := app.NewDaemon(
+			store,
+			router.New(router.Config{
+				OwnerOpenID:       "ou_owner",
+				Mode:              domain.ModeAuto,
+				PrivateReplyScope: domain.PrivateReplyScopeAll,
+			}),
+			app.WithContextBuilder(builder),
+			app.WithDecider(decider),
+			app.WithReplyHandler(replier),
+			app.WithDelegatedReplyResolver(semanticIntegrationResolver{
+				store:   store,
+				matcher: replymatch.New(semanticModel, "ou_owner"),
+				messages: []domain.NormalizedEvent{
+					{
+						MessageID: "om_owner_question", ChatID: "oc_private",
+						ChatType: "p2p", SenderID: "ou_owner",
+						Content:   "感觉你要不要给这个项目配一个 UI，客户端什么的？",
+						CreatedAt: base,
+					},
+					item.Event,
+					{
+						MessageID: "om_owner_continues", ChatID: "oc_private",
+						ChatType: "p2p", SenderID: "ou_owner",
+						Content:   "你们怎么还有这个项目？",
+						CreatedAt: base.Add(40 * time.Second),
+					},
+				},
+			}, 0.85, 30*time.Second),
+		)
+
+		result, err := daemon.RunOnce(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Decision.Reason != "delegated_reply_not_needed" ||
+			semanticModel.calls != 1 ||
+			builder.calls != 0 || decider.calls != 0 || replier.calls != 0 {
+			t.Fatalf(
+				"result=%+v semantic=%d builder=%d decider=%d replier=%d",
+				result,
+				semanticModel.calls,
+				builder.calls,
+				decider.calls,
+				replier.calls,
+			)
+		}
+	})
+
 	t.Run("malformed semantic result fails closed and retries later", func(t *testing.T) {
 		store := openSemanticIntegrationStore(t)
 		base := store.CurrentSession().StartedAt.Add(time.Second)
@@ -283,6 +401,38 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 			)
 		}
 	})
+}
+
+func TestOwnerAuthoredHumanPrivateMessageIsDroppedBeforeDurableIntake(t *testing.T) {
+	store := openSemanticIntegrationStore(t)
+	now := store.CurrentSession().StartedAt.Add(time.Minute)
+	if err := store.SetPollCursor("messages:all", now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	agentRouter := router.New(router.Config{
+		OwnerOpenID:       "ou_owner",
+		AssistantOpenIDs:  []string{"ou_assistant"},
+		Mode:              domain.ModeAuto,
+		PrivateReplyScope: domain.PrivateReplyScopeAll,
+	})
+	livePoller := poll.New(ownerOutboundPrivatePollIM{now: now}, store, poll.Config{
+		OwnerOpenID:    "ou_owner",
+		IncludePrivate: true,
+		Now:            func() time.Time { return now.Add(time.Second) },
+		Classify:       agentRouter.Route,
+	})
+
+	result, err := livePoller.Poll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := store.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Inserted != 0 || len(items) != 0 {
+		t.Fatalf("result=%+v items=%+v", result, items)
+	}
 }
 
 func openSemanticIntegrationStore(t *testing.T) *storage.Store {

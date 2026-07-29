@@ -143,6 +143,44 @@ func TestDaemonSemanticOwnerAnswerSkipsMainReplyModel(t *testing.T) {
 	}
 }
 
+func TestDaemonNoReplyNeededSkipsMainReplyModel(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:  "om_private_answer",
+		ChatID:     "oc_private",
+		ChatType:   "p2p",
+		SenderID:   "ou_sender",
+		SenderType: "user",
+		Content:    "有 UI 和客户端",
+	})}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_private_answer",
+		Result:          replymatch.ResultNoReplyNeeded,
+		Confidence:      0.98,
+		Reason:          "the message answers an owner-led question and adds no request",
+	}}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{
+			OwnerOpenID:       "ou_owner",
+			Mode:              domain.ModeAuto,
+			PrivateReplyScope: domain.PrivateReplyScopeAll,
+		}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolver.calls != 1 || decider.called || !q.done ||
+		result.Decision.Kind != domain.DecisionIgnore ||
+		result.Decision.Reason != "delegated_reply_not_needed" {
+		t.Fatalf("result=%+v queue=%+v resolver=%+v decider=%+v", result, q, resolver, decider)
+	}
+}
+
 func TestDaemonAmbiguousOwnerReplyDefersWithoutMainModel(t *testing.T) {
 	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID: "om_target",

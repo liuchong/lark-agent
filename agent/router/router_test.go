@@ -419,6 +419,33 @@ func TestOwnerPrivateAssistantChatRoutesAsOwnerRequest(t *testing.T) {
 	}
 }
 
+func TestOwnerHumanPrivateMessageDoesNotFallThroughToInferredRelevance(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:       "ou_owner",
+		AssistantOpenIDs:  []string{"ou_assistant"},
+		Mode:              domain.ModeAuto,
+		PrivateReplyScope: domain.PrivateReplyScopeAll,
+	})
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:     "om_owner_question",
+		ChatID:        "oc_human_private",
+		ChatType:      "p2p",
+		ChatPartnerID: "ou_teammate",
+		SenderID:      "ou_owner",
+		SenderType:    "user",
+		Content:       "感觉你要不要给这个项目配一个 UI，客户端什么的？",
+	})
+
+	decision, err := r.Route(context.Background(), item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionIgnore ||
+		decision.Reason != "owner_message_without_assistant_invocation" {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
 func TestOwnerTextMentioningAssistantNameRoutesAsOwnerRequest(t *testing.T) {
 	r := New(Config{
 		OwnerOpenID:    "ou_owner",

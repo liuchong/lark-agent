@@ -38,6 +38,19 @@ func (r fakeSemanticContextReader) GetSemanticReplyContext(
 	return r.result, r.err
 }
 
+type capturingSemanticContextReader struct {
+	request serviceim.SemanticReplyContextRequest
+	result  serviceim.SemanticReplyContext
+}
+
+func (r *capturingSemanticContextReader) GetSemanticReplyContext(
+	_ context.Context,
+	request serviceim.SemanticReplyContextRequest,
+) (serviceim.SemanticReplyContext, error) {
+	r.request = request
+	return r.result, nil
+}
+
 type fakeSemanticReplyStore struct {
 	pending  []domain.WorkItem
 	recorded []replymatch.Resolution
@@ -106,6 +119,31 @@ func TestLiveThreadStateUsesOneFinalSemanticReadForWithdrawnAndAnsweredChecks(t 
 			answered,
 			resolver.calls,
 		)
+	}
+}
+
+func TestLiveThreadStateTreatsNoReplyNeededAsFinalSuppression(t *testing.T) {
+	resolver := &fakeFinalReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_target",
+		Result:          replymatch.ResultNoReplyNeeded,
+		Confidence:      0.98,
+		Reason:          "the private message does not require a response",
+	}}
+	state := &liveThreadState{
+		resolver:      resolver,
+		confidenceMin: 0.85,
+		resolutions:   make(map[string]replymatch.Resolution),
+	}
+	item := domain.NewWorkItem(domain.NormalizedEvent{MessageID: "om_target"})
+	item.ID = 12
+	item.WorkKind = domain.WorkKindDirectMention
+
+	suppressed, err := state.OwnerAlreadyReplied(context.Background(), item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !suppressed || resolver.calls != 1 {
+		t.Fatalf("suppressed=%v resolver_calls=%d", suppressed, resolver.calls)
 	}
 }
 
@@ -189,6 +227,46 @@ func TestLiveDelegatedReplyResolverUsesLatestLarkContextAndAllPendingTargets(t *
 			matcher.request,
 			store.recorded,
 		)
+	}
+}
+
+func TestLiveDelegatedReplyResolverIncludesPreTargetConversationDirection(t *testing.T) {
+	base := time.Date(2026, 7, 29, 4, 23, 15, 0, time.UTC)
+	target := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_target", ChatID: "oc_private", ChatType: "p2p",
+		SenderID: "ou_teammate", Content: "有 UI 和客户端", CreatedAt: base,
+	})
+	target.ID = 8
+	contexts := &capturingSemanticContextReader{
+		result: serviceim.SemanticReplyContext{
+			Messages: []serviceim.Message{{
+				MessageID: "om_target", ChatID: "oc_private", ChatType: "p2p",
+				SenderOpenID: "ou_teammate", Content: "有 UI 和客户端",
+				CreateTime: base.Format(time.RFC3339),
+			}},
+			ContextCutoff: base.Add(3 * time.Minute),
+		},
+	}
+	store := &fakeSemanticReplyStore{pending: []domain.WorkItem{target}}
+	matcher := &fakeSemanticMatcher{result: replymatch.Resolution{
+		TargetMessageID: "om_target",
+		Result:          replymatch.ResultUnanswered,
+		Confidence:      0.96,
+		Reason:          "fixture",
+	}}
+	resolver := liveDelegatedReplyResolver{
+		contexts:  contexts,
+		store:     store,
+		matcher:   matcher,
+		ownerWait: 3 * time.Minute,
+	}
+
+	if _, err := resolver.Resolve(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+	wantSince := base.Add(-3 * time.Minute)
+	if !contexts.request.Since.Equal(wantSince) {
+		t.Fatalf("since=%s want=%s", contexts.request.Since, wantSince)
 	}
 }
 

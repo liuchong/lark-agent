@@ -148,10 +148,11 @@ policy:
 - `policy.reply_scope` 控制任意真人在群里 `@Owner` 后，Agent 是否可以用 Owner
   身份代回复。
 - `policy.private_reply_scope` 控制用户身份可见的真人私聊是否进入代回复；
-  `all_private` 启用，`disabled` 关闭。
+  `all_private` 启用语义候选，`disabled` 关闭。启用不代表每条消息都要回复：
+  对方回答 Owner 主动问题、确认、反应或没有新增请求的对话续接会静默结束。
 - `policy.owner_wait` 是本人优先回复窗口。等待由 SQLite 队列承担，不占用工作线程；
-  到期后才读取同一会话并逐条做语义判断。
-- `policy.owner_reply_confidence_min` 是“本人已回答/尚未回答”的最低可信度；
+  到期后才读取目标前后有界的同一会话并逐条做语义判断。
+- `policy.owner_reply_confidence_min` 是“本人已处理/无需回复/尚未回答”的最低可信度；
   `policy.owner_reply_retry` 是判断不清、上下文不完整或模型异常后的静默重试间隔。
 
 它们只放开“群范围”这一道门。黑名单、模型相关性与风险判断、置信度和审批模式、

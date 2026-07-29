@@ -356,6 +356,10 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 			decision.Kind = domain.DecisionIgnore
 			decision.Reason = "owner_semantically_replied"
 			return d.finishDecision(ctx, item, decision)
+		case replymatch.ResultNoReplyNeeded:
+			decision.Kind = domain.DecisionIgnore
+			decision.Reason = "delegated_reply_not_needed"
+			return d.finishDecision(ctx, item, decision)
 		case replymatch.ResultWithdrawn:
 			decision.Kind = domain.DecisionIgnore
 			decision.Reason = "message_withdrawn"
