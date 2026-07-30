@@ -360,6 +360,110 @@ func TestFalsePremiseTrapDoesNotInventMissingProductionSymbol(t *testing.T) {
 	}
 }
 
+func TestFalsePremiseRecoversFromParallelPolicyErrorsAndMalformedPlan(t *testing.T) {
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{
+			codingEvalToolCall("symbol", "search_code_symbols", `{"query":"ThisFunctionDefinitelyDoesNotExist20260730"}`),
+			codingEvalToolCall("shell_1", "shell", `{"command":"grep -rn ThisFunctionDefinitelyDoesNotExist20260730 Sample-Module"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			codingEvalToolCall("shell_2", "shell", `{"command":"grep -rn ThisFunctionDefinitelyDoesNotExist20260730 Sample-Module --include=*.go"}`),
+			codingEvalToolCall("search_before_plan", "search_workspace", `{"query":"ThisFunctionDefinitelyDoesNotExist20260730","path":"Sample-Module"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			codingEvalToolCall("bad_plan", "submit_investigation_plan", `{
+				"plan":"Search the Sample-Module tree for the exact symbol and stop after one bounded fallback."
+			}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			codingEvalToolCall("plan", "submit_investigation_plan", `{
+				"question":"Does ThisFunctionDefinitelyDoesNotExist20260730 exist?",
+				"entry_points":["Sample-Module"],
+				"symbols":["ThisFunctionDefinitelyDoesNotExist20260730"],
+				"tools":["search_workspace"],
+				"stop_conditions":["One exact bounded search returns no matches"]
+			}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			codingEvalToolCall("search", "search_workspace", `{
+				"query":"ThisFunctionDefinitelyDoesNotExist20260730",
+				"path":"Sample-Module"
+			}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			codingEvalToolCall("submit", "submit_decision", `{
+				"decision":"reply",
+				"relevance_confidence":0.99,
+				"reply_confidence":0.92,
+				"risk":"low",
+				"evidence_status":"insufficient",
+				"reply_text":"没有找到 ThisFunctionDefinitelyDoesNotExist20260730。我检查了当前 Workspace 的 Sample-Module 子目录，并对该完整名称做了精确搜索；搜索没有返回匹配项，因此不会推测它的实现。",
+				"reason":"the exact bounded workspace search returned no matches"
+			}`),
+		}),
+	}}
+	searchCalls := 0
+	registry, err := agenttools.NewRegistry(
+		agenttools.Definition{
+			Info: &schema.ToolInfo{Name: "search_code_symbols"},
+			Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+				return agenttools.Execution{Content: `{"index_available":false,"fallback":{"results":null,"truncated":true}}`}, nil
+			},
+		},
+		agenttools.Definition{
+			Info: &schema.ToolInfo{Name: "shell"},
+			Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+				return agenttools.Execution{}, errors.New(
+					"unbounded shell search is not allowed; use bounded code-search tools",
+				)
+			},
+		},
+		agenttools.Definition{
+			Info: &schema.ToolInfo{Name: "search_workspace"},
+			Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+				searchCalls++
+				return agenttools.Execution{Content: `{"results":[],"truncated":false,"files_scanned":124}`}, nil
+			},
+		},
+		agentruntime.SubmitInvestigationPlanDefinition(),
+		agentruntime.SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, trajectory, err := (agentruntime.AgentLoop{
+		Model:            model,
+		Tools:            registry,
+		MaxTurns:         10,
+		CodingMaxTurns:   10,
+		MaxNoProgress:    3,
+		MaxRepeatedCalls: 100,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		User: agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_false_premise_recovery",
+			SenderID:  "ou_owner",
+			Content:   "请在 Sample-Module 中核对 ThisFunctionDefinitelyDoesNotExist20260730 是否存在，不要推测。",
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
+	}
+	if decision.Kind != domain.DecisionReply || model.calls != 6 || searchCalls != 1 {
+		t.Fatalf("decision=%+v model_calls=%d search_calls=%d", decision, model.calls, searchCalls)
+	}
+	for _, want := range []string{
+		"unbounded shell search is not allowed",
+		"coding investigation requires submit_investigation_plan",
+		"question, entry_points, symbols, tools, and stop_conditions",
+	} {
+		if !codingEvalTrajectoryContains(trajectory, want) {
+			t.Fatalf("trajectory missing %q: %+v", want, trajectory)
+		}
+	}
+}
+
 func TestCodingQuestionWithEvidenceConvergesBeforeFinalTurns(t *testing.T) {
 	root := t.TempDir()
 	source := `package content_type

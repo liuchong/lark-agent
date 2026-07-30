@@ -40,3 +40,8 @@ Reusable verified rules:
   a work item ID or message digest. Resume must cancel unsent requirements,
   reject result-uncertain sends, and let a later dead-letter generation create
   a distinct requirement and public idempotency key.
+- Charge no-progress budget once per model turn, not once per sibling tool
+  call. A useful successful call in a mixed turn resets the streak; otherwise
+  parallel policy rejections can consume an entire run before the model can
+  correct a plan. Validation errors for structured planning tools must name the
+  exact required fields so bounded self-correction is possible.

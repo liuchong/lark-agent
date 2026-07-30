@@ -80,9 +80,13 @@ message. Code questions are investigated by the model using search, read,
 rules, skills, Lark-context, and shell tools.
 
 The loop has hard limits for model turns, elapsed time, individual and
-cumulative tool output, and repeated no-progress calls. Reaching a limit never
-creates a guessed answer. The work item becomes retryable, dead-lettered, or a
-source-backed notify/approval decision according to the failure type.
+cumulative tool output, and repeated no-progress model turns. Multiple tool
+calls emitted by one model turn count as one no-progress opportunity, not one
+opportunity per call. A useful successful call in that turn resets the
+no-progress streak even when a sibling call is rejected by policy. Reaching a
+limit never creates a guessed answer. The work item becomes retryable,
+dead-lettered, or a source-backed notify/approval decision according to the
+failure type.
 
 Fast-path work does not enter this loop. A configured owner asking deterministic
 local questions such as time, date, ping, daemon status, help, doctor, or queue
@@ -527,6 +531,12 @@ question is not answered by broad chat context alone. The model must either
 state that the question can be answered from the current message, or create a
 short investigation plan that names the code entry points, symbols, tools, and
 stopping condition it intends to use.
+
+The investigation-plan tool accepts the structured fields `question`,
+`entry_points`, `symbols`, `tools`, and `stop_conditions`. When the model sends
+a free-form `plan` field or otherwise malformed arguments, the rejection names
+the required fields so the model can correct the call within the same bounded
+run.
 
 The coding investigation is read-only by default. Plan-mode coding work may
 write only the active plan artifact; production code edits, shell writes,
@@ -1277,6 +1287,14 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given a coding question needs code investigation, when the model starts the
   run, then it creates a bounded investigation plan before broad workspace
   search and the plan names entry points, symbols, tools, and stop conditions.
+- Given one coding model turn emits both a useful bounded code lookup and a
+  policy-rejected shell search, when no-progress accounting is updated, then
+  that whole turn records progress instead of consuming one no-progress slot
+  per sibling tool call.
+- Given a coding model sends malformed free-form investigation-plan arguments
+  after earlier policy rejections, when the plan tool rejects them, then the
+  rejection names all required structured fields and a corrected plan plus
+  bounded workspace search can still finish within the original run.
 - Given a coding investigation is in plan mode, when the model attempts to edit
   production code, run a write shell command, commit, push, deploy, or send
   Lark messages directly, then the runtime denies that operation until the plan

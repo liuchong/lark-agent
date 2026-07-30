@@ -241,6 +241,8 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		}
 		messages = append(messages, assistant)
 		trajectory = append(trajectory, assistant)
+		turnMadeProgress := false
+		turnHadNoProgress := false
 		for _, call := range assistant.ToolCalls {
 			if strings.TrimSpace(call.ID) == "" || strings.TrimSpace(call.Function.Name) == "" {
 				return domain.Decision{}, trajectory, errs.NewInternalError(errs.SubtypeInvalidResponse, "model tool call is missing id or name")
@@ -369,15 +371,12 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			}
 			content := toolResultContent(execution, toolErr)
 			observation := callSignature + "\x00" + content
-			if observation == lastObservation || toolErr != nil {
-				noProgressStreak++
+			if toolErr == nil && observation != lastObservation {
+				turnMadeProgress = true
 			} else {
-				noProgressStreak = 0
+				turnHadNoProgress = true
 			}
 			lastObservation = observation
-			if noProgressStreak >= l.MaxNoProgress {
-				forceDecision = true
-			}
 			rawToolBytes := len(content)
 			content = clipToolContent(content, l.MaxToolBytes)
 			totalToolBytes += len(content)
@@ -420,6 +419,14 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				}
 				return *execution.Decision, trajectory, nil
 			}
+		}
+		if turnMadeProgress {
+			noProgressStreak = 0
+		} else if turnHadNoProgress {
+			noProgressStreak++
+		}
+		if noProgressStreak >= l.MaxNoProgress {
+			forceDecision = true
 		}
 	}
 	return domain.Decision{}, trajectory, errs.NewInternalError(errs.SubtypeInvalidResponse, "agent loop exceeded maximum turns")
@@ -929,7 +936,7 @@ func SubmitInvestigationPlanDefinition() agenttools.Definition {
 		NonOwnerReadOnly: true,
 		Info: &schema.ToolInfo{
 			Name: "submit_investigation_plan",
-			Desc: "Submit a bounded read-only investigation plan for a coding question before broad workspace search. This tool has no external side effect.",
+			Desc: "Submit a bounded read-only investigation plan for a coding question before broad workspace search. Use the structured fields question, entry_points, symbols, tools, and stop_conditions; do not send a free-form plan field. This tool has no external side effect.",
 			ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
 				"question":        {Type: schema.String, Required: true},
 				"entry_points":    {Type: schema.Array, Required: true, ElemInfo: &schema.ParameterInfo{Type: schema.String}},
@@ -949,7 +956,10 @@ func SubmitInvestigationPlanDefinition() agenttools.Definition {
 			decoder := json.NewDecoder(strings.NewReader(string(raw)))
 			decoder.DisallowUnknownFields()
 			if err := decoder.Decode(&plan); err != nil {
-				return agenttools.Execution{}, errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid investigation plan arguments").WithCause(err)
+				return agenttools.Execution{}, errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"invalid investigation plan arguments: use structured fields question, entry_points, symbols, tools, and stop_conditions; a free-form plan field is not accepted",
+				).WithCause(err)
 			}
 			if strings.TrimSpace(plan.Question) == "" || len(nonEmptyStrings(plan.EntryPoints)) == 0 ||
 				len(nonEmptyStrings(plan.Tools)) == 0 || len(nonEmptyStrings(plan.StopConditions)) == 0 {

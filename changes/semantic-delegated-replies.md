@@ -192,6 +192,19 @@ when the Owner notice and source-thread progress message are sent,
 then Lark receives stable distinct UUID digests of at most 50 characters,
 while the full keys remain available in the local audit record.
 
+### Scenario: Parallel tool rejections do not exhaust one coding run
+
+Given one coding model turn emits a useful bounded lookup together with a
+policy-rejected shell search,
+when the no-progress budget is updated,
+then the whole model turn records progress rather than charging each sibling
+tool call separately.
+
+Given the model later sends a malformed free-form investigation plan,
+when the plan tool rejects it,
+then the error names the required structured fields,
+and a corrected plan plus bounded search can complete in the same run.
+
 ### Scenario: Every inbound human private message is evaluated
 
 Given an inbound human P2P message to the owner that is not the assistant chat,
