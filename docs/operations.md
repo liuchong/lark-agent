@@ -30,12 +30,56 @@ app id、Keychain 凭据、事件订阅和权限；不能只用轮询回复成�
 ```bash
 lark-agent queue summary
 lark-agent queue list
+lark-agent queue tasks --view action
+lark-agent queue tasks --view running
 lark-agent queue inspect --work-id 123
 lark-agent queue inspect --message-id om_xxx
 ```
 
 inspect 会显示接收回执、工作项、最近模型步骤、最近外部动作和中断快照，用于判断
 消息是离线积压、重复、排队、处理中、中断、已回复还是终态。
+
+`queue tasks` 是面向处置的有界列表：
+
+- `action` 只列出需要 Owner 决策或收口的任务；
+- `running` 列出正在执行或会自动继续等待的任务；
+- `recent` 和 `all` 用于查看近期历史，不代表每条都需要操作。
+
+机器人上线或离线通知只显示非零分类。显示“需要你处理 0 条”表示当前没有人工待办，
+不会产生悬空任务。Owner 在智能助手私聊中发送 `/tasks` 能看到工作号、最新可靠事实
+和可执行的下一条命令；发送 `/task 工作号` 查看单条详情。
+
+## 智能助手私聊控制
+
+只有配置的 Owner 可以使用，且只在智能助手私聊中返回任务或审批详情：
+
+```text
+/help
+/status
+/doctor
+/tasks [action|running|recent|all] [页码]
+/task 工作号
+/approvals [页码]
+/approval 动作号
+/recent [数量]
+/version
+/ping
+```
+
+修改状态的命令会先校验当前持久化状态，重复投递同一条 Lark 消息不会重复修改：
+
+```text
+/task retry 工作号
+/task resume 工作号 [confirm]
+/task cancel 工作号 原因
+/task acknowledge 工作号 说明
+/task reconcile 工作号 completed|not-completed|unknown 核对说明
+/approval approve 动作号 confirm
+/approval reject 动作号 原因
+```
+
+Owner 在群聊中发送这些命令时只收到转到私聊的提示，群里不展示任务数量和内容。
+非 Owner 私聊机器人或直接 `@机器人` 仍然静默。
 
 ## 自动收敛与显式恢复
 
@@ -62,6 +106,20 @@ lark-agent queue resume --work-id 123 --force-terminal
 中断时正在执行的 shell、回复、Owner 通知或生命周期通知属于结果不确定的外部
 动作。系统不会自动重发；Owner 必须先根据飞书和本地审计证据确认实际结果。工作
 本身不会继续停在中断队列里。
+
+核对后用下列命令记录结果，不会触发原外部动作重放：
+
+```bash
+lark-agent queue reconcile --work-id 123 --result completed --reason "reply exists in Lark"
+lark-agent queue reconcile --work-id 123 --result not-completed --reason "no remote side effect found"
+lark-agent queue reconcile --work-id 123 --result unknown --reason "remote evidence unavailable"
+```
+
+已经审查且不再需要推进的中断或终态任务可以直接收口：
+
+```bash
+lark-agent queue acknowledge --work-id 123 --reason "superseded and reviewed"
+```
 
 ## 审核后取消
 

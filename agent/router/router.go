@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/liuchong/lark-agent/agent/control"
 	"github.com/liuchong/lark-agent/agent/domain"
 )
 
@@ -30,6 +31,7 @@ type Config struct {
 	DoctorText          func() string
 	QueueSummaryText    func() string
 	HelpText            string
+	Language            string
 }
 
 // Router decides whether a work item should enter the agent loop.
@@ -88,6 +90,16 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 			decision.Reason = "assistant_request_from_non_owner"
 			return decision, nil
 		}
+		if _, matched, _ := control.Parse(item.Event.Content); matched {
+			decision.Kind = domain.DecisionReply
+			decision.Relevance = domain.RelevanceAssistantRequest
+			decision.WorkKind = domain.WorkKindFastPath
+			decision.Priority = domain.PriorityFastPath
+			decision.Confidence = 1
+			decision.Reason = "owner_group_control_redirect"
+			decision.ReplyText = r.controlRedirectText()
+			return decision, nil
+		}
 		if !assistantGroupScopeAllows(r.cfg.AssistantReplyScope, item.Event) {
 			decision.Reason = "outside_assistant_reply_scope"
 			return decision, nil
@@ -128,6 +140,24 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 			decision.Reason = "owner_assistant_text_mention"
 		} else {
 			decision.Reason = "owner_assistant_mention"
+		}
+		if command, matched, parseErr := control.Parse(item.Event.Content); matched {
+			if item.Event.ChatType != "p2p" {
+				decision.Kind = domain.DecisionReply
+				decision.WorkKind = domain.WorkKindFastPath
+				decision.Priority = domain.PriorityFastPath
+				decision.Reason = "owner_group_control_redirect"
+				decision.ReplyText = r.controlRedirectText()
+				return decision, nil
+			}
+			if parseErr != nil {
+				command = domain.OwnerControlCommand{Name: domain.OwnerControlHelp}
+			}
+			decision.WorkKind = domain.WorkKindOwnerControl
+			decision.Priority = domain.PriorityOwnerControl
+			decision.Reason = "owner_private_control_command"
+			decision.ControlCommand = &command
+			return decision, nil
 		}
 		if !r.cfg.DisableFastPath {
 			if fast, ok := r.fastPathDecision(item.Event, decision); ok {
@@ -183,6 +213,13 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 		return decision, nil
 	}
 	return decision, nil
+}
+
+func (r *Router) controlRedirectText() string {
+	if r.cfg.Language == "en-US" {
+		return "Control commands are available only in the Intelligent Assistant private chat. Send `/help` there."
+	}
+	return "控制命令只在智能助手私聊中提供，请私聊发送 `/help`。"
 }
 
 func (r *Router) inboundHumanPrivateMessage(event domain.NormalizedEvent) bool {

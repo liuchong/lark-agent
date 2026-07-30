@@ -692,6 +692,56 @@ action. `queue resume` remains the explicit operator path for a selected
 terminal, blocked, or manually paused item. Safe startup recovery does not
 require it. Replaying an already terminal item requires an additional explicit
 force flag.
+
+The configured owner has the same durable control capability through commands
+sent in the assistant bot's private Lark chat. `/help`, `/status`, `/doctor`,
+`/tasks`, `/task`, `/approvals`, `/approval`, `/recent`, `/version`, and
+`/ping` form a typed owner-private control plane. Read-only commands never call
+the model. Mutation commands require exact work or action IDs and use the same
+storage transitions as their CLI equivalents. An owner command in a group only
+receives a private-control redirect; a non-owner command remains silent.
+
+`/tasks` defaults to a bounded actionable view instead of dumping historical
+storage status maps. Every listed item gives a localized semantic state, its
+last durable fact or failure, why owner attention is required, and an exact
+currently valid next command. `/task <work-id>` includes the latest durable
+stage and external-action uncertainty while excluding model chain-of-thought,
+credentials, raw Lark events, open IDs, and unrestricted absolute paths.
+Completed, ignored, cancelled, and owner-acknowledged items do not appear in the
+default actionable view.
+An owner resolution closes only the work-state version that existed when the
+resolution was recorded. If the owner explicitly resumes that work and it
+later becomes interrupted or terminal again, the newer `work_items.updated_at`
+epoch no longer equals the resolution's stored `work_updated_at` snapshot, so
+the old resolution becomes historical and the item returns to the default
+actionable view. These values are compared for exact equality, never ordered as
+variable-precision RFC3339 text.
+
+The owner may acknowledge an audited terminal item without deleting history.
+An uncertain external action must instead be reconciled as `completed`,
+`not-completed`, or `unknown`. Completed closes the work without replay.
+Not-completed resolves the uncertainty but requires a separate explicit resume
+before work can run again. Unknown keeps the work terminal and non-replayable.
+Retry, resume, and cancel reject unresolved uncertainty rather than guessing.
+The exact closure forms are `/task acknowledge <work-id> <note>` and
+`/task reconcile <work-id> completed|not-completed|unknown <reason>`. Local
+operators use the equivalent structured commands `queue acknowledge --work-id
+<id> --reason <note>` and `queue reconcile --work-id <id> --result
+completed|not-completed|unknown --reason <note>`.
+
+Owner command execution is journaled by command message identity. Parsing and
+authorization happen before mutation, and execution happens only after the
+ordinary work item is durably claimed. The resulting response uses the normal
+durable reply-action path. If a command commits but its Lark reply fails, the
+same command message returns the stored result without repeating the mutation.
+The journal insert is the first SQL statement in the mutation transaction so
+SQLite acquires the writer slot before duplicate-result reads and state
+validation; this avoids deferred read-to-write upgrade failures during normal
+daemon writes.
+Bot commands and local CLI commands share typed query, transition, and
+recommendation rules; CLI stdout remains structured while Lark output is
+localized human text.
+
 After an operator audits historical interrupted work, `queue cancel` can
 durably close exact work/message IDs or all interrupted work except explicit
 `--keep-work-id` selections. Every cancellation requires an operator reason,
@@ -1374,6 +1424,31 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given the owner explicitly resumes one interrupted or offline-backlog
   message, when the current session claims it, then a new run uses current
   evidence while preserving the prior audit timeline.
+- Given the configured owner privately sends `/help`, when routing runs, then
+  the bot returns localized query and mutation commands without a model call.
+- Given a non-owner privately sends `/tasks` or mentions the assistant with it,
+  when intake runs, then no work, reaction, model call, or reply is created.
+- Given the owner sends a control command in a group, when routing runs, then
+  only a private-control redirect is returned and no queue detail is exposed.
+- Given no work needs owner attention, when `/tasks` runs, then it says there
+  is nothing to handle and does not expose zero-valued raw status maps.
+- Given actionable work exists, when `/tasks` renders a page, then every item
+  explains the latest durable evidence and includes an exact valid next
+  command.
+- Given a mutation command names an invalid ID or ineligible transition, when
+  it runs, then it changes nothing and returns the exact safe alternative.
+- Given externally uncertain work, when retry, resume, or cancel is requested,
+  then it is rejected until the owner records an explicit reconciliation.
+- Given a command transaction committed but its reply was not delivered, when
+  the same command message is processed again, then the stored response is
+  resent and the state mutation is not repeated.
+- Given the daemon briefly holds the SQLite writer slot, when an owner mutation
+  begins and the writer slot is released within the configured wait interval,
+  then the mutation waits, commits once, and does not fail by upgrading an old
+  read snapshot.
+- Given a resolved terminal task is explicitly resumed, when that newer work
+  epoch later becomes interrupted or terminal again, then the previous
+  resolution remains audit history and `/tasks` shows the task as actionable.
 - Given an operator has audited interrupted historical work, when
   `queue cancel --all-interrupted` includes explicit kept work IDs and a
   non-empty reason, then every other safe interrupted item becomes cancelled,
@@ -1409,6 +1484,12 @@ The multi-step loop is accepted by these executable BDD scenarios:
   convergence are ready, when any new daemon process session comes online, then
   the bot sends one idempotent private online notice with resumed,
   waiting-owner, terminalized, and uncertain counts.
+- Given every lifecycle count is zero, when an offline or online notice is
+  rendered, then it says there is no unfinished or actionable work and does
+  not enumerate zero-valued categories.
+- Given lifecycle counts contain non-zero categories, when a notice is
+  rendered, then it includes only those categories, explains their meaning,
+  and points to `/tasks` or the exact handling command.
 - Given a reply decision, when policy blocks, awaits approval, sends, or finds
   the owner already replied, then the durable action status records that exact
   outcome and no generic fallback text is sent.

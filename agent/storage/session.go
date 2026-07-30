@@ -1338,6 +1338,7 @@ func (s *Store) InspectWork(
 		inspection.LatestAction.Kind == "reply" &&
 		inspection.LatestAction.Status == domain.ActionCompleted
 	inspection.State.Uncertain = inspection.LatestInterruption != nil &&
+		inspection.LatestInterruption.ResumedAt.IsZero() &&
 		inspection.LatestInterruption.ActionStatus == domain.ActionExecuting
 	return inspection, nil
 }

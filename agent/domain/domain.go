@@ -336,6 +336,7 @@ type WorkKind string
 const (
 	WorkKindGeneric        WorkKind = "generic"
 	WorkKindFastPath       WorkKind = "fast_path"
+	WorkKindOwnerControl   WorkKind = "owner_control"
 	WorkKindSimpleQuestion WorkKind = "simple_question"
 	WorkKindDirectMention  WorkKind = "direct_mention"
 	WorkKindCodingQuestion WorkKind = "coding_question"
@@ -347,6 +348,7 @@ const (
 	PriorityCodingQuestion = 40
 	PriorityDirectMention  = 60
 	PrioritySimpleQuestion = 70
+	PriorityOwnerControl   = 95
 	PriorityFastPath       = 90
 	PriorityPostReply      = 100
 )
@@ -537,19 +539,20 @@ const (
 
 // Decision is an auditable routing or agent decision.
 type Decision struct {
-	Kind           DecisionKind   `json:"kind" yaml:"kind"`
-	Mode           Mode           `json:"mode" yaml:"mode"`
-	Relevance      Relevance      `json:"relevance" yaml:"relevance"`
-	WorkKind       WorkKind       `json:"work_kind,omitempty" yaml:"work_kind,omitempty"`
-	Priority       int            `json:"priority,omitempty" yaml:"priority,omitempty"`
-	Confidence     float64        `json:"confidence" yaml:"confidence"`
-	Risk           Risk           `json:"risk" yaml:"risk"`
-	EvidenceStatus EvidenceStatus `json:"evidence_status,omitempty" yaml:"evidence_status,omitempty"`
-	Reason         string         `json:"reason" yaml:"reason"`
-	ReplyText      string         `json:"reply_text,omitempty" yaml:"reply_text,omitempty"`
-	OwnerAction    string         `json:"owner_action,omitempty" yaml:"owner_action,omitempty"`
-	Language       string         `json:"language,omitempty" yaml:"language,omitempty"`
-	Sources        []SourceRef    `json:"sources,omitempty" yaml:"sources,omitempty"`
+	Kind           DecisionKind         `json:"kind" yaml:"kind"`
+	Mode           Mode                 `json:"mode" yaml:"mode"`
+	Relevance      Relevance            `json:"relevance" yaml:"relevance"`
+	WorkKind       WorkKind             `json:"work_kind,omitempty" yaml:"work_kind,omitempty"`
+	Priority       int                  `json:"priority,omitempty" yaml:"priority,omitempty"`
+	Confidence     float64              `json:"confidence" yaml:"confidence"`
+	Risk           Risk                 `json:"risk" yaml:"risk"`
+	EvidenceStatus EvidenceStatus       `json:"evidence_status,omitempty" yaml:"evidence_status,omitempty"`
+	Reason         string               `json:"reason" yaml:"reason"`
+	ReplyText      string               `json:"reply_text,omitempty" yaml:"reply_text,omitempty"`
+	OwnerAction    string               `json:"owner_action,omitempty" yaml:"owner_action,omitempty"`
+	Language       string               `json:"language,omitempty" yaml:"language,omitempty"`
+	Sources        []SourceRef          `json:"sources,omitempty" yaml:"sources,omitempty"`
+	ControlCommand *OwnerControlCommand `json:"control_command,omitempty" yaml:"control_command,omitempty"`
 }
 
 // SourceRef identifies a source that may be shown to the model or owner.
@@ -721,6 +724,113 @@ type WorkInspection struct {
 	LatestAction       *ActionAttempt      `json:"latest_action,omitempty" yaml:"latest_action,omitempty"`
 	LatestInterruption *WorkInterruption   `json:"latest_interruption,omitempty" yaml:"latest_interruption,omitempty"`
 	State              WorkInspectionState `json:"state" yaml:"state"`
+}
+
+// OwnerControlName identifies a deterministic command in the owner-private
+// control plane.
+type OwnerControlName string
+
+const (
+	OwnerControlHelp            OwnerControlName = "help"
+	OwnerControlStatus          OwnerControlName = "status"
+	OwnerControlDoctor          OwnerControlName = "doctor"
+	OwnerControlTasks           OwnerControlName = "tasks"
+	OwnerControlTask            OwnerControlName = "task"
+	OwnerControlTaskRetry       OwnerControlName = "task_retry"
+	OwnerControlTaskResume      OwnerControlName = "task_resume"
+	OwnerControlTaskCancel      OwnerControlName = "task_cancel"
+	OwnerControlTaskAcknowledge OwnerControlName = "task_acknowledge"
+	OwnerControlTaskReconcile   OwnerControlName = "task_reconcile"
+	OwnerControlApprovals       OwnerControlName = "approvals"
+	OwnerControlApproval        OwnerControlName = "approval"
+	OwnerControlApprovalApprove OwnerControlName = "approval_approve"
+	OwnerControlApprovalReject  OwnerControlName = "approval_reject"
+	OwnerControlRecent          OwnerControlName = "recent"
+	OwnerControlVersion         OwnerControlName = "version"
+	OwnerControlPing            OwnerControlName = "ping"
+)
+
+type OwnerTaskView string
+
+const (
+	OwnerTaskViewAction  OwnerTaskView = "action"
+	OwnerTaskViewRunning OwnerTaskView = "running"
+	OwnerTaskViewRecent  OwnerTaskView = "recent"
+	OwnerTaskViewAll     OwnerTaskView = "all"
+)
+
+type OwnerResolutionDisposition string
+
+const (
+	OwnerResolutionAcknowledged OwnerResolutionDisposition = "acknowledged"
+	OwnerResolutionCompleted    OwnerResolutionDisposition = "completed"
+	OwnerResolutionNotCompleted OwnerResolutionDisposition = "not_completed"
+	OwnerResolutionUnknown      OwnerResolutionDisposition = "unknown"
+)
+
+type OwnerControlCommand struct {
+	Name        OwnerControlName           `json:"name" yaml:"name"`
+	Topic       string                     `json:"topic,omitempty" yaml:"topic,omitempty"`
+	View        OwnerTaskView              `json:"view,omitempty" yaml:"view,omitempty"`
+	Page        int                        `json:"page,omitempty" yaml:"page,omitempty"`
+	Count       int                        `json:"count,omitempty" yaml:"count,omitempty"`
+	WorkItemID  int64                      `json:"work_item_id,omitempty" yaml:"work_item_id,omitempty"`
+	ActionID    int64                      `json:"action_id,omitempty" yaml:"action_id,omitempty"`
+	Confirm     bool                       `json:"confirm,omitempty" yaml:"confirm,omitempty"`
+	Disposition OwnerResolutionDisposition `json:"disposition,omitempty" yaml:"disposition,omitempty"`
+	Reason      string                     `json:"reason,omitempty" yaml:"reason,omitempty"`
+}
+
+type OwnerWorkResolution struct {
+	ID               int64                      `json:"id" yaml:"id"`
+	WorkItemID       int64                      `json:"work_item_id" yaml:"work_item_id"`
+	ActionID         int64                      `json:"action_id,omitempty" yaml:"action_id,omitempty"`
+	CommandMessageID string                     `json:"command_message_id" yaml:"command_message_id"`
+	Disposition      OwnerResolutionDisposition `json:"disposition" yaml:"disposition"`
+	Reason           string                     `json:"reason" yaml:"reason"`
+	WorkUpdatedAt    time.Time                  `json:"work_updated_at,omitempty" yaml:"work_updated_at,omitempty"`
+	ResolvedAt       time.Time                  `json:"resolved_at" yaml:"resolved_at"`
+}
+
+type OwnerTaskQuery struct {
+	View     OwnerTaskView `json:"view" yaml:"view"`
+	Page     int           `json:"page" yaml:"page"`
+	PageSize int           `json:"page_size" yaml:"page_size"`
+}
+
+type OwnerTaskSummary struct {
+	WorkItem           WorkItem             `json:"work_item" yaml:"work_item"`
+	State              WorkInspectionState  `json:"state" yaml:"state"`
+	LatestRun          *AgentRun            `json:"latest_run,omitempty" yaml:"latest_run,omitempty"`
+	LatestStep         *AgentStep           `json:"latest_step,omitempty" yaml:"latest_step,omitempty"`
+	LatestAction       *ActionAttempt       `json:"latest_action,omitempty" yaml:"latest_action,omitempty"`
+	LatestInterruption *WorkInterruption    `json:"latest_interruption,omitempty" yaml:"latest_interruption,omitempty"`
+	Resolution         *OwnerWorkResolution `json:"resolution,omitempty" yaml:"resolution,omitempty"`
+}
+
+type OwnerTaskPage struct {
+	Items    []OwnerTaskSummary `json:"items" yaml:"items"`
+	Page     int                `json:"page" yaml:"page"`
+	PageSize int                `json:"page_size" yaml:"page_size"`
+	Total    int                `json:"total" yaml:"total"`
+}
+
+type OwnerApprovalPage struct {
+	Items    []ActionAttempt `json:"items" yaml:"items"`
+	Page     int             `json:"page" yaml:"page"`
+	PageSize int             `json:"page_size" yaml:"page_size"`
+	Total    int             `json:"total" yaml:"total"`
+}
+
+type OwnerMutationResult struct {
+	CommandMessageID string                     `json:"command_message_id" yaml:"command_message_id"`
+	Name             OwnerControlName           `json:"name" yaml:"name"`
+	WorkItemID       int64                      `json:"work_item_id,omitempty" yaml:"work_item_id,omitempty"`
+	ActionID         int64                      `json:"action_id,omitempty" yaml:"action_id,omitempty"`
+	Changed          int                        `json:"changed" yaml:"changed"`
+	Disposition      OwnerResolutionDisposition `json:"disposition,omitempty" yaml:"disposition,omitempty"`
+	Reason           string                     `json:"reason,omitempty" yaml:"reason,omitempty"`
+	Replayed         bool                       `json:"replayed" yaml:"replayed"`
 }
 
 // QueueSummary is a compact operational view of the durable queue.

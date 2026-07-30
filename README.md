@@ -100,17 +100,25 @@ lark-agent daemon status
 lark-agent mode paused
 lark-agent mode auto
 lark-agent queue summary
+lark-agent queue tasks --view action
 lark-agent queue inspect --message-id om_xxx
 lark-agent queue resume --message-id om_xxx
+lark-agent queue acknowledge --work-id 123 --reason "reviewed and closed"
+lark-agent queue reconcile --work-id 456 --result unknown --reason "external result could not be verified"
 lark-agent queue cancel --work-id 123 --reason "superseded"
 lark-agent queue cancel --all-interrupted --keep-work-id 456 --reason "audited stale work"
 lark-agent github auth status
 ```
 
+Owner 还可以在智能助手私聊中发送 `/help` 查看控制命令，用 `/status` 查看当前会话，
+用 `/tasks` 查看需要人工处理的任务，并按每条任务返回的精确命令继续处理。群聊中的
+控制命令只会提示转到私聊，不会泄露队列内容；非 Owner 私聊或群聊控制命令保持静默。
+
 安全的中断工作会在新会话 ready 后自动续跑。`queue resume` 用于经过人工核对的
 手动暂停、离线补录或终态工作；已经完成、忽略、取消或进入死信的终态工作还必须
 明确加 `--force-terminal`。结果不确定的外部动作不会自动重发。审核后确认无用的
-历史工作使用 `queue cancel` 做可审计取消；命令保留全部历史记录。
+历史工作使用 `queue acknowledge` 或 `queue cancel` 做可审计收口；外部结果不确定
+时使用 `queue reconcile` 记录人工核对结论。命令保留全部历史记录。
 
 ## GitHub 与 Lark
 

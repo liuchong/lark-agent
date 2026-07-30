@@ -867,6 +867,9 @@ func TestQueueExposesExplicitInspectAndResumeCommands(t *testing.T) {
 		{"queue", "resume"},
 		{"queue", "backfill"},
 		{"queue", "cancel"},
+		{"queue", "tasks"},
+		{"queue", "acknowledge"},
+		{"queue", "reconcile"},
 	} {
 		command, _, err := root.Find(path)
 		if err != nil {
@@ -875,6 +878,78 @@ func TestQueueExposesExplicitInspectAndResumeCommands(t *testing.T) {
 		if command == nil || command.Name() != path[len(path)-1] {
 			t.Fatalf("command %v is not registered", path)
 		}
+	}
+}
+
+func TestQueueTasksAndAcknowledgeUseOwnerControlState(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	first, err := storage.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_cli_owner_control",
+		Content:   "需要人工收口的历史任务",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := first.ListWorkItems()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("items=%+v err=%v", items, err)
+	}
+	workItemID := items[0].ID
+	if claimed, ok, claimErr := first.ClaimNext("owner-control-cli-test"); claimErr != nil {
+		t.Fatal(claimErr)
+	} else if !ok || claimed.ID != workItemID {
+		t.Fatalf("claimed=%+v ok=%v", claimed, ok)
+	}
+	if err := first.MarkDeadLetter(workItemID, "fixture requires owner acknowledgement"); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Execute(strings.NewReader(""), &out, &errOut, []string{
+		"--state", statePath, "queue", "tasks", "--view", "action",
+	})
+	if code != 0 {
+		t.Fatalf("tasks code=%d stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), `"total":1`) ||
+		!strings.Contains(out.String(), `"message_id":"om_cli_owner_control"`) {
+		t.Fatalf("tasks output=%s", out.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Execute(strings.NewReader(""), &out, &errOut, []string{
+		"--state", statePath, "queue", "acknowledge",
+		"--work-id", strconv.FormatInt(workItemID, 10),
+		"--reason", "已人工核对",
+	})
+	if code != 0 {
+		t.Fatalf("acknowledge code=%d stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), `"name":"task_acknowledge"`) ||
+		!strings.Contains(out.String(), `"work_item_id":`+strconv.FormatInt(workItemID, 10)) {
+		t.Fatalf("acknowledge output=%s", out.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Execute(strings.NewReader(""), &out, &errOut, []string{
+		"--state", statePath, "queue", "tasks", "--view", "action",
+	})
+	if code != 0 {
+		t.Fatalf("tasks after acknowledge code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), `"total":0`) {
+		t.Fatalf("tasks after acknowledge output=%s", out.String())
 	}
 }
 

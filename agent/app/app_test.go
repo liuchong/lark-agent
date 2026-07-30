@@ -100,6 +100,67 @@ type fakeReplyResolver struct {
 	calls      int
 }
 
+type fakeControlHandler struct {
+	called   bool
+	decision domain.Decision
+	err      error
+}
+
+func (h *fakeControlHandler) Handle(
+	_ context.Context,
+	_ domain.WorkItem,
+	_ domain.OwnerControlCommand,
+) (domain.Decision, error) {
+	h.called = true
+	return h.decision, h.err
+}
+
+func TestDaemonExecutesOwnerControlBeforeModel(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:     "om_owner_control",
+		ChatID:        "oc_private",
+		ChatType:      "p2p",
+		ChatPartnerID: "ou_bot",
+		SenderID:      "ou_owner",
+		Content:       "/help",
+	})}
+	handler := &fakeControlHandler{decision: domain.Decision{
+		Kind:       domain.DecisionReply,
+		Confidence: 1,
+		Risk:       domain.RiskLow,
+		Reason:     "owner_control_help",
+		ReplyText:  "命令帮助",
+	}}
+	decider := &fakeDecider{}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{
+			OwnerOpenID:      "ou_owner",
+			AssistantOpenIDs: []string{"ou_bot"},
+			Mode:             domain.ModeAuto,
+		}),
+		WithControlHandler(handler),
+		WithDecider(decider),
+		WithReplyHandler(replier),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || !handler.called || decider.called || !replier.called {
+		t.Fatalf(
+			"result=%+v handler=%+v decider=%+v replier=%+v",
+			result, handler, decider, replier,
+		)
+	}
+	if result.Decision.Relevance != domain.RelevanceOwnerRequest ||
+		result.Decision.WorkKind != domain.WorkKindOwnerControl {
+		t.Fatalf("route identity was not preserved: %+v", result.Decision)
+	}
+}
+
 func (r *fakeReplyResolver) Resolve(context.Context, domain.WorkItem) (replymatch.Resolution, error) {
 	r.calls++
 	return r.resolution, r.err

@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/app"
 	"github.com/liuchong/lark-agent/agent/config"
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
+	"github.com/liuchong/lark-agent/agent/control"
 	"github.com/liuchong/lark-agent/agent/daemon"
 	"github.com/liuchong/lark-agent/agent/domain"
 	"github.com/liuchong/lark-agent/agent/feedback"
@@ -89,6 +91,12 @@ after forced convergence by default. One interactive
 worker is reserved from the foreground pool, while CodingGoal work uses
 background workers. Time, date, ping, status, doctor, queue summary, and help
 use a deterministic fast path before any model loop.
+The configured owner can use /help, /status, /tasks, /task, /approvals, and
+/approval in the assistant's private chat to inspect and safely close durable
+work without invoking the model. Group commands disclose no queue details and
+redirect the owner to private chat; non-owner commands remain silent. Local
+operators can use queue tasks, queue acknowledge, and queue reconcile for the
+same bounded task views and durable closure rules.
 After restart, safe read-only and model work is automatically re-evaluated in
 the new ready session. Exact approval waits are preserved and privately
 reported. An interrupted external action is never replayed: it is terminalized
@@ -754,6 +762,7 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 			}
 			options = append(options, app.WithWorkLeases(map[domain.WorkKind]time.Duration{
 				domain.WorkKindFastPath:       cfg.Scheduler.FastPathLease,
+				domain.WorkKindOwnerControl:   cfg.Scheduler.FastPathLease,
 				domain.WorkKindSimpleQuestion: cfg.Scheduler.SimpleLease,
 				domain.WorkKindDirectMention:  cfg.Scheduler.SimpleLease,
 				domain.WorkKindCodingQuestion: cfg.Scheduler.CodingQuestionLease,
@@ -1406,7 +1415,14 @@ func buildLiveOptions(
 		},
 		includeLarkContext: userContextEnabled,
 	}
-	options := []app.Option{app.WithContextBuilder(builder)}
+	options := []app.Option{
+		app.WithContextBuilder(builder),
+		app.WithControlHandler(control.New(store, control.Config{
+			OwnerName: cfg.Owner.Name,
+			Language:  string(resolveConfiguredLanguage(cfg.Owner)),
+			Version:   buildVersion(),
+		})),
+	}
 	info["user_context"] = userContextEnabled
 	if userContextEnabled {
 		livePoller := newConfiguredLivePoller(
@@ -1635,15 +1651,39 @@ func newConfiguredLivePoller(
 
 func newAgentRouter(cfg config.Config, store *storage.Store) *router.Router {
 	queueText := func() string {
-		summary, err := store.QueueSummary()
+		english := resolveConfiguredLanguage(cfg.Owner) == agentlocale.LanguageEnglish
+		action, err := store.ListOwnerTasks(context.Background(), domain.OwnerTaskQuery{
+			View: domain.OwnerTaskViewAction, Page: 1, PageSize: 1,
+		})
 		if err != nil {
-			return "队列摘要暂时不可用：" + err.Error()
+			if english {
+				return "The task summary is temporarily unavailable."
+			}
+			return "任务摘要暂时不可用，请稍后重试或发送 `/doctor` 检查。"
+		}
+		running, err := store.ListOwnerTasks(context.Background(), domain.OwnerTaskQuery{
+			View: domain.OwnerTaskViewRunning, Page: 1, PageSize: 1,
+		})
+		if err != nil {
+			if english {
+				return "The task summary is temporarily unavailable."
+			}
+			return "任务摘要暂时不可用，请稍后重试或发送 `/doctor` 检查。"
+		}
+		if english {
+			return fmt.Sprintf(
+				"Needs your action: %d. In progress or waiting automatically: %d. Use `/tasks` for details.",
+				action.Total,
+				running.Total,
+			)
 		}
 		return fmt.Sprintf(
-			"队列状态：%v；工作通道：%v；陈旧 processing：%d；fast path 命中：%d。",
-			summary.StatusCounts, summary.LaneCounts, summary.StaleProcessing, summary.FastPathHits,
+			"需要你处理 %d 条；正在执行或自动等待 %d 条。发送 `/tasks` 查看详情。",
+			action.Total,
+			running.Total,
 		)
 	}
+	language := string(resolveConfiguredLanguage(cfg.Owner))
 	return router.New(router.Config{
 		OwnerOpenID:         cfg.Owner.OpenID,
 		AssistantOpenIDs:    cfg.Assistant.OpenIDs,
@@ -1659,10 +1699,20 @@ func newAgentRouter(cfg config.Config, store *storage.Store) *router.Router {
 		Sensitivity:         cfg.Policy.Sensitivity,
 		DisableFastPath:     !cfg.FastPath.Enabled,
 		DisableCodingGoal:   !cfg.Goal.Enabled,
-		StatusText:          func() string { return "lark-agent 正在运行，调度器可用。" + queueText() },
-		DoctorText:          func() string { return "基础诊断正常。" + queueText() },
+		StatusText:          func() string { return queueText() },
+		DoctorText:          func() string { return queueText() },
 		QueueSummaryText:    queueText,
+		HelpText:            control.HelpText(language, ""),
+		Language:            language,
 	})
+}
+
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok || strings.TrimSpace(info.Main.Version) == "" {
+		return "development"
+	}
+	return info.Main.Version
 }
 
 func runSchedulerWorker(ctx context.Context, daemonApp *app.Daemon, errOut io.Writer) {
@@ -2454,7 +2504,166 @@ func newQueueCommand(out io.Writer, configPath, statePath *string) *cobra.Comman
 	cmd.AddCommand(newQueueRetryCommand(out, statePath))
 	cmd.AddCommand(newQueueExportCommand(out, statePath))
 	cmd.AddCommand(newQueueCancelCommand(out, statePath))
+	cmd.AddCommand(newQueueTasksCommand(out, statePath))
+	cmd.AddCommand(newQueueAcknowledgeCommand(out, statePath))
+	cmd.AddCommand(newQueueReconcileCommand(out, statePath))
 	return cmd
+}
+
+func newQueueTasksCommand(out io.Writer, statePath *string) *cobra.Command {
+	var view string
+	var page int
+	var pageSize int
+	cmd := &cobra.Command{
+		Use:   "tasks",
+		Short: "List bounded owner-action task views",
+		Long: "List the same bounded action, running, recent, or all task view " +
+			"used by the owner-private Lark control commands.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := storage.OpenInspection(resolveStatePath(*statePath))
+			if err != nil {
+				return err
+			}
+			defer store.Close() //nolint:errcheck // diagnostic command
+			result, err := store.ListOwnerTasks(cmd.Context(), domain.OwnerTaskQuery{
+				View:     domain.OwnerTaskView(view),
+				Page:     page,
+				PageSize: pageSize,
+			})
+			if err != nil {
+				return err
+			}
+			return writeData(out, result)
+		},
+	}
+	cmd.Flags().StringVar(
+		&view,
+		"view",
+		string(domain.OwnerTaskViewAction),
+		"task view: action, running, recent, or all",
+	)
+	cmd.Flags().IntVar(&page, "page", 1, "one-based result page")
+	cmd.Flags().IntVar(&pageSize, "page-size", 10, "result count per page (maximum 20)")
+	return cmd
+}
+
+func newQueueAcknowledgeCommand(out io.Writer, statePath *string) *cobra.Command {
+	var workItemID int64
+	var reason string
+	cmd := &cobra.Command{
+		Use:   "acknowledge",
+		Short: "Acknowledge and close one interrupted or stopped task",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if workItemID <= 0 {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"queue acknowledge requires --work-id",
+				).WithParam("--work-id")
+			}
+			if strings.TrimSpace(reason) == "" {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"queue acknowledge requires --reason",
+				).WithParam("--reason")
+			}
+			return executeQueueOwnerMutation(
+				cmd.Context(),
+				out,
+				statePath,
+				domain.OwnerControlCommand{
+					Name:       domain.OwnerControlTaskAcknowledge,
+					WorkItemID: workItemID,
+					Reason:     reason,
+				},
+			)
+		},
+	}
+	cmd.Flags().Int64Var(&workItemID, "work-id", 0, "exact durable work item ID")
+	cmd.Flags().StringVar(&reason, "reason", "", "auditable acknowledgement note")
+	return cmd
+}
+
+func newQueueReconcileCommand(out io.Writer, statePath *string) *cobra.Command {
+	var workItemID int64
+	var result string
+	var reason string
+	cmd := &cobra.Command{
+		Use:   "reconcile",
+		Short: "Record the verified result of one uncertain external action",
+		Long: "Record completed, not-completed, or unknown after manual " +
+			"verification. The uncertain action is never replayed.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if workItemID <= 0 {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"queue reconcile requires --work-id",
+				).WithParam("--work-id")
+			}
+			if strings.TrimSpace(reason) == "" {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"queue reconcile requires --reason",
+				).WithParam("--reason")
+			}
+			disposition := domain.OwnerResolutionDisposition(
+				strings.ReplaceAll(strings.TrimSpace(result), "-", "_"),
+			)
+			switch disposition {
+			case domain.OwnerResolutionCompleted,
+				domain.OwnerResolutionNotCompleted,
+				domain.OwnerResolutionUnknown:
+			default:
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"queue reconcile --result must be completed, not-completed, or unknown",
+				).WithParam("--result")
+			}
+			return executeQueueOwnerMutation(
+				cmd.Context(),
+				out,
+				statePath,
+				domain.OwnerControlCommand{
+					Name:        domain.OwnerControlTaskReconcile,
+					WorkItemID:  workItemID,
+					Disposition: disposition,
+					Reason:      reason,
+				},
+			)
+		},
+	}
+	cmd.Flags().Int64Var(&workItemID, "work-id", 0, "exact durable work item ID")
+	cmd.Flags().StringVar(
+		&result,
+		"result",
+		"",
+		"verified result: completed, not-completed, or unknown",
+	)
+	cmd.Flags().StringVar(&reason, "reason", "", "auditable verification note")
+	return cmd
+}
+
+func executeQueueOwnerMutation(
+	ctx context.Context,
+	out io.Writer,
+	statePath *string,
+	command domain.OwnerControlCommand,
+) error {
+	store, err := storage.OpenInspection(resolveStatePath(*statePath))
+	if err != nil {
+		return err
+	}
+	defer store.Close() //nolint:errcheck // diagnostic command
+	commandID := fmt.Sprintf(
+		"cli:%s:%d:%d",
+		command.Name,
+		command.WorkItemID,
+		time.Now().UTC().UnixNano(),
+	)
+	result, err := store.ExecuteOwnerMutation(ctx, commandID, command)
+	if err != nil {
+		return err
+	}
+	return writeData(out, result)
 }
 
 func newQueueCancelCommand(out io.Writer, statePath *string) *cobra.Command {

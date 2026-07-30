@@ -254,6 +254,83 @@ func TestOwnerFastPathCoversResponseStatusQuestions(t *testing.T) {
 	}
 }
 
+func TestOwnerPrivateSlashCommandRoutesToControlPlane(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:      "ou_owner",
+		AssistantOpenIDs: []string{"ou_bot"},
+		Mode:             domain.ModeAuto,
+	})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:     "om_control_private",
+		ChatID:        "oc_private",
+		ChatType:      "p2p",
+		ChatPartnerID: "ou_bot",
+		SenderID:      "ou_owner",
+		Content:       "/tasks",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionNotify ||
+		decision.WorkKind != domain.WorkKindOwnerControl ||
+		decision.Relevance != domain.RelevanceOwnerRequest ||
+		decision.Reason != "owner_private_control_command" {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestOwnerGroupSlashCommandRedirectsWithoutQueueDetails(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantReplyScope: domain.ReplyScopeAllGroups,
+		Mode:                domain.ModeAuto,
+	})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_control_group",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_owner",
+		Content:   "@_user_1 /tasks",
+		Mentions:  []domain.Mention{{OpenID: "ou_bot", Name: "Assistant"}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		decision.WorkKind != domain.WorkKindFastPath ||
+		!strings.Contains(decision.ReplyText, "私聊") ||
+		strings.Contains(decision.ReplyText, "队列") {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestOwnerGroupSlashCommandRedirectUsesConfiguredEnglish(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantReplyScope: domain.ReplyScopeAllGroups,
+		Mode:                domain.ModeAuto,
+		Language:            "en-US",
+	})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_control_group_en",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_owner",
+		Content:   "@_user_1 /tasks",
+		Mentions:  []domain.Mention{{OpenID: "ou_bot", Name: "Assistant"}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		!strings.Contains(decision.ReplyText, "private chat") ||
+		strings.Contains(decision.ReplyText, "私聊") {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
 func TestFastPathCanBeDisabledAndCodingGoalIsClassified(t *testing.T) {
 	r := New(Config{OwnerOpenID: "owner", AssistantNames: []string{"Agent"}, DisableFastPath: true})
 	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{

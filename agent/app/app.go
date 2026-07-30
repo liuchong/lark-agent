@@ -127,6 +127,15 @@ type OwnerActivityHandler interface {
 	End(context.Context, domain.WorkItem, string) error
 }
 
+// ControlHandler executes one already-authorized owner-private command.
+type ControlHandler interface {
+	Handle(
+		context.Context,
+		domain.WorkItem,
+		domain.OwnerControlCommand,
+	) (domain.Decision, error)
+}
+
 type ownerActivityRecoverer interface {
 	Recover(context.Context) error
 }
@@ -147,6 +156,7 @@ type Daemon struct {
 	terminalFailure      TerminalFailureHandler
 	presenter            DecisionPresenter
 	activity             OwnerActivityHandler
+	control              ControlHandler
 	poller               Poller
 	workLeases           map[domain.WorkKind]time.Duration
 	lane                 domain.SchedulerLane
@@ -256,6 +266,10 @@ func WithDecisionPresenter(presenter DecisionPresenter) Option {
 // WithOwnerActivityHandler wires transient owner-request feedback.
 func WithOwnerActivityHandler(handler OwnerActivityHandler) Option {
 	return func(d *Daemon) { d.activity = handler }
+}
+
+func WithControlHandler(handler ControlHandler) Option {
+	return func(d *Daemon) { d.control = handler }
 }
 
 // WithPoller wires live user-message intake into the daemon.
@@ -418,6 +432,23 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 				_ = d.activity.End(context.WithoutCancel(ctx), item, token)
 			}()
 		}
+	}
+	if decision.WorkKind == domain.WorkKindOwnerControl {
+		if d.control == nil || decision.ControlCommand == nil {
+			err := errs.NewInternalError(
+				errs.SubtypeFailedPrecondition,
+				"owner control handler is not configured",
+			)
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+		controlDecision, err := d.control.Handle(ctx, item, *decision.ControlCommand)
+		if err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+		controlDecision = inheritRouteFields(controlDecision, decision)
+		return d.finishDecision(ctx, item, controlDecision)
 	}
 	goalTurnsRemaining := 0
 	goalBudgetExhausted := false

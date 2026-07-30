@@ -118,46 +118,106 @@ func (c *Controller) ownerName() string {
 
 func (c *Controller) offlineText(summary Summary) string {
 	if c.language() == agentlocale.LanguageEnglish {
+		parts := englishSummaryParts(summary, true)
+		if len(parts) == 0 {
+			return fmt.Sprintf(
+				"🤖 Intelligent Assistant is going offline. %s, there is no unfinished or unreconciled work.",
+				c.ownerName(),
+			)
+		}
 		return fmt.Sprintf(
-			"🤖 Intelligent Assistant is going offline. %s, paused: %d, already resumed this session: %d, waiting for your action: %d, terminalized: %d, externally uncertain: %d. Uncertain external actions will not be replayed.",
+			"🤖 Intelligent Assistant is going offline. %s, %s. Use `/tasks` to inspect actionable work.",
 			c.ownerName(),
-			summary.Paused,
-			summary.Resumed,
-			summary.WaitingOwner,
-			summary.Terminalized,
-			summary.Uncertain,
+			strings.Join(parts, "; "),
+		)
+	}
+	parts := chineseSummaryParts(summary, true)
+	if len(parts) == 0 {
+		return fmt.Sprintf(
+			"🤖 智能助手正在离线。%s，当前没有未完成或待核对任务。",
+			c.ownerName(),
 		)
 	}
 	return fmt.Sprintf(
-		"🤖 智能助手正在离线。%s，本次暂停 %d 条工作；本会话已续跑 %d 条，等待你处理 %d 条，已收口 %d 条，外部结果不确定 %d 条。不确定的外部动作不会重放。",
+		"🤖 智能助手正在离线。%s，%s。发送 `/tasks` 查看需要处理的任务。",
 		c.ownerName(),
-		summary.Paused,
-		summary.Resumed,
-		summary.WaitingOwner,
-		summary.Terminalized,
-		summary.Uncertain,
+		strings.Join(parts, "；"),
 	)
 }
 
 func (c *Controller) onlineText(summary Summary) string {
 	if c.language() == agentlocale.LanguageEnglish {
+		parts := englishSummaryParts(summary, false)
+		if len(parts) == 0 {
+			return fmt.Sprintf(
+				"🤖 Intelligent Assistant is online. %s, there is no work that needs your action. Use `/help` to view commands.",
+				c.ownerName(),
+			)
+		}
 		return fmt.Sprintf(
-			"🤖 Intelligent Assistant is online. %s, automatically resumed: %d, waiting for your action: %d, terminalized: %d, externally uncertain and not replayed: %d.",
+			"🤖 Intelligent Assistant is online. %s, %s. Use `/tasks` to inspect actionable work.",
 			c.ownerName(),
-			summary.Resumed,
-			summary.WaitingOwner,
-			summary.Terminalized,
-			summary.Uncertain,
+			strings.Join(parts, "; "),
+		)
+	}
+	parts := chineseSummaryParts(summary, false)
+	if len(parts) == 0 {
+		return fmt.Sprintf(
+			"🤖 智能助手已上线。%s，当前没有需要你处理的任务。发送 `/help` 查看可用命令。",
+			c.ownerName(),
 		)
 	}
 	return fmt.Sprintf(
-		"🤖 智能助手已上线。%s，已自动续跑 %d 条，等待你处理 %d 条，已收口 %d 条，外部结果不确定且未重放 %d 条。",
+		"🤖 智能助手已上线。%s，%s。发送 `/tasks` 查看并处理。",
 		c.ownerName(),
-		summary.Resumed,
-		summary.WaitingOwner,
-		summary.Terminalized,
-		summary.Uncertain,
+		strings.Join(parts, "；"),
 	)
+}
+
+func chineseSummaryParts(summary Summary, includePaused bool) []string {
+	var parts []string
+	if includePaused && summary.Paused > 0 {
+		parts = append(parts, fmt.Sprintf("本次暂停 %d 条工作", summary.Paused))
+	}
+	if summary.Resumed > 0 {
+		parts = append(parts, fmt.Sprintf("已自动续跑 %d 条", summary.Resumed))
+	}
+	if summary.WaitingOwner > 0 {
+		parts = append(parts, fmt.Sprintf("等待你处理 %d 条", summary.WaitingOwner))
+	}
+	if summary.Terminalized > 0 {
+		parts = append(parts, fmt.Sprintf("已收口 %d 条", summary.Terminalized))
+	}
+	if summary.Uncertain > 0 {
+		parts = append(parts, fmt.Sprintf(
+			"外部结果不确定 %d 条，这些动作不会重放",
+			summary.Uncertain,
+		))
+	}
+	return parts
+}
+
+func englishSummaryParts(summary Summary, includePaused bool) []string {
+	var parts []string
+	if includePaused && summary.Paused > 0 {
+		parts = append(parts, fmt.Sprintf("paused %d work items", summary.Paused))
+	}
+	if summary.Resumed > 0 {
+		parts = append(parts, fmt.Sprintf("automatically resumed %d", summary.Resumed))
+	}
+	if summary.WaitingOwner > 0 {
+		parts = append(parts, fmt.Sprintf("%d need your action", summary.WaitingOwner))
+	}
+	if summary.Terminalized > 0 {
+		parts = append(parts, fmt.Sprintf("closed %d", summary.Terminalized))
+	}
+	if summary.Uncertain > 0 {
+		parts = append(parts, fmt.Sprintf(
+			"%d external results are uncertain and will not be replayed",
+			summary.Uncertain,
+		))
+	}
+	return parts
 }
 
 func lifecycleIdempotencyKey(transition, identity string) string {

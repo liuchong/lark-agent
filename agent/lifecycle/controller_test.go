@@ -77,6 +77,56 @@ func TestControllerLifecycleIdempotencyKeyIsStable(t *testing.T) {
 	}
 }
 
+func TestControllerZeroSummaryDoesNotEnumerateZeroCategories(t *testing.T) {
+	messenger := &recordingMessenger{}
+	controller := NewController(messenger, Options{Language: "zh-CN", OwnerName: "测试负责人"})
+
+	if err := controller.NotifyOffline(context.Background(), "offline-zero", Summary{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.NotifyOnline(context.Background(), "online-zero", Summary{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(messenger.requests) != 2 {
+		t.Fatalf("requests=%+v", messenger.requests)
+	}
+	for _, request := range messenger.requests {
+		if strings.Contains(request.Text, "0 条") ||
+			strings.Contains(request.Text, "等待你处理") ||
+			strings.Contains(request.Text, "外部结果不确定") {
+			t.Fatalf("zero summary leaked empty categories: %s", request.Text)
+		}
+		if !strings.Contains(request.Text, "当前没有") {
+			t.Fatalf("zero summary lacks plain explanation: %s", request.Text)
+		}
+	}
+	if !strings.Contains(messenger.requests[1].Text, "/help") {
+		t.Fatalf("online zero summary lacks help path: %s", messenger.requests[1].Text)
+	}
+}
+
+func TestControllerSummaryOnlyRendersNonZeroCategoriesAndHandlingPath(t *testing.T) {
+	messenger := &recordingMessenger{}
+	controller := NewController(messenger, Options{Language: "zh-CN", OwnerName: "测试负责人"})
+	if err := controller.NotifyOnline(context.Background(), "online-mixed", Summary{
+		WaitingOwner: 2,
+		Uncertain:    1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	text := messenger.requests[0].Text
+	for _, want := range []string{"等待你处理 2 条", "外部结果不确定 1 条", "/tasks"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("notice missing %q: %s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"已自动续跑 0 条", "已收口 0 条"} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("notice includes empty category %q: %s", unwanted, text)
+		}
+	}
+}
+
 func TestControllerRejectsMissingTransitionIdentity(t *testing.T) {
 	controller := NewController(&recordingMessenger{}, Options{Language: "zh-CN", OwnerName: "测试负责人"})
 	if err := controller.NotifyOnline(context.Background(), "", Summary{}); err == nil {

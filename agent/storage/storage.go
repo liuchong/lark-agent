@@ -371,6 +371,37 @@ func (s *Store) migrate() error {
 			`CREATE INDEX IF NOT EXISTS idx_owner_reply_resolutions_work_item
 			 ON owner_reply_resolutions(work_item_id, evaluated_at DESC, id DESC)`,
 		}},
+		{version: 11, statements: []string{
+			`CREATE TABLE IF NOT EXISTS owner_control_commands (
+				message_id TEXT PRIMARY KEY,
+				command_json TEXT NOT NULL,
+				status TEXT NOT NULL,
+				result_json TEXT,
+				error TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_owner_control_commands_status
+			 ON owner_control_commands(status, updated_at)`,
+			`CREATE TABLE IF NOT EXISTS owner_work_resolutions (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				work_item_id INTEGER NOT NULL REFERENCES work_items(id),
+				action_id INTEGER REFERENCES action_attempts(id),
+				command_message_id TEXT NOT NULL UNIQUE,
+				disposition TEXT NOT NULL,
+				reason TEXT NOT NULL,
+				resolved_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_owner_work_resolutions_work_item
+			 ON owner_work_resolutions(work_item_id, resolved_at DESC, id DESC)`,
+			`CREATE INDEX IF NOT EXISTS idx_action_attempts_pending
+			 ON action_attempts(status, updated_at DESC, id DESC)`,
+		}},
+		{version: 12, statements: []string{
+			`ALTER TABLE owner_work_resolutions ADD COLUMN work_updated_at TEXT`,
+			`CREATE INDEX IF NOT EXISTS idx_owner_work_resolutions_work_epoch
+			 ON owner_work_resolutions(work_item_id, work_updated_at, id DESC)`,
+		}},
 	}
 	for _, migration := range migrations {
 		if version >= migration.version {
@@ -2465,8 +2496,13 @@ func (s *Store) ClaimNextForLane(worker string, lane domain.SchedulerLane) (doma
 	}
 	switch lane {
 	case domain.SchedulerLaneInteractive:
-		laneClause = ` AND work_kind IN (?, ?)`
-		args = append(args, domain.WorkKindFastPath, domain.WorkKindSimpleQuestion)
+		laneClause = ` AND work_kind IN (?, ?, ?)`
+		args = append(
+			args,
+			domain.WorkKindFastPath,
+			domain.WorkKindOwnerControl,
+			domain.WorkKindSimpleQuestion,
+		)
 	case domain.SchedulerLaneForeground:
 		laneClause = ` AND work_kind <> ?`
 		args = append(args, domain.WorkKindCodingGoal)
