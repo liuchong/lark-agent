@@ -351,20 +351,25 @@ func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T)
 		t.Fatal(err)
 	}
 	sources := map[string]string{
-		"sample-project/sample-module/sample-client/modify_request.kt": `data class SampleRequest(
-    val sampleContent: String,
-    val expectedEditVersion: Long,
-)`,
-		"sample-project/sample-module/go/internal/item_flow/api.go": `func SampleOperation(req SampleRequest, callback Callback) {
-    response, err := server.SampleOperation(req)
-    if err != nil {
-        callback.OnError(err)
-        return
-    }
-    callback.OnSuccess(response)
+		"sample-project/sample-module/sample-client/SampleRequest.java": `class SampleRequest {
+    String sampleContent;
+    long expectedEditVersion;
 }`,
-		"sample-project/sample-module/sample-client/message_listener.kt": `fun onSampleEvent(message: Message) {
-    localMessages.update(message.clientMsgID, message.sampleVersion)
+		"sample-project/sample-module/docs/sample-protocol-guide.md": `Sample-Client sends:
+new SampleRequest("conversation", 42L, "{\"content\":\"sample value\"}", 0L)
+The success callback means server acceptance only.
+Local state converges after WebSocket notification 9001 through onSampleEvent.
+Message exposes sampleFlag, sampleTimestamp, and sampleVersion.`,
+		"sample-project/sample-module/sample-client/SampleListener.java": `interface SampleListener {
+    void onSampleEvent(Message message);
+}`,
+		"sample-project/sample-module/sample-client/Message.java": `class Message {
+    boolean sampleFlag;
+    long sampleTimestamp;
+    long sampleVersion;
+}`,
+		"sample-project/sample-module/sample-client/SampleWrapperTest.java": `class SampleWrapperTest {
+    SampleRequest request;
 }`,
 	}
 	digests := make(map[string]string, len(sources))
@@ -439,29 +444,63 @@ func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T)
 		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
 			"read-request",
 			"read_workspace",
-			`{"path":"sample-client/modify_request.kt"}`,
+			`{"path":"sample-client/SampleRequest.java"}`,
 		)}),
-		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
-			"read-api",
-			"read_workspace",
-			`{"path":"go/internal/item_flow/api.go"}`,
-		)}),
-		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
-			"read-listener",
-			"read_workspace",
-			`{"path":"sample-client/message_listener.kt"}`,
-		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("premature-submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.99,
+			"reply_confidence":0.95,
+			"risk":"low",
+			"reply_text":"结论：已读取示例事件包装测试。依据：sample-project/sample-module/sample-client/SampleWrapperTest.java。未知/下一步：具体结构未知。",
+			"reason":"search-only source presented as a read",
+			"source_refs":[
+				{"relative_path":"sample-project/sample-module/sample-client/SampleRequest.java","digest":"`+digests["sample-project/sample-module/sample-client/SampleRequest.java"]+`","kind":"workspace_file"},
+				{"relative_path":"sample-project/sample-module/sample-client/SampleWrapperTest.java","digest":"`+digests["sample-project/sample-module/sample-client/SampleWrapperTest.java"]+`","kind":"workspace_search"}
+			]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("opaque-submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.99,
+			"reply_confidence":0.95,
+			"risk":"low",
+			"reply_text":"结论：sampleContent 是 JSON 结构。未知/下一步：没有。",
+			"reason":"opaque String declaration treated as concrete shape evidence",
+			"source_refs":[
+				{"relative_path":"sample-project/sample-module/sample-client/SampleRequest.java","digest":"`+digests["sample-project/sample-module/sample-client/SampleRequest.java"]+`","kind":"workspace_file"}
+			]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			codingEvalToolCall(
+				"read-guide",
+				"read_workspace",
+				`{"path":"docs/sample-protocol-guide.md"}`,
+			),
+			codingEvalToolCall(
+				"read-listener",
+				"read_workspace",
+				`{"path":"sample-client/SampleListener.java"}`,
+			),
+			codingEvalToolCall(
+				"read-message",
+				"read_workspace",
+				`{"path":"sample-client/Message.java"}`,
+			),
+		}),
 		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
 			"decision":"reply",
 			"relevance_confidence":0.99,
 			"reply_confidence":0.95,
 			"risk":"low",
-			"reply_text":"结论：sampleContent 是字符串形式的消息 JSON；接口成功只表示服务端接受修改；本地状态由 onSampleEvent 推送收敛。依据：请求、接口与监听器三个生产文件。未知/下一步：没有。",
+			"evidence_status":"verified",
+			"reply_text":"结论：sampleContent 是字符串形式的消息 JSON，具体为 {\"content\":\"sample value\"}；成功回调只表示服务端接受修改；本地状态由 9001 后的 onSampleEvent 推送以及 sampleFlag、sampleTimestamp、sampleVersion 字段收敛。依据：sample-project/sample-module/sample-client/SampleRequest.java、sample-project/sample-module/docs/sample-protocol-guide.md、sample-project/sample-module/sample-client/SampleListener.java、sample-project/sample-module/sample-client/Message.java。未知/下一步：没有。",
 			"reason":"all requested project facts have authoritative reads",
 			"source_refs":[
-				{"relative_path":"sample-project/sample-module/sample-client/modify_request.kt","digest":"`+digests["sample-project/sample-module/sample-client/modify_request.kt"]+`","kind":"workspace_file"},
-				{"relative_path":"sample-project/sample-module/go/internal/item_flow/api.go","digest":"`+digests["sample-project/sample-module/go/internal/item_flow/api.go"]+`","kind":"workspace_file"},
-				{"relative_path":"sample-project/sample-module/sample-client/message_listener.kt","digest":"`+digests["sample-project/sample-module/sample-client/message_listener.kt"]+`","kind":"workspace_file"}
+				{"relative_path":"sample-project/sample-module/sample-client/SampleRequest.java","digest":"`+digests["sample-project/sample-module/sample-client/SampleRequest.java"]+`","kind":"workspace_file"},
+				{"relative_path":"sample-project/sample-module/docs/sample-protocol-guide.md","digest":"`+digests["sample-project/sample-module/docs/sample-protocol-guide.md"]+`","kind":"workspace_file"},
+				{"relative_path":"sample-project/sample-module/sample-client/SampleListener.java","digest":"`+digests["sample-project/sample-module/sample-client/SampleListener.java"]+`","kind":"workspace_file"},
+				{"relative_path":"sample-project/sample-module/sample-client/Message.java","digest":"`+digests["sample-project/sample-module/sample-client/Message.java"]+`","kind":"workspace_file"}
 			]
 		}`)}),
 	}}
@@ -494,18 +533,29 @@ func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T)
 	if err != nil {
 		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
 	}
-	if decision.Kind != domain.DecisionReply || len(decision.Sources) != 3 {
+	if decision.Kind != domain.DecisionReply || len(decision.Sources) != 4 {
 		t.Fatalf("decision=%+v", decision)
 	}
-	for _, want := range []string{"字符串形式的消息 JSON", "服务端接受修改", "onSampleEvent"} {
+	for _, want := range []string{
+		`{"content":"sample value"}`,
+		"服务端接受修改",
+		"onSampleEvent",
+		"sampleTimestamp",
+	} {
 		if !strings.Contains(decision.ReplyText, want) {
 			t.Fatalf("reply=%q missing=%q", decision.ReplyText, want)
 		}
 	}
+	if !codingEvalTrajectoryContains(trajectory, "not backed by a current-run read") {
+		t.Fatalf("search-only draft was not rejected: %+v", trajectory)
+	}
+	if !codingEvalTrajectoryContains(trajectory, "concrete serialized shape") {
+		t.Fatalf("opaque-only draft was not rejected: %+v", trajectory)
+	}
 	if codingEvalTrajectoryContains(trajectory, "coding evidence is complete; submit_decision is required now") {
 		t.Fatalf("multi-field investigation was closed after partial evidence: %+v", trajectory)
 	}
-	if !codingEvalTrajectoryContains(trajectory, "sample-project/sample-module/sample-client/modify_request.kt") {
+	if !codingEvalTrajectoryContains(trajectory, "sample-project/sample-module/sample-client/SampleRequest.java") {
 		t.Fatalf("scoped search did not return the real project candidate: %+v", trajectory)
 	}
 	if len(model.toolNames) == 0 {
@@ -540,6 +590,101 @@ func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T)
 	}
 	if codingEvalTrajectoryContains(trajectory, "SIBLING_SECRET") {
 		t.Fatalf("exact scope leaked sibling content through symlink: %+v", trajectory)
+	}
+}
+
+func TestCodingQuestionRejectsUnreadDirectoryAndExtensionlessPaths(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := "service/router.go"
+	source := `package service
+
+func handler() {}`
+	if err := os.MkdirAll(filepath.Join(root, "service"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, sourcePath), []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(source))
+	digest := fmt.Sprintf("sha256:%s", hex.EncodeToString(sum[:8]))
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agenttools.NewRegistry(append(
+		agenttools.WorkspaceDefinitions(scope),
+		agentruntime.SubmitDecisionDefinition(),
+	)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, testCase := range []struct {
+		name     string
+		badPath  string
+		errorRef string
+	}{
+		{name: "directory", badPath: "service/internal", errorRef: "repository path service/internal"},
+		{name: "extensionless root file", badPath: "Makefile", errorRef: "repository path Makefile"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			model := &codingEvalModel{responses: []*schema.Message{
+				schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+					"read",
+					"read_workspace",
+					`{"path":"service/router.go"}`,
+				)}),
+				schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+					"bad-submit",
+					"submit_decision",
+					`{
+						"decision":"reply",
+						"evidence_status":"verified",
+						"relevance_confidence":0.99,
+						"reply_confidence":0.95,
+						"risk":"low",
+						"reply_text":"结论：实现依据位于 `+testCase.badPath+`。未知/下一步：没有。",
+						"reason":"unread repository path presented as evidence",
+						"source_refs":[
+							{"relative_path":"service/router.go","digest":"`+digest+`","kind":"workspace_file"}
+						]
+					}`,
+				)}),
+				schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+					"correct-submit",
+					"submit_decision",
+					`{
+						"decision":"reply",
+						"evidence_status":"verified",
+						"relevance_confidence":0.99,
+						"reply_confidence":0.95,
+						"risk":"low",
+						"reply_text":"结论：已核对处理函数。依据：service/router.go。未知/下一步：没有。",
+						"reason":"reply cites only the current-run read",
+						"source_refs":[
+							{"relative_path":"service/router.go","digest":"`+digest+`","kind":"workspace_file"}
+						]
+					}`,
+				)}),
+			}}
+			decision, trajectory, err := (agentruntime.AgentLoop{
+				Model: model, Tools: registry, MaxTurns: 3,
+			}).Decide(context.Background(), agentcontext.Bundle{
+				Event: domain.NormalizedEvent{
+					MessageID: "om_unread_path_" + testCase.name,
+					Content:   "请核对处理函数所在位置",
+				},
+				WorkKind: domain.WorkKindCodingQuestion,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decision.Kind != domain.DecisionReply || model.calls != 3 {
+				t.Fatalf("decision=%+v calls=%d", decision, model.calls)
+			}
+			if !codingEvalTrajectoryContains(trajectory, testCase.errorRef) {
+				t.Fatalf("trajectory missing %q: %+v", testCase.errorRef, trajectory)
+			}
+		})
 	}
 }
 

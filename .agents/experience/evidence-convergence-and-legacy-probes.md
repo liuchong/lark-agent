@@ -73,6 +73,18 @@ Two live failures established reusable implementation rules.
   multi-fact questions reserve enough calls for authoritative reads.
 - Do not require production call-site reachability when the user only asks for
   a named function's direct behavior.
+- A language-level opaque container such as `String`, bytes, or raw JSON proves
+  only the container type, not the concrete serialized shape. Keep a bounded
+  documentation, fixture, protocol, or serializer read available when shape is
+  part of the question, and enforce structural evidence at the terminal gate
+  instead of relying on prompt compliance alone.
+- Validate outward repository paths against current-run `read_workspace`
+  sources, not all submitted citations; a search receipt remains a locator even
+  when the model copies it into `source_refs`. Validate lower-camel-case
+  identifiers as complete identifiers against the cited read contents. This
+  catches plausible but wrong nearby names such as `modifyTime` versus
+  `sampleTimestamp` and prevents an unread test path from being presented as
+  inspected evidence.
 
 ## Explicit reply confidence
 

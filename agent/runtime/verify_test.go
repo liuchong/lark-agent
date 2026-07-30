@@ -130,6 +130,217 @@ func TestVerifyCodingDecisionRejectsInsufficientWithoutCodeInvestigation(t *test
 	}
 }
 
+func TestVerifyGroundedCodingReplyRejectsUncitedRepositoryPath(t *testing.T) {
+	source := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/sample-client/SampleRequest.java",
+		Digest:       "sha256:request",
+		Kind:         "workspace_file",
+	}
+	err := verifyGroundedCodingReply(
+		"请核对示例事件行为",
+		domain.Decision{
+			Kind:           domain.DecisionReply,
+			EvidenceStatus: domain.EvidenceVerified,
+			ReplyText:      "依据：sample-project/sample-module/sample-client/SampleWrapperTest.java",
+			Sources:        []domain.SourceRef{source},
+		},
+		map[string]string{
+			sourceKey(source): "class SampleRequest { private String sampleContent; }",
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "not backed by a current-run read") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestVerifyGroundedCodingReplyRejectsSearchOnlyRepositoryPath(t *testing.T) {
+	readSource := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/sample-client/SampleRequest.java",
+		Digest:       "sha256:request",
+		Kind:         "workspace_file",
+	}
+	searchOnlySource := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/sample-client/SampleWrapperTest.java",
+		Digest:       "sha256:test",
+		Kind:         "workspace_file",
+	}
+	err := verifyGroundedCodingReply(
+		"请核对示例事件行为",
+		domain.Decision{
+			Kind:           domain.DecisionReply,
+			EvidenceStatus: domain.EvidenceVerified,
+			ReplyText:      "依据：sample-project/sample-module/sample-client/SampleWrapperTest.java",
+			Sources:        []domain.SourceRef{readSource, searchOnlySource},
+		},
+		map[string]string{
+			sourceKey(readSource): "class SampleRequest { private String sampleContent; }",
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "not backed by a current-run read") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestVerifyGroundedCodingReplyRejectsDirectoryAndExtensionlessPaths(t *testing.T) {
+	source := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/sample-client/Message.java",
+		Digest:       "sha256:message",
+		Kind:         "workspace_file",
+	}
+	for _, reply := range []string{
+		"依据：sample-project/sample-module/sample-client",
+		"依据：sample-project/sample-module/Makefile",
+		"依据：sample-project/sample-module/Dockerfile",
+		"依据：Makefile",
+	} {
+		err := verifyGroundedCodingReply(
+			"请核对示例事件行为",
+			domain.Decision{
+				Kind:           domain.DecisionReply,
+				EvidenceStatus: domain.EvidenceVerified,
+				ReplyText:      reply,
+				Sources:        []domain.SourceRef{source},
+			},
+			map[string]string{
+				sourceKey(source): "class Message {}",
+			},
+		)
+		if err == nil || !strings.Contains(err.Error(), "repository path") {
+			t.Fatalf("reply=%q err=%v", reply, err)
+		}
+	}
+}
+
+func TestVerifyGroundedCodingReplyAllowsMIMETypeAndAbsoluteAPIRoute(t *testing.T) {
+	source := domain.SourceRef{
+		RelativePath: "service/router.go",
+		Digest:       "sha256:router",
+		Kind:         "workspace_file",
+	}
+	err := verifyGroundedCodingReply(
+		"请核对接口返回值",
+		domain.Decision{
+			Kind:           domain.DecisionReply,
+			EvidenceStatus: domain.EvidenceVerified,
+			ReplyText: "结论：/api/sample/items 返回 image/jpeg。" +
+				"依据：service/router.go。",
+			Sources: []domain.SourceRef{source},
+		},
+		map[string]string{
+			sourceKey(source): `router.POST("/api/sample/items", handler)
+const result = "image/jpeg"`,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestVerifyGroundedCodingReplyRejectsOpaqueDeclarationForConcreteShape(t *testing.T) {
+	source := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/sample-client/SampleRequest.java",
+		Digest:       "sha256:request",
+		Kind:         "workspace_file",
+	}
+	for _, content := range []string{
+		"class SampleRequest { private String sampleContent; }",
+		"type SampleRequest struct { sampleContent string }",
+		"type SampleRequest struct { sampleContent []byte }",
+	} {
+		err := verifyGroundedCodingReply(
+			"Sample-Client SampleRequest 的 sampleContent 是什么结构？",
+			domain.Decision{
+				Kind:           domain.DecisionReply,
+				EvidenceStatus: domain.EvidenceVerified,
+				ReplyText:      "结论：sampleContent 是 JSON 结构。",
+				Sources:        []domain.SourceRef{source},
+			},
+			map[string]string{
+				sourceKey(source): content,
+			},
+		)
+		if err == nil || !strings.Contains(err.Error(), "concrete serialized shape") {
+			t.Fatalf("content=%q err=%v", content, err)
+		}
+	}
+}
+
+func TestVerifyGroundedCodingReplyRejectsUnsupportedConcreteJSONExample(t *testing.T) {
+	source := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/docs/sample-protocol-guide.md",
+		Digest:       "sha256:guide",
+		Kind:         "workspace_file",
+	}
+	err := verifyGroundedCodingReply(
+		"Sample-Client SampleRequest 的 sampleContent 是什么结构？",
+		domain.Decision{
+			Kind:           domain.DecisionReply,
+			EvidenceStatus: domain.EvidenceVerified,
+			ReplyText:      `结论：sampleContent 具体为 {"text":"invented"}。`,
+			Sources:        []domain.SourceRef{source},
+		},
+		map[string]string{
+			sourceKey(source): `sampleContent example: {\"content\":\"sample value\"}`,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "unsupported serialized example") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestVerifyGroundedCodingReplyRejectsIdentifierAbsentFromCitedReads(t *testing.T) {
+	source := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/sample-client/Message.java",
+		Digest:       "sha256:message",
+		Kind:         "workspace_file",
+	}
+	err := verifyGroundedCodingReply(
+		"请核对示例事件行为",
+		domain.Decision{
+			Kind:           domain.DecisionReply,
+			EvidenceStatus: domain.EvidenceVerified,
+			ReplyText: "结论：本地通过 sampleFlag、modifyTime 和 sampleVersion 收敛。" +
+				"依据：sample-project/sample-module/sample-client/Message.java",
+			Sources: []domain.SourceRef{source},
+		},
+		map[string]string{
+			sourceKey(source): "class Message { boolean sampleFlag; long sampleTimestamp; long sampleVersion; }",
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "modifyTime") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestVerifyGroundedCodingReplyAcceptsCitedPathsAndIdentifiers(t *testing.T) {
+	source := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/sample-client/Message.java",
+		Digest:       "sha256:message",
+		Kind:         "workspace_file",
+	}
+	err := verifyGroundedCodingReply(
+		"Sample-Client SampleRequest 的 sampleContent 是什么结构？",
+		domain.Decision{
+			Kind:           domain.DecisionReply,
+			EvidenceStatus: domain.EvidenceVerified,
+			ReplyText: "结论：本地通过 sampleFlag、sampleTimestamp 和 sampleVersion 收敛。" +
+				"依据：sample-project/sample-module/sample-client/Message.java",
+			Sources: []domain.SourceRef{source},
+		},
+		map[string]string{
+			sourceKey(source): `class Message {
+    boolean sampleFlag;
+    long sampleTimestamp;
+    long sampleVersion;
+}
+Example payload: {"content":"sample value"}`,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestVerifyCodingDecisionRejectsApprovalBypass(t *testing.T) {
 	err := verifyCodingDecision(agentcontext.Bundle{
 		Event: domain.NormalizedEvent{Content: "请检查生产源码是否存在 NormalizeContentType"},

@@ -149,7 +149,8 @@ func exactCodingWorkspaceScopePrompt(scope string, maxToolCalls int) string {
 	return fmt.Sprintf(
 		"Exact coding workspace scope: %s. This exact scope is already a readable subtree inside the configured workspace root; do not request changing workspace_root and do not substitute a similarly named repository. "+
 			"Use only paths inside this scope. Path-scoped tools may use either the full scope path or a repository-relative path such as sample-client/...; the runtime safely prefixes repository-relative paths with %s. "+
-			"Use at most two bounded locating searches, then read the promising production files and answer every requested field. The investigation tool-call limit is %d; reserve calls for authoritative reads and submit_decision.",
+			"Use at most two bounded locating searches, then read the promising production files and answer every requested field. If a requested serialized payload is declared only as String, bytes, raw JSON, or another opaque container, that declaration does not prove the concrete shape; use a remaining bounded read for current docs, tests, protocol definitions, or serialization code. "+
+			"The investigation tool-call limit is %d; reserve calls for authoritative reads and submit_decision.",
 		scope,
 		scope,
 		maxToolCalls,

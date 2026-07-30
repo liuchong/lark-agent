@@ -970,12 +970,14 @@ Workspace or a business warehouse is not enough. Routing and runtime evidence
 validation use the same classifier.
 
 For `coding_question` work, a successful authoritative `read_workspace` result
-containing a production source is the convergence boundary. Code-index and
+containing a production source starts convergence. Code-index and
 workspace-search results only locate candidates and cannot trigger convergence
-before the production file is actually read. The immediately following model
-turn exposes only `submit_decision`; it cannot spend more turns on Lark
-history, rules, tests, broad search, or shell commands. The model must answer
-from the verified production facts and state any remaining unknowns explicitly.
+before the production file is actually read. If that production read answers
+every requested fact, the model must stop broad investigation and submit its
+decision. If it proves only part of a multi-field request or only the container
+type of a serialized value, the remaining bounded search and read tools stay
+available for the unanswered facts. The model must answer from verified facts
+and state any remaining unknowns explicitly.
 A definite coding reply must declare `evidence_status=verified` and cite at
 least one production source returned by an authoritative `read_workspace`
 result in the current run. A reply that cannot make a definite claim declares
@@ -986,6 +988,25 @@ accepted after at least one successful workspace/code search, trace, explore,
 or read in the current run; reading Lark history alone does not count as code
 investigation. Search-only candidate sources cannot support a definite code
 claim.
+
+When the requested fact is the concrete shape of an opaque serialized value,
+reading only a language-level declaration such as `String`, `[]byte`, or
+`json.RawMessage` is incomplete evidence. The investigation must use its
+remaining bounded calls to read a current documentation example, test fixture,
+protocol definition, or serialization implementation that exposes structural
+serialization evidence such as a concrete object example or serializer
+operation. A verified answer to that request is rejected when its cited
+current-run reads contain only opaque declarations.
+
+A verified reply may mention repository-relative file or directory paths only
+when those paths identify cited sources returned by `read_workspace` in the
+current run. Search-only candidates are not readable evidence even when the
+model copies their source references into the final decision. This applies to
+paths with extensions, directories, and conventional extensionless repository
+files such as `Makefile` and `Dockerfile`. Lower-camel-case code identifiers in
+the reply must occur as complete identifiers in the cited authoritative reads;
+this prevents a nearby but different field or callback name from being
+presented as verified.
 
 ## Reply Policy
 
@@ -1441,6 +1462,17 @@ The multi-step loop is accepted by these executable BDD scenarios:
   bounded locating searches before reading the candidate production files and
   to reserve enough tool and model budget to answer every requested field or
   state the exact remaining unknown.
+- Given a coding question asks for the concrete structure of a serialized
+  string field, when the first production declaration proves only that the
+  field is a string, then a verified decision is rejected until a bounded
+  documentation, fixture, protocol, or serialization read supplies structural
+  serialization evidence.
+- Given a verified coding draft names a repository-relative path that was not
+  cited from a current-run read, including a search-only path, directory, or
+  extensionless repository file, or names a lower-camel-case code identifier
+  absent from all cited authoritative reads, when the verify gate evaluates the
+  draft, then it rejects the draft and gives the model a chance to repair the
+  evidence or wording before any Lark reply is sent.
 - Given a coding run submits its required bounded investigation plan, when the
   runtime reports the current tool-call budget, then the plan is control
   metadata and does not consume an investigation call; every model turn sees

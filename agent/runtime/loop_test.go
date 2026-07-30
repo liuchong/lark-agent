@@ -731,7 +731,8 @@ func TestAgentLoopKeepsBoundedReadsAvailableUntilMultiFieldQuestionIsAnswered(t 
 			}
 			readPaths = append(readPaths, input.Path)
 			digest := "sha256:request"
-			content := `type SampleRequest struct { SampleContent string }`
+			content := "type SampleRequest struct { SampleContent string } // " +
+				`{"content":"sample value"}`
 			if strings.HasSuffix(input.Path, "listener.go") {
 				digest = "sha256:listener"
 				content = `func onSampleEvent(message Message) { updateLocal(message) }`

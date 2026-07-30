@@ -151,6 +151,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	allowedSources := make(map[string]bool)
 	observedSources := make(map[string]map[string]domain.SourceRef)
 	authoritativeSources := make(map[string]bool)
+	authoritativeContents := make(map[string]string)
 	codingEvidenceReads := 0
 	for _, source := range bundle.Sources {
 		allowedSources[sourceKey(source)] = true
@@ -412,6 +413,16 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					execution.Decision = nil
 				}
 			}
+			if toolErr == nil && execution.Decision != nil {
+				if err := verifyGroundedCodingReply(
+					bundle.Event.Content+"\n"+conversationText(bundle.Conversation),
+					*execution.Decision,
+					authoritativeContents,
+				); err != nil {
+					toolErr = err
+					execution.Decision = nil
+				}
+			}
 			if toolErr == nil && execution.Decision == nil && call.Function.Name == "search_workspace" && len(execution.Sources) == 0 {
 				sourceLessWorkspaceSearches++
 			}
@@ -472,9 +483,11 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			for _, source := range execution.Sources {
 				allowedSources[sourceKey(source)] = true
 				recordObservedSource(observedSources, source)
-				if call.Function.Name == "read_workspace" &&
-					hasProductionSource([]domain.SourceRef{source}) {
-					authoritativeSources[sourceKey(source)] = true
+				if call.Function.Name == "read_workspace" {
+					authoritativeContents[sourceKey(source)] = execution.Content
+					if hasProductionSource([]domain.SourceRef{source}) {
+						authoritativeSources[sourceKey(source)] = true
+					}
 				}
 			}
 			if bundle.WorkKind == domain.WorkKindCodingQuestion &&
@@ -697,7 +710,7 @@ func terminalOnlyPrompt(attempt, maxAttempts int) string {
 }
 
 func codingEvidenceConvergencePrompt() string {
-	return "Citable workspace evidence is now available. If it answers the concrete fields the user asked for, call submit_decision now. Do not expand into unrelated Lark history, repository-wide searches, or production call-site proof unless the user explicitly asked about reachability. For an exact function's direct behavior, its digest-backed definition is sufficient; preserve explicit unknowns instead of over-investigating."
+	return "Citable workspace evidence is now available. If it answers every concrete field the user asked for, call submit_decision now. A declaration that only shows an opaque String, bytes, raw JSON, or generic container does not prove its concrete serialized shape: use a remaining bounded read for current docs, tests, protocol definitions, or serialization code before claiming that shape is verified. Do not expand into unrelated Lark history, repository-wide searches, or production call-site proof unless the user explicitly asked about reachability. For an exact function's direct behavior, its digest-backed definition is sufficient; preserve explicit unknowns instead of over-investigating."
 }
 
 func submitDecisionOnly(infos []*schema.ToolInfo) []*schema.ToolInfo {
@@ -1118,7 +1131,7 @@ func SubmitDecisionDefinition() agenttools.Definition {
 				},
 				"reply_text": {
 					Type: schema.String,
-					Desc: "Exact sender-facing text. Required for reply and request_approval. For delegated work, state completed read-only work, a concise initial finding or explicit unknown, and concrete information passed to the owner; do not merely acknowledge, restate, or promise future coordination. For verified coding replies, keep the structure as 结论、依据、未知/下一步 and cite authoritative production source_refs. For insufficient coding replies, the runtime emits canonical evidence-limited text. Lark mention placeholders like @_user_1 are internal keys from the mentions mapping: do not invent them, and do not use shell to send messages. The runtime renders known mention placeholders into Lark-native mentions and adds the robot marker only when replying as the owner on the owner's behalf.",
+					Desc: "Exact sender-facing text. Required for reply and request_approval. For delegated work, state completed read-only work, a concise initial finding or explicit unknown, and concrete information passed to the owner; do not merely acknowledge, restate, or promise future coordination. For verified coding replies, keep the structure as 结论、依据、未知/下一步 and cite authoritative production source_refs. Every repository-relative path in the reply must be cited, and every lower-camel-case code identifier must occur in the cited authoritative reads. An opaque String, bytes, raw JSON, or generic container declaration does not prove its concrete serialized shape; cite a current example, fixture, protocol, or serialization implementation before claiming that shape. For insufficient coding replies, the runtime emits canonical evidence-limited text. Lark mention placeholders like @_user_1 are internal keys from the mentions mapping: do not invent them, and do not use shell to send messages. The runtime renders known mention placeholders into Lark-native mentions and adds the robot marker only when replying as the owner on the owner's behalf.",
 				},
 				"owner_action": {
 					Type: schema.String,
