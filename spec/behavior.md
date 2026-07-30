@@ -573,6 +573,14 @@ binds the run, tool call, argument hash, result digest, and source references.
 The model may not claim it read, searched, tested, or verified something when no
 matching receipt exists.
 
+The tool-result digest and each cited source digest have different meanings.
+If the model copies the tool-result digest into a `source_ref`, the runtime may
+canonicalize it to the recorded source digest only when the submitted relative
+path and source kind identify exactly one source digest in the current run. A
+source that was never observed, has a different kind, or has multiple recorded
+digests for the same path and kind remains invalid; the runtime must not guess
+which version the model intended.
+
 Examples, tests, fixtures, and documentation are supporting evidence. A
 definite claim about production implementation requires at least one production
 source; otherwise the reply must explicitly state that production behavior
@@ -1348,6 +1356,12 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given a tool result is cited in a coding conclusion, when `submit_decision`
   is validated, then a matching receipt-equivalent audit record must bind the
   run, tool call, arguments, result digest, and source references.
+- Given a workspace read records one source digest and the same receipt exposes
+  a different tool-result digest, when the model cites the correct relative path
+  and source kind but copies the tool-result digest, then the runtime
+  canonicalizes the citation to the unique recorded source digest and validates
+  the decision; when two recorded digests share that path and kind, the same
+  mismatch is rejected as ambiguous.
 - Given the coding run approaches tool-output, context, or turn budget, when
   useful evidence already exists, then the runtime summarizes stale evidence and
   forces convergence instead of failing the whole work item only because raw

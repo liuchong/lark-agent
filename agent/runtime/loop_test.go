@@ -600,6 +600,62 @@ func TestAgentLoopKeepsBoundedReadsAvailableUntilMultiFieldQuestionIsAnswered(t 
 	}
 }
 
+func TestCanonicalizeDecisionSourcesUsesUniqueObservedIdentity(t *testing.T) {
+	recorded := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/sample-client/SampleRequest.java",
+		Digest:       "sha256:fb39caf1b13bea28",
+		Kind:         "workspace_file",
+	}
+	allowed := map[string]bool{sourceKey(recorded): true}
+	observed := map[string]map[string]domain.SourceRef{}
+	recordObservedSource(observed, recorded)
+	decision := domain.Decision{Sources: []domain.SourceRef{{
+		RelativePath: recorded.RelativePath,
+		Digest:       "fb39caf1b13bea28cce16d2744a964e1445808b2a3be0861414de47f85d7ead7",
+		Kind:         recorded.Kind,
+	}}}
+
+	decision = canonicalizeDecisionSources(decision, allowed, observed)
+
+	if len(decision.Sources) != 1 || decision.Sources[0] != recorded {
+		t.Fatalf("sources=%+v want %+v", decision.Sources, recorded)
+	}
+	if err := validateDecisionSources(decision, allowed); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCanonicalizeDecisionSourcesDoesNotGuessBetweenObservedVersions(t *testing.T) {
+	first := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/sample-client/SampleRequest.java",
+		Digest:       "sha256:first",
+		Kind:         "workspace_file",
+	}
+	second := first
+	second.Digest = "sha256:second"
+	allowed := map[string]bool{
+		sourceKey(first):  true,
+		sourceKey(second): true,
+	}
+	observed := map[string]map[string]domain.SourceRef{}
+	recordObservedSource(observed, first)
+	recordObservedSource(observed, second)
+	decision := domain.Decision{Sources: []domain.SourceRef{{
+		RelativePath: first.RelativePath,
+		Digest:       "sha256:tool-result",
+		Kind:         first.Kind,
+	}}}
+
+	decision = canonicalizeDecisionSources(decision, allowed, observed)
+
+	if decision.Sources[0].Digest != "sha256:tool-result" {
+		t.Fatalf("ambiguous source was rewritten: %+v", decision.Sources[0])
+	}
+	if err := validateDecisionSources(decision, allowed); err == nil {
+		t.Fatal("ambiguous source should remain unavailable")
+	}
+}
+
 func TestAgentLoopReservesFinalTwoTurnsAfterCitableEvidence(t *testing.T) {
 	model := &scriptedModel{responses: []*schema.Message{
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{

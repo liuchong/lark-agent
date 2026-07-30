@@ -25,3 +25,8 @@ one provider protocol unit.
 - A provider accepting the first request does not prove the tool schema is at
   fault when a later request fails. Inspect the exact post-compaction message
   sequence before changing schemas or credentials.
+- A tool receipt result digest identifies the whole tool output; a source
+  digest identifies one concrete file or reference. Models can confuse them
+  when both are visible. Canonicalize only by a unique current-run
+  `(source kind, relative path)` identity, and keep multiple observed digests
+  ambiguous rather than guessing a version.

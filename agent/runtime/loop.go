@@ -140,10 +140,12 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	}
 	sequence := 0
 	allowedSources := make(map[string]bool)
+	observedSources := make(map[string]map[string]domain.SourceRef)
 	authoritativeSources := make(map[string]bool)
 	codingEvidenceReads := 0
 	for _, source := range bundle.Sources {
 		allowedSources[sourceKey(source)] = true
+		recordObservedSource(observedSources, source)
 	}
 	totalToolBytes := 0
 	repeatedCalls := map[string]int{}
@@ -351,6 +353,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			}
 			if toolErr == nil && execution.Decision != nil {
 				normalized := normalizeDecisionLanguage(bundle, *execution.Decision)
+				normalized = canonicalizeDecisionSources(normalized, allowedSources, observedSources)
 				execution.Decision = &normalized
 			}
 			if toolErr == nil && execution.Decision != nil {
@@ -450,6 +453,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			}
 			for _, source := range execution.Sources {
 				allowedSources[sourceKey(source)] = true
+				recordObservedSource(observedSources, source)
 				if call.Function.Name == "read_workspace" &&
 					hasProductionSource([]domain.SourceRef{source}) {
 					authoritativeSources[sourceKey(source)] = true
@@ -1085,6 +1089,7 @@ func SubmitDecisionDefinition() agenttools.Definition {
 				"reason": {Type: schema.String, Required: true},
 				"source_refs": {
 					Type: schema.Array,
+					Desc: "Cite only exact entries copied from a successful tool result's top-level sources array. Its source digest identifies the file or reference; never substitute receipt.result_digest, which identifies the whole tool output.",
 					ElemInfo: &schema.ParameterInfo{
 						Type: schema.Object,
 						SubParams: map[string]*schema.ParameterInfo{
@@ -1225,6 +1230,44 @@ func validateDecisionSources(decision domain.Decision, allowed map[string]bool) 
 		}
 	}
 	return nil
+}
+
+func recordObservedSource(
+	observed map[string]map[string]domain.SourceRef,
+	source domain.SourceRef,
+) {
+	if strings.TrimSpace(source.RelativePath) == "" ||
+		strings.TrimSpace(source.Kind) == "" ||
+		strings.TrimSpace(source.Digest) == "" {
+		return
+	}
+	identity := sourceIdentityKey(source)
+	if observed[identity] == nil {
+		observed[identity] = make(map[string]domain.SourceRef)
+	}
+	observed[identity][sourceKey(source)] = source
+}
+
+func canonicalizeDecisionSources(
+	decision domain.Decision,
+	allowed map[string]bool,
+	observed map[string]map[string]domain.SourceRef,
+) domain.Decision {
+	sources := append([]domain.SourceRef(nil), decision.Sources...)
+	for index, source := range sources {
+		if allowed[sourceKey(source)] {
+			continue
+		}
+		candidates := observed[sourceIdentityKey(source)]
+		if len(candidates) != 1 {
+			continue
+		}
+		for _, candidate := range candidates {
+			sources[index] = candidate
+		}
+	}
+	decision.Sources = sources
+	return decision
 }
 
 func validateTerminalDecision(bundle agentcontext.Bundle, decision domain.Decision) error {
@@ -1440,4 +1483,8 @@ func nonEmptyStrings(values []string) []string {
 
 func sourceKey(source domain.SourceRef) string {
 	return source.Kind + "\x00" + source.RelativePath + "\x00" + source.Digest
+}
+
+func sourceIdentityKey(source domain.SourceRef) string {
+	return source.Kind + "\x00" + source.RelativePath
 }

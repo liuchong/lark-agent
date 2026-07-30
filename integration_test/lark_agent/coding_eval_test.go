@@ -114,6 +114,228 @@ func handler() {
 	}
 }
 
+func TestCodingQuestionCanonicalizesUniqueSourceWhenModelCopiesToolResultDigest(t *testing.T) {
+	source := `public class SampleRequest {
+    private String sampleContent;
+}`
+	sum := sha256.Sum256([]byte(source))
+	fullDigest := hex.EncodeToString(sum[:])
+	for _, testCase := range []struct {
+		name            string
+		submittedDigest string
+	}{
+		{name: "live_model_omits_digest_prefix", submittedDigest: fullDigest},
+		{name: "model_copies_exact_receipt_digest", submittedDigest: "sha256:" + fullDigest},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			testCodingQuestionCanonicalizesUniqueSource(
+				t,
+				source,
+				testCase.submittedDigest,
+			)
+		})
+	}
+}
+
+func testCodingQuestionCanonicalizesUniqueSource(
+	t *testing.T,
+	source string,
+	toolResultDigestCopiedByModel string,
+) {
+	t.Helper()
+	root := t.TempDir()
+	const relativePath = "sample-project/sample-module/sample-client/SampleRequest.java"
+	fullPath := filepath.Join(root, relativePath)
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fullPath, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(source))
+	sourceDigest := fmt.Sprintf("sha256:%s", hex.EncodeToString(sum[:8]))
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agenttools.NewRegistry(
+		append(
+			agenttools.WorkspaceDefinitions(scope),
+			agentruntime.SubmitInvestigationPlanDefinition(),
+			agentruntime.SubmitDecisionDefinition(),
+		)...,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("plan", "submit_investigation_plan", `{
+			"question":"确认 SampleRequest.sampleContent 的类型",
+			"entry_points":["sample-project/sample-module/sample-client/SampleRequest.java"],
+			"symbols":["SampleRequest","sampleContent"],
+			"tools":["read_workspace"],
+			"stop_conditions":["读到 sampleContent 的生产定义"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read",
+			"read_workspace",
+			`{"path":"`+relativePath+`"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.99,
+			"reply_confidence":0.98,
+			"risk":"low",
+			"reply_text":"结论：sampleContent 是 String。依据：已读取 Sample-Client 请求模型。未知/下一步：没有。",
+			"reason":"production source was read",
+			"source_refs":[{
+				"relative_path":"`+relativePath+`",
+				"digest":"`+toolResultDigestCopiedByModel+`",
+				"kind":"workspace_file"
+			}]
+		}`)}),
+	}}
+	decision, _, err := (agentruntime.AgentLoop{
+		Model: model,
+		Tools: registry,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_tool_result_digest",
+			Content:   "请检查示例模块中样例请求字段的类型",
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decision.Sources) != 1 || decision.Sources[0].Digest != sourceDigest {
+		t.Fatalf("sources=%+v want canonical digest %q", decision.Sources, sourceDigest)
+	}
+}
+
+func TestCodingQuestionRejectsUnsafeSourceCanonicalization(t *testing.T) {
+	const relativePath = "sample-project/sample-module/sample-client/SampleRequest.java"
+	for _, testCase := range []struct {
+		name          string
+		bundleSources []domain.SourceRef
+		submitted     domain.SourceRef
+	}{
+		{
+			name: "unobserved_path",
+			submitted: domain.SourceRef{
+				RelativePath: "sample-project/sample-module/sample-client/Unobserved.java",
+				Digest:       "sha256:tool-result",
+				Kind:         "workspace_file",
+			},
+		},
+		{
+			name: "different_source_kind",
+			submitted: domain.SourceRef{
+				RelativePath: relativePath,
+				Digest:       "sha256:tool-result",
+				Kind:         "code_index",
+			},
+		},
+		{
+			name: "ambiguous_observed_versions",
+			bundleSources: []domain.SourceRef{
+				{RelativePath: relativePath, Digest: "sha256:older", Kind: "workspace_file"},
+				{RelativePath: relativePath, Digest: "sha256:newer", Kind: "workspace_file"},
+			},
+			submitted: domain.SourceRef{
+				RelativePath: relativePath,
+				Digest:       "sha256:tool-result",
+				Kind:         "workspace_file",
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			testCodingQuestionRejectsSourceCanonicalization(
+				t,
+				testCase.bundleSources,
+				testCase.submitted,
+			)
+		})
+	}
+}
+
+func testCodingQuestionRejectsSourceCanonicalization(
+	t *testing.T,
+	bundleSources []domain.SourceRef,
+	submitted domain.SourceRef,
+) {
+	t.Helper()
+	root := t.TempDir()
+	const relativePath = "sample-project/sample-module/sample-client/SampleRequest.java"
+	fullPath := filepath.Join(root, relativePath)
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fullPath, []byte("class SampleRequest {}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agenttools.NewRegistry(
+		append(
+			agenttools.WorkspaceDefinitions(scope),
+			agentruntime.SubmitInvestigationPlanDefinition(),
+			agentruntime.SubmitDecisionDefinition(),
+		)...,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	submittedJSON, err := json.Marshal([]domain.SourceRef{submitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("plan", "submit_investigation_plan", `{
+			"question":"确认 SampleRequest 的生产定义",
+			"entry_points":["`+relativePath+`"],
+			"symbols":["SampleRequest"],
+			"tools":["read_workspace"],
+			"stop_conditions":["读到生产定义"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read",
+			"read_workspace",
+			`{"path":"`+relativePath+`"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.99,
+			"reply_confidence":0.98,
+			"risk":"low",
+			"reply_text":"结论：已确认生产定义。依据：源码。未知/下一步：没有。",
+			"reason":"attempted source citation",
+			"source_refs":`+string(submittedJSON)+`
+		}`)}),
+	}}
+	_, trajectory, err := (agentruntime.AgentLoop{
+		Model: model,
+		Tools: registry,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_reject_source_canonicalization",
+			Content:   "请检查示例模块中样例请求的生产定义",
+		},
+		Sources:  bundleSources,
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err == nil {
+		t.Fatal("unsafe source canonicalization should not complete")
+	}
+	if !codingEvalTrajectoryContains(trajectory, "model decision referenced an unavailable source") {
+		t.Fatalf("trajectory did not retain source rejection: %+v", trajectory)
+	}
+}
+
 func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T) {
 	root := t.TempDir()
 	sources := map[string]string{
