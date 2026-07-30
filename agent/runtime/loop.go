@@ -148,10 +148,9 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	totalToolBytes := 0
 	repeatedCalls := map[string]int{}
 	sourceLessWorkspaceSearches := 0
+	requestedWorkspaceScope := requestedCodingWorkspaceScope(bundle)
 	toolBudgetConvergencePrompted := false
 	codingEvidenceConvergencePrompted := false
-	// Initial rules and memories are citable context, but only a fresh successful
-	// tool result may close a coding investigation.
 	codingEvidenceAvailable := false
 	var codingSearches codingSearchEvidence
 	investigationPlanSubmitted := false
@@ -191,9 +190,15 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		if budget.RemainingTurns() == 0 {
 			forceDecision = true
 		}
-		codingTerminalOnly := bundle.WorkKind == domain.WorkKindCodingQuestion &&
-			codingEvidenceAvailable
-		terminalOnly := forceDecision || codingTerminalOnly
+		if bundle.WorkKind == domain.WorkKindCodingQuestion &&
+			codingEvidenceAvailable &&
+			budget.RemainingTurns() <= 1 {
+			forceDecision = true
+		}
+		if toolCalls >= l.MaxToolCalls {
+			forceDecision = true
+		}
+		terminalOnly := forceDecision
 		turnToolInfos := visibleToolInfos
 		if terminalOnly {
 			if terminalOnlyAttempts >= maxTerminalOnlyAttempts {
@@ -263,16 +268,10 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			toolCtx = agenttools.WithInvocationScope(toolCtx, invocationScope)
 			var execution agenttools.Execution
 			var toolErr error
-			if codingTerminalOnly && call.Function.Name != "submit_decision" {
+			if forceDecision && call.Function.Name != "submit_decision" {
 				toolErr = errs.NewInternalError(
 					errs.SubtypeInvalidResponse,
-					"coding evidence is complete; submit_decision is required now with verified facts and explicit unknowns",
-				)
-				forceDecision = true
-			} else if forceDecision && call.Function.Name != "submit_decision" {
-				toolErr = errs.NewInternalError(
-					errs.SubtypeInvalidResponse,
-					"investigation made no progress or exhausted its tool budget; submit_decision now with verified facts and explicit unknowns",
+					"investigation must converge because the remaining turn, no-progress, or tool budget requires a terminal decision; submit_decision now with verified facts and explicit unknowns",
 				)
 			} else if toolCalls >= l.MaxToolCalls && call.Function.Name != "submit_decision" {
 				toolErr = errs.NewInternalError(
@@ -301,6 +300,18 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					errs.SubtypeInvalidResponse,
 					"search_workspace is exhausted for this work item after repeated searches without citable sources; use list_workspace, read_workspace, a path-specific shell command, or submit_decision with explicit unknowns",
 				)
+			} else if isCodingBundle(bundle) && requestedWorkspaceScope != "" {
+				toolErr = validateCodingWorkspaceScope(
+					call.Function.Name,
+					call.Function.Arguments,
+					requestedWorkspaceScope,
+				)
+				if toolErr == nil {
+					execution, toolErr = l.Tools.Execute(toolCtx, call.Function.Name, json.RawMessage(call.Function.Arguments))
+					if toolErr == nil && call.Function.Name != "submit_decision" {
+						toolCalls++
+					}
+				}
 			} else {
 				execution, toolErr = l.Tools.Execute(toolCtx, call.Function.Name, json.RawMessage(call.Function.Arguments))
 				if toolErr == nil && call.Function.Name != "submit_decision" {
@@ -417,6 +428,9 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				call.Function.Name == "read_workspace" &&
 				hasProductionSource(execution.Sources) {
 				codingEvidenceAvailable = true
+				if budget.RemainingTurns() <= 1 {
+					forceDecision = true
+				}
 				if !codingEvidenceConvergencePrompted {
 					messages = append(messages, schema.SystemMessage(codingEvidenceConvergencePrompt()))
 					codingEvidenceConvergencePrompted = true

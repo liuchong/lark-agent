@@ -289,7 +289,7 @@ func TestDelegatedReplyCannotBurnGeneralTurnsAfterForcedDecision(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "terminal decision after 3 attempts") {
 		t.Fatalf("err=%v", err)
 	}
-	if model.calls != 5 || searchCalls != 0 {
+	if model.calls != 4 || searchCalls != 0 {
 		t.Fatalf("modelCalls=%d searchCalls=%d", model.calls, searchCalls)
 	}
 }

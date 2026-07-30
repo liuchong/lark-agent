@@ -34,10 +34,21 @@ Two live failures established reusable implementation rules.
   require `reply` and reject `ignore`, `record`, `notify`, and
   `request_approval` so no terminal type can bypass authoritative reads or
   turn an answerable prompt into silence.
-- After an authoritative production read, expose only `submit_decision` on the
-  immediately following model turn. Reject any model-emitted non-terminal call
-  without execution and keep a bounded repair turn. Waiting until the final two
-  turns still allows long, unrelated investigations after the answer is known.
+- An authoritative production read proves only the facts contained in that
+  source; it does not prove that a multi-field investigation is complete.
+  Prompt the model to compare the read against every requested field and plan
+  stop condition. Keep bounded code tools available for unanswered fields, and
+  reserve the final two model turns for terminal submission and one bounded
+  correction once citable evidence exists. Exhausted tool or no-progress
+  budgets also force terminal-only mode.
+- When the user names a repository or workspace-relative path, preserve its
+  exact spelling and case. Do not silently substitute a similarly named sibling
+  project merely because a broad search finds it first. Resolve relative paths
+  only against known top-level workspace directories, and only when one such
+  path is present so comparisons are not collapsed onto the first repository.
+  Inherit a scope from conversation context only for an explicit continuation
+  from the same sender. Reject global index/trace tools that cannot carry the
+  exact path boundary.
 - Do not require production call-site reachability when the user only asks for
   a named function's direct behavior.
 

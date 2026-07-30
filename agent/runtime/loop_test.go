@@ -524,38 +524,50 @@ func TestAgentLoopForcesTerminalBeforeTurnExhaustion(t *testing.T) {
 	}
 }
 
-func TestAgentLoopConvergesImmediatelyAfterCitableEvidence(t *testing.T) {
+func TestAgentLoopKeepsBoundedReadsAvailableUntilMultiFieldQuestionIsAnswered(t *testing.T) {
 	model := &scriptedModel{responses: []*schema.Message{
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{
-			"question":"GetType 对 .JPG 返回什么",
-			"entry_points":["content_type.go"],
-			"symbols":["GetType"],
+			"question":"SampleRequest 的 sampleContent 结构和本地收敛回调分别是什么",
+			"entry_points":["sample-project/sample-module/sample-client/request.go","sample-project/sample-module/sample-client/listener.go"],
+			"symbols":["SampleRequest","onSampleEvent"],
 			"tools":["read_workspace"],
-			"stop_conditions":["读到 GetType 定义"]
+			"stop_conditions":["读到请求结构","读到本地示例事件回调"]
 		}`)}),
-		schema.AssistantMessage("", []schema.ToolCall{toolCall("read", "read_workspace", `{"path":"content_type.go"}`)}),
-		schema.AssistantMessage("", []schema.ToolCall{toolCall("extra", "search_workspace", `{"query":"unrelated call sites"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("read-request", "read_workspace", `{"path":"sample-project/sample-module/sample-client/request.go"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("read-listener", "read_workspace", `{"path":"sample-project/sample-module/sample-client/listener.go"}`)}),
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("submit", "submit_decision", `{
 			"decision":"reply",
 			"relevance_confidence":0.95,
 			"reply_confidence":0.92,
 			"risk":"low",
-			"reply_text":"结论：.JPG 返回 image/jpeg。依据：content_type.go 的 GetType 会去掉前导点并做小写映射。未知/下一步：没有。",
-			"reason":"exact function definition answers the requested behavior",
-			"source_refs":[{"relative_path":"content_type.go","digest":"sha256:test","kind":"workspace_file"}]
+			"reply_text":"结论：sampleContent 是文本消息 JSON，本地通过 onSampleEvent 收敛。依据：请求定义和监听器实现。未知/下一步：没有。",
+			"reason":"both requested fields now have production evidence",
+			"source_refs":[
+				{"relative_path":"sample-project/sample-module/sample-client/request.go","digest":"sha256:request","kind":"workspace_file"},
+				{"relative_path":"sample-project/sample-module/sample-client/listener.go","digest":"sha256:listener","kind":"workspace_file"}
+			]
 		}`)}),
 	}}
-	extraSearches := 0
+	readPaths := make([]string, 0, 2)
 	registry, err := agenttools.NewRegistry(
-		testTool("read_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+		testTool("read_workspace", func(_ context.Context, raw json.RawMessage) (agenttools.Execution, error) {
+			var input struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal(raw, &input); err != nil {
+				return agenttools.Execution{}, err
+			}
+			readPaths = append(readPaths, input.Path)
+			digest := "sha256:request"
+			content := `type SampleRequest struct { SampleContent string }`
+			if strings.HasSuffix(input.Path, "listener.go") {
+				digest = "sha256:listener"
+				content = `func onSampleEvent(message Message) { updateLocal(message) }`
+			}
 			return agenttools.Execution{
-				Content: `func GetType(s string) string { return "image/jpeg" }`,
-				Sources: []domain.SourceRef{{RelativePath: "content_type.go", Digest: "sha256:test", Kind: "workspace_file"}},
+				Content: content,
+				Sources: []domain.SourceRef{{RelativePath: input.Path, Digest: digest, Kind: "workspace_file"}},
 			}, nil
-		}),
-		testTool("search_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
-			extraSearches++
-			return agenttools.Execution{Content: `{"results":[]}`}, nil
 		}),
 		SubmitInvestigationPlanDefinition(),
 		SubmitDecisionDefinition(),
@@ -565,7 +577,10 @@ func TestAgentLoopConvergesImmediatelyAfterCitableEvidence(t *testing.T) {
 	}
 	loop := AgentLoop{Model: model, Tools: registry, MaxTurns: 8}
 	decision, trajectory, err := loop.Decide(context.Background(), agentcontext.Bundle{
-		Event:    domain.NormalizedEvent{MessageID: "om_exact", Content: "请检查 GetType 对 .JPG 返回什么"},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_multi_field",
+			Content:   "请检查 sample-org/sample-project/sample-module 里 SampleRequest 的 sampleContent 结构和本地收敛回调",
+		},
 		WorkKind: domain.WorkKindCodingQuestion,
 	})
 	if err != nil {
@@ -574,14 +589,74 @@ func TestAgentLoopConvergesImmediatelyAfterCitableEvidence(t *testing.T) {
 	if decision.Kind != domain.DecisionReply || model.calls != 4 {
 		t.Fatalf("decision=%+v calls=%d", decision, model.calls)
 	}
-	if extraSearches != 0 {
-		t.Fatalf("extra searches executed=%d", extraSearches)
+	if got, want := strings.Join(readPaths, ","), "sample-project/sample-module/sample-client/request.go,sample-project/sample-module/sample-client/listener.go"; got != want {
+		t.Fatalf("read paths=%q want=%q", got, want)
 	}
 	if !messagesContain(model.inputs[2], "Citable workspace evidence is now available") {
 		t.Fatalf("third model input missing evidence convergence prompt: %+v", model.inputs[2])
 	}
-	if !trajectoryContains(trajectory, "coding evidence is complete; submit_decision is required now") {
-		t.Fatalf("trajectory missing terminal-only rejection: %+v", trajectory)
+	if trajectoryContains(trajectory, "coding evidence is complete; submit_decision is required now") {
+		t.Fatalf("partial evidence incorrectly forced terminal-only mode: %+v", trajectory)
+	}
+}
+
+func TestAgentLoopReservesFinalTwoTurnsAfterCitableEvidence(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{
+			"question":"确认 GetType 的直接返回值",
+			"entry_points":["content_type.go"],
+			"symbols":["GetType"],
+			"tools":["read_workspace"],
+			"stop_conditions":["读到 GetType 定义"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("read", "read_workspace", `{"path":"content_type.go"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("late-search", "search_workspace", `{"query":"unrelated history"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"relevance_confidence":0.95,
+			"reply_confidence":0.92,
+			"risk":"low",
+			"reply_text":"结论：GetType 直接返回 image/jpeg。依据：content_type.go 的函数定义。未知/下一步：没有。",
+			"reason":"the final two turns were reserved for a source-backed decision",
+			"source_refs":[{"relative_path":"content_type.go","digest":"sha256:type","kind":"workspace_file"}]
+		}`)}),
+	}}
+	searchCalls := 0
+	registry, err := agenttools.NewRegistry(
+		testTool("read_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			return agenttools.Execution{
+				Content: `func GetType(string) string { return "image/jpeg" }`,
+				Sources: []domain.SourceRef{{
+					RelativePath: "content_type.go",
+					Digest:       "sha256:type",
+					Kind:         "workspace_file",
+				}},
+			}, nil
+		}),
+		testTool("search_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			searchCalls++
+			return agenttools.Execution{Content: `{"results":[]}`}, nil
+		}),
+		SubmitInvestigationPlanDefinition(),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, trajectory, err := (AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 4,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event:    domain.NormalizedEvent{MessageID: "om_final_two", Content: "确认 GetType 的直接返回值"},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply || model.calls != 4 || searchCalls != 0 {
+		t.Fatalf("decision=%+v modelCalls=%d searchCalls=%d", decision, model.calls, searchCalls)
+	}
+	if !trajectoryContains(trajectory, "remaining turn") {
+		t.Fatalf("trajectory missing final-two-turn rejection: %+v", trajectory)
 	}
 }
 
@@ -665,7 +740,7 @@ func TestAgentLoopStopsAfterThreeIgnoredTerminalOnlyAttempts(t *testing.T) {
 	if !ok || problem.Subtype != errs.SubtypeModelNonConvergence {
 		t.Fatalf("problem=%+v", problem)
 	}
-	if model.calls != 5 {
+	if model.calls != 4 {
 		t.Fatalf("model calls=%d", model.calls)
 	}
 }

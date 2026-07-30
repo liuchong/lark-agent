@@ -241,6 +241,8 @@ func TestAgentSystemPromptDefinesAssistantAndDelegatedOwnerRoles(t *testing.T) {
 		"never use an internal label such as direct_mention",
 		"matching successful tool receipt",
 		"read_workspace",
+		"preserve its exact spelling and case",
+		"similarly named sibling",
 		"concrete business questions",
 		"run is read-only",
 		"runtime chooses bot identity for assistant_request and owner_request",

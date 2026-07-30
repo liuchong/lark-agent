@@ -1343,9 +1343,29 @@ The multi-step loop is accepted by these executable BDD scenarios:
   forces convergence instead of failing the whole work item only because raw
   output exceeded a bound.
 - Given a coding question names an exact function and a digest-backed read
-  establishes that function's direct behavior, when the model considers more
-  unrelated chat or call-site searches, then it is told that the requested
-  evidence is already sufficient unless reachability was part of the question.
+  establishes every concrete field requested by the user, when the next model
+  turn starts, then the model is told to submit the decision without expanding
+  into unrelated chat or call-site searches unless reachability was requested.
+- Given a coding question asks for several code facts and the first
+  digest-backed production read supports only some of them, when the next model
+  turn starts, then the remaining bounded search and read tools stay available
+  so the model can satisfy the unanswered plan stop conditions.
+- Given the user names an exact repository or workspace-relative path, when a
+  coding investigation selects entry points, then it preserves the named
+  spelling and case and does not substitute a similarly named sibling project.
+- Given an exact repository scope is workspace-relative, when it is resolved,
+  then its top-level component must match the bounded workspace directory
+  snapshot and it must be the only matching workspace-relative path in that
+  message; an API route or a comparison naming multiple repositories is not
+  inferred as one hard workspace scope.
+- Given the current message explicitly continues a previous message, when an
+  exact repository scope is inherited, then it comes from the most recent
+  bounded same-sender message; unrelated history, another sender, or a bot
+  message cannot impose a hard workspace scope.
+- Given an exact repository scope is active, when the model calls a workspace
+  tool that cannot carry that path boundary, including global symbol search or
+  call-path tracing, then the runtime rejects it and requires a path-scoped
+  search or read.
 - Given a coding run has citable workspace evidence and enters its final two
   model turns, when the model attempts another investigation tool, then the
   runtime rejects that tool call and preserves the final turn for
@@ -1472,9 +1492,10 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given any reply has confidence below `policy.reply_confidence_min`, when the
   final gate runs, then direct owner mentions and assistant-facing requests
   enter approval just like other replies and do not use a hidden lower floor.
-- Given a coding question has read a production source that supports a useful
-  answer, when the next model turn starts, then only `submit_decision` is
-  available and no Lark-history, rule, test, search, or shell tool can run.
+- Given a coding question has read a production source that supports only part
+  of a multi-field question, when the next model turn starts, then that read is
+  citable evidence but does not by itself prove the investigation complete or
+  remove the remaining bounded code tools.
 - Given code-index or workspace search returns a candidate production path,
   when the model has not yet read that file with `read_workspace`, then the
   candidate source does not trigger convergence and the production read remains

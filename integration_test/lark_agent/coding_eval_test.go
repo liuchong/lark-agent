@@ -114,6 +114,163 @@ func handler() {
 	}
 }
 
+func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T) {
+	root := t.TempDir()
+	sources := map[string]string{
+		"sample-project/sample-module/sample-client/modify_request.kt": `data class SampleRequest(
+    val sampleContent: String,
+    val expectedEditVersion: Long,
+)`,
+		"sample-project/sample-module/go/internal/item_flow/api.go": `func SampleOperation(req SampleRequest) (*SampleChangeResponse, error) {
+    return server.SampleOperation(req)
+}`,
+		"sample-project/sample-module/sample-client/message_listener.kt": `fun onSampleEvent(message: Message) {
+    localMessages.update(message.clientMsgID, message.sampleVersion)
+}`,
+	}
+	digests := make(map[string]string, len(sources))
+	for path, source := range sources {
+		fullPath := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, []byte(source), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256([]byte(source))
+		digests[path] = fmt.Sprintf("sha256:%s", hex.EncodeToString(sum[:8]))
+	}
+	decoy := filepath.Join(root, "Sample-Module", "message_manager.java")
+	if err := os.MkdirAll(filepath.Dir(decoy), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(decoy, []byte("class MessageManager {}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definitions := append(
+		agenttools.WorkspaceDefinitions(scope),
+		agentruntime.SubmitInvestigationPlanDefinition(),
+		agentruntime.SubmitDecisionDefinition(),
+	)
+	definitions = append(agenttools.CodeIndexDefinitions(scope, nil), definitions...)
+	registry, err := agenttools.NewRegistry(definitions...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("wrong-plan", "submit_investigation_plan", `{
+			"question":"核对消息修改行为",
+			"entry_points":["Sample-Module/sample-client"],
+			"symbols":["SampleRequest"],
+			"tools":["read_workspace"],
+			"stop_conditions":["找到任意同名消息修改实现"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("plan", "submit_investigation_plan", `{
+			"question":"核对 sample-project/sample-module 的请求结构、成功回调和本地收敛",
+			"entry_points":[
+				"sample-project/sample-module/sample-client/modify_request.kt",
+				"sample-project/sample-module/go/internal/item_flow/api.go",
+				"sample-project/sample-module/sample-client/message_listener.kt"
+			],
+			"symbols":["SampleRequest","SampleOperation","onSampleEvent"],
+			"tools":["read_workspace"],
+			"stop_conditions":["确认请求结构","确认成功回调语义","确认本地收敛事件"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"wrong-read",
+			"read_workspace",
+			`{"path":"Sample-Module/message_manager.java"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"wrong-symbol-search",
+			"search_code_symbols",
+			`{"query":"MessageManager","max_results":5}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-request",
+			"read_workspace",
+			`{"path":"sample-project/sample-module/sample-client/modify_request.kt"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-api",
+			"read_workspace",
+			`{"path":"sample-project/sample-module/go/internal/item_flow/api.go"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-listener",
+			"read_workspace",
+			`{"path":"sample-project/sample-module/sample-client/message_listener.kt"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"relevance_confidence":0.99,
+			"reply_confidence":0.95,
+			"risk":"low",
+			"reply_text":"结论：sampleContent 是字符串形式的消息 JSON；接口成功只表示服务端接受修改；本地状态由 onSampleEvent 推送收敛。依据：请求、接口与监听器三个生产文件。未知/下一步：没有。",
+			"reason":"all requested project facts have authoritative reads",
+			"source_refs":[
+				{"relative_path":"sample-project/sample-module/sample-client/modify_request.kt","digest":"`+digests["sample-project/sample-module/sample-client/modify_request.kt"]+`","kind":"workspace_file"},
+				{"relative_path":"sample-project/sample-module/go/internal/item_flow/api.go","digest":"`+digests["sample-project/sample-module/go/internal/item_flow/api.go"]+`","kind":"workspace_file"},
+				{"relative_path":"sample-project/sample-module/sample-client/message_listener.kt","digest":"`+digests["sample-project/sample-module/sample-client/message_listener.kt"]+`","kind":"workspace_file"}
+			]
+		}`)}),
+	}}
+	decision, trajectory, err := (agentruntime.AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 12,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		User: agentcontext.UserProfile{OpenID: "ou_owner"},
+		Environment: agentcontext.EnvironmentSnapshot{
+			WorkspaceRoot:     "/workspace/sample-org",
+			WorkspaceRealRoot: "/workspace/sample-org",
+			Directory: []agentcontext.DirectoryEntry{{
+				Path: "sample-project",
+				Kind: "dir",
+			}},
+		},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_real_project_multi_fact",
+			SenderID:  "ou_owner",
+			Content:   "结合上一条：Sample-Client SampleRequest 的 sampleContent 是什么结构，成功回调代表什么，本地如何收敛？",
+		},
+		Conversation: []domain.NormalizedEvent{
+			{
+				MessageID: "om_scope",
+				SenderID:  "ou_owner",
+				Content:   "这次只看 sample-org/sample-project/sample-module，不要看同名的旧项目。",
+			},
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply || len(decision.Sources) != 3 {
+		t.Fatalf("decision=%+v", decision)
+	}
+	for _, want := range []string{"字符串形式的消息 JSON", "服务端接受修改", "onSampleEvent"} {
+		if !strings.Contains(decision.ReplyText, want) {
+			t.Fatalf("reply=%q missing=%q", decision.ReplyText, want)
+		}
+	}
+	if codingEvalTrajectoryContains(trajectory, "coding evidence is complete; submit_decision is required now") {
+		t.Fatalf("multi-field investigation was closed after partial evidence: %+v", trajectory)
+	}
+	for _, want := range []string{
+		"exact workspace scope sample-project/sample-module",
+		"Sample-Module/sample-client",
+		"Sample-Module/message_manager.java",
+		"search_code_symbols cannot guarantee exact workspace scope",
+	} {
+		if !codingEvalTrajectoryContains(trajectory, want) {
+			t.Fatalf("trajectory missing exact-scope rejection %q: %+v", want, trajectory)
+		}
+	}
+}
+
 func TestContextualIntentBackendHandoffInvestigatesSampleEventInsteadOfNetwork(t *testing.T) {
 	root := t.TempDir()
 	apiSource := `package api
@@ -538,7 +695,7 @@ func TestFalsePremiseRecoversFromParallelPolicyErrorsAndMalformedPlan(t *testing
 	}
 }
 
-func TestCodingQuestionWithEvidenceConvergesBeforeFinalTurns(t *testing.T) {
+func TestCodingQuestionWithCompleteEvidenceIsPromptedToConvergeBeforeFinalTurns(t *testing.T) {
 	root := t.TempDir()
 	source := `package content_type
 
@@ -572,8 +729,11 @@ func GetType(value string) string {
 			"tools":["read_workspace"],
 			"stop_conditions":["读取 GetType 定义"]
 		}`)}),
-		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("read", "read_workspace", `{"path":"content_type.go"}`)}),
-		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("waste", "search_code_symbols", `{"query":"unrelated history","max_results":5}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("candidate", "search_code_symbols", `{"query":"GetType","max_results":5}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			codingEvalToolCall("read", "read_workspace", `{"path":"content_type.go"}`),
+			codingEvalToolCall("late-search", "search_code_symbols", `{"query":"unrelated history","max_results":5}`),
+		}),
 		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
 			"decision":"reply",
 			"relevance_confidence":0.95,
@@ -584,7 +744,7 @@ func GetType(value string) string {
 			"source_refs":[{"relative_path":"content_type.go","digest":"`+digest+`","kind":"workspace_file"}]
 		}`)}),
 	}}
-	loop := agentruntime.AgentLoop{Model: model, Tools: registry, MaxTurns: 8}
+	loop := agentruntime.AgentLoop{Model: model, Tools: registry, MaxTurns: 4}
 	decision, trajectory, err := loop.Decide(context.Background(), agentcontext.Bundle{
 		Event:    domain.NormalizedEvent{MessageID: "om_converge", Content: "请检查 GetType 的直接返回行为"},
 		WorkKind: domain.WorkKindCodingQuestion,
@@ -595,8 +755,12 @@ func GetType(value string) string {
 	if decision.Kind != domain.DecisionReply {
 		t.Fatalf("decision=%+v", decision)
 	}
-	if !codingEvalTrajectoryContains(trajectory, "coding evidence is complete; submit_decision is required now") {
-		t.Fatalf("trajectory did not reject the extra search: %+v", trajectory)
+	if model.calls != 4 ||
+		!codingEvalMessagesContain(model.inputs[3], "Citable workspace evidence is now available") {
+		t.Fatalf("model calls=%d fourth input=%+v", model.calls, model.inputs[3])
+	}
+	if !codingEvalTrajectoryContains(trajectory, "remaining turn") {
+		t.Fatalf("late search was not rejected to preserve a correction turn: %+v", trajectory)
 	}
 }
 
@@ -1047,4 +1211,8 @@ func codingEvalTrajectoryContains(messages []*schema.Message, substring string) 
 		}
 	}
 	return false
+}
+
+func codingEvalMessagesContain(messages []*schema.Message, substring string) bool {
+	return codingEvalTrajectoryContains(messages, substring)
 }
