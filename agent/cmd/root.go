@@ -799,20 +799,14 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 				return err
 			}
 			if liveMessenger != nil {
-				pendingNotices, err := store.ListPendingOwnerResolutionNotifications(cmd.Context())
-				if err != nil {
+				if err := flushOwnerResolutionNotifications(
+					cmd.Context(),
+					store,
+					liveMessenger,
+					cfg.Owner,
+					cmd.ErrOrStderr(),
+				); err != nil {
 					return err
-				}
-				for _, pending := range pendingNotices {
-					if err := sendOwnerResolutionText(
-						cmd.Context(),
-						store,
-						liveMessenger,
-						pending.WorkItemID,
-						pending.Text,
-					); err != nil {
-						writeError(cmd.ErrOrStderr(), err)
-					}
 				}
 				for _, notice := range recoveryReport.Notices {
 					if err := notifyRecoveryConvergence(
@@ -941,6 +935,17 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 					if _, err := daemonApp.PollOnce(cmd.Context()); err != nil {
 						writeError(cmd.ErrOrStderr(), err)
 					}
+					if liveMessenger != nil {
+						if err := flushOwnerResolutionNotifications(
+							cmd.Context(),
+							store,
+							liveMessenger,
+							cfg.Owner,
+							cmd.ErrOrStderr(),
+						); err != nil {
+							writeError(cmd.ErrOrStderr(), err)
+						}
+					}
 				}
 			}
 		},
@@ -1034,6 +1039,56 @@ func sendOwnerResolutionText(
 	if err != nil || !send {
 		return err
 	}
+	return executeOwnerResolutionSend(ctx, store, messenger, actionID, key, text)
+}
+
+func sendOwnerResolutionRequirement(
+	ctx context.Context,
+	store *storage.Store,
+	messenger agenttools.Messenger,
+	requirement storage.RequiredOwnerResolutionNotification,
+	text string,
+) error {
+	actionID, key, send, err := store.BeginOwnerResolutionNotificationForRequirement(
+		ctx,
+		requirement.ID,
+		requirement.WorkItemID,
+		text,
+	)
+	if err != nil || !send {
+		return err
+	}
+	return executeOwnerResolutionSend(ctx, store, messenger, actionID, key, text)
+}
+
+func retryOwnerResolutionText(
+	ctx context.Context,
+	store *storage.Store,
+	messenger agenttools.Messenger,
+	actionID int64,
+) error {
+	notice, send, err := store.RetryOwnerResolutionNotification(ctx, actionID)
+	if err != nil || !send {
+		return err
+	}
+	return executeOwnerResolutionSend(
+		ctx,
+		store,
+		messenger,
+		notice.ID,
+		notice.IdempotencyKey,
+		notice.Text,
+	)
+}
+
+func executeOwnerResolutionSend(
+	ctx context.Context,
+	store *storage.Store,
+	messenger agenttools.Messenger,
+	actionID int64,
+	key string,
+	text string,
+) error {
 	sendErr := (agenttools.NotifyOwnerTool{Messenger: messenger}).Execute(ctx, agenttools.NotifyRequest{
 		Text:           text,
 		IdempotencyKey: key,
@@ -1056,6 +1111,57 @@ func sendOwnerResolutionText(
 		return completeErr
 	}
 	return sendErr
+}
+
+func flushOwnerResolutionNotifications(
+	ctx context.Context,
+	store *storage.Store,
+	messenger agenttools.Messenger,
+	owner config.OwnerConfig,
+	errOut io.Writer,
+) error {
+	if err := store.ConvergeOwnerResolutionRequirements(ctx); err != nil {
+		return err
+	}
+	pending, err := store.ListPendingOwnerResolutionNotifications(ctx)
+	if err != nil {
+		return err
+	}
+	for _, notice := range pending {
+		if err := retryOwnerResolutionText(
+			ctx,
+			store,
+			messenger,
+			notice.ID,
+		); err != nil {
+			writeError(errOut, err)
+		}
+	}
+	required, err := store.ListRequiredOwnerResolutionNotifications(ctx)
+	if err != nil {
+		return err
+	}
+	handler := liveTerminalFailureHandler{
+		store:     store,
+		messenger: messenger,
+		owner:     owner,
+	}
+	for _, requirement := range required {
+		item, err := store.GetWorkItem(ctx, requirement.WorkItemID)
+		if err != nil {
+			writeError(errOut, err)
+			continue
+		}
+		if err := handler.handleTerminalFailureRequirement(
+			ctx,
+			item,
+			errors.New(requirement.Reason),
+			requirement,
+		); err != nil {
+			writeError(errOut, err)
+		}
+	}
+	return nil
 }
 
 func recoveryConvergenceText(
@@ -2074,6 +2180,50 @@ func (h liveTerminalFailureHandler) HandleTerminalFailure(
 	item domain.WorkItem,
 	runErr error,
 ) error {
+	required, err := h.store.ListRequiredOwnerResolutionNotifications(ctx)
+	if err != nil {
+		return err
+	}
+	for _, requirement := range required {
+		if requirement.WorkItemID == item.ID {
+			return h.handleTerminalFailureRequirement(ctx, item, runErr, requirement)
+		}
+	}
+	current, err := h.store.GetWorkItem(ctx, item.ID)
+	if err != nil {
+		return err
+	}
+	if current.Status != domain.StatusDeadLetter {
+		return nil
+	}
+	return sendOwnerResolutionText(
+		ctx,
+		h.store,
+		h.messenger,
+		current.ID,
+		h.terminalFailureText(current, runErr),
+	)
+}
+
+func (h liveTerminalFailureHandler) handleTerminalFailureRequirement(
+	ctx context.Context,
+	item domain.WorkItem,
+	runErr error,
+	requirement storage.RequiredOwnerResolutionNotification,
+) error {
+	return sendOwnerResolutionRequirement(
+		ctx,
+		h.store,
+		h.messenger,
+		requirement,
+		h.terminalFailureText(item, runErr),
+	)
+}
+
+func (h liveTerminalFailureHandler) terminalFailureText(
+	item domain.WorkItem,
+	runErr error,
+) string {
 	language := agentlocale.Resolve(
 		h.owner.PreferredLanguage,
 		h.owner.FallbackLanguage,
@@ -2091,24 +2241,26 @@ func (h liveTerminalFailureHandler) HandleTerminalFailure(
 	var text string
 	if language == agentlocale.LanguageEnglish {
 		text = fmt.Sprintf(
-			"%s, work #%d for message %s has stopped after bounded retries: %s. Completed evidence and failure history were preserved. Inspect it with `lark-agent queue inspect --work-id %d`; only use `queue resume --force-terminal` after reviewing side effects.",
+			"%s, work #%d for message %s has stopped after bounded retries: %s. Completed evidence and failure history were preserved. In the intelligent-assistant private chat, send `/task %d` to inspect it; after reviewing side effects, send `/task resume %d confirm` only if it should run again.",
 			name,
 			item.ID,
 			item.Event.MessageID,
 			reason,
+			item.ID,
 			item.ID,
 		)
 	} else {
 		text = fmt.Sprintf(
-			"%s，工作 #%d（消息 %s）在有界重试后已停止：%s。已完成的证据和失败记录均已保留。请执行 `lark-agent queue inspect --work-id %d` 查看；核对外部动作后，确需重做时再使用 `queue resume --force-terminal`。",
+			"%s，工作 #%d（消息 %s）在有界重试后已停止：%s。已完成的证据和失败记录均已保留。请在智能助手私聊发送 `/task %d` 查看；核对外部动作后，确需重做时再发送 `/task resume %d confirm`。",
 			name,
 			item.ID,
 			item.Event.MessageID,
 			reason,
 			item.ID,
+			item.ID,
 		)
 	}
-	return sendOwnerResolutionText(ctx, h.store, h.messenger, item.ID, text)
+	return text
 }
 
 func (n liveOwnerNotifier) HandleNotification(

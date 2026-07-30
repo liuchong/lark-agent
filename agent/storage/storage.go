@@ -3953,15 +3953,118 @@ func (s *Store) DeferWaitingUserClaim(
 			"encode delegated reply defer reason",
 		).WithCause(err)
 	}
-	result, err := s.db.Exec(
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin delegated reply defer",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var retryCount int
+	if err := tx.QueryRow(
+		`SELECT retry_count
+		 FROM work_items
+		 WHERE id = ? AND status = ? AND lease_by = ?`,
+		id,
+		domain.StatusProcessing,
+		leaseToken,
+	).Scan(&retryCount); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"delegated reply lease is no longer current",
+			)
+		}
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read delegated reply retry count",
+		).WithCause(err)
+	}
+	retryCount++
+	nowRaw := now.Format(time.RFC3339Nano)
+	if s.maxRetries > 0 && retryCount >= s.maxRetries {
+		result, err := tx.Exec(
+			`UPDATE work_items
+			 SET status = ?, decision_json = ?, lease_by = NULL, lease_time = NULL,
+			     retry_count = ?, next_attempt_at = NULL, updated_at = ?
+			 WHERE id = ? AND status = ? AND lease_by = ?`,
+			domain.StatusDeadLetter,
+			string(decisionJSON),
+			retryCount,
+			nowRaw,
+			id,
+			domain.StatusProcessing,
+			leaseToken,
+		)
+		if err != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"move deferred delegated reply to dead letter",
+			).WithCause(err)
+		}
+		if affected, _ := result.RowsAffected(); affected != 1 {
+			return errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"delegated reply lease is no longer current",
+			)
+		}
+		metadata, _ := json.Marshal(map[string]any{
+			"retry_count": retryCount,
+			"source":      "semantic_waiting_user",
+		})
+		if _, err := tx.Exec(
+			`INSERT INTO dead_letters(work_item_id, reason, metadata_json, created_at)
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT(work_item_id) DO UPDATE SET reason = excluded.reason,
+				metadata_json = excluded.metadata_json, created_at = excluded.created_at`,
+			id,
+			reason,
+			string(metadata),
+			nowRaw,
+		); err != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"record delegated reply dead-letter reason",
+			).WithCause(err)
+		}
+		if _, err := tx.Exec(
+			`UPDATE coding_goals SET status = ?, updated_at = ? WHERE work_item_id = ?`,
+			domain.CodingGoalBlocked,
+			nowRaw,
+			id,
+		); err != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"block deferred delegated coding goal",
+			).WithCause(err)
+		}
+		if err := requireOwnerResolutionNotificationTx(
+			tx,
+			id,
+			reason,
+			nowRaw,
+		); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"commit delegated reply dead-letter transition",
+			).WithCause(err)
+		}
+		return nil
+	}
+	result, err := tx.Exec(
 		`UPDATE work_items
 		 SET status = ?, decision_json = ?, lease_by = NULL, lease_time = NULL,
-		     retry_count = retry_count + 1, next_attempt_at = ?, updated_at = ?
+		     retry_count = ?, next_attempt_at = ?, updated_at = ?
 		 WHERE id = ? AND status = ? AND lease_by = ?`,
 		domain.StatusWaitingUser,
 		string(decisionJSON),
+		retryCount,
 		now.Add(delay).Format(time.RFC3339Nano),
-		now.Format(time.RFC3339Nano),
+		nowRaw,
 		id,
 		domain.StatusProcessing,
 		leaseToken,
@@ -3984,6 +4087,12 @@ func (s *Store) DeferWaitingUserClaim(
 			errs.SubtypeFailedPrecondition,
 			"delegated reply lease is no longer current",
 		)
+	}
+	if err := tx.Commit(); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit delegated reply defer",
+		).WithCause(err)
 	}
 	return nil
 }

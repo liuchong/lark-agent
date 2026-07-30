@@ -666,6 +666,14 @@ func (d *Daemon) deferDelegatedReply(
 	); err != nil {
 		return Result{}, err
 	}
+	d.notifyTerminalFailure(
+		item,
+		errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"delegated reply context did not converge before the retry ceiling: %s",
+			reason,
+		),
+	)
 	return Result{
 		Processed: true,
 		Decision: domain.Decision{

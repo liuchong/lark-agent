@@ -1148,11 +1148,315 @@ func (s *Store) CompleteOwnerResolutionNotification(
 	return s.CompleteShellApproval(ctx, actionID, "", errorText)
 }
 
+// RequiredOwnerResolutionNotification is a durable local outbox intent. It
+// proves that terminal work still needs an owner-visible resolution action.
+type RequiredOwnerResolutionNotification struct {
+	ID         int64  `json:"id" yaml:"id"`
+	WorkItemID int64  `json:"work_item_id" yaml:"work_item_id"`
+	Reason     string `json:"reason" yaml:"reason"`
+}
+
+func requireOwnerResolutionNotificationTx(
+	tx *sql.Tx,
+	workItemID int64,
+	reason string,
+	now string,
+) error {
+	requestJSON, err := json.Marshal(map[string]string{
+		"reason": strings.TrimSpace(reason),
+	})
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"encode owner resolution requirement",
+		).WithCause(err)
+	}
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%d:%s:%s", workItemID, reason, now)))
+	key := fmt.Sprintf("owner-resolution-required:%d:%x", workItemID, digest[:8])
+	if _, err := tx.Exec(
+		`INSERT INTO action_attempts(
+			work_item_id, kind, idempotency_key, status, request_json,
+			created_at, updated_at
+		 ) VALUES (?, 'owner_resolution_required', ?, ?, ?, ?, ?)`,
+		workItemID,
+		key,
+		domain.ActionBlocked,
+		string(requestJSON),
+		now,
+		now,
+	); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"record owner resolution requirement",
+		).WithCause(err)
+	}
+	return nil
+}
+
+// BeginOwnerResolutionNotificationForRequirement atomically fences one exact
+// terminal generation before its private Lark send begins.
+func (s *Store) BeginOwnerResolutionNotificationForRequirement(
+	ctx context.Context,
+	requirementID int64,
+	workItemID int64,
+	text string,
+) (int64, string, bool, error) {
+	text = strings.TrimSpace(text)
+	if requirementID <= 0 || workItemID <= 0 || text == "" {
+		return 0, "", false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"owner resolution notification requires requirement_id, work_item_id, and text",
+		)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, "", false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin terminal owner resolution notification",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE work_items SET updated_at = updated_at WHERE id = ?`,
+		workItemID,
+	); err != nil {
+		return 0, "", false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"lock terminal work for owner resolution notification",
+		).WithCause(err)
+	}
+	var requiredWorkID int64
+	var requiredStatus domain.ActionStatus
+	var workStatus domain.WorkItemStatus
+	if err := tx.QueryRowContext(ctx,
+		`SELECT required.work_item_id, required.status, work.status
+		 FROM action_attempts AS required
+		 JOIN work_items AS work ON work.id = required.work_item_id
+		 WHERE required.id = ? AND required.kind = 'owner_resolution_required'`,
+		requirementID,
+	).Scan(&requiredWorkID, &requiredStatus, &workStatus); errors.Is(err, sql.ErrNoRows) {
+		return 0, "", false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"owner resolution requirement %d was not found",
+			requirementID,
+		)
+	} else if err != nil {
+		return 0, "", false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read terminal owner resolution requirement",
+		).WithCause(err)
+	}
+	if requiredWorkID != workItemID {
+		return 0, "", false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"owner resolution requirement does not belong to work item",
+		)
+	}
+	if requiredStatus != domain.ActionBlocked {
+		return 0, "", false, nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if workStatus != domain.StatusDeadLetter {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE action_attempts
+			 SET status = ?, error = ?, updated_at = ?
+			 WHERE id = ? AND status = ?`,
+			domain.ActionCancelled,
+			"terminal generation is no longer current",
+			now,
+			requirementID,
+			domain.ActionBlocked,
+		); err != nil {
+			return 0, "", false, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"cancel stale owner resolution requirement",
+			).WithCause(err)
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, "", false, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"commit stale owner resolution cancellation",
+			).WithCause(err)
+		}
+		return 0, "", false, nil
+	}
+
+	key := fmt.Sprintf("owner-res:%x:%x", workItemID, requirementID)
+	requestJSON, _ := json.Marshal(map[string]string{
+		"text":           text,
+		"requirement_id": fmt.Sprint(requirementID),
+	})
+	result, err := tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO action_attempts(
+			work_item_id, kind, idempotency_key, status, request_json,
+			created_at, updated_at
+		 ) VALUES (?, 'owner_resolution', ?, ?, ?, ?, ?)`,
+		workItemID,
+		key,
+		domain.ActionExecuting,
+		string(requestJSON),
+		now,
+		now,
+	)
+	if err != nil {
+		return 0, "", false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin terminal owner resolution action",
+		).WithCause(err)
+	}
+	var actionID int64
+	send := false
+	if affected, _ := result.RowsAffected(); affected == 1 {
+		actionID, err = lastInsertID(result)
+		if err != nil {
+			return 0, "", false, err
+		}
+		send = true
+	} else {
+		var status domain.ActionStatus
+		if err := tx.QueryRowContext(ctx,
+			`SELECT id, status FROM action_attempts WHERE idempotency_key = ?`,
+			key,
+		).Scan(&actionID, &status); err != nil {
+			return 0, "", false, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"read terminal owner resolution action",
+			).WithCause(err)
+		}
+		if status == domain.ActionBlocked {
+			result, err := tx.ExecContext(ctx,
+				`UPDATE action_attempts
+				 SET status = ?, request_json = ?, error = NULL, updated_at = ?
+				 WHERE id = ? AND status = ?`,
+				domain.ActionExecuting,
+				string(requestJSON),
+				now,
+				actionID,
+				domain.ActionBlocked,
+			)
+			if err != nil {
+				return 0, "", false, errs.NewInternalError(
+					errs.SubtypeStorage,
+					"retry terminal owner resolution action",
+				).WithCause(err)
+			}
+			affected, _ := result.RowsAffected()
+			send = affected == 1
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE action_attempts
+		 SET status = ?, updated_at = ?
+		 WHERE id = ? AND status = ?`,
+		domain.ActionCompleted,
+		now,
+		requirementID,
+		domain.ActionBlocked,
+	); err != nil {
+		return 0, "", false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"complete terminal owner resolution requirement",
+		).WithCause(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, "", false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit terminal owner resolution notification",
+		).WithCause(err)
+	}
+	return actionID, key, send, nil
+}
+
+// ConvergeOwnerResolutionRequirements closes local outbox intents once a
+// separately fenced owner-resolution send action exists. Completed, blocked,
+// and executing send actions then follow their existing replay rules.
+func (s *Store) ConvergeOwnerResolutionRequirements(ctx context.Context) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE action_attempts AS required
+		 SET status = ?, updated_at = ?
+		 WHERE required.kind = 'owner_resolution_required'
+		   AND required.status = ?
+		   AND EXISTS (
+		     SELECT 1 FROM action_attempts AS actual
+		     WHERE actual.work_item_id = required.work_item_id
+		       AND actual.kind = 'owner_resolution'
+		       AND actual.idempotency_key =
+		           printf('owner-res:%x:%x', required.work_item_id, required.id)
+		   )`,
+		domain.ActionCompleted,
+		now,
+		domain.ActionBlocked,
+	); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"converge owner resolution requirements",
+		).WithCause(err)
+	}
+	return nil
+}
+
+// ListRequiredOwnerResolutionNotifications returns terminal work for which no
+// real owner-resolution send action has begun yet.
+func (s *Store) ListRequiredOwnerResolutionNotifications(
+	ctx context.Context,
+) ([]RequiredOwnerResolutionNotification, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, work_item_id, request_json
+		 FROM action_attempts
+		 WHERE kind = 'owner_resolution_required' AND status = ?
+		 ORDER BY id`,
+		domain.ActionBlocked,
+	)
+	if err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"list required owner resolution notifications",
+		).WithCause(err)
+	}
+	defer rows.Close() //nolint:errcheck // iteration reports row errors below
+	var out []RequiredOwnerResolutionNotification
+	for rows.Next() {
+		var item RequiredOwnerResolutionNotification
+		var requestJSON string
+		if err := rows.Scan(&item.ID, &item.WorkItemID, &requestJSON); err != nil {
+			return nil, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"scan required owner resolution notification",
+			).WithCause(err)
+		}
+		var request map[string]string
+		if err := json.Unmarshal([]byte(requestJSON), &request); err != nil {
+			return nil, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"decode required owner resolution notification",
+			).WithCause(err)
+		}
+		item.Reason = strings.TrimSpace(request["reason"])
+		if item.Reason == "" {
+			return nil, errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"required owner resolution notification has no reason",
+			)
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"iterate required owner resolution notifications",
+		).WithCause(err)
+	}
+	return out, nil
+}
+
 // PendingOwnerResolutionNotification is one previously failed private summary
 // that may be retried on a later ready startup.
 type PendingOwnerResolutionNotification struct {
-	WorkItemID int64  `json:"work_item_id" yaml:"work_item_id"`
-	Text       string `json:"text" yaml:"text"`
+	ID             int64  `json:"id" yaml:"id"`
+	WorkItemID     int64  `json:"work_item_id" yaml:"work_item_id"`
+	IdempotencyKey string `json:"idempotency_key" yaml:"idempotency_key"`
+	Text           string `json:"text" yaml:"text"`
 }
 
 // ListPendingOwnerResolutionNotifications returns known failed sends only.
@@ -1161,7 +1465,7 @@ func (s *Store) ListPendingOwnerResolutionNotifications(
 	ctx context.Context,
 ) ([]PendingOwnerResolutionNotification, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT work_item_id, request_json
+		`SELECT id, work_item_id, idempotency_key, request_json
 		 FROM action_attempts
 		 WHERE kind = 'owner_resolution' AND status = ?
 		 ORDER BY id`,
@@ -1178,7 +1482,12 @@ func (s *Store) ListPendingOwnerResolutionNotifications(
 	for rows.Next() {
 		var item PendingOwnerResolutionNotification
 		var requestJSON string
-		if err := rows.Scan(&item.WorkItemID, &requestJSON); err != nil {
+		if err := rows.Scan(
+			&item.ID,
+			&item.WorkItemID,
+			&item.IdempotencyKey,
+			&requestJSON,
+		); err != nil {
 			return nil, errs.NewInternalError(
 				errs.SubtypeStorage,
 				"scan pending owner resolution notification",
@@ -1207,6 +1516,92 @@ func (s *Store) ListPendingOwnerResolutionNotifications(
 		).WithCause(err)
 	}
 	return out, nil
+}
+
+// RetryOwnerResolutionNotification fences one known failed private send by its
+// durable action identity. Executing or completed actions are never replayed.
+func (s *Store) RetryOwnerResolutionNotification(
+	ctx context.Context,
+	actionID int64,
+) (PendingOwnerResolutionNotification, bool, error) {
+	if actionID <= 0 {
+		return PendingOwnerResolutionNotification{}, false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"owner resolution action id must be positive",
+		)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PendingOwnerResolutionNotification{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin owner resolution notification retry",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var notice PendingOwnerResolutionNotification
+	var requestJSON string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id, work_item_id, idempotency_key, request_json
+		 FROM action_attempts
+		 WHERE id = ? AND kind = 'owner_resolution' AND status = ?`,
+		actionID,
+		domain.ActionBlocked,
+	).Scan(
+		&notice.ID,
+		&notice.WorkItemID,
+		&notice.IdempotencyKey,
+		&requestJSON,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PendingOwnerResolutionNotification{}, false, nil
+	}
+	if err != nil {
+		return PendingOwnerResolutionNotification{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"retry owner resolution notification",
+		).WithCause(err)
+	}
+	var request map[string]string
+	if err := json.Unmarshal([]byte(requestJSON), &request); err != nil {
+		return PendingOwnerResolutionNotification{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"decode retried owner resolution notification",
+		).WithCause(err)
+	}
+	notice.Text = strings.TrimSpace(request["text"])
+	if notice.Text == "" {
+		return PendingOwnerResolutionNotification{}, false, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"retried owner resolution notification has no text",
+		)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx,
+		`UPDATE action_attempts
+		 SET status = ?, error = NULL, updated_at = ?
+		 WHERE id = ? AND kind = 'owner_resolution' AND status = ?`,
+		domain.ActionExecuting,
+		now,
+		actionID,
+		domain.ActionBlocked,
+	)
+	if err != nil {
+		return PendingOwnerResolutionNotification{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"fence owner resolution notification retry",
+		).WithCause(err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected != 1 {
+		return PendingOwnerResolutionNotification{}, false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return PendingOwnerResolutionNotification{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit owner resolution notification retry",
+		).WithCause(err)
+	}
+	return notice, true, nil
 }
 
 func interruptionSnapshot(
@@ -1437,10 +1832,58 @@ func (s *Store) ResumeWork(
 	}
 	defer tx.Rollback() //nolint:errcheck
 	if _, err := tx.ExecContext(ctx,
+		`UPDATE work_items SET updated_at = updated_at WHERE id = ?`,
+		item.ID,
+	); err != nil {
+		return domain.WorkInspection{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"lock work for explicit resume",
+		).WithCause(err)
+	}
+	var executingOwnerNotices int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM action_attempts
+		 WHERE work_item_id = ?
+		   AND kind = 'owner_resolution'
+		   AND status = ?`,
+		item.ID,
+		domain.ActionExecuting,
+	).Scan(&executingOwnerNotices); err != nil {
+		return domain.WorkInspection{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"check terminal notification before explicit resume",
+		).WithCause(err)
+	}
+	if executingOwnerNotices > 0 {
+		return domain.WorkInspection{}, errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"work item %d has an executing or result-uncertain owner notification",
+			item.ID,
+		)
+	}
+	nowRaw := now.Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE action_attempts
+		 SET status = ?, error = ?, updated_at = ?
+		 WHERE work_item_id = ?
+		   AND kind IN ('owner_resolution_required', 'owner_resolution')
+		   AND status = ?`,
+		domain.ActionCancelled,
+		"terminal generation explicitly resumed",
+		nowRaw,
+		item.ID,
+		domain.ActionBlocked,
+	); err != nil {
+		return domain.WorkInspection{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"cancel stale terminal notification before resume",
+		).WithCause(err)
+	}
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE work_items SET status = ?, session_id = ?, decision_json = NULL,
 		        lease_by = NULL, lease_time = NULL, retry_count = 0,
 		        next_attempt_at = NULL, updated_at = ? WHERE id = ?`,
-		domain.StatusReceived, s.session.ID, now.Format(time.RFC3339Nano), item.ID); err != nil {
+		domain.StatusReceived, s.session.ID, nowRaw, item.ID); err != nil {
 		return domain.WorkInspection{}, errs.NewInternalError(
 			errs.SubtypeStorage,
 			"resume interrupted work",
@@ -1453,7 +1896,7 @@ func (s *Store) ResumeWork(
 			WHERE work_item_id = ? AND resumed_at IS NULL
 			ORDER BY interrupted_at DESC, id DESC LIMIT 1
 		 )`,
-		now.Format(time.RFC3339Nano), item.ID); err != nil {
+		nowRaw, item.ID); err != nil {
 		return domain.WorkInspection{}, errs.NewInternalError(
 			errs.SubtypeStorage,
 			"record explicit work resume",

@@ -320,6 +320,10 @@ summary. Progress and final sends use separate stable action keys. Restart
 resumes read-only investigation without duplicating completed progress. A
 progress message may promise the required closure; no other unapproved
 delegated reply may promise future delivery, coordination, or reporting.
+The complete internal action key remains in the audit store, while every key
+sent to Lark's public message API is a deterministic digest no longer than
+Lark's 50-character UUID limit. Owner-notice and progress actions derive
+different public UUIDs from their different internal action keys.
 
 When the durable semantic gate admits a `direct_mention` or `private_message`
 as still unanswered, the model must finish with a useful sender-facing `reply`
@@ -868,6 +872,14 @@ never fabricates a reply or external action.
 Provider rate limits honor `Retry-After` when present and otherwise use bounded
 exponential backoff from 15 seconds to 15 minutes. A configurable retry ceiling
 moves permanently failing work to dead letter instead of retrying forever.
+Semantic `waiting_user` deferrals use the same retry ceiling. Reaching the
+ceiling atomically clears the lease and next-attempt time, records a dead-letter
+reason, and records a durable owner-resolution requirement in the same
+transaction. Immediate handling, periodic maintenance, and startup recovery
+consume that requirement through one idempotent private summary. The summary
+contains `/task <id>` and `/task resume <id> confirm`; it does not require the
+Owner to leave Lark for a local CLI. The target is not returned to the original
+conversation and is never left in an indefinitely claimable waiting state.
 
 Runs carry model and agent-configuration fingerprints for diagnosis. A changed
 runtime may safely re-evaluate non-terminal interrupted work under the current
@@ -1145,6 +1157,10 @@ The multi-step loop is accepted by these executable BDD scenarios:
   the semantic gate admits it, then one owner notice and one progress reply are
   recorded before Agent work and one final, owner-handled, or blocked closure
   eventually completes the investigation.
+- Given an investigation action's full internal idempotency key is longer than
+  Lark's public message UUID limit, when the owner notice and progress reply are
+  sent, then the audit store retains the full distinct keys while Lark receives
+  stable, distinct UUID digests of at most 50 characters.
 - Given the daemon restarts after the progress reply completed, when recovery
   runs, then progress is not duplicated, the original normalized context
   snapshot is restored without image bytes, initial classification is not
@@ -1607,6 +1623,27 @@ The multi-step loop is accepted by these executable BDD scenarios:
   the decision completes; when the model ignores terminal-only instructions
   for three attempts, then the run fails before the general turn limit, moves
   directly to dead letter, and does not fabricate a reply or action.
+- Given semantic context remains incomplete or ambiguous through the configured
+  retry ceiling, when the final exact lease is deferred, then the work moves
+  atomically to dead letter, has no future attempt time, produces one localized
+  owner summary with `/task <id>`, and does not send a late message to the
+  original chat.
+- Given the process stops after the dead-letter transaction commits but before
+  its owner-summary action begins, when the daemon continues or restarts, then
+  the same-transaction owner-resolution requirement is discovered and consumed
+  once; a failed first send is retried from its durable blocked action, while
+  an executing result-uncertain send is never replayed.
+- Given terminal work is explicitly resumed before its pending owner summary
+  begins, when maintenance next runs, then the old terminal-generation
+  requirement is cancelled and no stale "work stopped" summary is sent.
+- Given a terminal owner summary has a known failed send result, when the Owner
+  explicitly resumes that work, then the failed summary action is cancelled as
+  superseded; an executing summary whose Lark result is uncertain still blocks
+  resume and is never replayed.
+- Given a completed terminal work is explicitly resumed and later reaches dead
+  letter again, when the second terminal generation is committed, then it gets
+  a new outbox identity and a new idempotent owner summary; historical
+  owner-resolution actions from the first generation cannot complete it.
 - Given the user intentionally stops or restarts the service, when control
   begins, then the bot sends one idempotent private offline notice before
   `launchctl` unloads it; an unexpected crash sends no false offline notice.

@@ -1086,12 +1086,16 @@ func TestOwnerNotificationTextDoesNotPasteEnglishModelReason(t *testing.T) {
 type capturingOwnerMessenger struct {
 	notification string
 	key          string
+	count        int
+	replyCount   int
+	fail         error
 }
 
 func (m *capturingOwnerMessenger) ReplyAsUser(
 	context.Context,
 	agenttools.ReplyRequest,
 ) (agenttools.ReplyResult, error) {
+	m.replyCount++
 	return agenttools.ReplyResult{}, nil
 }
 
@@ -1101,7 +1105,268 @@ func (m *capturingOwnerMessenger) NotifyOwner(
 ) error {
 	m.notification = request.Text
 	m.key = request.IdempotencyKey
+	m.count++
+	if m.fail != nil {
+		err := m.fail
+		m.fail = nil
+		return err
+	}
 	return nil
+}
+
+func TestTerminalFailureRequirementSendsPrivateBotCommandsOnce(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	store.ConfigureRecovery(1)
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		Source:    domain.SourcePoll,
+		EventID:   "poll:om_terminal_private_commands",
+		MessageID: "om_terminal_private_commands",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_teammate",
+		Content:   "@测试负责人 请结合前文处理",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		CreatedAt: store.CurrentSession().StartedAt.Add(time.Second),
+	})
+	item.Status = domain.StatusWaitingUser
+	item.WorkKind = domain.WorkKindDirectMention
+	item.Priority = domain.PriorityDirectMention
+	item.NextAttemptAt = time.Now().UTC().Add(-time.Second)
+	if _, err := store.RecordWorkIntake(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNext("terminal-command-test")
+	if err != nil || !ok {
+		t.Fatalf("claimed=%+v ok=%v err=%v", claimed, ok, err)
+	}
+	if err := store.DeferWaitingUserClaim(
+		claimed.ID,
+		claimed.LeaseBy,
+		"same-chat context is incomplete",
+		time.Minute,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	messenger := &capturingOwnerMessenger{}
+	owner := config.OwnerConfig{
+		Name:              "测试负责人",
+		PreferredLanguage: agentlocale.LanguageChinese,
+		FallbackLanguage:  agentlocale.LanguageChinese,
+	}
+	if err := flushOwnerResolutionNotifications(
+		context.Background(),
+		store,
+		messenger,
+		owner,
+		&bytes.Buffer{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"/task " + strconv.FormatInt(claimed.ID, 10),
+		"/task resume " + strconv.FormatInt(claimed.ID, 10) + " confirm",
+	} {
+		if !strings.Contains(messenger.notification, want) {
+			t.Fatalf("terminal notification missing %q: %s", want, messenger.notification)
+		}
+	}
+	if strings.Contains(messenger.notification, "queue inspect") ||
+		strings.Contains(messenger.notification, "queue resume") {
+		t.Fatalf("terminal notification requires local CLI: %s", messenger.notification)
+	}
+	if messenger.count != 1 {
+		t.Fatalf("notification count=%d", messenger.count)
+	}
+	if messenger.replyCount != 0 {
+		t.Fatalf("terminal handling sent %d source-chat replies", messenger.replyCount)
+	}
+	if err := flushOwnerResolutionNotifications(
+		context.Background(),
+		store,
+		messenger,
+		owner,
+		&bytes.Buffer{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if messenger.count != 1 {
+		t.Fatalf("duplicate terminal notification count=%d", messenger.count)
+	}
+}
+
+func TestTerminalFailureRequirementDoesNotSendAfterExplicitResume(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	store.ConfigureRecovery(1)
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		Source:    domain.SourcePoll,
+		EventID:   "poll:om_resumed_before_terminal_notice",
+		MessageID: "om_resumed_before_terminal_notice",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_teammate",
+		Content:   "@测试负责人 请结合前文处理",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		CreatedAt: store.CurrentSession().StartedAt.Add(time.Second),
+	})
+	item.Status = domain.StatusWaitingUser
+	item.WorkKind = domain.WorkKindDirectMention
+	item.Priority = domain.PriorityDirectMention
+	item.NextAttemptAt = time.Now().UTC().Add(-time.Second)
+	if _, err := store.RecordWorkIntake(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNext("resume-before-terminal-notice")
+	if err != nil || !ok {
+		t.Fatalf("claimed=%+v ok=%v err=%v", claimed, ok, err)
+	}
+	if err := store.DeferWaitingUserClaim(
+		claimed.ID,
+		claimed.LeaseBy,
+		"same-chat context is incomplete",
+		time.Minute,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResumeWork(context.Background(), domain.ResumeWorkRequest{
+		WorkItemID:    claimed.ID,
+		ForceTerminal: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	messenger := &capturingOwnerMessenger{}
+	if err := flushOwnerResolutionNotifications(
+		context.Background(),
+		store,
+		messenger,
+		config.OwnerConfig{
+			Name:              "测试负责人",
+			PreferredLanguage: agentlocale.LanguageChinese,
+			FallbackLanguage:  agentlocale.LanguageChinese,
+		},
+		&bytes.Buffer{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if messenger.count != 0 || messenger.replyCount != 0 {
+		t.Fatalf("stale notification was sent: %+v", messenger)
+	}
+	handler := liveTerminalFailureHandler{
+		store:     store,
+		messenger: messenger,
+		owner: config.OwnerConfig{
+			Name:              "测试负责人",
+			PreferredLanguage: agentlocale.LanguageChinese,
+			FallbackLanguage:  agentlocale.LanguageChinese,
+		},
+	}
+	if err := handler.HandleTerminalFailure(
+		context.Background(),
+		claimed,
+		errors.New("same-chat context is incomplete"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if messenger.count != 0 || messenger.replyCount != 0 {
+		t.Fatalf("stale immediate notification was sent: %+v", messenger)
+	}
+}
+
+func TestTerminalFailureRequirementRetriesExactFailedSend(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	store.ConfigureRecovery(1)
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		Source:    domain.SourcePoll,
+		EventID:   "poll:om_retry_terminal_notice",
+		MessageID: "om_retry_terminal_notice",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_teammate",
+		Content:   "@测试负责人 请结合前文处理",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		CreatedAt: store.CurrentSession().StartedAt.Add(time.Second),
+	})
+	item.Status = domain.StatusWaitingUser
+	item.WorkKind = domain.WorkKindDirectMention
+	item.Priority = domain.PriorityDirectMention
+	item.NextAttemptAt = time.Now().UTC().Add(-time.Second)
+	if _, err := store.RecordWorkIntake(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNext("retry-terminal-notice")
+	if err != nil || !ok {
+		t.Fatalf("claimed=%+v ok=%v err=%v", claimed, ok, err)
+	}
+	if err := store.DeferWaitingUserClaim(
+		claimed.ID,
+		claimed.LeaseBy,
+		"same-chat context is incomplete",
+		time.Minute,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	messenger := &capturingOwnerMessenger{fail: errors.New("temporary Lark failure")}
+	owner := config.OwnerConfig{
+		Name:              "测试负责人",
+		PreferredLanguage: agentlocale.LanguageChinese,
+		FallbackLanguage:  agentlocale.LanguageChinese,
+	}
+	errOut := &bytes.Buffer{}
+	if err := flushOwnerResolutionNotifications(
+		context.Background(),
+		store,
+		messenger,
+		owner,
+		errOut,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if messenger.count != 1 || !strings.Contains(errOut.String(), "temporary Lark failure") {
+		t.Fatalf("first send messenger=%+v stderr=%s", messenger, errOut.String())
+	}
+	firstKey := messenger.key
+	if firstKey == "" || len(firstKey) > 50 {
+		t.Fatalf("first key=%q", firstKey)
+	}
+
+	if err := flushOwnerResolutionNotifications(
+		context.Background(),
+		store,
+		messenger,
+		owner,
+		&bytes.Buffer{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if messenger.count != 2 || messenger.key != firstKey {
+		t.Fatalf("retry messenger=%+v firstKey=%q", messenger, firstKey)
+	}
+	if err := flushOwnerResolutionNotifications(
+		context.Background(),
+		store,
+		messenger,
+		owner,
+		&bytes.Buffer{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if messenger.count != 2 {
+		t.Fatalf("completed notice was sent again: %+v", messenger)
+	}
 }
 
 func TestLiveOwnerNotifierSendsIdempotentExactApprovalNotice(t *testing.T) {

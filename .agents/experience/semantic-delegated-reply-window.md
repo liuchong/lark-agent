@@ -28,3 +28,15 @@ Reusable verified rules:
   never replay an old draft, approval, or uncertain action.
 - Keep group owner mentions, inbound human private messages, and native
   assistant invocations as separate configured scopes and routing identities.
+- Apply the recovery retry ceiling to semantic `waiting_user` deferrals too.
+  The final exact lease must atomically become dead letter, clear its future
+  attempt, and enter the existing owner-resolution path; a special waiting
+  state must not bypass the queue's convergence bound.
+- Keep complete action idempotency keys in local audit storage, but derive a
+  stable, domain-prefixed digest for public Lark message UUIDs. Public API
+  limits are transport contracts and must not truncate or redefine the
+  internal uniqueness key.
+- Bind terminal owner summaries to a durable terminal-generation ID, not only
+  a work item ID or message digest. Resume must cancel unsent requirements,
+  reject result-uncertain sends, and let a later dead-letter generation create
+  a distinct requirement and public idempotency key.

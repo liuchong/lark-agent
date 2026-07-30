@@ -3,6 +3,7 @@ package investigation
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"strings"
 
@@ -194,7 +195,7 @@ func (c *Controller) sendOwnerNotice(
 	}
 	err = c.messenger.NotifyOwner(ctx, tools.NotifyRequest{
 		Text:           text,
-		IdempotencyKey: action.Idempotency,
+		IdempotencyKey: publicMessageUUID(action.Idempotency),
 	})
 	if completeErr := c.store.CompleteInvestigationMessageAction(
 		context.WithoutCancel(ctx),
@@ -234,7 +235,7 @@ func (c *Controller) sendProgress(
 	result, sendErr := c.messenger.ReplyAsBot(ctx, tools.ReplyRequest{
 		MessageID:      item.Event.MessageID,
 		Text:           text,
-		IdempotencyKey: action.Idempotency,
+		IdempotencyKey: publicMessageUUID(action.Idempotency),
 	})
 	if completeErr := c.store.CompleteInvestigationMessageAction(
 		context.WithoutCancel(ctx),
@@ -245,6 +246,11 @@ func (c *Controller) sendProgress(
 		return completeErr
 	}
 	return sendErr
+}
+
+func publicMessageUUID(internalKey string) string {
+	digest := sha256.Sum256([]byte(internalKey))
+	return fmt.Sprintf("investigation:%x", digest[:16])
 }
 
 func (c *Controller) ownerNoticeText(

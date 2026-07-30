@@ -66,7 +66,10 @@ IDs and digests, not credentials or unbounded message bodies.
    `@Owner` work cannot use this result. A high-confidence `unanswered` result
    admits only that target to reply work. `ambiguous`, malformed, unavailable,
    or low-confidence results fail closed and return the target to
-   `waiting_user` for a bounded retry.
+   `waiting_user` for a bounded retry. When the configured retry ceiling is
+   reached, the same transaction moves the target to dead letter, clears its
+   lease and next-attempt time, records the exact terminal reason, and writes a
+   durable owner-resolution requirement.
 7. The main reply context includes post-target discussion, while the verified
    semantic-resolution record remains in the audit ledger. The reply must still satisfy the existing useful-work,
    evidence, commitment, and non-owner read-only gates.
@@ -83,6 +86,7 @@ IDs and digests, not credentials or unbounded message bodies.
 - `no_reply_needed -> cancelled(delegated_reply_not_needed)`
 - `unanswered -> routed/model -> reply|record|notify|approval`
 - `ambiguous/error -> waiting_user(next semantic retry)`
+- `ambiguous/error at retry ceiling -> dead_letter(owner resolution summary)`
 - `withdrawn -> cancelled(message_withdrawn)`
 
 An edit before send replaces the target content used for future evaluation and
@@ -112,6 +116,13 @@ Doctor and help expose all effective values without exposing message content.
 ### Failure And Safety
 
 - A semantic model or Lark history failure never means "unanswered".
+- Repeated incomplete or ambiguous context cannot remain in `waiting_user`
+  forever. Retry exhaustion sends one private, localized, actionable summary
+  to the Owner and never posts a late reply to the original chat.
+- The dead-letter transaction and owner-summary requirement commit together.
+  Immediate handling, periodic maintenance, and startup recovery consume the
+  requirement idempotently, so a crash before notification action creation
+  cannot leave an invisible terminal tail.
 - Resolver output is strict JSON. Every matched ID must be an owner-authored,
   same-chat message newer than the target; unknown IDs reject the result.
 - Context is time-, count-, and byte-bounded. An incomplete window is
@@ -121,6 +132,9 @@ Doctor and help expose all effective values without exposing message content.
   same-chat boundary, workspace sandbox, and commitment approval rules.
 - Lark has no compare-and-send primitive. The final incremental check minimizes
   but cannot eliminate the interval between the last read and the send call.
+- Durable investigation messages keep their complete internal action keys for
+  audit, but the UUID passed to Lark is a stable stage-distinct digest no longer
+  than 50 characters.
 
 ## BDD Acceptance
 
@@ -130,6 +144,53 @@ Given an allowed human message mentions the owner in any allowed group,
 when less than three minutes have elapsed,
 then the item remains `waiting_user`,
 and neither semantic nor reply model is called.
+
+### Scenario: Ambiguous context reaches a bounded terminal state
+
+Given a delegated target repeatedly has incomplete or ambiguous semantic
+context,
+when the final configured retry is deferred,
+then the target becomes dead letter with no next attempt,
+one private Owner summary names the work, `/task <id>`, and
+`/task resume <id> confirm`,
+and no delayed response is posted to the source conversation.
+
+### Scenario: Crash before terminal notification action is recoverable
+
+Given the final semantic deferral commits its dead letter,
+when the process exits before beginning the private notification action,
+then the same transaction has already persisted an owner-resolution
+requirement,
+and periodic or startup recovery sends the idempotent private summary once.
+
+### Scenario: Resume cancels an unsent terminal generation
+
+Given terminal work has an unsent owner-resolution requirement,
+when the Owner explicitly resumes that terminal work before its send action
+begins,
+then the resume transaction cancels the old requirement,
+and later maintenance does not send a stale stopped-work summary.
+
+### Scenario: A later terminal generation is independent
+
+Given one terminal summary completed and the Owner explicitly resumed the work,
+when the same work later reaches dead letter again,
+then a distinct outbox generation and distinct Lark idempotency key are used,
+and no action from the earlier terminal generation can complete the later one.
+
+### Scenario: Explicit resume distinguishes failed from uncertain sends
+
+Given an owner summary send has a known failed result,
+when the Owner explicitly resumes the terminal work,
+then that failed summary is cancelled as superseded and is not retried;
+but an executing summary with an uncertain Lark result blocks resume.
+
+### Scenario: Investigation messages satisfy Lark UUID limits
+
+Given a durable investigation uses a full action key longer than 50 characters,
+when the Owner notice and source-thread progress message are sent,
+then Lark receives stable distinct UUID digests of at most 50 characters,
+while the full keys remain available in the local audit record.
 
 ### Scenario: Every inbound human private message is evaluated
 

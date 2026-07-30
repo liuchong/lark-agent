@@ -130,6 +130,36 @@ func TestDelegatedInvestigationPersistsAndResumesWithoutDuplicateProgress(t *tes
 			len(messenger.progress),
 		)
 	}
+	ownerUUID := messenger.ownerNotices[0].IdempotencyKey
+	progressUUID := messenger.progress[0].IdempotencyKey
+	if len(ownerUUID) > 50 || len(progressUUID) > 50 {
+		t.Fatalf(
+			"public UUID limit exceeded: owner=%q progress=%q",
+			ownerUUID,
+			progressUUID,
+		)
+	}
+	if ownerUUID == progressUUID {
+		t.Fatalf("owner notice and progress share public UUID %q", ownerUUID)
+	}
+	actions, err := store.ListActionAttempts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var internalKeys []string
+	for _, action := range actions {
+		if action.WorkItemID == item.ID &&
+			(action.Kind == "investigation_owner_notice" ||
+				action.Kind == "investigation_progress") {
+			internalKeys = append(internalKeys, action.IdempotencyKey)
+		}
+	}
+	if len(internalKeys) != 2 ||
+		len(internalKeys[0]) <= 50 ||
+		len(internalKeys[1]) <= 50 ||
+		internalKeys[0] == internalKeys[1] {
+		t.Fatalf("internal investigation action keys=%q", internalKeys)
+	}
 	if got := messenger.progress[0].Text; !strings.Contains(got, "智能助手") ||
 		!strings.Contains(got, "已通知测试负责人") ||
 		!strings.Contains(got, plan.TaskSummary) {
