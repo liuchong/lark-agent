@@ -111,6 +111,13 @@ Two live failures established reusable implementation rules.
   introduction for another lower-camel field starts a different context.
   Validate the reply's exact inline JSON against those same field-related local
   snippets, not against the union of all cited source contents.
+- Multi-fact protocol answers need two JSON checks rather than one overloaded
+  comparison. First require every concrete reply JSON example to occur in the
+  union of cited current-run reads. Then extract only reply contexts locally
+  bound to the named shape target and require those examples to occur in that
+  target's local evidence. Comparing response, push, or local-state JSON
+  directly against a `sampleContent`-only snippet creates false insufficiency;
+  checking only the union permits unrelated JSON to masquerade as the target.
 - Validate outward repository paths against current-run `read_workspace`
   sources, not all submitted citations; a search receipt remains a locator even
   when the model copies it into `source_refs`. Validate lower-camel-case

@@ -387,6 +387,55 @@ func TestVerifyGroundedCodingReplyRejectsUnsupportedConcreteJSONExample(t *testi
 	}
 }
 
+func TestVerifyGroundedCodingReplyAllowsOtherCitedProtocolJSON(t *testing.T) {
+	source := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/docs/sample-protocol-reference.md",
+		Digest:       "sha256:reference",
+		Kind:         "workspace_file",
+	}
+	err := verifyGroundedCodingReply(
+		"Sample-Client SampleRequest 的 sampleContent 是什么结构，成功响应是什么？",
+		domain.Decision{
+			Kind:           domain.DecisionReply,
+			EvidenceStatus: domain.EvidenceVerified,
+			ReplyText:      `sampleContent 具体为 {"content":"sample value"}，成功响应为 {"sampleTimestamp":1720000000000,"sampleVersion":1}。`,
+			Sources:        []domain.SourceRef{source},
+		},
+		map[string]string{
+			sourceKey(source): `sampleContent example: {"content":"sample value"}
+Success response example: {"sampleTimestamp":1720000000000,"sampleVersion":1}`,
+		},
+	)
+	if err != nil {
+		t.Fatalf("cited response JSON was compared as sampleContent evidence: %v", err)
+	}
+}
+
+func TestVerifyGroundedCodingReplyRejectsUncitedProtocolJSON(t *testing.T) {
+	source := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/docs/sample-protocol-reference.md",
+		Digest:       "sha256:reference",
+		Kind:         "workspace_file",
+	}
+	err := verifyGroundedCodingReply(
+		"Sample-Client SampleRequest 的 sampleContent 是什么结构，成功响应是什么？",
+		domain.Decision{
+			Kind:           domain.DecisionReply,
+			EvidenceStatus: domain.EvidenceVerified,
+			ReplyText: `sampleContent 具体为 {"content":"sample value"}。
+成功响应为 {"sampleTimestamp":999,"sampleVersion":77}。`,
+			Sources: []domain.SourceRef{source},
+		},
+		map[string]string{
+			sourceKey(source): `sampleContent example: {"content":"sample value"}
+Success response example: {"sampleTimestamp":1720000000000,"sampleVersion":1}`,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "unsupported serialized example") {
+		t.Fatalf("uncited response JSON err=%v", err)
+	}
+}
+
 func TestVerifyGroundedCodingReplyRejectsExampleFromUnrelatedSource(t *testing.T) {
 	guide := domain.SourceRef{
 		RelativePath: "sample-project/sample-module/docs/sample-protocol-guide.md",
@@ -403,7 +452,7 @@ func TestVerifyGroundedCodingReplyRejectsExampleFromUnrelatedSource(t *testing.T
 		domain.Decision{
 			Kind:           domain.DecisionReply,
 			EvidenceStatus: domain.EvidenceVerified,
-			ReplyText:      `结论：sampleContent 具体为 {"text":"invented"}。`,
+			ReplyText:      `结论：sampleContent 具体为 {"text":"invented"}；未知/下一步：没有。`,
 			Sources:        []domain.SourceRef{guide, unrelated},
 		},
 		map[string]string{

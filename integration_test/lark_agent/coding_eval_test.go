@@ -359,6 +359,7 @@ func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T)
 sampleContent example: {"content":"sample value"}
 new SampleRequest("conversation", 42L, "{\"content\":\"sample value\"}", 0L)
 The success callback means server acceptance only.
+Success response example: {"sampleTimestamp":1720000000000,"sampleVersion":1}
 Local state converges after WebSocket notification 9001 through onSampleEvent.
 Message exposes sampleFlag, sampleTimestamp, and sampleVersion.`,
 		"sample-project/sample-module/sample-client/SampleListener.java": `interface SampleListener {
@@ -477,7 +478,7 @@ Message exposes sampleFlag, sampleTimestamp, and sampleVersion.`,
 			"reply_confidence":0.95,
 			"risk":"low",
 			"evidence_status":"verified",
-			"reply_text":"结论：sampleContent 是字符串形式的消息 JSON，具体为 {\"content\":\"sample value\"}；成功回调只表示服务端接受修改；本地状态由 9001 后的 onSampleEvent 推送以及 sampleFlag、sampleTimestamp、sampleVersion 字段收敛。依据：sample-project/sample-module/sample-client/SampleRequest.java、sample-project/sample-module/docs/sample-protocol-guide.md、sample-project/sample-module/sample-client/SampleListener.java、sample-project/sample-module/sample-client/Message.java。未知/下一步：没有。",
+			"reply_text":"结论：sampleContent 是字符串形式的消息 JSON，具体为 {\"content\":\"sample value\"}；成功回调只表示服务端接受修改，响应示例为 {\"sampleTimestamp\":1720000000000,\"sampleVersion\":1}；本地状态由 9001 后的 onSampleEvent 推送以及 sampleFlag、sampleTimestamp、sampleVersion 字段收敛。依据：sample-project/sample-module/sample-client/SampleRequest.java、sample-project/sample-module/docs/sample-protocol-guide.md、sample-project/sample-module/sample-client/SampleListener.java、sample-project/sample-module/sample-client/Message.java。未知/下一步：没有。",
 			"reason":"all requested project facts have authoritative reads",
 			"source_refs":[
 				{"relative_path":"sample-project/sample-module/sample-client/SampleRequest.java","digest":"`+digests["sample-project/sample-module/sample-client/SampleRequest.java"]+`","kind":"workspace_file"},

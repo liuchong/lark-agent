@@ -1011,6 +1011,20 @@ same or another cited file does not complete the field's evidence.
 The concrete JSON example stated in the reply must also occur in that
 field-related local evidence. A matching JSON object from an unrelated cited
 source cannot support a different claimed shape.
+When one reply answers several related protocol facts, JSON examples that do
+not claim to be the named field's shape are not compared against that field's
+local structural snippet. Every concrete JSON example in the reply must still
+occur verbatim after whitespace normalization in at least one cited
+current-run read, while JSON examples locally bound to the named field must
+additionally occur in that field's local evidence. Thus a cited response body,
+push payload, or converged local-state example may accompany a `sampleContent`
+answer without being mistaken for the `sampleContent` shape, but an invented JSON
+object or an unrelated object presented as `sampleContent` is rejected.
+Reply-side field binding is evaluated per JSON example rather than by reusing
+source-snippet extraction over a whole line. A standard `unknown/next step`
+suffix after an example does not erase the binding, and a later response,
+push, notification, or local-state fact marker ends the earlier field binding
+even when several JSON examples share one line.
 As soon as a current-run read proves only the opaque declaration and at least
 two model turns remain before the terminal turn, the runtime enters bounded
 structural-evidence recovery. It exposes only `search_workspace` for one exact
@@ -1537,6 +1551,20 @@ The multi-step loop is accepted by these executable BDD scenarios:
   when candidate filtering and final grounding run, then that nearby JSON is
   not bound to the named field and the path is not accepted as structural
   evidence.
+- Given one verified reply includes the cited `sampleContent` example plus cited
+  response-body, push-payload, or local-state JSON examples, when final
+  grounding runs, then every JSON example is checked against the union of
+  cited current-run reads and only the JSON locally presented as `sampleContent`
+  is additionally checked against `sampleContent`-local evidence; the other cited
+  protocol JSON examples do not cause a false rejection.
+- Given any JSON example in that multi-fact reply does not occur in any cited
+  current-run read, when final grounding runs, then the verified reply is
+  rejected even if the `sampleContent` example itself is correct.
+- Given a reply places the named-field JSON and a cited response JSON on the
+  same line, or places the standard `unknown/next step` suffix after the named
+  field JSON, when reply-side field binding runs, then each JSON keeps its own
+  fact association: the response JSON is not compared as the field shape and
+  the suffix does not allow unrelated evidence to masquerade as that shape.
 - Given the model tries to submit `evidence_status=insufficient` before the
   bounded structural recovery is complete, when the terminal gate evaluates
   the draft, then it rejects the early conclusion and directs the model through

@@ -130,8 +130,20 @@ func verifyGroundedCodingReply(
 				"verified coding reply claims a concrete serialized shape but cited reads contain only opaque declarations; read and cite a current example, protocol, or serializer",
 			)
 		}
+		normalizedReply := normalizeEscapedSerializationText(decision.ReplyText)
+		allCitedEvidence := strings.Join(normalizedContents, "\n")
 		if unsupported := unsupportedConcreteJSONExample(
-			normalizeEscapedSerializationText(decision.ReplyText),
+			normalizedReply,
+			allCitedEvidence,
+		); unsupported != "" {
+			return errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"verified coding reply contains unsupported serialized example %s; cite the exact current-run evidence or correct it",
+				unsupported,
+			)
+		}
+		if unsupported := unsupportedConcreteJSONExample(
+			fieldBoundSerializationReplyExamples(question, normalizedReply),
 			structuralSerializationEvidenceForQuestion(
 				question,
 				normalizedContents,
@@ -139,7 +151,7 @@ func verifyGroundedCodingReply(
 		); unsupported != "" {
 			return errs.NewInternalError(
 				errs.SubtypeInvalidResponse,
-				"verified coding reply contains unsupported serialized example %s; cite the exact current-run evidence or correct it",
+				"verified coding reply contains unsupported serialized example %s for the named field; it is absent from that field's local evidence, so cite the exact field evidence or correct it",
 				unsupported,
 			)
 		}
@@ -636,6 +648,74 @@ func unsupportedConcreteJSONExample(reply, evidence string) string {
 		}
 	}
 	return ""
+}
+
+func fieldBoundSerializationReplyExamples(question, reply string) string {
+	targets := concreteSerializedShapeTargets(question)
+	if len(targets) == 0 {
+		return ""
+	}
+	locations := inlineJSONObjectPattern.FindAllStringIndex(reply, -1)
+	examples := make([]string, 0, len(locations))
+	for _, location := range locations {
+		prefix := reply[:location[0]]
+		if boundary := lastReplyFactBoundary(prefix); boundary >= 0 {
+			prefix = prefix[boundary+1:]
+		}
+		targetIndex := lastTargetIdentifierIndex(prefix, targets)
+		if targetIndex < 0 ||
+			lastDifferentProtocolFactIndex(prefix) > targetIndex {
+			continue
+		}
+		examples = append(examples, reply[location[0]:location[1]])
+	}
+	return strings.Join(examples, "\n")
+}
+
+func lastReplyFactBoundary(text string) int {
+	last := -1
+	for _, marker := range []string{"\n", "。", "；", ";"} {
+		last = max(last, strings.LastIndex(text, marker))
+	}
+	return last
+}
+
+func lastTargetIdentifierIndex(text string, targets []string) int {
+	last := -1
+	for _, location := range codeIdentifierPattern.FindAllStringIndex(text, -1) {
+		identifier := text[location[0]:location[1]]
+		for _, target := range targets {
+			if strings.EqualFold(identifier, target) {
+				last = max(last, location[0])
+				break
+			}
+		}
+	}
+	return last
+}
+
+func lastDifferentProtocolFactIndex(text string) int {
+	text = strings.ToLower(text)
+	last := -1
+	for _, marker := range []string{
+		"成功响应",
+		"响应体",
+		"响应示例",
+		"返回体",
+		"推送",
+		"通知",
+		"本地状态",
+		"本地消息",
+		"收敛字段",
+		"消息字段",
+		"response",
+		"push payload",
+		"notification",
+		"local state",
+	} {
+		last = max(last, strings.LastIndex(text, marker))
+	}
+	return last
 }
 
 func compactSerializationExample(value string) string {
