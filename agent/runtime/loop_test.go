@@ -709,6 +709,48 @@ func TestCompactMessagesCreatesEvidenceCheckpointWithinBudget(t *testing.T) {
 	}
 }
 
+func TestMultimodalPayloadCountsTowardBudgetAndExpiresAfterFirstTurn(
+	t *testing.T,
+) {
+	imageURL := "data:image/png;base64," + strings.Repeat("A", 4096)
+	messages := []*schema.Message{
+		schema.SystemMessage("system"),
+		{
+			Role: schema.User,
+			UserInputMultiContent: []schema.MessageInputPart{
+				{Type: schema.ChatMessagePartTypeText, Text: "请分析图片"},
+				{
+					Type: schema.ChatMessagePartTypeImageURL,
+					Image: &schema.MessageInputImage{
+						MessagePartCommon: schema.MessagePartCommon{URL: &imageURL},
+					},
+				},
+			},
+		},
+	}
+	if got := messageBytes(messages); got < len(imageURL) {
+		t.Fatalf("multimodal payload bytes=%d, want at least %d", got, len(imageURL))
+	}
+	expired, removed := expireEphemeralImages(messages)
+	if removed != 1 {
+		t.Fatalf("removed images=%d", removed)
+	}
+	expiredText := expired[1].UserInputMultiContent[1].Text
+	if messageBytes(expired) >= messageBytes(messages) ||
+		!strings.Contains(expiredText, "ephemeral image") {
+		t.Fatalf(
+			"expired bytes=%d original=%d messages=%+v",
+			messageBytes(expired),
+			messageBytes(messages),
+			expired,
+		)
+	}
+	sourceURL := messages[1].UserInputMultiContent[1].Image.URL
+	if sourceURL == nil || *sourceURL != imageURL {
+		t.Fatalf("source messages were mutated: %+v", messages[1])
+	}
+}
+
 func TestModelBudgetPromptIncludesTurnAndContextUrgency(t *testing.T) {
 	got := modelRunProgressPrompt(runBudget{
 		CurrentTurn:      121,
@@ -816,9 +858,9 @@ func TestToolCallAndNoProgressBudgetsForceConvergence(t *testing.T) {
 	}
 	decision, _, err := (AgentLoop{
 		Model: model, Tools: registry, MaxTurns: 20,
-		CodingMaxTurns: 20, MaxToolCalls: 10, MaxNoProgress: 3, MaxRepeatedCalls: 100,
+		SimpleMaxTurns: 20, MaxToolCalls: 10, MaxNoProgress: 3, MaxRepeatedCalls: 100,
 	}).Decide(context.Background(), agentcontext.Bundle{
-		WorkKind: domain.WorkKindCodingQuestion,
+		WorkKind: domain.WorkKindSimpleQuestion,
 		Event:    domain.NormalizedEvent{MessageID: "om_budget", Content: "investigate"},
 	})
 	if err != nil {

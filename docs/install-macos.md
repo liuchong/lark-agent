@@ -102,10 +102,16 @@ Owner 发给其他真人的普通私聊消息不会进入代回复队列。
 agent:
   max_context_bytes: 65536
   context_compaction_ratio: 0.80
+  vision_model: <已验证支持图片的模型名>
+  max_context_images: 2
+  max_context_image_bytes: 1048576
+  max_context_image_total_bytes: 2097152
 fast_path:
   simple_max_turns: 3
 tool_policy:
   coding_max_tool_calls: 16
+policy:
+  investigation_progress: enabled
 ```
 
 这不会放宽安全边界。非 Owner 请求仍是同群和 Workspace 只读，环境刺探与工作目录

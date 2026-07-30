@@ -94,26 +94,39 @@ type Mention struct {
 // NormalizedEvent is the single durable intake shape for real-time and polled
 // events. Content is untrusted business data.
 type NormalizedEvent struct {
-	Source           EventSource `json:"source" yaml:"source"`
-	EventID          string      `json:"event_id,omitempty" yaml:"event_id,omitempty"`
-	MessageID        string      `json:"message_id" yaml:"message_id"`
-	ChatID           string      `json:"chat_id,omitempty" yaml:"chat_id,omitempty"`
-	ChatName         string      `json:"chat_name,omitempty" yaml:"chat_name,omitempty"`
-	ChatType         string      `json:"chat_type,omitempty" yaml:"chat_type,omitempty"`
-	ChatPartnerID    string      `json:"chat_partner_id,omitempty" yaml:"chat_partner_id,omitempty"`
-	RootMessageID    string      `json:"root_id,omitempty" yaml:"root_id,omitempty"`
-	ReplyToMessageID string      `json:"reply_to,omitempty" yaml:"reply_to,omitempty"`
-	ThreadID         string      `json:"thread_id,omitempty" yaml:"thread_id,omitempty"`
-	SenderID         string      `json:"sender_id,omitempty" yaml:"sender_id,omitempty"`
-	SenderType       string      `json:"sender_type,omitempty" yaml:"sender_type,omitempty"`
-	Content          string      `json:"content,omitempty" yaml:"content,omitempty"`
-	Mentions         []Mention   `json:"mentions,omitempty" yaml:"mentions,omitempty"`
-	CreatedAt        time.Time   `json:"created_at,omitempty" yaml:"created_at,omitempty"`
-	UpdatedAt        time.Time   `json:"updated_at,omitempty" yaml:"updated_at,omitempty"`
-	RawDigest        string      `json:"raw_digest,omitempty" yaml:"raw_digest,omitempty"`
-	WorkspaceID      string      `json:"workspace_id,omitempty" yaml:"workspace_id,omitempty"`
-	InTestScope      bool        `json:"in_test_scope,omitempty" yaml:"in_test_scope,omitempty"`
-	InAssistantScope bool        `json:"in_assistant_scope,omitempty" yaml:"in_assistant_scope,omitempty"`
+	Source           EventSource  `json:"source" yaml:"source"`
+	EventID          string       `json:"event_id,omitempty" yaml:"event_id,omitempty"`
+	MessageID        string       `json:"message_id" yaml:"message_id"`
+	ChatID           string       `json:"chat_id,omitempty" yaml:"chat_id,omitempty"`
+	ChatName         string       `json:"chat_name,omitempty" yaml:"chat_name,omitempty"`
+	ChatType         string       `json:"chat_type,omitempty" yaml:"chat_type,omitempty"`
+	ChatPartnerID    string       `json:"chat_partner_id,omitempty" yaml:"chat_partner_id,omitempty"`
+	RootMessageID    string       `json:"root_id,omitempty" yaml:"root_id,omitempty"`
+	ReplyToMessageID string       `json:"reply_to,omitempty" yaml:"reply_to,omitempty"`
+	ThreadID         string       `json:"thread_id,omitempty" yaml:"thread_id,omitempty"`
+	SenderID         string       `json:"sender_id,omitempty" yaml:"sender_id,omitempty"`
+	SenderName       string       `json:"sender_name,omitempty" yaml:"sender_name,omitempty"`
+	SenderType       string       `json:"sender_type,omitempty" yaml:"sender_type,omitempty"`
+	Content          string       `json:"content,omitempty" yaml:"content,omitempty"`
+	Attachments      []Attachment `json:"attachments,omitempty" yaml:"attachments,omitempty"`
+	Mentions         []Mention    `json:"mentions,omitempty" yaml:"mentions,omitempty"`
+	CreatedAt        time.Time    `json:"created_at,omitempty" yaml:"created_at,omitempty"`
+	UpdatedAt        time.Time    `json:"updated_at,omitempty" yaml:"updated_at,omitempty"`
+	RawDigest        string       `json:"raw_digest,omitempty" yaml:"raw_digest,omitempty"`
+	WorkspaceID      string       `json:"workspace_id,omitempty" yaml:"workspace_id,omitempty"`
+	InTestScope      bool         `json:"in_test_scope,omitempty" yaml:"in_test_scope,omitempty"`
+	InAssistantScope bool         `json:"in_assistant_scope,omitempty" yaml:"in_assistant_scope,omitempty"`
+}
+
+// Attachment describes bounded message evidence. DataURL is ephemeral and is
+// deliberately excluded from durable event serialization.
+type Attachment struct {
+	Type             string `json:"type" yaml:"type"`
+	Key              string `json:"key,omitempty" yaml:"key,omitempty"`
+	MediaType        string `json:"media_type,omitempty" yaml:"media_type,omitempty"`
+	Readable         bool   `json:"readable,omitempty" yaml:"readable,omitempty"`
+	UnreadableReason string `json:"unreadable_reason,omitempty" yaml:"unreadable_reason,omitempty"`
+	DataURL          string `json:"-" yaml:"-"`
 }
 
 // ContextMode describes how same-chat messages were selected around a target.
@@ -343,6 +356,43 @@ const (
 	WorkKindCodingGoal     WorkKind = "coding_goal"
 )
 
+// TaskClass describes the work implied by bounded conversation context.
+type TaskClass string
+
+const (
+	TaskClassSimple        TaskClass = "simple"
+	TaskClassInvestigation TaskClass = "investigation"
+	TaskClassCoding        TaskClass = "coding"
+)
+
+// DelegatedInvestigationStatus tracks one resumable delegated investigation.
+type DelegatedInvestigationStatus string
+
+const (
+	InvestigationPendingProgress DelegatedInvestigationStatus = "pending_progress"
+	InvestigationInvestigating   DelegatedInvestigationStatus = "investigating"
+	InvestigationFinalizing      DelegatedInvestigationStatus = "finalizing"
+	InvestigationCompleted       DelegatedInvestigationStatus = "completed"
+	InvestigationBlocked         DelegatedInvestigationStatus = "blocked"
+)
+
+// DelegatedInvestigation is the durable closure contract for staged replies.
+type DelegatedInvestigation struct {
+	ID               int64                        `json:"id" yaml:"id"`
+	WorkItemID       int64                        `json:"work_item_id" yaml:"work_item_id"`
+	TaskSummary      string                       `json:"task_summary" yaml:"task_summary"`
+	TaskClass        TaskClass                    `json:"task_class" yaml:"task_class"`
+	ContextCutoff    time.Time                    `json:"context_cutoff" yaml:"context_cutoff"`
+	ContextDigest    string                       `json:"context_digest" yaml:"context_digest"`
+	ContextMessages  []NormalizedEvent            `json:"context_messages,omitempty" yaml:"context_messages,omitempty"`
+	Status           DelegatedInvestigationStatus `json:"status" yaml:"status"`
+	ProgressActionID int64                        `json:"progress_action_id,omitempty" yaml:"progress_action_id,omitempty"`
+	FinalActionID    int64                        `json:"final_action_id,omitempty" yaml:"final_action_id,omitempty"`
+	LastError        string                       `json:"last_error,omitempty" yaml:"last_error,omitempty"`
+	CreatedAt        time.Time                    `json:"created_at" yaml:"created_at"`
+	UpdatedAt        time.Time                    `json:"updated_at" yaml:"updated_at"`
+}
+
 const (
 	PriorityBackground     = 10
 	PriorityCodingQuestion = 40
@@ -366,20 +416,26 @@ const (
 
 // WorkItem is a durable task produced from a normalized event.
 type WorkItem struct {
-	ID            int64           `json:"id" yaml:"id"`
-	DedupKey      string          `json:"dedup_key" yaml:"dedup_key"`
-	Status        WorkItemStatus  `json:"status" yaml:"status"`
-	WorkKind      WorkKind        `json:"work_kind,omitempty" yaml:"work_kind,omitempty"`
-	Priority      int             `json:"priority,omitempty" yaml:"priority,omitempty"`
-	DuplicateOf   int64           `json:"duplicate_of,omitempty" yaml:"duplicate_of,omitempty"`
-	SessionID     string          `json:"session_id,omitempty" yaml:"session_id,omitempty"`
-	Event         NormalizedEvent `json:"event" yaml:"event"`
-	LeaseBy       string          `json:"lease_by,omitempty" yaml:"lease_by,omitempty"`
-	LeaseTime     time.Time       `json:"lease_time,omitempty" yaml:"lease_time,omitempty"`
-	RetryCount    int             `json:"retry_count,omitempty" yaml:"retry_count,omitempty"`
-	NextAttemptAt time.Time       `json:"next_attempt_at,omitempty" yaml:"next_attempt_at,omitempty"`
-	CreatedAt     time.Time       `json:"created_at,omitempty" yaml:"created_at,omitempty"`
-	UpdatedAt     time.Time       `json:"updated_at,omitempty" yaml:"updated_at,omitempty"`
+	ID                  int64             `json:"id" yaml:"id"`
+	DedupKey            string            `json:"dedup_key" yaml:"dedup_key"`
+	Status              WorkItemStatus    `json:"status" yaml:"status"`
+	WorkKind            WorkKind          `json:"work_kind,omitempty" yaml:"work_kind,omitempty"`
+	Priority            int               `json:"priority,omitempty" yaml:"priority,omitempty"`
+	DuplicateOf         int64             `json:"duplicate_of,omitempty" yaml:"duplicate_of,omitempty"`
+	SessionID           string            `json:"session_id,omitempty" yaml:"session_id,omitempty"`
+	Event               NormalizedEvent   `json:"event" yaml:"event"`
+	LeaseBy             string            `json:"lease_by,omitempty" yaml:"lease_by,omitempty"`
+	LeaseTime           time.Time         `json:"lease_time,omitempty" yaml:"lease_time,omitempty"`
+	RetryCount          int               `json:"retry_count,omitempty" yaml:"retry_count,omitempty"`
+	NextAttemptAt       time.Time         `json:"next_attempt_at,omitempty" yaml:"next_attempt_at,omitempty"`
+	CreatedAt           time.Time         `json:"created_at,omitempty" yaml:"created_at,omitempty"`
+	UpdatedAt           time.Time         `json:"updated_at,omitempty" yaml:"updated_at,omitempty"`
+	TaskSummary         string            `json:"-" yaml:"-"`
+	TaskClass           TaskClass         `json:"-" yaml:"-"`
+	ContextCutoff       time.Time         `json:"-" yaml:"-"`
+	ContextDigest       string            `json:"-" yaml:"-"`
+	ResolvedContext     []NormalizedEvent `json:"-" yaml:"-"`
+	InvestigationActive bool              `json:"-" yaml:"-"`
 }
 
 // CodingWorkKind distinguishes one-shot answers from durable follow-up goals.
@@ -718,13 +774,14 @@ type WorkInspectionState struct {
 // WorkInspection combines the latest receipt, queue, run, step, action, and
 // interruption evidence for one message.
 type WorkInspection struct {
-	Receipt            *IntakeReceipt      `json:"receipt,omitempty" yaml:"receipt,omitempty"`
-	WorkItem           *WorkItem           `json:"work_item,omitempty" yaml:"work_item,omitempty"`
-	LatestRun          *AgentRun           `json:"latest_run,omitempty" yaml:"latest_run,omitempty"`
-	LatestStep         *AgentStep          `json:"latest_step,omitempty" yaml:"latest_step,omitempty"`
-	LatestAction       *ActionAttempt      `json:"latest_action,omitempty" yaml:"latest_action,omitempty"`
-	LatestInterruption *WorkInterruption   `json:"latest_interruption,omitempty" yaml:"latest_interruption,omitempty"`
-	State              WorkInspectionState `json:"state" yaml:"state"`
+	Receipt            *IntakeReceipt          `json:"receipt,omitempty" yaml:"receipt,omitempty"`
+	WorkItem           *WorkItem               `json:"work_item,omitempty" yaml:"work_item,omitempty"`
+	LatestRun          *AgentRun               `json:"latest_run,omitempty" yaml:"latest_run,omitempty"`
+	LatestStep         *AgentStep              `json:"latest_step,omitempty" yaml:"latest_step,omitempty"`
+	LatestAction       *ActionAttempt          `json:"latest_action,omitempty" yaml:"latest_action,omitempty"`
+	LatestInterruption *WorkInterruption       `json:"latest_interruption,omitempty" yaml:"latest_interruption,omitempty"`
+	Investigation      *DelegatedInvestigation `json:"investigation,omitempty" yaml:"investigation,omitempty"`
+	State              WorkInspectionState     `json:"state" yaml:"state"`
 }
 
 // OwnerControlName identifies a deterministic command in the owner-private
@@ -800,13 +857,14 @@ type OwnerTaskQuery struct {
 }
 
 type OwnerTaskSummary struct {
-	WorkItem           WorkItem             `json:"work_item" yaml:"work_item"`
-	State              WorkInspectionState  `json:"state" yaml:"state"`
-	LatestRun          *AgentRun            `json:"latest_run,omitempty" yaml:"latest_run,omitempty"`
-	LatestStep         *AgentStep           `json:"latest_step,omitempty" yaml:"latest_step,omitempty"`
-	LatestAction       *ActionAttempt       `json:"latest_action,omitempty" yaml:"latest_action,omitempty"`
-	LatestInterruption *WorkInterruption    `json:"latest_interruption,omitempty" yaml:"latest_interruption,omitempty"`
-	Resolution         *OwnerWorkResolution `json:"resolution,omitempty" yaml:"resolution,omitempty"`
+	WorkItem           WorkItem                `json:"work_item" yaml:"work_item"`
+	State              WorkInspectionState     `json:"state" yaml:"state"`
+	LatestRun          *AgentRun               `json:"latest_run,omitempty" yaml:"latest_run,omitempty"`
+	LatestStep         *AgentStep              `json:"latest_step,omitempty" yaml:"latest_step,omitempty"`
+	LatestAction       *ActionAttempt          `json:"latest_action,omitempty" yaml:"latest_action,omitempty"`
+	LatestInterruption *WorkInterruption       `json:"latest_interruption,omitempty" yaml:"latest_interruption,omitempty"`
+	Investigation      *DelegatedInvestigation `json:"investigation,omitempty" yaml:"investigation,omitempty"`
+	Resolution         *OwnerWorkResolution    `json:"resolution,omitempty" yaml:"resolution,omitempty"`
 }
 
 type OwnerTaskPage struct {

@@ -134,6 +134,15 @@ type DelegatedReplyResolver interface {
 	Resolve(context.Context, domain.WorkItem) (replymatch.Resolution, error)
 }
 
+// InvestigationProgressHandler owns the durable progress/finalization state
+// for contextual delegated investigations.
+type InvestigationProgressHandler interface {
+	Begin(context.Context, domain.WorkItem, replymatch.Resolution) error
+	Finalizing(context.Context, domain.WorkItem) error
+	Complete(context.Context, domain.WorkItem) error
+	Block(context.Context, domain.WorkItem, error) error
+}
+
 // OwnerActivityHandler provides transient feedback for owner-initiated work.
 type OwnerActivityHandler interface {
 	Begin(context.Context, domain.WorkItem) (string, error)
@@ -158,25 +167,26 @@ type Option func(*Daemon)
 
 // Daemon processes queued work items.
 type Daemon struct {
-	queue                Queue
-	router               *router.Router
-	worker               string
-	leaseMaxAge          time.Duration
-	builder              ContextBuilder
-	decider              Decider
-	replier              ReplyHandler
-	notifier             NotificationHandler
-	terminalFailure      TerminalFailureHandler
-	presenter            DecisionPresenter
-	activity             OwnerActivityHandler
-	control              ControlHandler
-	poller               Poller
-	workLeases           map[domain.WorkKind]time.Duration
-	lane                 domain.SchedulerLane
-	goalMaxTurns         int
-	replyResolver        DelegatedReplyResolver
-	replyConfidenceMin   float64
-	replyResolutionRetry time.Duration
+	queue                 Queue
+	router                *router.Router
+	worker                string
+	leaseMaxAge           time.Duration
+	builder               ContextBuilder
+	decider               Decider
+	replier               ReplyHandler
+	notifier              NotificationHandler
+	terminalFailure       TerminalFailureHandler
+	presenter             DecisionPresenter
+	activity              OwnerActivityHandler
+	control               ControlHandler
+	poller                Poller
+	workLeases            map[domain.WorkKind]time.Duration
+	lane                  domain.SchedulerLane
+	goalMaxTurns          int
+	replyResolver         DelegatedReplyResolver
+	replyConfidenceMin    float64
+	replyResolutionRetry  time.Duration
+	investigationProgress InvestigationProgressHandler
 }
 
 // WithCodingGoalMaxTurns bounds durable background investigations.
@@ -203,6 +213,13 @@ func WithDelegatedReplyResolver(
 		if retryDelay > 0 {
 			d.replyResolutionRetry = retryDelay
 		}
+	}
+}
+
+// WithInvestigationProgressHandler enables durable staged delegated replies.
+func WithInvestigationProgressHandler(handler InvestigationProgressHandler) Option {
+	return func(d *Daemon) {
+		d.investigationProgress = handler
 	}
 }
 
@@ -396,7 +413,9 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 		defer stopHeartbeat()
 		ctx = runCtx
 	}
-	if isDelegatedReply(decision.Relevance) && d.replyResolver != nil {
+	if isDelegatedReply(decision.Relevance) &&
+		d.replyResolver != nil &&
+		!item.InvestigationActive {
 		resolution, resolveErr := d.replyResolver.Resolve(ctx, item)
 		if resolveErr != nil {
 			return d.deferDelegatedReply(
@@ -428,7 +447,60 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 			decision.Reason = "message_withdrawn"
 			return d.finishDecision(ctx, item, decision)
 		case replymatch.ResultUnanswered:
-			// Continue into the ordinary read-only delegated reply workflow.
+			if resolution.ClassificationConfidence < d.replyConfidenceMin {
+				return d.deferDelegatedReply(
+					item,
+					decision,
+					"delegated_task_classification_ambiguous",
+					d.replyResolutionRetry,
+				)
+			}
+			item.TaskSummary = resolution.TaskSummary
+			item.TaskClass = resolution.TaskClass
+			item.ContextCutoff = resolution.ContextCutoff
+			item.ContextDigest = resolution.ContextDigest
+			item.ResolvedContext = append(
+				[]domain.NormalizedEvent(nil),
+				resolution.ContextMessages...,
+			)
+			switch resolution.TaskClass {
+			case domain.TaskClassCoding:
+				item.WorkKind = domain.WorkKindCodingQuestion
+				decision.WorkKind = domain.WorkKindCodingQuestion
+				decision.Priority = domain.PriorityCodingQuestion
+			case domain.TaskClassInvestigation, domain.TaskClassSimple:
+			default:
+				return d.deferDelegatedReply(
+					item,
+					decision,
+					"delegated_task_classification_invalid",
+					d.replyResolutionRetry,
+				)
+			}
+			if scheduler, ok := d.queue.(schedulingStore); ok {
+				lease := leaseForWorkKind(
+					decision.WorkKind,
+					d.leaseMaxAge,
+					d.workLeases,
+				)
+				if err := scheduler.UpdateWorkItemSchedulingClaim(
+					item.ID,
+					item.LeaseBy,
+					decision.WorkKind,
+					decision.Priority,
+					lease,
+				); err != nil {
+					d.markRetry(item, err)
+					return Result{}, err
+				}
+			}
+			if resolution.RequiresProgress && d.investigationProgress != nil {
+				if err := d.investigationProgress.Begin(ctx, item, resolution); err != nil {
+					d.markRetry(item, err)
+					return Result{}, err
+				}
+				item.InvestigationActive = true
+			}
 		default:
 			return d.deferDelegatedReply(
 				item,
@@ -520,6 +592,53 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 		)
 		d.markRetry(item, err)
 		return Result{}, err
+	}
+	if item.InvestigationActive && d.replyResolver != nil {
+		latest, err := d.replyResolver.Resolve(ctx, item)
+		if err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+		if latest.Confidence < d.replyConfidenceMin ||
+			latest.Result == replymatch.ResultAmbiguous {
+			return d.deferDelegatedReply(
+				item,
+				decision,
+				"investigation_final_context_ambiguous",
+				d.replyResolutionRetry,
+			)
+		}
+		switch latest.Result {
+		case replymatch.ResultAnswered:
+			decision.Kind = domain.DecisionIgnore
+			decision.Reason = "owner_semantically_replied_during_investigation"
+			decision.ReplyText = ""
+			decision.OwnerAction = ""
+		case replymatch.ResultNoReplyNeeded:
+			decision.Kind = domain.DecisionIgnore
+			decision.Reason = "delegated_reply_no_longer_needed_during_investigation"
+			decision.ReplyText = ""
+			decision.OwnerAction = ""
+		case replymatch.ResultWithdrawn:
+			decision.Kind = domain.DecisionIgnore
+			decision.Reason = "message_withdrawn_during_investigation"
+			decision.ReplyText = ""
+			decision.OwnerAction = ""
+		case replymatch.ResultUnanswered:
+		default:
+			return d.deferDelegatedReply(
+				item,
+				decision,
+				"investigation_final_context_invalid",
+				d.replyResolutionRetry,
+			)
+		}
+	}
+	if item.InvestigationActive && d.investigationProgress != nil {
+		if err := d.investigationProgress.Finalizing(ctx, item); err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
 	}
 	return d.finishDecision(ctx, item, decision)
 }
@@ -702,6 +821,14 @@ func (d *Daemon) finishDecisionWithApprovalState(
 			return Result{}, err
 		}
 	}
+	if d.investigationProgress != nil &&
+		(decision.Kind == domain.DecisionReply ||
+			decision.Kind == domain.DecisionIgnore) {
+		if err := d.investigationProgress.Complete(ctx, item); err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+	}
 	if err := d.complete(item, decision); err != nil {
 		return Result{}, err
 	}
@@ -835,9 +962,6 @@ func (d *Daemon) markRetry(item domain.WorkItem, runErr error) {
 }
 
 func (d *Daemon) notifyTerminalFailure(item domain.WorkItem, runErr error) {
-	if d.terminalFailure == nil {
-		return
-	}
 	reader, ok := d.queue.(workItemReader)
 	if !ok {
 		return
@@ -846,6 +970,12 @@ func (d *Daemon) notifyTerminalFailure(item domain.WorkItem, runErr error) {
 	defer cancel()
 	current, err := reader.GetWorkItem(ctx, item.ID)
 	if err != nil || current.Status != domain.StatusDeadLetter {
+		return
+	}
+	if d.investigationProgress != nil {
+		_ = d.investigationProgress.Block(ctx, current, runErr)
+	}
+	if d.terminalFailure == nil {
 		return
 	}
 	_ = d.terminalFailure.HandleTerminalFailure(ctx, current, runErr)

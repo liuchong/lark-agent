@@ -65,12 +65,14 @@ func (r semanticIntegrationResolver) Resolve(
 
 type semanticIntegrationBuilder struct {
 	calls int
+	item  domain.WorkItem
 }
 
 func (b *semanticIntegrationBuilder) Build(
 	item domain.WorkItem,
 ) (agentcontext.Bundle, error) {
 	b.calls++
+	b.item = item
 	return agentcontext.Bundle{Event: item.Event, WorkKind: item.WorkKind}, nil
 }
 
@@ -233,7 +235,11 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 			"target_message_id":"om_private_target",
 			"result":"unanswered",
 			"confidence":0.97,
-			"reason":"no owner-authored message answered this private request"
+			"reason":"no owner-authored message answered this private request",
+			"task_summary":"确认发布包当前是否可用",
+			"task_class":"simple",
+			"classification_confidence":0.97,
+			"requires_progress":false
 		}`}
 		builder := &semanticIntegrationBuilder{}
 		decider := &semanticIntegrationDecider{}
@@ -260,11 +266,14 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 			t.Fatal(err)
 		}
 		if result.Decision.Relevance != domain.RelevancePrivateMessage ||
-			builder.calls != 1 || decider.calls != 1 || replier.calls != 1 {
+			builder.calls != 1 || decider.calls != 1 || replier.calls != 1 ||
+			builder.item.TaskSummary != "确认发布包当前是否可用" ||
+			builder.item.TaskClass != domain.TaskClassSimple ||
+			builder.item.InvestigationActive {
 			t.Fatalf(
-				"result=%+v builder=%d decider=%d replier=%d",
+				"result=%+v builder=%+v decider=%d replier=%d",
 				result,
-				builder.calls,
+				builder,
 				decider.calls,
 				replier.calls,
 			)

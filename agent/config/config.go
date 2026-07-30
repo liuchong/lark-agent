@@ -40,16 +40,20 @@ type Config struct {
 
 // AgentConfig bounds the multi-step loop and workspace shell.
 type AgentConfig struct {
-	MaxTurns           int           `json:"max_turns" yaml:"max_turns"`
-	MaxRetries         int           `json:"max_retries" yaml:"max_retries"`
-	MaxToolOutput      int           `json:"max_tool_output_bytes" yaml:"max_tool_output_bytes"`
-	MaxTotalToolOutput int           `json:"max_total_tool_output_bytes" yaml:"max_total_tool_output_bytes"`
-	MaxContextBytes    int           `json:"max_context_bytes" yaml:"max_context_bytes"`
-	ContextCompaction  float64       `json:"context_compaction_ratio" yaml:"context_compaction_ratio"`
-	LoopTimeout        time.Duration `json:"loop_timeout" yaml:"loop_timeout"`
-	MaxRepeatedCalls   int           `json:"max_repeated_calls" yaml:"max_repeated_calls"`
-	ShellTimeout       time.Duration `json:"shell_timeout" yaml:"shell_timeout"`
-	ShellApproval      bool          `json:"shell_approval" yaml:"shell_approval"`
+	MaxTurns                  int           `json:"max_turns" yaml:"max_turns"`
+	MaxRetries                int           `json:"max_retries" yaml:"max_retries"`
+	MaxToolOutput             int           `json:"max_tool_output_bytes" yaml:"max_tool_output_bytes"`
+	MaxTotalToolOutput        int           `json:"max_total_tool_output_bytes" yaml:"max_total_tool_output_bytes"`
+	MaxContextBytes           int           `json:"max_context_bytes" yaml:"max_context_bytes"`
+	ContextCompaction         float64       `json:"context_compaction_ratio" yaml:"context_compaction_ratio"`
+	LoopTimeout               time.Duration `json:"loop_timeout" yaml:"loop_timeout"`
+	MaxRepeatedCalls          int           `json:"max_repeated_calls" yaml:"max_repeated_calls"`
+	ShellTimeout              time.Duration `json:"shell_timeout" yaml:"shell_timeout"`
+	ShellApproval             bool          `json:"shell_approval" yaml:"shell_approval"`
+	VisionModel               string        `json:"vision_model,omitempty" yaml:"vision_model,omitempty"`
+	MaxContextImages          int           `json:"max_context_images" yaml:"max_context_images"`
+	MaxContextImageBytes      int64         `json:"max_context_image_bytes" yaml:"max_context_image_bytes"`
+	MaxContextImageTotalBytes int64         `json:"max_context_image_total_bytes" yaml:"max_context_image_total_bytes"`
 }
 
 // CodingConfig controls read-only coding investigations.
@@ -201,6 +205,7 @@ type PolicyConfig struct {
 	OwnerReplyRetry         time.Duration            `json:"owner_reply_retry" yaml:"owner_reply_retry"`
 	MentionPoll             time.Duration            `json:"mention_poll" yaml:"mention_poll"`
 	ReplyConfidenceMin      float64                  `json:"reply_confidence_min" yaml:"reply_confidence_min"`
+	InvestigationProgress   string                   `json:"investigation_progress" yaml:"investigation_progress"`
 	AllowChats              []string                 `json:"allow_chats,omitempty" yaml:"allow_chats,omitempty"`
 	BlockChats              []string                 `json:"block_chats,omitempty" yaml:"block_chats,omitempty"`
 	BlockUsers              []string                 `json:"block_users,omitempty" yaml:"block_users,omitempty"`
@@ -252,16 +257,19 @@ func Default() Config {
 			Timeout:  60 * time.Second,
 		},
 		Agent: AgentConfig{
-			MaxTurns:           150,
-			MaxRetries:         20,
-			MaxToolOutput:      32 * 1024,
-			MaxTotalToolOutput: 128 * 1024,
-			MaxContextBytes:    64 * 1024,
-			ContextCompaction:  0.80,
-			LoopTimeout:        2 * time.Hour,
-			MaxRepeatedCalls:   3,
-			ShellTimeout:       2 * time.Minute,
-			ShellApproval:      false,
+			MaxTurns:                  150,
+			MaxRetries:                20,
+			MaxToolOutput:             32 * 1024,
+			MaxTotalToolOutput:        128 * 1024,
+			MaxContextBytes:           64 * 1024,
+			ContextCompaction:         0.80,
+			LoopTimeout:               2 * time.Hour,
+			MaxRepeatedCalls:          3,
+			ShellTimeout:              2 * time.Minute,
+			ShellApproval:             false,
+			MaxContextImages:          2,
+			MaxContextImageBytes:      1 << 20,
+			MaxContextImageTotalBytes: 2 << 20,
 		},
 		FastPath: FastPathConfig{Enabled: true, SimpleMaxTurns: 3, CodingMaxTurns: 20},
 		Scheduler: SchedulerConfig{
@@ -306,6 +314,7 @@ func Default() Config {
 			OwnerReplyRetry:         30 * time.Second,
 			MentionPoll:             30 * time.Second,
 			ReplyConfidenceMin:      0.85,
+			InvestigationProgress:   "enabled",
 		},
 		Workspace: WorkspaceConfig{
 			Excludes: []string{".git", ".env*", "node_modules", "vendor", "dist", "build", "*.pem", "*.key"},
@@ -436,6 +445,13 @@ func (c Config) Validate() error {
 	if c.Policy.ReplyConfidenceMin < 0 || c.Policy.ReplyConfidenceMin > 1 {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "policy.reply_confidence_min must be between 0 and 1").WithField("policy.reply_confidence_min")
 	}
+	if c.Policy.InvestigationProgress != "enabled" &&
+		c.Policy.InvestigationProgress != "disabled" {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"policy.investigation_progress must be enabled or disabled",
+		).WithField("policy.investigation_progress")
+	}
 	if c.Assistant.OwnerDirect.Enabled && len(c.Assistant.OpenIDs) == 0 && len(c.Assistant.Names) == 0 {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "assistant owner_direct requires assistant.open_ids or assistant.names").WithField("assistant")
 	}
@@ -450,6 +466,25 @@ func (c Config) Validate() error {
 	}
 	if c.Agent.MaxContextBytes < 32*1024 {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "agent.max_context_bytes must be at least 32768").WithField("agent.max_context_bytes")
+	}
+	if c.Agent.MaxContextImages < 0 || c.Agent.MaxContextImages > 2 {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"agent.max_context_images must be between 0 and 2",
+		).WithField("agent.max_context_images")
+	}
+	if c.Agent.MaxContextImageBytes <= 0 || c.Agent.MaxContextImageBytes > 1<<20 {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"agent.max_context_image_bytes must be between 1 and 1048576",
+		).WithField("agent.max_context_image_bytes")
+	}
+	if c.Agent.MaxContextImageTotalBytes < c.Agent.MaxContextImageBytes ||
+		c.Agent.MaxContextImageTotalBytes > 2<<20 {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"agent.max_context_image_total_bytes must cover one image and be at most 2097152",
+		).WithField("agent.max_context_image_total_bytes")
 	}
 	if c.Agent.ContextCompaction < 0.5 || c.Agent.ContextCompaction > 0.95 {
 		return errs.NewConfigError(

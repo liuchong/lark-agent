@@ -100,6 +100,31 @@ func TestDelegatedReplyQualityRejectsUnauthorizedFutureCommitment(t *testing.T) 
 	}
 }
 
+func TestDelegatedReplyQualityRejectsImplicitFutureSynchronization(t *testing.T) {
+	err := validateResponseQuality(delegatedBundle("请确认示例事件生产状态"), domain.Decision{
+		Kind:      domain.DecisionReply,
+		Risk:      domain.RiskLow,
+		ReplyText: "我来确认示例事件后台服务在 prod 的部署状态，之后同步给大家。",
+	}, responseEvidence{SuccessfulReads: 1})
+	if err == nil {
+		t.Fatal("accepted implicit future synchronization without durable investigation")
+	}
+	if !strings.Contains(err.Error(), "future commitment") {
+		t.Fatalf("wrong error: %v", err)
+	}
+}
+
+func TestResponseEvidenceCountsOnlyUniqueNonEmptyReads(t *testing.T) {
+	var evidence responseEvidence
+	evidence.RecordRelevantRead("context:sha256:abc", true)
+	evidence.RecordRelevantRead("context:sha256:abc", true)
+	evidence.RecordRelevantRead("image:sha256:empty", false)
+	evidence.RecordRelevantRead("workspace:sha256:def", true)
+	if evidence.SuccessfulReads != 2 {
+		t.Fatalf("successful reads=%d, want 2", evidence.SuccessfulReads)
+	}
+}
+
 func delegatedBundle(content string) agentcontext.Bundle {
 	return agentcontext.Bundle{
 		User: agentcontext.UserProfile{OpenID: "ou_owner"},

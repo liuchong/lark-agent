@@ -402,6 +402,32 @@ func (s *Store) migrate() error {
 			`CREATE INDEX IF NOT EXISTS idx_owner_work_resolutions_work_epoch
 			 ON owner_work_resolutions(work_item_id, work_updated_at, id DESC)`,
 		}},
+		{version: 13, statements: []string{
+			`ALTER TABLE owner_reply_resolutions ADD COLUMN task_summary TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE owner_reply_resolutions ADD COLUMN task_class TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE owner_reply_resolutions ADD COLUMN classification_confidence REAL NOT NULL DEFAULT 0`,
+			`ALTER TABLE owner_reply_resolutions ADD COLUMN requires_progress INTEGER NOT NULL DEFAULT 0`,
+			`CREATE TABLE IF NOT EXISTS delegated_investigations (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				work_item_id INTEGER NOT NULL UNIQUE REFERENCES work_items(id),
+				task_summary TEXT NOT NULL,
+				task_class TEXT NOT NULL,
+				context_cutoff TEXT NOT NULL,
+				context_digest TEXT NOT NULL,
+				status TEXT NOT NULL,
+				progress_action_id INTEGER REFERENCES action_attempts(id),
+				final_action_id INTEGER REFERENCES action_attempts(id),
+				last_error TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_delegated_investigations_status
+			 ON delegated_investigations(status, updated_at)`,
+		}},
+		{version: 14, statements: []string{
+			`ALTER TABLE delegated_investigations
+			 ADD COLUMN context_messages_json TEXT NOT NULL DEFAULT '[]'`,
+		}},
 	}
 	for _, migration := range migrations {
 		if version >= migration.version {
@@ -2545,7 +2571,37 @@ func (s *Store) ClaimNextForLane(worker string, lane domain.SchedulerLane) (doma
 	item.Status = domain.StatusProcessing
 	item.LeaseBy = leaseToken
 	item.LeaseTime = now
+	if err := s.hydrateDelegatedInvestigationWorkItem(&item); err != nil {
+		_ = s.MarkRetryClaim(item.ID, item.LeaseBy, err.Error(), time.Second)
+		return domain.WorkItem{}, false, err
+	}
 	return item, true, nil
+}
+
+func (s *Store) hydrateDelegatedInvestigationWorkItem(
+	item *domain.WorkItem,
+) error {
+	investigation, ok, err := s.GetDelegatedInvestigation(item.ID)
+	if err != nil || !ok {
+		return err
+	}
+	switch investigation.Status {
+	case domain.InvestigationPendingProgress,
+		domain.InvestigationInvestigating,
+		domain.InvestigationFinalizing:
+	default:
+		return nil
+	}
+	item.TaskSummary = investigation.TaskSummary
+	item.TaskClass = investigation.TaskClass
+	item.ContextCutoff = investigation.ContextCutoff
+	item.ContextDigest = investigation.ContextDigest
+	item.ResolvedContext = append(
+		[]domain.NormalizedEvent(nil),
+		investigation.ContextMessages...,
+	)
+	item.InvestigationActive = true
+	return nil
 }
 
 // RequeueExpiredLeases moves expired processing items back to received.
@@ -3048,14 +3104,19 @@ func (s *Store) RecordOwnerReplyResolution(
 		`INSERT INTO owner_reply_resolutions(
 			work_item_id, target_message_id, result,
 			matched_owner_message_ids_json, confidence, reason,
-			context_cutoff, evaluated_at
-		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			task_summary, task_class, classification_confidence,
+			requires_progress, context_cutoff, evaluated_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		workItemID,
 		resolution.TargetMessageID,
 		resolution.Result,
 		string(matchedJSON),
 		resolution.Confidence,
 		resolution.Reason,
+		resolution.TaskSummary,
+		resolution.TaskClass,
+		resolution.ClassificationConfidence,
+		resolution.RequiresProgress,
 		resolution.ContextCutoff.UTC().Format(time.RFC3339Nano),
 		time.Now().UTC().Format(time.RFC3339Nano),
 	)
@@ -3075,7 +3136,8 @@ func (s *Store) ListOwnerReplyResolutions(
 	rows, err := s.db.QueryContext(
 		context.Background(),
 		`SELECT target_message_id, result, matched_owner_message_ids_json,
-		        confidence, reason, context_cutoff
+		        confidence, reason, task_summary, task_class,
+		        classification_confidence, requires_progress, context_cutoff
 		 FROM owner_reply_resolutions
 		 WHERE work_item_id = ?
 		 ORDER BY evaluated_at, id`,
@@ -3093,13 +3155,17 @@ func (s *Store) ListOwnerReplyResolutions(
 	var out []replymatch.Resolution
 	for rows.Next() {
 		var resolution replymatch.Resolution
-		var resultRaw, matchedRaw, cutoffRaw string
+		var resultRaw, matchedRaw, taskClassRaw, cutoffRaw string
 		if err := rows.Scan(
 			&resolution.TargetMessageID,
 			&resultRaw,
 			&matchedRaw,
 			&resolution.Confidence,
 			&resolution.Reason,
+			&resolution.TaskSummary,
+			&taskClassRaw,
+			&resolution.ClassificationConfidence,
+			&resolution.RequiresProgress,
 			&cutoffRaw,
 		); err != nil {
 			return nil, errs.NewInternalError(
@@ -3108,6 +3174,7 @@ func (s *Store) ListOwnerReplyResolutions(
 			).WithCause(err)
 		}
 		resolution.Result = replymatch.Result(resultRaw)
+		resolution.TaskClass = domain.TaskClass(taskClassRaw)
 		if err := json.Unmarshal(
 			[]byte(matchedRaw),
 			&resolution.MatchedOwnerMessageIDs,
@@ -3127,6 +3194,512 @@ func (s *Store) ListOwnerReplyResolutions(
 		).WithCause(err)
 	}
 	return out, nil
+}
+
+// BeginDelegatedInvestigation creates one idempotent resumable investigation.
+func (s *Store) BeginDelegatedInvestigation(
+	plan domain.DelegatedInvestigation,
+) (domain.DelegatedInvestigation, bool, error) {
+	if plan.WorkItemID <= 0 {
+		return domain.DelegatedInvestigation{}, false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"delegated investigation requires work_item_id",
+		).WithParam("work_item_id")
+	}
+	if strings.TrimSpace(plan.TaskSummary) == "" {
+		return domain.DelegatedInvestigation{}, false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"delegated investigation requires task_summary",
+		).WithParam("task_summary")
+	}
+	switch plan.TaskClass {
+	case domain.TaskClassInvestigation, domain.TaskClassCoding:
+	default:
+		return domain.DelegatedInvestigation{}, false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"delegated investigation requires investigation or coding task_class",
+		).WithParam("task_class")
+	}
+	if plan.ContextCutoff.IsZero() || strings.TrimSpace(plan.ContextDigest) == "" {
+		return domain.DelegatedInvestigation{}, false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"delegated investigation requires context cutoff and digest",
+		)
+	}
+	if plan.Status == "" {
+		plan.Status = domain.InvestigationPendingProgress
+	}
+	contextJSON, err := json.Marshal(plan.ContextMessages)
+	if err != nil {
+		return domain.DelegatedInvestigation{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"encode delegated investigation context",
+		).WithCause(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(
+		context.Background(),
+		`INSERT OR IGNORE INTO delegated_investigations(
+			work_item_id, task_summary, task_class, context_cutoff,
+			context_digest, status, context_messages_json, created_at, updated_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		plan.WorkItemID,
+		strings.TrimSpace(plan.TaskSummary),
+		plan.TaskClass,
+		plan.ContextCutoff.UTC().Format(time.RFC3339Nano),
+		strings.TrimSpace(plan.ContextDigest),
+		plan.Status,
+		string(contextJSON),
+		now,
+		now,
+	)
+	if err != nil {
+		return domain.DelegatedInvestigation{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin delegated investigation",
+		).WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.DelegatedInvestigation{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read delegated investigation insert result",
+		).WithCause(err)
+	}
+	investigation, ok, err := s.GetDelegatedInvestigation(plan.WorkItemID)
+	if err == nil && ok &&
+		(investigation.TaskSummary != strings.TrimSpace(plan.TaskSummary) ||
+			investigation.TaskClass != plan.TaskClass ||
+			!investigation.ContextCutoff.Equal(plan.ContextCutoff.UTC()) ||
+			investigation.ContextDigest != strings.TrimSpace(plan.ContextDigest)) {
+		return domain.DelegatedInvestigation{}, false, errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"delegated investigation context changed after it was persisted",
+		)
+	}
+	return investigation, affected == 1 && ok, err
+}
+
+// BeginInvestigationMessageAction creates or reads one staged-message action.
+// Existing executing actions are returned without being replayed because their
+// external result is uncertain.
+func (s *Store) BeginInvestigationMessageAction(
+	ctx context.Context,
+	workItemID int64,
+	stage string,
+	text string,
+) (domain.Action, bool, string, error) {
+	if workItemID <= 0 || strings.TrimSpace(text) == "" {
+		return domain.Action{}, false, "", errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"investigation message action requires work item and text",
+		)
+	}
+	var suffix, kind string
+	switch stage {
+	case "owner_notice":
+		suffix = "investigation-owner-notice"
+		kind = "investigation_owner_notice"
+	case "progress":
+		suffix = "investigation-progress"
+		kind = "investigation_progress"
+	default:
+		return domain.Action{}, false, "", errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"unsupported investigation message stage %q",
+			stage,
+		).WithParam("stage")
+	}
+	var dedupKey string
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT dedup_key FROM work_items WHERE id = ?`,
+		workItemID,
+	).Scan(&dedupKey); err != nil {
+		return domain.Action{}, false, "", errs.NewInternalError(
+			errs.SubtypeStorage,
+			"locate investigation work item",
+		).WithCause(err)
+	}
+	key := dedupKey + ":" + suffix
+	requestJSON, err := json.Marshal(map[string]string{"text": text})
+	if err != nil {
+		return domain.Action{}, false, "", errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"encode investigation message action",
+		).WithCause(err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.Action{}, false, "", errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin investigation message action",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	action := domain.Action{Kind: kind, Idempotency: key}
+	var responseJSON string
+	err = tx.QueryRowContext(
+		ctx,
+		`SELECT id, status, COALESCE(response_json, '')
+		 FROM action_attempts WHERE idempotency_key = ?`,
+		key,
+	).Scan(&action.ID, &action.Status, &responseJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		result, insertErr := tx.ExecContext(
+			ctx,
+			`INSERT INTO action_attempts(
+				work_item_id, kind, idempotency_key, status, request_json,
+				created_at, updated_at
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			workItemID,
+			kind,
+			key,
+			domain.ActionExecuting,
+			string(requestJSON),
+			now,
+			now,
+		)
+		if insertErr != nil {
+			return domain.Action{}, false, "", errs.NewInternalError(
+				errs.SubtypeStorage,
+				"insert investigation message action",
+			).WithCause(insertErr)
+		}
+		action.ID, err = result.LastInsertId()
+		if err != nil {
+			return domain.Action{}, false, "", errs.NewInternalError(
+				errs.SubtypeStorage,
+				"read investigation message action id",
+			).WithCause(err)
+		}
+		action.Status = domain.ActionExecuting
+		if stage == "progress" {
+			if _, err := tx.ExecContext(
+				ctx,
+				`UPDATE delegated_investigations
+				 SET progress_action_id = ?, updated_at = ?
+				 WHERE work_item_id = ?`,
+				action.ID,
+				now,
+				workItemID,
+			); err != nil {
+				return domain.Action{}, false, "", errs.NewInternalError(
+					errs.SubtypeStorage,
+					"link investigation progress action",
+				).WithCause(err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return domain.Action{}, false, "", errs.NewInternalError(
+				errs.SubtypeStorage,
+				"commit investigation message action",
+			).WithCause(err)
+		}
+		return action, true, "", nil
+	}
+	if err != nil {
+		return domain.Action{}, false, "", errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read investigation message action",
+		).WithCause(err)
+	}
+	var response map[string]string
+	if responseJSON != "" {
+		if err := json.Unmarshal([]byte(responseJSON), &response); err != nil {
+			return domain.Action{}, false, "", errs.NewInternalError(
+				errs.SubtypeStorage,
+				"decode investigation message action response",
+			).WithCause(err)
+		}
+	}
+	if action.Status == domain.ActionBlocked {
+		if _, err := tx.ExecContext(
+			ctx,
+			`UPDATE action_attempts
+			 SET status = ?, request_json = ?, error = NULL, updated_at = ?
+			 WHERE id = ?`,
+			domain.ActionExecuting,
+			string(requestJSON),
+			time.Now().UTC().Format(time.RFC3339Nano),
+			action.ID,
+		); err != nil {
+			return domain.Action{}, false, "", errs.NewInternalError(
+				errs.SubtypeStorage,
+				"resume known-failed investigation message action",
+			).WithCause(err)
+		}
+		action.Status = domain.ActionExecuting
+		if err := tx.Commit(); err != nil {
+			return domain.Action{}, false, "", errs.NewInternalError(
+				errs.SubtypeStorage,
+				"commit resumed investigation message action",
+			).WithCause(err)
+		}
+		return action, true, "", nil
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Action{}, false, "", errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit existing investigation message action",
+		).WithCause(err)
+	}
+	return action, false, response["message_id"], nil
+}
+
+// CompleteInvestigationMessageAction records a staged message result.
+func (s *Store) CompleteInvestigationMessageAction(
+	ctx context.Context,
+	actionID int64,
+	messageID string,
+	actionErr string,
+) error {
+	return s.CompleteReplyAction(ctx, actionID, messageID, actionErr)
+}
+
+// GetDelegatedInvestigation returns one investigation by work item.
+func (s *Store) GetDelegatedInvestigation(
+	workItemID int64,
+) (domain.DelegatedInvestigation, bool, error) {
+	var investigation domain.DelegatedInvestigation
+	var taskClass, status, cutoffRaw, contextRaw, createdRaw, updatedRaw string
+	var progressActionID, finalActionID sql.NullInt64
+	var lastError sql.NullString
+	err := s.db.QueryRowContext(
+		context.Background(),
+		`SELECT id, work_item_id, task_summary, task_class, context_cutoff,
+		        context_digest, status, progress_action_id, final_action_id,
+		        last_error, context_messages_json, created_at, updated_at
+		 FROM delegated_investigations WHERE work_item_id = ?`,
+		workItemID,
+	).Scan(
+		&investigation.ID,
+		&investigation.WorkItemID,
+		&investigation.TaskSummary,
+		&taskClass,
+		&cutoffRaw,
+		&investigation.ContextDigest,
+		&status,
+		&progressActionID,
+		&finalActionID,
+		&lastError,
+		&contextRaw,
+		&createdRaw,
+		&updatedRaw,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.DelegatedInvestigation{}, false, nil
+	}
+	if err != nil {
+		return domain.DelegatedInvestigation{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"get delegated investigation",
+		).WithCause(err)
+	}
+	investigation.TaskClass = domain.TaskClass(taskClass)
+	investigation.Status = domain.DelegatedInvestigationStatus(status)
+	investigation.ContextCutoff, _ = time.Parse(time.RFC3339Nano, cutoffRaw)
+	investigation.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdRaw)
+	investigation.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedRaw)
+	if progressActionID.Valid {
+		investigation.ProgressActionID = progressActionID.Int64
+	}
+	if finalActionID.Valid {
+		investigation.FinalActionID = finalActionID.Int64
+	}
+	if lastError.Valid {
+		investigation.LastError = lastError.String
+	}
+	if err := json.Unmarshal(
+		[]byte(contextRaw),
+		&investigation.ContextMessages,
+	); err != nil {
+		return domain.DelegatedInvestigation{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"decode delegated investigation context",
+		).WithCause(err)
+	}
+	markExpiredInvestigationImages(investigation.ContextMessages)
+	return investigation, true, nil
+}
+
+func markExpiredInvestigationImages(messages []domain.NormalizedEvent) {
+	for messageIndex := range messages {
+		for attachmentIndex := range messages[messageIndex].Attachments {
+			attachment := &messages[messageIndex].Attachments[attachmentIndex]
+			if attachment.Type != "image" || attachment.DataURL != "" {
+				continue
+			}
+			if attachment.Readable {
+				attachment.Readable = false
+				attachment.UnreadableReason = "image_bytes_not_persisted"
+			}
+		}
+	}
+}
+
+// TransitionDelegatedInvestigation applies one checked state transition.
+func (s *Store) TransitionDelegatedInvestigation(
+	workItemID int64,
+	from domain.DelegatedInvestigationStatus,
+	to domain.DelegatedInvestigationStatus,
+	lastError string,
+) error {
+	if !validInvestigationTransition(from, to) {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"invalid delegated investigation transition %s -> %s",
+			from,
+			to,
+		)
+	}
+	result, err := s.db.ExecContext(
+		context.Background(),
+		`UPDATE delegated_investigations
+		 SET status = ?, last_error = ?, updated_at = ?
+		 WHERE work_item_id = ? AND status = ?`,
+		to,
+		strings.TrimSpace(lastError),
+		time.Now().UTC().Format(time.RFC3339Nano),
+		workItemID,
+		from,
+	)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"transition delegated investigation",
+		).WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read delegated investigation transition result",
+		).WithCause(err)
+	}
+	if affected != 1 {
+		return errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"delegated investigation state is no longer %s",
+			from,
+		)
+	}
+	return nil
+}
+
+// MarkDelegatedInvestigationFinalizing idempotently enters finalization.
+func (s *Store) MarkDelegatedInvestigationFinalizing(workItemID int64) error {
+	investigation, ok, err := s.GetDelegatedInvestigation(workItemID)
+	if err != nil || !ok {
+		return err
+	}
+	switch investigation.Status {
+	case domain.InvestigationFinalizing, domain.InvestigationCompleted:
+		return nil
+	case domain.InvestigationInvestigating:
+		return s.TransitionDelegatedInvestigation(
+			workItemID,
+			domain.InvestigationInvestigating,
+			domain.InvestigationFinalizing,
+			"",
+		)
+	default:
+		return errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"delegated investigation cannot finalize from %s",
+			investigation.Status,
+		)
+	}
+}
+
+// CompleteDelegatedInvestigation links a completed final reply when present
+// and terminalizes the durable investigation before the work item is closed.
+func (s *Store) CompleteDelegatedInvestigation(workItemID int64) error {
+	investigation, ok, err := s.GetDelegatedInvestigation(workItemID)
+	if err != nil || !ok {
+		return err
+	}
+	if investigation.Status == domain.InvestigationCompleted {
+		return nil
+	}
+	if investigation.Status != domain.InvestigationFinalizing {
+		return errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"delegated investigation cannot complete from %s",
+			investigation.Status,
+		)
+	}
+	var finalActionID sql.NullInt64
+	err = s.db.QueryRowContext(
+		context.Background(),
+		`SELECT a.id
+		 FROM action_attempts a
+		 JOIN work_items w ON w.id = a.work_item_id
+		 WHERE w.id = ?
+		   AND a.idempotency_key = w.dedup_key || ':reply'
+		   AND a.status = ?
+		 ORDER BY a.id DESC
+		 LIMIT 1`,
+		workItemID,
+		domain.ActionCompleted,
+	).Scan(&finalActionID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"locate delegated investigation final action",
+		).WithCause(err)
+	}
+	result, err := s.db.ExecContext(
+		context.Background(),
+		`UPDATE delegated_investigations
+		 SET status = ?, final_action_id = ?, last_error = '', updated_at = ?
+		 WHERE work_item_id = ? AND status = ?`,
+		domain.InvestigationCompleted,
+		finalActionID,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		workItemID,
+		domain.InvestigationFinalizing,
+	)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"complete delegated investigation",
+		).WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read delegated investigation completion result",
+		).WithCause(err)
+	}
+	if affected != 1 {
+		return errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"delegated investigation finalization changed concurrently",
+		)
+	}
+	return nil
+}
+
+func validInvestigationTransition(
+	from domain.DelegatedInvestigationStatus,
+	to domain.DelegatedInvestigationStatus,
+) bool {
+	switch from {
+	case domain.InvestigationPendingProgress:
+		return to == domain.InvestigationInvestigating ||
+			to == domain.InvestigationBlocked
+	case domain.InvestigationInvestigating:
+		return to == domain.InvestigationFinalizing ||
+			to == domain.InvestigationBlocked
+	case domain.InvestigationFinalizing:
+		return to == domain.InvestigationCompleted ||
+			to == domain.InvestigationBlocked
+	default:
+		return false
+	}
 }
 
 // Complete marks a work item completed, ignored, or cancelled according to its

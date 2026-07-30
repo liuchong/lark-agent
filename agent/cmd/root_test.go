@@ -17,6 +17,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/replymatch"
 	"github.com/liuchong/lark-agent/agent/storage"
 	agenttools "github.com/liuchong/lark-agent/agent/tools"
+	internalgithub "github.com/liuchong/lark-agent/internal/github"
 	serviceim "github.com/liuchong/lark-agent/internal/lark"
 )
 
@@ -568,6 +569,53 @@ func TestConversationBuilderContinuesWhenLarkHistoryIsUnavailable(t *testing.T) 
 		bundle.ContextSelection.Reason != "lark_context_unavailable" ||
 		len(bundle.Conversation) != 0 {
 		t.Fatalf("bundle=%+v", bundle)
+	}
+}
+
+func TestConversationBuilderResolvesTrustedGitHubReferenceFromSharedContext(t *testing.T) {
+	signingKey := "synthetic-signing-key"
+	ref := domain.GitHubReference{
+		SchemaVersion:      1,
+		Repository:         "example/widgets",
+		Kind:               domain.GitHubReferenceWorkflowRun,
+		WorkflowRunID:      981,
+		WorkflowRunAttempt: 2,
+	}
+	marker, err := internalgithub.EncodeReferenceMarker(ref, signingKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := domain.NormalizedEvent{
+		MessageID:        "om_question",
+		ChatID:           "oc_synthetic",
+		ReplyToMessageID: "om_notification",
+		Content:          "请检查这次工作流失败",
+	}
+	item := domain.NewWorkItem(target)
+	item.ResolvedContext = []domain.NormalizedEvent{
+		{
+			MessageID:  "om_notification",
+			ChatID:     "oc_synthetic",
+			SenderID:   "cli_current",
+			SenderType: "app",
+			Content:    marker,
+		},
+		target,
+	}
+	builder := &conversationBuilder{
+		githubEnabled:       true,
+		currentAppID:        "cli_current",
+		allowedRepositories: []string{"example/widgets"},
+		referenceSigningKey: signingKey,
+		base:                agentcontext.Builder{},
+	}
+
+	bundle, err := builder.Build(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundle.GitHubReference == nil || *bundle.GitHubReference != ref {
+		t.Fatalf("github reference=%+v", bundle.GitHubReference)
 	}
 }
 

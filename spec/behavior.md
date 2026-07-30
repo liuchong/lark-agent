@@ -157,6 +157,30 @@ content handled them. Ambiguous, malformed, low-confidence, truncated, or
 unavailable resolution fails closed and retries after the configured semantic
 retry delay.
 
+The semantic resolver and the main delegated Agent consume one logically
+identical context snapshot. The snapshot includes at most twenty same-chat
+messages and three minutes before the target, the target itself, messages
+observed through the semantic cutoff, and explicitly related reply/root/thread
+messages. It retains sender display names, message types, and typed attachment
+descriptors. The semantic result also carries a concrete task summary, a
+simple/investigation/coding task class, classification confidence, and whether
+durable progress is required. A high-confidence contextual coding task receives
+the coding budget and read-only workspace tools even when the target's literal
+last sentence has no coding keyword.
+
+Reply/root/thread relations are resolved even when the related message is older
+than the adjacent chat page. If a required relation cannot be read, the
+snapshot is incomplete and semantic classification fails closed rather than
+guessing the antecedent.
+
+When durable progress starts, the normalized context snapshot is persisted
+without ephemeral image bytes. A restart restores the original cutoff, digest,
+task classification, and normalized messages and skips initial
+reclassification against a different time window. Restored image descriptors
+are explicitly unreadable until fetched again; persisted metadata never claims
+that discarded bytes remain available. The final owner-handled check still
+reads fresh same-chat context immediately before any final reply.
+
 The delegated agent context includes bounded post-target discussion so its
 response reflects what happened during the grace period. The semantic result
 is retained in the audit ledger. Immediately before a reply action is persisted, the runtime reads
@@ -279,6 +303,23 @@ actually checked, the initial finding or explicit unknown, and what concrete
 information was passed to the owner. Merely saying that the owner was reminded,
 paraphrasing the request, or promising future work is not useful work and is
 rejected before sending.
+
+A repeated read of the same context digest, an empty or unreadable attachment,
+or an unrelated source does not count as completed relevant work. Relevant Lark
+images are downloaded only through `internal/lark` and the official public Go
+SDK. At most two supported images are read serially, at most 1 MiB each and
+2 MiB total. Raw image bytes are ephemeral model input and are never persisted.
+An unavailable, oversized, unauthorized, or provider-rejected image is recorded
+as explicitly unreadable, never as empty successful evidence.
+
+High-confidence delegated investigation or coding work may send an early
+progress reply only after a resumable investigation record and owner notice are
+durable. The investigation then has a mandatory terminal closure: an
+evidence-backed result, an owner-handled closure, or an explicit blocked
+summary. Progress and final sends use separate stable action keys. Restart
+resumes read-only investigation without duplicating completed progress. A
+progress message may promise the required closure; no other unapproved
+delegated reply may promise future delivery, coordination, or reporting.
 
 When the durable semantic gate admits a `direct_mention` or `private_message`
 as still unanswered, the model must finish with a useful sender-facing `reply`
@@ -523,6 +564,12 @@ investigation produced too much raw output or restart broad investigation after
 compaction. Repeated Lark-context reads that return no new target-message
 context are treated as no-progress tool calls and force convergence.
 
+Multimodal text and encoded image input count toward model-visible request
+bytes. Ephemeral image data is sent only on the first model turn; later turns
+replace it with an explicit removal marker and retain facts extracted into the
+trajectory. This prevents repeated multi-megabyte payloads while making the
+budget prompt reflect the actual first request.
+
 Before a coding reply is sent, a verify gate checks three properties:
 completeness (the answer addresses the original question), correctness (the
 claim is supported by cited code evidence), and coherence (the response obeys
@@ -723,6 +770,11 @@ last durable fact or failure, why owner attention is required, and an exact
 currently valid next command. `/task <work-id>` includes the latest durable
 stage and external-action uncertainty while excluding model chain-of-thought,
 credentials, raw Lark events, open IDs, and unrestricted absolute paths.
+When a delegated investigation exists, both task views also show its concrete
+subject, pending/investigating/finalizing/completed/blocked state, whether the
+context evidence digest is fixed, and its latest error. Active investigations
+include the exact `/task <work-id>` refresh command in addition to any valid
+queue recovery or cancellation command.
 Lark mention placeholders in task content are never copied into reply text.
 Known mentions render as `@<display-name>`; unknown placeholders render as a
 localized generic person label so the durable reply layer never rejects the
@@ -1073,6 +1125,34 @@ The multi-step loop is accepted by these executable BDD scenarios:
   mentions the owner with substantive declarative feedback, when semantic
   resolution runs, then the older owner message does not count as handling the
   newer target and the target remains unanswered.
+- Given the messages before a delegated target discuss a production
+  sample-event failure, a nearby image contains `1408 SampleEventDisabled`, the
+  target says the sender's computer disconnected, and later messages clarify
+  that production is not deployed, when the semantic gate and main Agent run,
+  then their shared context identifies message editing as the task, preserves
+  the later clarification through the semantic cutoff, and never treats the
+  sender's network as the investigation subject.
+- Given a contextual target has no coding keyword but its shared task summary
+  is a high-confidence production-code investigation, when the runtime budgets
+  the run, then coding read tools and coding turns are available without
+  widening non-owner write authority.
+- Given a relevant Lark image is within the bounded image limits, when the
+  configured model supports image input, then the Agent may use its contents
+  as ephemeral evidence; when it is unavailable, over limit, unauthorized, or
+  rejected by the provider, then the Agent states the exact evidence gap and
+  does not invent image contents.
+- Given high-confidence contextual work requires durable investigation, when
+  the semantic gate admits it, then one owner notice and one progress reply are
+  recorded before Agent work and one final, owner-handled, or blocked closure
+  eventually completes the investigation.
+- Given the daemon restarts after the progress reply completed, when recovery
+  runs, then progress is not duplicated, the original normalized context
+  snapshot is restored without image bytes, initial classification is not
+  repeated against a new cutoff, and read-only investigation resumes.
+- Given an ambiguous target replies to a root or thread message outside the
+  adjacent chat page, when semantic context is selected, then the readable
+  relation is included; if it cannot be read, resolution is incomplete and no
+  antecedent is invented.
 - Given a delegated group mention or human private message passed the semantic
   gate as unanswered, when the main model submits `ignore`, `record`, or
   `notify`, then the runtime rejects that terminal decision and requires a
@@ -1421,6 +1501,9 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given a delegated coordination or investigation request, when the proposed
   reply only says the owner was reminded or repeats the request without a
   successful relevant read receipt, then the terminal quality gate rejects it.
+- Given a delegated run re-reads the same context digest or receives an empty
+  or unreadable image, when relevant-work receipts are counted, then those
+  calls do not satisfy the completed-investigation requirement.
 - Given the delegated run reads relevant same-chat or production workspace
   evidence, when the reply briefly states completed work, an initial finding or
   explicit unknown, and what was passed to the owner, then it may pass the

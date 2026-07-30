@@ -147,4 +147,34 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 			t.Fatalf("README missing %q", want)
 		}
 	}
+	configuration, err := os.ReadFile(filepath.Join(root, "docs/configuration.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"policy.investigation_progress",
+		"agent.vision_model",
+		"agent.max_context_images",
+		"max_context_image_bytes",
+		"max_context_image_total_bytes",
+	} {
+		if !strings.Contains(string(configuration), want) {
+			t.Fatalf("configuration docs missing %q", want)
+		}
+	}
+	operations, err := os.ReadFile(filepath.Join(root, "docs/operations.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"/tasks",
+		"/task",
+		"调查主题",
+		"调查状态",
+		"上下文证据",
+	} {
+		if !strings.Contains(string(operations), want) {
+			t.Fatalf("operations docs missing %q", want)
+		}
+	}
 }

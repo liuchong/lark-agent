@@ -221,6 +221,7 @@ func (h *Handler) taskSummaryText(task domain.OwnerTaskSummary) string {
 	next := ownerTaskCommands(task, h.english())
 	if h.english() {
 		text := fmt.Sprintf("#%d %s\nStatus: %s", id, subject, state.en)
+		text += investigationTaskText(task.Investigation, true, false)
 		if state.fact != "" {
 			text += "\nLast fact: " + sanitizeText(state.fact, 120, true)
 		}
@@ -230,6 +231,7 @@ func (h *Handler) taskSummaryText(task domain.OwnerTaskSummary) string {
 		return text
 	}
 	text := fmt.Sprintf("#%d %s\n状态：%s", id, subject, state.zh)
+	text += investigationTaskText(task.Investigation, false, false)
 	if state.fact != "" {
 		text += "\n最新事实：" + sanitizeText(state.fact, 120, false)
 	}
@@ -260,6 +262,7 @@ func (h *Handler) taskText(ctx context.Context, workItemID int64) (string, error
 		LatestStep:         inspection.LatestStep,
 		LatestAction:       inspection.LatestAction,
 		LatestInterruption: inspection.LatestInterruption,
+		Investigation:      inspection.Investigation,
 	}
 	state := ownerTaskStateText(task, h.ownerName())
 	commands := ownerTaskCommands(task, h.english())
@@ -270,6 +273,7 @@ func (h *Handler) taskText(ctx context.Context, workItemID int64) (string, error
 			sanitizeEventText(task.WorkItem.Event, 160, true),
 			state.en,
 		)
+		text += investigationTaskText(task.Investigation, true, true)
 		if state.fact != "" {
 			text += "\nLatest durable fact: " + sanitizeText(state.fact, 240, true)
 		}
@@ -286,6 +290,7 @@ func (h *Handler) taskText(ctx context.Context, workItemID int64) (string, error
 		sanitizeEventText(task.WorkItem.Event, 160, false),
 		state.zh,
 	)
+	text += investigationTaskText(task.Investigation, false, true)
 	if state.fact != "" {
 		text += "\n最新可靠事实：" + sanitizeText(state.fact, 240, false)
 	}
@@ -528,6 +533,8 @@ func detailedHelp(english bool, topic string) string {
 			"`/task cancel <工作号> <原因>`",
 			"`/task acknowledge <工作号> <说明>`",
 			"`/task reconcile <工作号> completed|not-completed|unknown <核对说明>`",
+			"`/tasks` 和 `/task <工作号>` 会显示调查主题、调查状态、上下文证据和最近错误。",
+			"正在自动调查时可再次发送 `/task <工作号>` 刷新；中断、失败或结果不确定时按详情给出的精确命令处理。",
 			"外部结果不确定时必须先核对，智能助手不会自动重放。",
 		}, "\n")
 	case "approval", "approvals", "审批":
@@ -612,49 +619,142 @@ func ownerTaskStateText(task domain.OwnerTaskSummary, ownerName string) taskStat
 
 func ownerTaskCommands(task domain.OwnerTaskSummary, english bool) []string {
 	id := task.WorkItem.ID
+	commands := investigationRefreshCommand(task.Investigation, id)
 	if task.State.Uncertain {
 		if english {
-			return []string{fmt.Sprintf(
+			return append(commands, fmt.Sprintf(
 				"`/task reconcile %d completed|not-completed|unknown <verification-note>`",
 				id,
-			)}
+			))
 		}
-		return []string{fmt.Sprintf(
+		return append(commands, fmt.Sprintf(
 			"`/task reconcile %d completed|not-completed|unknown <核对说明>`",
 			id,
-		)}
+		))
 	}
 	if task.LatestAction != nil &&
 		task.LatestAction.Status == domain.ActionAwaitingApproval {
-		return []string{fmt.Sprintf("`/approval %d`", task.LatestAction.ID)}
+		return append(commands, fmt.Sprintf("`/approval %d`", task.LatestAction.ID))
 	}
 	switch task.WorkItem.Status {
 	case domain.StatusRetryWait:
-		return []string{fmt.Sprintf("`/task retry %d`", id)}
+		return append(commands, fmt.Sprintf("`/task retry %d`", id))
 	case domain.StatusInterrupted:
 		if english {
-			return []string{
+			return append(commands,
 				fmt.Sprintf("`/task resume %d`", id),
 				fmt.Sprintf("`/task cancel %d <reason>`", id),
-			}
+			)
 		}
-		return []string{
+		return append(commands,
 			fmt.Sprintf("`/task resume %d`", id),
 			fmt.Sprintf("`/task cancel %d <原因>`", id),
-		}
+		)
 	case domain.StatusDeadLetter:
 		if english {
-			return []string{
+			return append(commands,
 				fmt.Sprintf("`/task resume %d confirm`", id),
 				fmt.Sprintf("`/task acknowledge %d <note>`", id),
-			}
+			)
 		}
-		return []string{
+		return append(commands,
 			fmt.Sprintf("`/task resume %d confirm`", id),
 			fmt.Sprintf("`/task acknowledge %d <说明>`", id),
-		}
+		)
+	default:
+		return commands
+	}
+}
+
+func investigationRefreshCommand(
+	investigation *domain.DelegatedInvestigation,
+	workItemID int64,
+) []string {
+	if investigation == nil {
+		return nil
+	}
+	switch investigation.Status {
+	case domain.InvestigationPendingProgress,
+		domain.InvestigationInvestigating,
+		domain.InvestigationFinalizing:
+		return []string{fmt.Sprintf("`/task %d`", workItemID)}
 	default:
 		return nil
+	}
+}
+
+func investigationTaskText(
+	investigation *domain.DelegatedInvestigation,
+	english bool,
+	detail bool,
+) string {
+	if investigation == nil {
+		return ""
+	}
+	statusZH, statusEN := investigationStatusText(investigation.Status)
+	evidenceZH, evidenceEN := "尚未固定", "not fixed"
+	if strings.TrimSpace(investigation.ContextDigest) != "" {
+		digest := sanitizeText(investigation.ContextDigest, 80, english)
+		evidenceZH = "已固定（" + digest + "）"
+		evidenceEN = "fixed (" + digest + ")"
+	}
+	if english {
+		text := "\nInvestigation subject: " +
+			sanitizeText(investigation.TaskSummary, 160, true) +
+			"\nInvestigation status: " + statusEN +
+			"\nContext evidence: " + evidenceEN
+		if detail {
+			lastError := sanitizeText(investigation.LastError, 240, true)
+			if lastError == "" {
+				lastError = "none"
+			}
+			text += "\nInvestigation type: " + string(investigation.TaskClass) +
+				"\nInvestigation last error: " + lastError
+		}
+		return text
+	}
+	text := "\n调查主题：" +
+		sanitizeText(investigation.TaskSummary, 160, false) +
+		"\n调查状态：" + statusZH +
+		"\n上下文证据：" + evidenceZH
+	if detail {
+		lastError := sanitizeText(investigation.LastError, 240, false)
+		if lastError == "" {
+			lastError = "无"
+		}
+		text += "\n调查类型：" + investigationClassText(investigation.TaskClass) +
+			"\n调查最近错误：" + lastError
+	}
+	return text
+}
+
+func investigationStatusText(status domain.DelegatedInvestigationStatus) (string, string) {
+	switch status {
+	case domain.InvestigationPendingProgress:
+		return "准备发送进度", "preparing progress"
+	case domain.InvestigationInvestigating:
+		return "正在调查", "investigating"
+	case domain.InvestigationFinalizing:
+		return "正在发送最终结果", "sending final result"
+	case domain.InvestigationCompleted:
+		return "已完成", "completed"
+	case domain.InvestigationBlocked:
+		return "已阻塞", "blocked"
+	default:
+		return string(status), string(status)
+	}
+}
+
+func investigationClassText(class domain.TaskClass) string {
+	switch class {
+	case domain.TaskClassSimple:
+		return "简单问答"
+	case domain.TaskClassInvestigation:
+		return "业务调查"
+	case domain.TaskClassCoding:
+		return "代码调查"
+	default:
+		return string(class)
 	}
 }
 

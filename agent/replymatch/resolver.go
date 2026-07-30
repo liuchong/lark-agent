@@ -35,13 +35,19 @@ type Request struct {
 }
 
 type Resolution struct {
-	TargetMessageID        string        `json:"target_message_id"`
-	Result                 Result        `json:"result"`
-	MatchedOwnerMessageIDs []string      `json:"matched_owner_message_ids,omitempty"`
-	Confidence             float64       `json:"confidence"`
-	Reason                 string        `json:"reason"`
-	ContextCutoff          time.Time     `json:"context_cutoff"`
-	RetryAfter             time.Duration `json:"-"`
+	TargetMessageID          string                   `json:"target_message_id"`
+	Result                   Result                   `json:"result"`
+	MatchedOwnerMessageIDs   []string                 `json:"matched_owner_message_ids,omitempty"`
+	Confidence               float64                  `json:"confidence"`
+	Reason                   string                   `json:"reason"`
+	TaskSummary              string                   `json:"task_summary,omitempty"`
+	TaskClass                domain.TaskClass         `json:"task_class,omitempty"`
+	ClassificationConfidence float64                  `json:"classification_confidence,omitempty"`
+	RequiresProgress         bool                     `json:"requires_progress,omitempty"`
+	ContextCutoff            time.Time                `json:"context_cutoff"`
+	RetryAfter               time.Duration            `json:"-"`
+	ContextDigest            string                   `json:"-"`
+	ContextMessages          []domain.NormalizedEvent `json:"-"`
 }
 
 type Model interface {
@@ -172,7 +178,10 @@ func resolutionPrompt(req Request, ownerOpenID string) (string, error) {
 			"encode semantic owner-reply prompt",
 		).WithCause(err)
 	}
-	return "Return JSON with target_message_id, result, matched_owner_message_ids, confidence, and reason.\n" +
+	return "Return JSON with target_message_id, result, matched_owner_message_ids, confidence, reason, task_summary, task_class, classification_confidence, and requires_progress. " +
+		"For unanswered results, task_summary must identify the concrete subject from the full bounded conversation; task_class must be simple, investigation, or coding. " +
+		"Use coding for source, configuration, deployment, API, or error-code investigation even when the target's final sentence is ambiguous. " +
+		"requires_progress is true only when durable investigation is needed.\n" +
 		string(data), nil
 }
 
@@ -198,6 +207,28 @@ func validateResolution(req Request, ownerOpenID string, resolution Resolution) 
 	}
 	if strings.TrimSpace(resolution.Reason) == "" {
 		return invalidResolution("semantic result requires a reason")
+	}
+	if resolution.Result == ResultUnanswered {
+		if strings.TrimSpace(resolution.TaskSummary) == "" {
+			return invalidResolution("unanswered semantic result requires task_summary")
+		}
+		switch resolution.TaskClass {
+		case domain.TaskClassSimple, domain.TaskClassInvestigation, domain.TaskClassCoding:
+		default:
+			return invalidResolution("unanswered semantic result requires a valid task_class")
+		}
+		if resolution.ClassificationConfidence <= 0 ||
+			resolution.ClassificationConfidence > 1 {
+			return invalidResolution(
+				"unanswered semantic classification confidence is outside 0..1",
+			)
+		}
+		if resolution.RequiresProgress &&
+			resolution.TaskClass == domain.TaskClassSimple {
+			return invalidResolution(
+				"simple semantic work cannot require durable progress",
+			)
+		}
 	}
 	ownerMessages := make(map[string]domain.NormalizedEvent)
 	for _, message := range req.Messages {

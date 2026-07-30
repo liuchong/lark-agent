@@ -1328,6 +1328,13 @@ func (s *Store) InspectWork(
 	if err != nil {
 		return inspection, err
 	}
+	investigation, found, err := s.GetDelegatedInvestigation(item.ID)
+	if err != nil {
+		return inspection, err
+	}
+	if found {
+		inspection.Investigation = &investigation
+	}
 	inspection.State.Observed = inspection.Receipt != nil || inspection.WorkItem != nil
 	inspection.State.Admitted = inspection.WorkItem != nil
 	inspection.State.OfflineBacklog = inspection.Receipt != nil &&
@@ -1750,6 +1757,9 @@ func (s *Store) getWorkItem(ctx context.Context, id int64) (domain.WorkItem, err
 			errs.SubtypeInvalidArgument,
 			"work item was not found",
 		).WithParam("work_item_id")
+	}
+	if err == nil {
+		err = s.hydrateDelegatedInvestigationWorkItem(&item)
 	}
 	return item, err
 }

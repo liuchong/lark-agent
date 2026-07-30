@@ -122,7 +122,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	bundle = filterBundleTools(bundle, visibleToolInfos, invocationScope)
 	messages := []*schema.Message{
 		schema.SystemMessage(l.SystemPrompt),
-		schema.UserMessage(agentcontext.AgentUserPrompt(bundle)),
+		initialUserMessage(bundle),
 	}
 	var runID string
 	runFinished := false
@@ -164,6 +164,15 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	for turn := 0; turn < l.MaxTurns; turn++ {
 		if err := ctx.Err(); err != nil {
 			return domain.Decision{}, trajectory, err
+		}
+		if turn > 0 {
+			var removed int
+			messages, removed = expireEphemeralImages(messages)
+			if removed > 0 {
+				messages = append(messages, schema.SystemMessage(
+					"Ephemeral image inputs were supplied only in the first model turn and have now been removed from repeated context. Use facts already extracted into the trajectory; if they are insufficient, state that the image evidence cannot be rechecked instead of guessing.",
+				))
+			}
 		}
 		compaction := compactMessages(messages, l.MaxContextBytes, l.ContextCompaction)
 		messages = compaction.Messages
@@ -269,7 +278,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					l.MaxToolCalls,
 				)
 				forceDecision = true
-			} else if domain.IsCodingQuestion(bundle.Event.Content) && !investigationPlanSubmitted && call.Function.Name == "search_workspace" {
+			} else if isCodingBundle(bundle) && !investigationPlanSubmitted && call.Function.Name == "search_workspace" {
 				toolErr = errs.NewInternalError(
 					errs.SubtypeInvalidResponse,
 					"coding investigation requires submit_investigation_plan before broad workspace search; name entry points, symbols, tools, and stop conditions first",
@@ -316,6 +325,12 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				execution.Decision = &normalized
 			}
 			if toolErr == nil && execution.Decision != nil {
+				if err := validateResponseQuality(bundle, *execution.Decision, evidence); err != nil {
+					toolErr = err
+					execution.Decision = nil
+				}
+			}
+			if toolErr == nil && execution.Decision != nil {
 				if err := verifyCodingDecision(
 					bundle,
 					*execution.Decision,
@@ -323,12 +338,6 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					authoritativeSources,
 					codingEvidenceReads,
 				); err != nil {
-					toolErr = err
-					execution.Decision = nil
-				}
-			}
-			if toolErr == nil && execution.Decision != nil {
-				if err := validateResponseQuality(bundle, *execution.Decision, evidence); err != nil {
 					toolErr = err
 					execution.Decision = nil
 				}
@@ -343,11 +352,18 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				noProgressLarkContext = true
 			}
 			if toolErr == nil && execution.Decision == nil && isRelevantEvidenceTool(call.Function.Name) {
-				evidence.SuccessfulReads++
+				content := strings.TrimSpace(execution.Content)
+				nonEmpty := content != "" &&
+					(call.Function.Name != "get_lark_context" ||
+						!toolContentNoNewContext(execution.Content))
+				evidence.RecordRelevantRead(
+					evidenceDigest(call.Function.Name, content),
+					nonEmpty,
+				)
 			}
 			if toolErr == nil &&
 				execution.Decision == nil &&
-				domain.IsCodingQuestion(bundle.Event.Content) &&
+				isCodingBundle(bundle) &&
 				isCodingEvidenceTool(call.Function.Name) {
 				codingEvidenceReads++
 			}
@@ -729,11 +745,53 @@ func messageBytes(messages []*schema.Message) int {
 			continue
 		}
 		total += len(message.Content) + len(message.ReasoningContent)
+		if data, err := json.Marshal(message.UserInputMultiContent); err == nil {
+			total += len(data)
+		}
 		for _, call := range message.ToolCalls {
 			total += len(call.ID) + len(call.Function.Name) + len(call.Function.Arguments)
 		}
 	}
 	return total
+}
+
+func expireEphemeralImages(
+	messages []*schema.Message,
+) ([]*schema.Message, int) {
+	out := append([]*schema.Message(nil), messages...)
+	removed := 0
+	for messageIndex, message := range messages {
+		if message == nil || len(message.UserInputMultiContent) == 0 {
+			continue
+		}
+		parts := append(
+			[]schema.MessageInputPart(nil),
+			message.UserInputMultiContent...,
+		)
+		changed := false
+		for partIndex := range parts {
+			part := parts[partIndex]
+			if part.Type != schema.ChatMessagePartTypeImageURL ||
+				part.Image == nil ||
+				part.Image.URL == nil ||
+				!strings.HasPrefix(*part.Image.URL, "data:image/") {
+				continue
+			}
+			parts[partIndex] = schema.MessageInputPart{
+				Type: schema.ChatMessagePartTypeText,
+				Text: "[ephemeral image removed after the first model turn]",
+			}
+			removed++
+			changed = true
+		}
+		if !changed {
+			continue
+		}
+		clone := *message
+		clone.UserInputMultiContent = parts
+		out[messageIndex] = &clone
+	}
+	return out, removed
 }
 
 func clipMiddle(content string, maxBytes int) string {
@@ -987,7 +1045,7 @@ func validateTerminalDecision(bundle agentcontext.Bundle, decision domain.Decisi
 	delegated := isDelegatedInvocation(bundle)
 	if delegated &&
 		decision.Kind == domain.DecisionNotify &&
-		domain.IsCodingQuestion(bundle.Event.Content) {
+		isCodingBundle(bundle) {
 		return errs.NewInternalError(
 			errs.SubtypeInvalidResponse,
 			"coding question cannot finish as notify; delegated work requires a useful sender-facing reply with completed checks and explicit unknowns",
@@ -1047,7 +1105,7 @@ func verifyCodingDecision(
 	authoritative map[string]bool,
 	codingEvidenceReads int,
 ) error {
-	if !domain.IsCodingQuestion(bundle.Event.Content) {
+	if !isCodingBundle(bundle) {
 		return nil
 	}
 	if decision.Kind != domain.DecisionReply {
@@ -1115,12 +1173,17 @@ const canonicalInsufficientCodingReply = "结论：当前证据不足，不能�
 	"未知/下一步：相关符号是否存在及实际行为仍未核实，我不会据此推测。"
 
 func normalizeCodingDecision(bundle agentcontext.Bundle, decision domain.Decision) domain.Decision {
-	if domain.IsCodingQuestion(bundle.Event.Content) &&
+	if isCodingBundle(bundle) &&
 		decision.Kind == domain.DecisionReply &&
 		decision.EvidenceStatus == domain.EvidenceInsufficient {
 		decision.ReplyText = canonicalInsufficientCodingReply
 	}
 	return decision
+}
+
+func isCodingBundle(bundle agentcontext.Bundle) bool {
+	return bundle.WorkKind == domain.WorkKindCodingQuestion ||
+		domain.IsCodingQuestion(bundle.Event.Content)
 }
 
 func isRelevantEvidenceTool(name string) bool {

@@ -114,6 +114,252 @@ func handler() {
 	}
 }
 
+func TestContextualIntentBackendHandoffInvestigatesSampleEventInsteadOfNetwork(t *testing.T) {
+	root := t.TempDir()
+	apiSource := `package api
+
+func (m *MessageApi) SampleOperation(c *gin.Context) {
+	a2r.Call(c, msg.MsgClient.SampleOperation, m.Client)
+}`
+	rpcSource := `package msg
+
+func (m *msgServer) SampleOperation(ctx context.Context, req *samplepb.SampleOperationReq) (*samplepb.SampleChangeResp, error) {
+	if req == nil {
+		return nil, errs.ErrArgs.WrapMsg("request is nil")
+	}
+	if _, err := m.ensureConversationAccess(ctx, actorID, req.TargetID); err != nil {
+		return nil, err
+	}
+	sampleVersion, err := m.SampleStore.ApplySampleChange(ctx, req.TargetID, req.Seq, actorID, req.SampleContent, sampleContent.eventCode, sampleContent.sampleIDs, req.ExpectedVersion, now)
+	if err != nil {
+		return nil, err
+	}
+	return &samplepb.SampleChangeResp{ModifiedTime: now, EditVersion: sampleVersion}, nil
+}`
+	for path, source := range map[string]string{
+		"internal/api/msg.go":        apiSource,
+		"internal/rpc/msg/modify.go": rpcSource,
+	} {
+		fullPath := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, []byte(source), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	digestFor := func(source string) string {
+		sum := sha256.Sum256([]byte(source))
+		return fmt.Sprintf("sha256:%s", hex.EncodeToString(sum[:8]))
+	}
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agenttools.NewRegistry(append(
+		agenttools.CodeIndexDefinitions(scope, nil),
+		append(
+			agenttools.WorkspaceDefinitions(scope),
+			agentruntime.SubmitInvestigationPlanDefinition(),
+			agentruntime.SubmitDecisionDefinition(),
+		)...,
+	)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("plan", "submit_investigation_plan", `{
+			"question":"生产环境示例事件返回 1408 SampleEventDisabled 的原因是什么",
+			"entry_points":["internal/api/msg.go"],
+			"symbols":["MessageApi.SampleOperation","msgServer.SampleOperation"],
+			"tools":["search_code_symbols","read_workspace"],
+			"stop_conditions":["确认当前 HTTP 和 RPC 路径并区分部署版本未知"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"search",
+			"search_code_symbols",
+			`{"query":"SampleOperation SampleEventDisabled","max_results":10}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-api",
+			"read_workspace",
+			`{"path":"internal/api/msg.go"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-rpc",
+			"read_workspace",
+			`{"path":"internal/rpc/msg/modify.go"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"relevance_confidence":0.99,
+			"reply_confidence":0.94,
+			"risk":"low",
+			"reply_text":"智能助手已检查当前示例事件入口和 RPC 实现：HTTP 的 SampleOperation 已转发到 msg.MsgClient.SampleOperation，RPC 会校验会话后写入消息内容，当前源码不是直接返回 1408 SampleEventDisabled。结合群里后续提到生产环境尚未上线，初步判断应先核对生产部署版本；现有证据不能把问题归因于发起人的电脑网络。以上源码结论和部署版本待核对项已通知测试负责人。",
+			"owner_action":"核对生产环境部署版本是否包含示例事件 HTTP 转发改动。",
+			"reason":"bounded current production source contradicts the literal network interpretation",
+			"source_refs":[
+				{"relative_path":"internal/api/msg.go","digest":"`+digestFor(apiSource)+`","kind":"workspace_file"},
+				{"relative_path":"internal/rpc/msg/modify.go","digest":"`+digestFor(rpcSource)+`","kind":"workspace_file"}
+			]
+		}`)}),
+	}}
+	bundle := agentcontext.Bundle{
+		User: agentcontext.UserProfile{OpenID: "ou_owner", Name: "测试负责人"},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_handoff",
+			SenderID:  "ou_teammate",
+			Content:   "@测试负责人 你看看吧，我电脑断线了",
+		},
+		Conversation: []domain.NormalizedEvent{
+			{MessageID: "om_issue", SenderName: "仇亚颖", Content: "示例事件的后台服务还没上线么"},
+			{MessageID: "om_mention", SenderName: "许嘉诺", Content: "@测试负责人 是不是开关没打开"},
+			{MessageID: "om_image", SenderName: "仇亚颖", Content: "[图片：1408 SampleEventDisabled message edit is temporarily unavailable]"},
+			{MessageID: "om_handoff", SenderName: "许嘉诺", Content: "@测试负责人 你看看吧，我电脑断线了"},
+		},
+		WorkKind:    domain.WorkKindDirectMention,
+		TaskClass:   domain.TaskClassCoding,
+		TaskSummary: "调查生产环境示例事件返回 1408 SampleEventDisabled",
+	}
+	decision, _, err := (agentruntime.AgentLoop{
+		Model:    model,
+		Tools:    registry,
+		MaxTurns: 8,
+	}).Decide(context.Background(), bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply || len(decision.Sources) != 2 {
+		t.Fatalf("decision=%+v", decision)
+	}
+	for _, want := range []string{
+		"HTTP 的 SampleOperation 已转发",
+		"生产部署版本",
+		"不能把问题归因于发起人的电脑网络",
+		"已通知测试负责人",
+	} {
+		if !strings.Contains(decision.ReplyText, want) {
+			t.Fatalf("reply=%q missing=%q", decision.ReplyText, want)
+		}
+	}
+}
+
+func TestIndependentVerifiableBasicQuestionReturnsExactCalculation(t *testing.T) {
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"submit",
+			"submit_decision",
+			`{
+				"decision":"reply",
+				"relevance_confidence":0.99,
+				"reply_confidence":0.99,
+				"risk":"low",
+				"reply_text":"17 × 23 = 391。",
+				"reason":"direct arithmetic calculation"
+			}`,
+		)}),
+	}}
+	registry, err := agenttools.NewRegistry(
+		agentruntime.SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, _, err := (agentruntime.AgentLoop{
+		Model:    model,
+		Tools:    registry,
+		MaxTurns: 3,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		User: agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_basic_calculation",
+			SenderID:  "ou_owner",
+			Content:   "17 × 23 等于多少？",
+		},
+		WorkKind: domain.WorkKindSimpleQuestion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		decision.ReplyText != "17 × 23 = 391。" {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestFalsePremiseTrapDoesNotInventMissingProductionSymbol(t *testing.T) {
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"plan",
+			"submit_investigation_plan",
+			`{
+				"question":"解释 NormalizeContentType 为什么固定返回 image/avif",
+				"symbols":["NormalizeContentType"],
+				"tools":["search_code_symbols"],
+				"stop_conditions":["确认符号是否存在"]
+			}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"search",
+			"search_code_symbols",
+			`{"query":"NormalizeContentType","max_results":5}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"submit",
+			"submit_decision",
+			`{
+				"decision":"reply",
+				"relevance_confidence":0.99,
+				"reply_confidence":0.90,
+				"risk":"low",
+				"evidence_status":"insufficient",
+				"reply_text":"没有找到 NormalizeContentType，无法确认它存在或具有题目描述的返回行为。",
+				"reason":"the named production symbol was not found"
+			}`,
+		)}),
+	}}
+	searchCalls := 0
+	registry, err := agenttools.NewRegistry(
+		agenttools.Definition{
+			Info: &schema.ToolInfo{Name: "search_code_symbols"},
+			Execute: func(
+				context.Context,
+				json.RawMessage,
+			) (agenttools.Execution, error) {
+				searchCalls++
+				return agenttools.Execution{Content: `{"matches":[]}`}, nil
+			},
+		},
+		agentruntime.SubmitInvestigationPlanDefinition(),
+		agentruntime.SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, _, err := (agentruntime.AgentLoop{
+		Model:    model,
+		Tools:    registry,
+		MaxTurns: 4,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		User: agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_false_premise",
+			SenderID:  "ou_owner",
+			Content:   "NormalizeContentType 固定返回 image/avif，解释一下原因。",
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		searchCalls != 1 ||
+		!strings.Contains(decision.ReplyText, "当前证据不足") ||
+		!strings.Contains(decision.ReplyText, "不会据此推测") {
+		t.Fatalf("decision=%+v search_calls=%d", decision, searchCalls)
+	}
+}
+
 func TestCodingQuestionWithEvidenceConvergesBeforeFinalTurns(t *testing.T) {
 	root := t.TempDir()
 	source := `package content_type

@@ -71,6 +71,14 @@ func (f *fakeQueue) ClaimNext(string) (domain.WorkItem, bool, error) {
 	return f.item, f.ok, nil
 }
 
+func (f *fakeQueue) GetWorkItem(context.Context, int64) (domain.WorkItem, error) {
+	item := f.item
+	if f.deadLetter {
+		item.Status = domain.StatusDeadLetter
+	}
+	return item, nil
+}
+
 func (f *fakeQueue) Complete(_ int64, decision domain.Decision) error {
 	f.done = true
 	f.completed = decision
@@ -95,9 +103,48 @@ func (f *fakeQueue) DeferWaitingUserClaim(_ int64, _ string, _ string, delay tim
 }
 
 type fakeReplyResolver struct {
-	resolution replymatch.Resolution
-	err        error
-	calls      int
+	resolution  replymatch.Resolution
+	resolutions []replymatch.Resolution
+	err         error
+	calls       int
+}
+
+type fakeInvestigationProgress struct {
+	events *[]string
+}
+
+func (f *fakeInvestigationProgress) Begin(
+	_ context.Context,
+	_ domain.WorkItem,
+	_ replymatch.Resolution,
+) error {
+	*f.events = append(*f.events, "progress")
+	return nil
+}
+
+func (f *fakeInvestigationProgress) Finalizing(
+	_ context.Context,
+	_ domain.WorkItem,
+) error {
+	*f.events = append(*f.events, "finalizing")
+	return nil
+}
+
+func (f *fakeInvestigationProgress) Complete(
+	_ context.Context,
+	_ domain.WorkItem,
+) error {
+	*f.events = append(*f.events, "complete")
+	return nil
+}
+
+func (f *fakeInvestigationProgress) Block(
+	_ context.Context,
+	_ domain.WorkItem,
+	_ error,
+) error {
+	*f.events = append(*f.events, "blocked")
+	return nil
 }
 
 type fakeControlHandler struct {
@@ -163,6 +210,10 @@ func TestDaemonExecutesOwnerControlBeforeModel(t *testing.T) {
 
 func (r *fakeReplyResolver) Resolve(context.Context, domain.WorkItem) (replymatch.Resolution, error) {
 	r.calls++
+	if len(r.resolutions) > 0 {
+		index := min(r.calls-1, len(r.resolutions)-1)
+		return r.resolutions[index], r.err
+	}
 	return r.resolution, r.err
 }
 
@@ -314,6 +365,186 @@ func TestDaemonWithdrawnDelegatedTargetCancelsWithoutMainModel(t *testing.T) {
 	}
 }
 
+func TestDaemonDurablyStartsAndClosesContextualInvestigation(t *testing.T) {
+	events := []string{}
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_contextual",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Content:   "@Owner 你看看吧，我电脑断线了",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	q.item.ID = 77
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID:          "om_contextual",
+		Result:                   replymatch.ResultUnanswered,
+		Confidence:               0.97,
+		Reason:                   "bounded context identifies production message editing",
+		TaskSummary:              "核查生产环境示例事件返回 1408",
+		TaskClass:                domain.TaskClassCoding,
+		ClassificationConfidence: 0.98,
+		RequiresProgress:         true,
+		ContextCutoff:            time.Now().UTC(),
+		ContextDigest:            "sha256:context",
+	}}
+	builder := &fakeBuilder{}
+	decider := &fakeDecider{decision: domain.Decision{
+		Kind:       domain.DecisionReply,
+		ReplyText:  "已核对当前源码，旧接口会直接返回 1408，当前代码已转发 RPC；仍需核对生产版本。",
+		Confidence: 0.95,
+	}}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted, events: &events}
+	progress := &fakeInvestigationProgress{events: &events}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(builder),
+		WithDecider(decider),
+		WithReplyHandler(replier),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+		WithInvestigationProgressHandler(progress),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || !q.done {
+		t.Fatalf("result=%+v queue=%+v", result, q)
+	}
+	if got := strings.Join(events, ","); got != "progress,finalizing,reply,complete" {
+		t.Fatalf("events=%s", got)
+	}
+	if !builder.called ||
+		builder.item.TaskSummary != resolver.resolution.TaskSummary ||
+		builder.item.WorkKind != domain.WorkKindCodingQuestion {
+		t.Fatalf("builder item=%+v", builder.item)
+	}
+}
+
+func TestDaemonRechecksOwnerHandlingBeforeInvestigationFinalReply(t *testing.T) {
+	events := []string{}
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_contextual",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Content:   "@Owner 帮忙核查生产示例事件",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	q.item.ID = 78
+	resolver := &fakeReplyResolver{resolutions: []replymatch.Resolution{
+		{
+			TargetMessageID:          "om_contextual",
+			Result:                   replymatch.ResultUnanswered,
+			Confidence:               0.97,
+			Reason:                   "unanswered",
+			TaskSummary:              "核查生产示例事件",
+			TaskClass:                domain.TaskClassCoding,
+			ClassificationConfidence: 0.98,
+			RequiresProgress:         true,
+			ContextCutoff:            time.Now().UTC(),
+			ContextDigest:            "sha256:before",
+		},
+		{
+			TargetMessageID:        "om_contextual",
+			Result:                 replymatch.ResultAnswered,
+			Confidence:             0.99,
+			Reason:                 "owner answered while investigation was running",
+			MatchedOwnerMessageIDs: []string{"om_owner_answer"},
+		},
+	}}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted, events: &events}
+	progress := &fakeInvestigationProgress{events: &events}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(&fakeDecider{decision: domain.Decision{
+			Kind:      domain.DecisionReply,
+			ReplyText: "调查结论",
+		}}),
+		WithReplyHandler(replier),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+		WithInvestigationProgressHandler(progress),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolver.calls != 2 || replier.called ||
+		result.Decision.Kind != domain.DecisionIgnore ||
+		result.Decision.Reason != "owner_semantically_replied_during_investigation" {
+		t.Fatalf("result=%+v resolver=%+v replier=%+v", result, resolver, replier)
+	}
+	if got := strings.Join(events, ","); got != "progress,finalizing,complete" {
+		t.Fatalf("events=%s", got)
+	}
+}
+
+func TestDaemonResumedInvestigationSkipsInitialReclassification(t *testing.T) {
+	events := []string{}
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_resumed_contextual",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Content:   "@Owner 你看一下",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})
+	item.ID = 79
+	item.TaskSummary = "核查生产示例事件"
+	item.TaskClass = domain.TaskClassCoding
+	item.ContextCutoff = time.Now().UTC().Add(-time.Minute)
+	item.ContextDigest = "sha256:persisted"
+	item.ResolvedContext = []domain.NormalizedEvent{{
+		MessageID: "om_root",
+		ChatID:    "oc_group",
+		Content:   "生产示例事件返回 1408 SampleEventDisabled",
+	}}
+	item.InvestigationActive = true
+	q := &fakeQueue{ok: true, item: item}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_resumed_contextual",
+		Result:          replymatch.ResultUnanswered,
+		Confidence:      0.99,
+		Reason:          "owner still has not answered",
+	}}
+	builder := &fakeBuilder{}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(builder),
+		WithDecider(&fakeDecider{decision: domain.Decision{
+			Kind:       domain.DecisionReply,
+			ReplyText:  "已核查生产示例事件。",
+			Confidence: 0.95,
+		}}),
+		WithReplyHandler(&fakeReplyHandler{
+			status: domain.ActionCompleted,
+			events: &events,
+		}),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+		WithInvestigationProgressHandler(&fakeInvestigationProgress{
+			events: &events,
+		}),
+	)
+
+	if _, err := daemon.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if resolver.calls != 1 {
+		t.Fatalf("resolver calls=%d, want only final owner-handled check", resolver.calls)
+	}
+	if !builder.called ||
+		builder.item.ContextDigest != item.ContextDigest ||
+		len(builder.item.ResolvedContext) != 1 {
+		t.Fatalf("builder item=%+v", builder.item)
+	}
+	if got := strings.Join(events, ","); got != "finalizing,reply,complete" {
+		t.Fatalf("events=%s", got)
+	}
+}
+
 func TestDaemonHonorsLongerSemanticRetryDeadline(t *testing.T) {
 	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID: "om_target",
@@ -399,8 +630,12 @@ func (b *fakeBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, error) {
 	b.called = true
 	b.item = item
 	return agentcontext.Bundle{
-		Event: item.Event, WorkKind: item.WorkKind, Priority: item.Priority,
-		User: agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event:       item.Event,
+		WorkKind:    item.WorkKind,
+		TaskSummary: item.TaskSummary,
+		TaskClass:   item.TaskClass,
+		Priority:    item.Priority,
+		User:        agentcontext.UserProfile{OpenID: "ou_owner"},
 	}, nil
 }
 
@@ -418,12 +653,14 @@ func (d *fakeDecider) Decide(_ context.Context, bundle agentcontext.Bundle) (dom
 }
 
 func TestDaemonDeadLettersModelNonConvergenceWithoutRetry(t *testing.T) {
+	events := []string{}
 	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID: "om_non_convergent",
 		Content:   "@Owner 看看删号报 10005",
 		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
 	})}
 	q.item.ID = 42
+	q.item.InvestigationActive = true
 	daemon := NewDaemon(
 		q,
 		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
@@ -432,6 +669,7 @@ func TestDaemonDeadLettersModelNonConvergenceWithoutRetry(t *testing.T) {
 			errs.SubtypeModelNonConvergence,
 			"model did not submit a terminal decision after 3 attempts",
 		)}),
+		WithInvestigationProgressHandler(&fakeInvestigationProgress{events: &events}),
 	)
 	_, err := daemon.RunOnce(context.Background())
 	if err == nil {
@@ -440,6 +678,9 @@ func TestDaemonDeadLettersModelNonConvergenceWithoutRetry(t *testing.T) {
 	if !q.deadLetter || q.retried ||
 		!strings.Contains(q.deadReason, "terminal decision after 3 attempts") {
 		t.Fatalf("queue=%+v", q)
+	}
+	if got := strings.Join(events, ","); got != "blocked" {
+		t.Fatalf("events=%s", got)
 	}
 }
 

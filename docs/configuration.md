@@ -59,9 +59,18 @@ lark-agent config show
   `disabled` 时关闭。
 - `policy.owner_wait`、`owner_reply_confidence_min`、`owner_reply_retry`：
   本人优先回复窗口、语义判断最低置信度和不确定结果的重试间隔。
+- `policy.investigation_progress`：`enabled` 或 `disabled`，默认 `enabled`。开启后，
+  高置信度的调查或代码问题会先持久化任务、通知具体姓名的 Owner，再用智能助手身份
+  在原会话发送一次进度；该任务随后必须以结果、本人已处理或明确阻塞收口。
 - `policy.allow_chats`、`block_chats`、`block_users`：确定性的会话和用户边界。
 - `scheduler.*`：不同工作通道的 lease 和 worker 数量。
 - `agent.*`、`tool_policy.*`、`goal.*`：模型轮次、工具输出、无进展和长任务上限。
+- `agent.vision_model`：可选的图片理解模型名。未配置时，相关图片会明确标记为不可读，
+  不会当成空证据或猜测图片内容。
+- `agent.max_context_images`、`max_context_image_bytes`、
+  `max_context_image_total_bytes`：上下文图片硬上限，默认分别为 `2`、`1048576`
+  和 `2097152`。图片串行读取，编码后的图片负载计入模型请求字节，只在首个模型回合
+  发送；后续回合用明确的临时图片移除标记代替。原始字节不写入 SQLite。
 
 默认 `agent.max_context_bytes` 为 `65536`，
 `agent.context_compaction_ratio` 为 `0.80`。每次模型调用都会收到轮次和上下文的
@@ -154,6 +163,7 @@ owner:
 policy:
   reply_scope: all_groups
   private_reply_scope: all_private
+  investigation_progress: enabled
   owner_wait: 3m
   owner_reply_confidence_min: 0.85
   owner_reply_retry: 30s

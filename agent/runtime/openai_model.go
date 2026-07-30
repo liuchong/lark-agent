@@ -178,9 +178,34 @@ func toOpenAIMessages(input []*schema.Message) []map[string]any {
 		if msg == nil {
 			continue
 		}
+		content := any(msg.Content)
+		if len(msg.UserInputMultiContent) > 0 {
+			parts := make([]map[string]any, 0, len(msg.UserInputMultiContent))
+			for _, part := range msg.UserInputMultiContent {
+				switch part.Type {
+				case schema.ChatMessagePartTypeText:
+					parts = append(parts, map[string]any{
+						"type": "text",
+						"text": part.Text,
+					})
+				case schema.ChatMessagePartTypeImageURL:
+					if part.Image == nil || part.Image.URL == nil {
+						continue
+					}
+					parts = append(parts, map[string]any{
+						"type": "image_url",
+						"image_url": map[string]any{
+							"url":    *part.Image.URL,
+							"detail": string(part.Image.Detail),
+						},
+					})
+				}
+			}
+			content = parts
+		}
 		wire := map[string]any{
 			"role":    string(msg.Role),
-			"content": msg.Content,
+			"content": content,
 		}
 		if msg.Name != "" {
 			wire["name"] = msg.Name

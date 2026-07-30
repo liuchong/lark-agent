@@ -33,6 +33,21 @@ func TestEnglishHelpAndTaskCommandsContainNoChineseExplanation(t *testing.T) {
 	}
 }
 
+func TestTaskHelpExplainsInvestigationFieldsAndRefreshCommand(t *testing.T) {
+	help := HelpText("zh-CN", "task")
+	for _, want := range []string{
+		"调查主题",
+		"调查状态",
+		"上下文证据",
+		"最近错误",
+		"`/task <工作号>`",
+	} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help=%q missing=%q", help, want)
+		}
+	}
+}
+
 func TestSanitizeEventTextMapsLarkMentionPlaceholders(t *testing.T) {
 	event := domain.NormalizedEvent{
 		Content: "@_user_1 看看这个问题，顺便问 @_user_2",

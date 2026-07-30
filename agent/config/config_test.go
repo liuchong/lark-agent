@@ -57,6 +57,22 @@ func TestDefaultCodingConfig(t *testing.T) {
 	}
 }
 
+func TestDefaultContextImageAndInvestigationProgressConfig(t *testing.T) {
+	cfg := Default()
+	if cfg.Agent.MaxContextImages != 2 ||
+		cfg.Agent.MaxContextImageBytes != 1<<20 ||
+		cfg.Agent.MaxContextImageTotalBytes != 2<<20 {
+		t.Fatalf("agent image limits=%+v", cfg.Agent)
+	}
+	if cfg.Policy.InvestigationProgress != "enabled" {
+		t.Fatalf("investigation progress=%q", cfg.Policy.InvestigationProgress)
+	}
+	cfg.Agent.MaxContextImages = 3
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("accepted more than two context images")
+	}
+}
+
 func TestDefaultHarnessConfig(t *testing.T) {
 	cfg := validConfigForTest(t)
 	if !cfg.FastPath.Enabled {

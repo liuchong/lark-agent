@@ -44,6 +44,67 @@ func TestOpenAICompatibleModelGenerate(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatibleModelSerializesUserMultimodalContentParts(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	imageURL := "https://example.test/evidence.png"
+	model := &OpenAICompatibleModel{
+		APIKey:  "key",
+		BaseURL: server.URL,
+		Model:   "vision-model",
+		Client:  server.Client(),
+	}
+	_, err := model.Generate(context.Background(), []*schema.Message{{
+		Role: schema.User,
+		UserInputMultiContent: []schema.MessageInputPart{
+			{Type: schema.ChatMessagePartTypeText, Text: "Inspect this evidence."},
+			{
+				Type: schema.ChatMessagePartTypeImageURL,
+				Image: &schema.MessageInputImage{
+					MessagePartCommon: schema.MessagePartCommon{URL: &imageURL},
+					Detail:            schema.ImageURLDetailHigh,
+				},
+			},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	messages, ok := body["messages"].([]any)
+	if !ok || len(messages) != 1 {
+		t.Fatalf("messages=%+v", body["messages"])
+	}
+	message, ok := messages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("message=%+v", messages[0])
+	}
+	parts, ok := message["content"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("multimodal content=%+v, want text and image_url parts", message["content"])
+	}
+	textPart, ok := parts[0].(map[string]any)
+	if !ok || textPart["type"] != "text" || textPart["text"] != "Inspect this evidence." {
+		t.Fatalf("text part=%+v", parts[0])
+	}
+	imagePart, ok := parts[1].(map[string]any)
+	if !ok || imagePart["type"] != "image_url" {
+		t.Fatalf("image part=%+v", parts[1])
+	}
+	imageContent, ok := imagePart["image_url"].(map[string]any)
+	if !ok || imageContent["url"] != imageURL || imageContent["detail"] != "high" {
+		t.Fatalf("image_url content=%+v", imagePart["image_url"])
+	}
+}
+
 func TestOpenAICompatibleModelToolCallingWireFormat(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any

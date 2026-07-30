@@ -4,6 +4,7 @@ package cmd
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/daemon"
 	"github.com/liuchong/lark-agent/agent/domain"
 	"github.com/liuchong/lark-agent/agent/feedback"
+	"github.com/liuchong/lark-agent/agent/investigation"
 	"github.com/liuchong/lark-agent/agent/lifecycle"
 	agentlocale "github.com/liuchong/lark-agent/agent/locale"
 	"github.com/liuchong/lark-agent/agent/memory"
@@ -1479,12 +1481,26 @@ func buildLiveOptions(
 			Model:   model,
 			Timeout: cfg.Model.Timeout,
 		}
+		loopModelAdapter := modelAdapter
+		if visionModel := strings.TrimSpace(cfg.Agent.VisionModel); visionModel != "" {
+			loopModelAdapter = &agentruntime.OpenAICompatibleModel{
+				APIKey:  apiKey,
+				BaseURL: baseURL,
+				Model:   visionModel,
+				Timeout: cfg.Model.Timeout,
+			}
+			info["vision_model"] = visionModel
+		}
 		if userContextEnabled {
 			delegatedResolver = &liveDelegatedReplyResolver{
-				contexts:  imSvc,
-				store:     store,
-				matcher:   replymatch.New(modelAdapter, cfg.Owner.OpenID),
-				ownerWait: cfg.Policy.OwnerWait,
+				contexts:             imSvc,
+				store:                store,
+				matcher:              replymatch.New(modelAdapter, cfg.Owner.OpenID),
+				ownerWait:            cfg.Policy.OwnerWait,
+				visionEnabled:        strings.TrimSpace(cfg.Agent.VisionModel) != "",
+				maxContextImages:     cfg.Agent.MaxContextImages,
+				maxContextImageBytes: cfg.Agent.MaxContextImageBytes,
+				maxContextImageTotal: cfg.Agent.MaxContextImageTotalBytes,
 			}
 			options = append(options, app.WithDelegatedReplyResolver(
 				delegatedResolver,
@@ -1493,7 +1509,7 @@ func buildLiveOptions(
 			))
 		}
 		options = append(options, app.WithDecider(agentruntime.LoopDecisionAgent{Loop: agentruntime.AgentLoop{
-			Model:             modelAdapter,
+			Model:             loopModelAdapter,
 			Tools:             registry,
 			MaxTurns:          cfg.Agent.MaxTurns,
 			MaxToolBytes:      cfg.Agent.MaxToolOutput,
@@ -1508,7 +1524,7 @@ func buildLiveOptions(
 			CodingMaxTurns:    cfg.FastPath.CodingMaxTurns,
 			GoalMaxTurns:      cfg.Goal.MaxInvestigationTurns,
 			Recorder:          store,
-			ModelFingerprint:  modelFingerprint,
+			ModelFingerprint:  loopModelAdapter.Model + "@" + baseURL,
 			ConfigFingerprint: configFingerprint,
 		}}))
 		info["model_configured"] = true
@@ -1561,6 +1577,17 @@ func buildLiveOptions(
 			}),
 			app.WithOwnerActivityHandler(feedback.NewController(imSvc, store)),
 		)
+		if cfg.Policy.InvestigationProgress == "enabled" {
+			options = append(options, app.WithInvestigationProgressHandler(
+				investigation.New(store, imSvc, investigation.Config{
+					OwnerName: cfg.Owner.Name,
+					Language:  string(resolveConfiguredLanguage(cfg.Owner)),
+				}),
+			))
+			info["investigation_progress"] = true
+		} else {
+			info["investigation_progress"] = false
+		}
 	}
 	return options, realtimeSource, imSvc, info, nil
 }
@@ -1824,6 +1851,14 @@ type semanticReplyContextReader interface {
 	) (serviceim.SemanticReplyContext, error)
 }
 
+type semanticContextImageHydrator interface {
+	HydrateContextImages(
+		context.Context,
+		[]serviceim.Message,
+		serviceim.ImageHydrationLimits,
+	) []serviceim.Message
+}
+
 type semanticReplyStore interface {
 	ListPendingDelegatedWork(string) ([]domain.WorkItem, error)
 	RecordOwnerReplyResolution(int64, replymatch.Resolution) error
@@ -1846,11 +1881,15 @@ func (unavailableDelegatedReplyResolver) Resolve(
 }
 
 type liveDelegatedReplyResolver struct {
-	contexts    semanticReplyContextReader
-	store       semanticReplyStore
-	matcher     semanticReplyMatcher
-	maxMessages int
-	ownerWait   time.Duration
+	contexts             semanticReplyContextReader
+	store                semanticReplyStore
+	matcher              semanticReplyMatcher
+	maxMessages          int
+	ownerWait            time.Duration
+	visionEnabled        bool
+	maxContextImages     int
+	maxContextImageBytes int64
+	maxContextImageTotal int64
 }
 
 func (r liveDelegatedReplyResolver) Resolve(
@@ -1905,6 +1944,29 @@ func (r liveDelegatedReplyResolver) Resolve(
 			return replymatch.Resolution{}, err
 		}
 		return resolution, nil
+	}
+	if r.visionEnabled {
+		if hydrator, ok := r.contexts.(semanticContextImageHydrator); ok {
+			larkContext.Messages = hydrator.HydrateContextImages(
+				ctx,
+				larkContext.Messages,
+				serviceim.ImageHydrationLimits{
+					MaxImages:     r.maxContextImages,
+					MaxImageBytes: r.maxContextImageBytes,
+					MaxTotalBytes: r.maxContextImageTotal,
+					As:            serviceim.IdentityUser,
+				},
+			)
+		}
+	} else {
+		for messageIndex := range larkContext.Messages {
+			for attachmentIndex := range larkContext.Messages[messageIndex].Attachments {
+				attachment := &larkContext.Messages[messageIndex].Attachments[attachmentIndex]
+				if attachment.Type == "image" && !attachment.Readable {
+					attachment.UnreadableReason = "vision_model_not_configured"
+				}
+			}
+		}
 	}
 
 	messages := normalizeToolMessages(larkContext.Messages)
@@ -1971,6 +2033,19 @@ func (r liveDelegatedReplyResolver) Resolve(
 	if resolution.ContextCutoff.IsZero() {
 		resolution.ContextCutoff = larkContext.ContextCutoff
 	}
+	resolution.ContextMessages = append(
+		[]domain.NormalizedEvent(nil),
+		messages...,
+	)
+	contextJSON, digestErr := json.Marshal(messages)
+	if digestErr != nil {
+		return replymatch.Resolution{}, errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"encode delegated context digest",
+		).WithCause(digestErr)
+	}
+	contextDigest := sha256.Sum256(contextJSON)
+	resolution.ContextDigest = fmt.Sprintf("sha256:%x", contextDigest[:])
 	if err := r.store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
 		return replymatch.Resolution{}, err
 	}
@@ -2251,6 +2326,21 @@ func normalizeToolMessages(messages []serviceim.Message) []domain.NormalizedEven
 	events := make([]domain.NormalizedEvent, 0, len(messages))
 	for _, message := range messages {
 		sum := sha256.Sum256([]byte(message.MessageID + "\x00" + message.Content))
+		attachments := make([]domain.Attachment, 0, len(message.Attachments))
+		for _, attachment := range message.Attachments {
+			normalized := domain.Attachment{
+				Type:             attachment.Type,
+				Key:              attachment.Key,
+				MediaType:        attachment.MediaType,
+				Readable:         attachment.Readable,
+				UnreadableReason: attachment.UnreadableReason,
+			}
+			if len(attachment.Data) > 0 && attachment.MediaType != "" {
+				normalized.DataURL = "data:" + attachment.MediaType + ";base64," +
+					base64.StdEncoding.EncodeToString(attachment.Data)
+			}
+			attachments = append(attachments, normalized)
+		}
 		events = append(events, domain.NormalizedEvent{
 			Source:           domain.SourcePoll,
 			MessageID:        message.MessageID,
@@ -2260,8 +2350,10 @@ func normalizeToolMessages(messages []serviceim.Message) []domain.NormalizedEven
 			ReplyToMessageID: message.ReplyToMessageID,
 			ThreadID:         message.ThreadID,
 			SenderID:         message.SenderOpenID,
+			SenderName:       message.SenderDisplayName,
 			SenderType:       message.SenderType,
 			Content:          message.Content,
+			Attachments:      attachments,
 			Mentions:         message.Mentions,
 			CreatedAt:        normalizeServiceMessageTime(message.CreateTime),
 			UpdatedAt:        normalizeServiceMessageTime(message.UpdateTime),
@@ -2283,7 +2375,23 @@ func normalizeServiceMessageTime(raw string) time.Time {
 
 func (b *conversationBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, error) {
 	builder := b.base
-	if b.includeLarkContext && b.svc != nil && item.Event.ChatID != "" {
+	if len(item.ResolvedContext) > 0 {
+		builder.Conversation = append(
+			builder.Conversation,
+			item.ResolvedContext...,
+		)
+		builder.ContextSelection = domain.ContextSelection{
+			Mode:            domain.ContextModeAdjacent,
+			AnchorMessageID: item.Event.MessageID,
+			Reason:          "shared_delegated_context_snapshot",
+		}
+		for _, event := range item.ResolvedContext {
+			if event.MessageID == item.Event.MessageID {
+				item.Event = event
+				break
+			}
+		}
+	} else if b.includeLarkContext && b.svc != nil && item.Event.ChatID != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		var messages []serviceim.Message
@@ -2330,52 +2438,56 @@ func (b *conversationBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, 
 				Incomplete:       true,
 				Reason:           "lark_context_unavailable",
 			}
-			if err := b.applyStoredGitHubReference(&builder, item.Event); err != nil {
-				return agentcontext.Bundle{}, err
-			}
-			resolveBuilderUser(&builder, item.Event)
-			return builder.Build(item)
-		}
-		normalized := normalizeToolMessages(messages)
-		builder.Conversation = append(builder.Conversation, normalized...)
-		builder.ContextSelection = selection
-		if item.WorkKind == domain.WorkKindDirectMention {
-			for _, event := range normalized {
-				if event.MessageID == item.Event.MessageID {
-					item.Event = event
-					break
-				}
-			}
-		}
-		if b.githubEnabled {
-			verified, ok, err := agentcontext.ResolveGitHubReference(
-				item.Event,
-				builder.Conversation,
-				b.currentAppID,
-				b.allowedRepositories,
-				b.referenceSigningKey,
-			)
-			if err != nil {
-				return agentcontext.Bundle{}, err
-			}
-			if ok {
-				if b.store != nil {
-					verified, err = b.store.UpsertExternalReference(context.Background(), verified)
-					if err != nil {
-						return agentcontext.Bundle{}, err
+		} else {
+			normalized := normalizeToolMessages(messages)
+			builder.Conversation = append(builder.Conversation, normalized...)
+			builder.ContextSelection = selection
+			if item.WorkKind == domain.WorkKindDirectMention {
+				for _, event := range normalized {
+					if event.MessageID == item.Event.MessageID {
+						item.Event = event
+						break
 					}
 				}
-				ref := verified.Reference
-				builder.GitHubReference = &ref
-			} else if err := b.applyStoredGitHubReference(&builder, item.Event); err != nil {
-				return agentcontext.Bundle{}, err
 			}
 		}
-	} else if err := b.applyStoredGitHubReference(&builder, item.Event); err != nil {
+	}
+	if err := b.resolveGitHubReference(&builder, item.Event); err != nil {
 		return agentcontext.Bundle{}, err
 	}
 	resolveBuilderUser(&builder, item.Event)
 	return builder.Build(item)
+}
+
+func (b *conversationBuilder) resolveGitHubReference(
+	builder *agentcontext.Builder,
+	event domain.NormalizedEvent,
+) error {
+	if !b.githubEnabled {
+		return nil
+	}
+	verified, ok, err := agentcontext.ResolveGitHubReference(
+		event,
+		builder.Conversation,
+		b.currentAppID,
+		b.allowedRepositories,
+		b.referenceSigningKey,
+	)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return b.applyStoredGitHubReference(builder, event)
+	}
+	if b.store != nil {
+		verified, err = b.store.UpsertExternalReference(context.Background(), verified)
+		if err != nil {
+			return err
+		}
+	}
+	ref := verified.Reference
+	builder.GitHubReference = &ref
+	return nil
 }
 
 func resolveBuilderUser(builder *agentcontext.Builder, event domain.NormalizedEvent) {

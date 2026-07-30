@@ -161,17 +161,135 @@ type Message struct {
 	ReplyToMessageID  string
 	ThreadID          string
 	SenderOpenID      string
+	SenderDisplayName string
 	SenderType        string
 	MsgType           string
 	Content           string
+	Attachments       []MessageAttachment
 	Mentions          []domain.Mention
 	CreateTime        string
 	UpdateTime        string
 }
 
+// MessageAttachment is a typed reference to message evidence that can be
+// fetched through the Lark resource API when the model needs it.
+type MessageAttachment struct {
+	Type             string
+	Key              string
+	MediaType        string
+	Data             []byte
+	Readable         bool
+	UnreadableReason string
+}
+
+type messageResourceCaller interface {
+	GetMessageResource(context.Context, MessageResourceRequest) (MessageResource, error)
+}
+
+// ImageHydrationLimits bounds ephemeral image evidence for one model request.
+type ImageHydrationLimits struct {
+	MaxImages     int
+	MaxImageBytes int64
+	MaxTotalBytes int64
+	As            Identity
+}
+
 // NewService creates an IM service.
 func NewService(caller Caller, ownerOpenID string) *Service {
 	return &Service{caller: caller, ownerOpenID: ownerOpenID}
+}
+
+// HydrateContextImages fetches image evidence serially and records an explicit
+// unreadable reason for every image that cannot be supplied to the model.
+func (s *Service) HydrateContextImages(
+	ctx context.Context,
+	messages []Message,
+	limits ImageHydrationLimits,
+) []Message {
+	out := append([]Message(nil), messages...)
+	if limits.MaxImages <= 0 || limits.MaxImages > 2 {
+		limits.MaxImages = 2
+	}
+	if limits.MaxImageBytes <= 0 || limits.MaxImageBytes > 1<<20 {
+		limits.MaxImageBytes = 1 << 20
+	}
+	if limits.MaxTotalBytes <= 0 || limits.MaxTotalBytes > 2<<20 {
+		limits.MaxTotalBytes = 2 << 20
+	}
+	reader, available := s.caller.(messageResourceCaller)
+	seen := 0
+	var total int64
+	for messageIndex := range out {
+		out[messageIndex].Attachments = append(
+			[]MessageAttachment(nil),
+			out[messageIndex].Attachments...,
+		)
+		for attachmentIndex := range out[messageIndex].Attachments {
+			attachment := &out[messageIndex].Attachments[attachmentIndex]
+			if attachment.Type != "image" {
+				continue
+			}
+			if seen >= limits.MaxImages {
+				attachment.UnreadableReason = "image_count_limit_reached"
+				continue
+			}
+			seen++
+			if !available {
+				attachment.UnreadableReason = "image_resource_reader_unavailable"
+				continue
+			}
+			remaining := limits.MaxTotalBytes - total
+			if remaining <= 0 {
+				attachment.UnreadableReason = "image_total_size_limit_reached"
+				continue
+			}
+			maxBytes := min(limits.MaxImageBytes, remaining)
+			resource, err := reader.GetMessageResource(ctx, MessageResourceRequest{
+				MessageID: out[messageIndex].MessageID,
+				FileKey:   attachment.Key,
+				Type:      "image",
+				As:        limits.As,
+				MaxBytes:  maxBytes,
+			})
+			if err != nil {
+				attachment.UnreadableReason = "image_download_failed"
+				continue
+			}
+			if resource.TooLarge || int64(len(resource.Data)) > maxBytes {
+				if maxBytes < limits.MaxImageBytes {
+					attachment.UnreadableReason = "image_total_size_limit_reached"
+				} else {
+					attachment.UnreadableReason = "image_exceeds_size_limit"
+				}
+				continue
+			}
+			mediaType := supportedImageMediaType(resource.Data)
+			if mediaType == "" {
+				attachment.UnreadableReason = "unsupported_image_type"
+				continue
+			}
+			attachment.MediaType = mediaType
+			attachment.Data = append([]byte(nil), resource.Data...)
+			attachment.Readable = true
+			attachment.UnreadableReason = ""
+			total += int64(len(resource.Data))
+		}
+	}
+	return out
+}
+
+func supportedImageMediaType(data []byte) string {
+	mediaType := strings.TrimSpace(strings.SplitN(
+		http.DetectContentType(data),
+		";",
+		2,
+	)[0])
+	switch mediaType {
+	case "image/jpeg", "image/png", "image/gif", "image/webp":
+		return mediaType
+	default:
+		return ""
+	}
 }
 
 // SearchChats searches chats visible to the requested identity.
@@ -442,8 +560,30 @@ func (s *Service) GetSemanticReplyContext(
 	}
 	maxMessages := clamp(req.MaxMessages, 1, 200, 100)
 	byID := map[string]Message{target.MessageID: target}
-	pageToken := ""
 	incomplete := false
+	if target.ThreadID != "" ||
+		target.ReplyToMessageID != "" ||
+		target.RootMessageID != "" {
+		related, relationErr := s.GetMessageContext(ctx, MessageContextRequest{
+			ChatID:           req.ChatID,
+			MessageID:        target.MessageID,
+			RootMessageID:    target.RootMessageID,
+			ReplyToMessageID: target.ReplyToMessageID,
+			ThreadID:         target.ThreadID,
+			CreatedAt:        parseMessageTime(target.CreateTime),
+			Limit:            min(maxMessages, 30),
+		})
+		if relationErr != nil {
+			return SemanticReplyContext{}, relationErr
+		}
+		incomplete = related.Selection.Incomplete
+		for _, message := range related.Messages {
+			if message.ChatID == req.ChatID {
+				byID[message.MessageID] = message
+			}
+		}
+	}
+	pageToken := ""
 	for {
 		page, pageErr := s.ListRecentMessages(ctx, ListRecentMessagesRequest{
 			ChatID:    req.ChatID,
@@ -468,8 +608,7 @@ func (s *Service) GetSemanticReplyContext(
 				incomplete = true
 				break
 			}
-			if message.MessageID == req.TargetMessageID ||
-				(!since.IsZero() && !createdAt.IsZero() && !createdAt.After(since)) {
+			if !since.IsZero() && !createdAt.IsZero() && !createdAt.After(since) {
 				reachedBoundary = true
 			}
 		}
@@ -1184,6 +1323,7 @@ func parseMessage(raw any) Message {
 		CreateTime:        firstString(item, "create_time", "createTime"),
 		UpdateTime:        firstString(item, "update_time", "updateTime"),
 	}
+	msg.SenderDisplayName = firstString(sender, "name", "display_name", "displayName")
 	msg.SenderOpenID = firstString(senderID, "open_id", "openId", "user_id", "userId")
 	if msg.SenderOpenID == "" {
 		msg.SenderOpenID = firstString(sender, "open_id", "openId", "sender_id", "senderId", "id")
@@ -1196,7 +1336,31 @@ func parseMessage(raw any) Message {
 	} else {
 		msg.Content = textFromContent(msg.Content)
 	}
+	if msg.MsgType == "image" {
+		imageKey := contentString(item["content"], "image_key")
+		if imageKey == "" {
+			imageKey = contentString(item["body"], "image_key")
+		}
+		if imageKey != "" {
+			msg.Attachments = []MessageAttachment{{Type: "image", Key: imageKey}}
+		}
+		if strings.TrimSpace(msg.Content) == "" {
+			msg.Content = "[图片]"
+		}
+	}
 	return msg
+}
+
+func contentString(raw any, key string) string {
+	value := raw
+	if encoded, ok := raw.(string); ok {
+		var decoded map[string]any
+		if json.Unmarshal([]byte(encoded), &decoded) != nil {
+			return ""
+		}
+		value = decoded
+	}
+	return firstString(mapValue(value), key)
 }
 
 func parseChat(item map[string]any) Chat {

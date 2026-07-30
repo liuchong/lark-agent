@@ -203,3 +203,92 @@ func TestResolverSuppressesOwnerAuthoredDelegatedTargetWithoutCallingModel(t *te
 		t.Fatalf("resolution=%+v model_calls=%d", resolution, len(model.inputs))
 	}
 }
+
+func TestResolverClassifiesContextualCodingHandoff(t *testing.T) {
+	base := time.Date(2026, 7, 30, 2, 42, 0, 0, time.UTC)
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_handoff",
+		"result":"unanswered",
+		"confidence":0.98,
+		"reason":"the owner has not handled the production sample-event handoff",
+		"task_summary":"investigate why production message editing returns 1408 SampleEventDisabled",
+		"task_class":"coding",
+		"classification_confidence":0.97,
+		"requires_progress":true
+	}`}
+	resolution, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_handoff", ChatID: "oc_rd", ChatType: "group",
+			SenderID: "ou_sender", Content: "@测试负责人 你看看吧，我电脑断线了",
+			Mentions: []domain.Mention{{OpenID: "ou_owner"}}, CreatedAt: base.Add(5 * time.Minute),
+		}),
+		Messages: []domain.NormalizedEvent{
+			{
+				MessageID: "om_question", ChatID: "oc_rd", ChatType: "group",
+				SenderID: "ou_a", Content: "示例事件的后台服务还没上线么",
+				CreatedAt: base,
+			},
+			{
+				MessageID: "om_image", ChatID: "oc_rd", ChatType: "group",
+				SenderID: "ou_b", Content: "[图片: 1408 SampleEventDisabled]",
+				CreatedAt: base.Add(4 * time.Minute),
+			},
+			{
+				MessageID: "om_handoff", ChatID: "oc_rd", ChatType: "group",
+				SenderID: "ou_sender", Content: "@测试负责人 你看看吧，我电脑断线了",
+				Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+				CreatedAt: base.Add(5 * time.Minute),
+			},
+			{
+				MessageID: "om_clarify", ChatID: "oc_rd", ChatType: "group",
+				SenderID: "ou_a", Content: "对，是 prod 环境没上线",
+				CreatedAt: base.Add(5*time.Minute + 20*time.Second),
+			},
+		},
+		ContextCutoff: base.Add(8 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.TaskSummary != "investigate why production message editing returns 1408 SampleEventDisabled" ||
+		resolution.TaskClass != domain.TaskClassCoding ||
+		resolution.ClassificationConfidence != 0.97 ||
+		!resolution.RequiresProgress {
+		t.Fatalf("resolution=%+v", resolution)
+	}
+	if len(model.inputs) != 1 {
+		t.Fatalf("model calls=%d", len(model.inputs))
+	}
+	prompt := model.inputs[0][1].Content
+	for _, want := range []string{
+		"示例事件的后台服务还没上线么",
+		"1408 SampleEventDisabled",
+		"我电脑断线了",
+		"prod 环境没上线",
+		"task_summary",
+		"task_class",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("semantic prompt missing %q: %s", want, prompt)
+		}
+	}
+}
+
+func TestResolverRejectsMissingContextualTaskClassification(t *testing.T) {
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_handoff",
+		"result":"unanswered",
+		"confidence":0.98,
+		"reason":"unanswered"
+	}`}
+	_, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_handoff", ChatID: "oc_rd", ChatType: "group",
+			SenderID: "ou_sender", Content: "@测试负责人 你看看吧",
+			Mentions: []domain.Mention{{OpenID: "ou_owner"}},
+		}),
+	})
+	if err == nil {
+		t.Fatal("resolver accepted an unanswered target without contextual task classification")
+	}
+}

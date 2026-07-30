@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,30 @@ import (
 
 type responseEvidence struct {
 	SuccessfulReads int
+	digests         map[string]struct{}
+}
+
+func (e *responseEvidence) RecordRelevantRead(digest string, nonEmpty bool) {
+	if e == nil || !nonEmpty {
+		return
+	}
+	digest = strings.TrimSpace(digest)
+	if digest == "" {
+		return
+	}
+	if e.digests == nil {
+		e.digests = make(map[string]struct{})
+	}
+	if _, exists := e.digests[digest]; exists {
+		return
+	}
+	e.digests[digest] = struct{}{}
+	e.SuccessfulReads++
+}
+
+func evidenceDigest(toolName, content string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(content)))
+	return fmt.Sprintf("%s:sha256:%x", strings.TrimSpace(toolName), sum[:])
 }
 
 func guardedRequestDecision(bundle agentcontext.Bundle) (domain.Decision, bool) {
@@ -126,7 +151,7 @@ func validateResponseQuality(bundle agentcontext.Bundle, decision domain.Decisio
 	if decision.Kind == domain.DecisionReply && containsFutureCommitment(decision.ReplyText) {
 		return qualityError("delegated automatic reply contains an unapproved future commitment")
 	}
-	if !requiresRelevantWork(bundle.Event.Content) {
+	if !bundleRequiresRelevantWork(bundle) {
 		return nil
 	}
 	if decision.Kind != domain.DecisionReply && decision.Kind != domain.DecisionNotify && decision.Kind != domain.DecisionRecord {
@@ -141,13 +166,27 @@ func validateResponseQuality(bundle agentcontext.Bundle, decision domain.Decisio
 	if isAcknowledgementOnly(decision.ReplyText) {
 		return qualityError("delegated reply is acknowledgement-only; state completed work and an initial finding or explicit unknown")
 	}
-	if highRestatementSimilarity(bundle.Event.Content, decision.ReplyText) && !containsCompletedWorkSignal(decision.ReplyText) {
+	requestText := strings.TrimSpace(bundle.TaskSummary)
+	if requestText == "" {
+		requestText = bundle.Event.Content
+	}
+	if highRestatementSimilarity(requestText, decision.ReplyText) && !containsCompletedWorkSignal(decision.ReplyText) {
 		return qualityError("delegated reply mostly restates the request without completed relevant work")
 	}
 	if !containsCompletedWorkSignal(decision.ReplyText) {
 		return qualityError("delegated reply must state completed relevant work and an initial finding or explicit unknown")
 	}
 	return nil
+}
+
+func bundleRequiresRelevantWork(bundle agentcontext.Bundle) bool {
+	if bundle.TaskClass == domain.TaskClassInvestigation ||
+		bundle.TaskClass == domain.TaskClassCoding ||
+		bundle.WorkKind == domain.WorkKindCodingQuestion {
+		return true
+	}
+	return requiresRelevantWork(bundle.TaskSummary) ||
+		requiresRelevantWork(bundle.Event.Content)
 }
 
 func isDelegatedInvocation(bundle agentcontext.Bundle) bool {
@@ -173,7 +212,8 @@ func containsFutureCommitment(reply string) bool {
 	lower := strings.ToLower(reply)
 	return containsAny(lower,
 		"我会", "我们会", "将会", "稍后", "后续会", "之后会", "忙完后", "尽快",
-		"马上安排", "对齐后同步", "确认后同步", "完成后同步", "will follow up",
+		"马上安排", "对齐后同步", "确认后同步", "完成后同步", "之后同步", "后续同步",
+		"稍后同步", "我来确认", "我来调查", "有结果再", "有结果会", "will follow up",
 		"will deliver", "will coordinate",
 	)
 }

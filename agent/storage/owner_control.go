@@ -97,6 +97,7 @@ func (s *Store) ListOwnerTasks(
 			LatestStep:         inspection.LatestStep,
 			LatestAction:       inspection.LatestAction,
 			LatestInterruption: inspection.LatestInterruption,
+			Investigation:      inspection.Investigation,
 		}
 		if found {
 			summary.Resolution = &resolution
