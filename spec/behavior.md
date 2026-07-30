@@ -1191,8 +1191,9 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given owner asks the same coding question in private chat and in a group
   mention inside the dedupe window, when both events are ingested, then only
   one canonical investigation runs and the duplicate item links to that result.
-- Given an assistant request asks to inspect source code or a production/code
-  entry point inside the configured Workspace and report evidence,
+- Given an assistant request asks to inspect source code, a production/code
+  entry point, an implementation file, a test file, or a related test inside
+  the configured Workspace and report evidence,
   when deterministic routing classifies the work, then it enters
   `coding_question` rather than `simple_question`, so code investigation tools
   and the evidence-backed conclusion flow are available.

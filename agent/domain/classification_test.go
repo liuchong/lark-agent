@@ -7,6 +7,7 @@ func TestIsCodingQuestionRecognizesSourceInvestigationLanguage(t *testing.T) {
 		"请检查 Workspace 内示例文件预览上传与审核相关的生产入口",
 		"请从源码确认缩略图审核流程",
 		"这个代码入口为什么每次都访问 SampleDB",
+		"请核对仓库里的一个相关测试或实现文件作为证据",
 	} {
 		if !IsCodingQuestion(content) {
 			t.Fatalf("content=%q was not classified as coding", content)
