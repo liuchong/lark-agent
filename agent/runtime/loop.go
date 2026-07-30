@@ -174,7 +174,18 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				))
 			}
 		}
-		compaction := compactMessages(messages, l.MaxContextBytes, l.ContextCompaction)
+		compaction := compactMessages(
+			messages,
+			contextMessageBudget(l.MaxContextBytes),
+			l.ContextCompaction,
+		)
+		if compaction.Overflow {
+			return domain.Decision{}, trajectory, errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"model context cannot preserve the latest complete tool protocol unit within %d bytes",
+				l.MaxContextBytes,
+			)
+		}
 		messages = compaction.Messages
 		requestMessages := append([]*schema.Message(nil), messages...)
 		budget := runBudget{
@@ -186,6 +197,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			ReplacedMessages: compaction.ReplacedMessages,
 			TargetLanguage:   resolvedBundleLanguage(bundle),
 		}
+		progressMessageIndex := len(requestMessages)
 		requestMessages = append(requestMessages, schema.SystemMessage(modelRunProgressPrompt(budget)))
 		if budget.RemainingTurns() == 0 {
 			forceDecision = true
@@ -213,6 +225,22 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			requestMessages = append(requestMessages, schema.SystemMessage(
 				terminalOnlyPrompt(terminalOnlyAttempts, maxTerminalOnlyAttempts),
 			))
+		}
+		for range 4 {
+			budget.ContextBytes = messageBytes(requestMessages)
+			progress := modelRunProgressPrompt(budget)
+			if requestMessages[progressMessageIndex].Content == progress {
+				break
+			}
+			requestMessages[progressMessageIndex] = schema.SystemMessage(progress)
+		}
+		if requestBytes := messageBytes(requestMessages); requestBytes > l.MaxContextBytes {
+			return domain.Decision{}, trajectory, errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"model request context is %d bytes and exceeds the configured %d-byte limit after compaction",
+				requestBytes,
+				l.MaxContextBytes,
+			)
 		}
 		assistant, err := l.Model.Generate(ctx, requestMessages,
 			einomodel.WithTools(turnToolInfos),
@@ -249,6 +277,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		trajectory = append(trajectory, assistant)
 		turnMadeProgress := false
 		turnHadNoProgress := false
+		postToolPrompts := make([]string, 0, 2)
 		for _, call := range assistant.ToolCalls {
 			if strings.TrimSpace(call.ID) == "" || strings.TrimSpace(call.Function.Name) == "" {
 				return domain.Decision{}, trajectory, errs.NewInternalError(errs.SubtypeInvalidResponse, "model tool call is missing id or name")
@@ -416,7 +445,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				continue
 			}
 			if !toolBudgetConvergencePrompted && shouldPromptToolBudgetConvergence(rawToolBytes, l.MaxToolBytes, totalToolBytes, l.MaxTotalBytes) {
-				messages = append(messages, schema.SystemMessage(toolBudgetConvergencePrompt()))
+				postToolPrompts = append(postToolPrompts, toolBudgetConvergencePrompt())
 				toolBudgetConvergencePrompted = true
 			}
 			for _, source := range execution.Sources {
@@ -434,7 +463,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					forceDecision = true
 				}
 				if !codingEvidenceConvergencePrompted {
-					messages = append(messages, schema.SystemMessage(codingEvidenceConvergencePrompt()))
+					postToolPrompts = append(postToolPrompts, codingEvidenceConvergencePrompt())
 					codingEvidenceConvergencePrompted = true
 				}
 			}
@@ -447,6 +476,9 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				}
 				return *execution.Decision, trajectory, nil
 			}
+		}
+		for _, prompt := range postToolPrompts {
+			messages = append(messages, schema.SystemMessage(prompt))
 		}
 		if turnMadeProgress {
 			noProgressStreak = 0
@@ -641,6 +673,15 @@ type compactionResult struct {
 	AfterBytes       int
 	Compacted        bool
 	ReplacedMessages int
+	Overflow         bool
+}
+
+func contextMessageBudget(maxBytes int) int {
+	if maxBytes <= 0 {
+		return maxBytes
+	}
+	reserve := min(2*1024, maxBytes/4)
+	return max(1, maxBytes-reserve)
 }
 
 func compactMessages(messages []*schema.Message, maxBytes int, ratio float64) compactionResult {
@@ -664,6 +705,7 @@ func compactMessages(messages []*schema.Message, maxBytes int, ratio float64) co
 	if protectedFrom < 2 {
 		protectedFrom = 2
 	}
+	protectedFrom = latestCompleteToolUnitStart(messages, protectedFrom)
 	compacted := make([]*schema.Message, 0, len(messages))
 	if len(messages) > 0 {
 		compacted = append(compacted, cloneMessageWithContentLimit(messages[0], maxBytes/8))
@@ -671,8 +713,13 @@ func compactMessages(messages []*schema.Message, maxBytes int, ratio float64) co
 	if len(messages) > 1 {
 		compacted = append(compacted, cloneMessageWithContentLimit(messages[1], maxBytes/3))
 	}
+	checkpointOverflow := false
 	if protectedFrom > 2 {
-		checkpoint := buildContextCheckpoint(messages[2:protectedFrom], maxBytes/4)
+		checkpoint, complete := buildContextCheckpoint(
+			messages[2:protectedFrom],
+			maxBytes/4,
+		)
+		checkpointOverflow = !complete
 		if checkpoint != "" {
 			compacted = append(compacted, schema.SystemMessage(checkpoint))
 		}
@@ -683,11 +730,9 @@ func compactMessages(messages []*schema.Message, maxBytes int, ratio float64) co
 	for messageBytes(compacted) > maxBytes {
 		changed := false
 		for i := 1; i < len(compacted) && messageBytes(compacted) > maxBytes; i++ {
-			if compacted[i] == nil || len(compacted[i].Content) <= 512 {
-				continue
-			}
-			compacted[i] = cloneMessageWithContentLimit(compacted[i], len(compacted[i].Content)*3/4)
-			changed = true
+			var messageChanged bool
+			compacted[i], messageChanged = shrinkMessageForContext(compacted[i])
+			changed = changed || messageChanged
 		}
 		if !changed {
 			break
@@ -697,7 +742,36 @@ func compactMessages(messages []*schema.Message, maxBytes int, ratio float64) co
 	result.AfterBytes = messageBytes(compacted)
 	result.Compacted = true
 	result.ReplacedMessages = max(0, protectedFrom-2)
+	result.Overflow = checkpointOverflow || result.AfterBytes > maxBytes
 	return result
+}
+
+func latestCompleteToolUnitStart(messages []*schema.Message, fallback int) int {
+	for index := len(messages) - 1; index >= 2; index-- {
+		message := messages[index]
+		if message == nil || message.Role != schema.Assistant {
+			continue
+		}
+		if len(message.ToolCalls) == 0 {
+			return fallback
+		}
+		pending := make(map[string]bool, len(message.ToolCalls))
+		for _, call := range message.ToolCalls {
+			if strings.TrimSpace(call.ID) != "" {
+				pending[call.ID] = true
+			}
+		}
+		for _, result := range messages[index+1:] {
+			if result != nil && result.Role == schema.Tool {
+				delete(pending, result.ToolCallID)
+			}
+		}
+		if len(pending) == 0 && index < fallback {
+			return index
+		}
+		return fallback
+	}
+	return fallback
 }
 
 func cloneMessageWithContentLimit(message *schema.Message, limit int) *schema.Message {
@@ -707,26 +781,95 @@ func cloneMessageWithContentLimit(message *schema.Message, limit int) *schema.Me
 	clone := *message
 	clone.Content = clipMiddle(clone.Content, limit)
 	clone.ReasoningContent = clipMiddle(clone.ReasoningContent, limit/2)
+	clone.ToolCalls = append([]schema.ToolCall(nil), message.ToolCalls...)
+	argumentLimit := max(128, limit/2)
+	for index := range clone.ToolCalls {
+		arguments := clone.ToolCalls[index].Function.Arguments
+		clone.ToolCalls[index].Function.Arguments = compactToolArguments(
+			arguments,
+			argumentLimit,
+		)
+	}
 	return &clone
 }
 
-func buildContextCheckpoint(messages []*schema.Message, maxBytes int) string {
+func compactToolArguments(arguments string, limit int) string {
+	if len(arguments) <= limit {
+		return arguments
+	}
+	compacted, _ := json.Marshal(map[string]any{
+		"bytes":     len(arguments),
+		"compacted": true,
+		"digest":    evidenceDigest("tool_arguments", arguments),
+	})
+	return string(compacted)
+}
+
+func shrinkMessageForContext(message *schema.Message) (*schema.Message, bool) {
+	if message == nil {
+		return nil, false
+	}
+	clone := *message
+	changed := false
+	if len(message.Content) > 64 {
+		clone.Content = clipMiddle(
+			message.Content,
+			max(64, len(message.Content)*3/4),
+		)
+		changed = changed || clone.Content != message.Content
+	}
+	if len(message.ReasoningContent) > 32 {
+		clone.ReasoningContent = clipMiddle(
+			message.ReasoningContent,
+			max(32, len(message.ReasoningContent)*3/4),
+		)
+		changed = changed || clone.ReasoningContent != message.ReasoningContent
+	}
+	clone.ToolCalls = append([]schema.ToolCall(nil), message.ToolCalls...)
+	for index := range clone.ToolCalls {
+		arguments := clone.ToolCalls[index].Function.Arguments
+		if len(arguments) <= 128 {
+			continue
+		}
+		clone.ToolCalls[index].Function.Arguments = compactToolArguments(arguments, 128)
+		changed = changed ||
+			clone.ToolCalls[index].Function.Arguments != arguments
+	}
+	if !changed {
+		return message, false
+	}
+	return &clone, true
+}
+
+func buildContextCheckpoint(messages []*schema.Message, maxBytes int) (string, bool) {
 	type entry struct {
-		Role      schema.RoleType `json:"role"`
-		Tool      string          `json:"tool,omitempty"`
-		Arguments string          `json:"arguments,omitempty"`
-		Evidence  json.RawMessage `json:"evidence,omitempty"`
-		Excerpt   string          `json:"excerpt,omitempty"`
+		Role       schema.RoleType `json:"role"`
+		ToolCallID string          `json:"tool_call_id,omitempty"`
+		Tool       string          `json:"tool,omitempty"`
+		Arguments  string          `json:"arguments,omitempty"`
+		Evidence   json.RawMessage `json:"evidence,omitempty"`
+		Excerpt    string          `json:"excerpt,omitempty"`
 	}
 	entries := make([]entry, 0, len(messages))
 	for _, message := range messages {
 		if message == nil {
 			continue
 		}
-		item := entry{Role: message.Role, Tool: message.ToolName}
 		if len(message.ToolCalls) > 0 {
-			item.Tool = message.ToolCalls[0].Function.Name
-			item.Arguments = clipMiddle(message.ToolCalls[0].Function.Arguments, 256)
+			for _, call := range message.ToolCalls {
+				entries = append(entries, entry{
+					Role:       message.Role,
+					ToolCallID: call.ID,
+					Tool:       call.Function.Name,
+					Arguments:  clipMiddle(call.Function.Arguments, 256),
+				})
+			}
+			continue
+		}
+		item := entry{
+			Role:       message.Role,
+			ToolCallID: message.ToolCallID,
+			Tool:       message.ToolName,
 		}
 		if message.Role == schema.Tool && json.Valid([]byte(message.Content)) {
 			var raw map[string]json.RawMessage
@@ -756,21 +899,26 @@ func buildContextCheckpoint(messages []*schema.Message, maxBytes int) string {
 		"entries":            entries,
 	})
 	if maxBytes <= 0 || len(data) <= maxBytes {
-		return string(data)
+		return string(data), true
 	}
-	target := maxBytes / 2
-	for target > 64 {
-		bounded, _ := json.Marshal(map[string]any{
-			"context_checkpoint": true,
-			"instruction":        "Compacted prior evidence; preserve receipts and explicit unknowns.",
-			"compacted_entries":  clipMiddle(string(data), target),
-		})
-		if len(bounded) <= maxBytes {
-			return string(bounded)
-		}
-		target = target * 3 / 4
+	minimalEntries := append([]entry(nil), entries...)
+	for index := range minimalEntries {
+		minimalEntries[index].Evidence = nil
+		minimalEntries[index].Excerpt = ""
+		minimalEntries[index].Arguments = compactToolArguments(
+			minimalEntries[index].Arguments,
+			128,
+		)
 	}
-	return `{"context_checkpoint":true,"instruction":"Prior evidence was compacted; do not restart broad investigation."}`
+	minimal, _ := json.Marshal(map[string]any{
+		"context_checkpoint": true,
+		"instruction":        "Compacted prior tool protocol; preserve call/result bindings.",
+		"entries":            minimalEntries,
+	})
+	if len(minimal) <= maxBytes {
+		return string(minimal), true
+	}
+	return string(minimal), false
 }
 
 func messageBytes(messages []*schema.Message) int {

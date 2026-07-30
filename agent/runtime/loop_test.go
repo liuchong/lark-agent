@@ -784,6 +784,237 @@ func TestCompactMessagesCreatesEvidenceCheckpointWithinBudget(t *testing.T) {
 	}
 }
 
+func TestCompactMessagesPreservesParallelToolProtocolUnit(t *testing.T) {
+	messages := []*schema.Message{
+		schema.SystemMessage("system"),
+		schema.UserMessage(strings.Repeat("请核对当前实现", 500)),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("list", "list_workspace", `{"path":"sample-project/sample-module"}`),
+			toolCall("search", "search_code_symbols", `{"query":"SampleRequest"}`),
+		}),
+		schema.ToolMessage(
+			strings.Repeat("bounded directory listing\n", 500),
+			"list",
+			schema.WithToolName("list_workspace"),
+		),
+		schema.ToolMessage(
+			`{"ok":false,"error":"exact repository scope requires path-bounded tools"}`,
+			"search",
+			schema.WithToolName("search_code_symbols"),
+		),
+	}
+
+	result := compactMessages(messages, 4*1024, 0.80)
+	if !result.Compacted {
+		t.Fatalf("result=%+v", result)
+	}
+	assertValidToolProtocol(t, result.Messages)
+	if !messageHasToolCalls(result.Messages, "list", "search") {
+		t.Fatalf("parallel assistant tool call was not preserved: %+v", result.Messages)
+	}
+}
+
+func TestCompactMessagesCheckpointPreservesEveryParallelCall(t *testing.T) {
+	messages := []*schema.Message{
+		schema.SystemMessage("system"),
+		schema.UserMessage(strings.Repeat("核对两个入口", 400)),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("first", "read_workspace", `{"path":"first.go"}`),
+			toolCall("second", "read_workspace", `{"path":"second.go"}`),
+		}),
+		schema.ToolMessage(
+			`{"ok":true,"content":"first evidence"}`,
+			"first",
+			schema.WithToolName("read_workspace"),
+		),
+		schema.ToolMessage(
+			`{"ok":true,"content":"second evidence"}`,
+			"second",
+			schema.WithToolName("read_workspace"),
+		),
+		schema.AssistantMessage("recent plain-text correction", nil),
+		schema.SystemMessage("plain assistant text is not accepted"),
+	}
+
+	result := compactMessages(messages, 2*1024, 0.80)
+	var checkpoint string
+	for _, message := range result.Messages {
+		if message != nil && strings.Contains(message.Content, "context_checkpoint") {
+			checkpoint = message.Content
+		}
+	}
+	for _, want := range []string{
+		`"tool_call_id":"first"`,
+		`"tool_call_id":"second"`,
+		`first.go`,
+		`second.go`,
+	} {
+		if !strings.Contains(checkpoint, want) {
+			t.Fatalf("checkpoint missing %q: %s", want, checkpoint)
+		}
+	}
+}
+
+func TestCompactMessagesBoundsOversizedToolArguments(t *testing.T) {
+	arguments := fmt.Sprintf(`{"path":"sample-project/sample-module","padding":%q}`, strings.Repeat("x", 12*1024))
+	messages := []*schema.Message{
+		schema.SystemMessage("system"),
+		schema.UserMessage("请核对当前实现"),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("large", "list_workspace", arguments),
+		}),
+		schema.ToolMessage("bounded result", "large", schema.WithToolName("list_workspace")),
+	}
+
+	result := compactMessages(messages, 2*1024, 0.80)
+	if got := messageBytes(result.Messages); got > 2*1024 {
+		t.Fatalf("compacted bytes=%d", got)
+	}
+	var compactedArguments string
+	for _, message := range result.Messages {
+		if message != nil && len(message.ToolCalls) == 1 {
+			compactedArguments = message.ToolCalls[0].Function.Arguments
+		}
+	}
+	if !json.Valid([]byte(compactedArguments)) ||
+		!strings.Contains(compactedArguments, `"compacted":true`) ||
+		!strings.Contains(compactedArguments, `"digest"`) {
+		t.Fatalf("compacted arguments=%q", compactedArguments)
+	}
+}
+
+func TestCompactMessagesBoundsAccumulatedModerateToolArguments(t *testing.T) {
+	calls := make([]schema.ToolCall, 0, 16)
+	messages := []*schema.Message{
+		schema.SystemMessage("system"),
+		schema.UserMessage(strings.Repeat("核对并行入口", 300)),
+	}
+	for index := range 16 {
+		callID := fmt.Sprintf("moderate-%d", index)
+		arguments := fmt.Sprintf(
+			`{"path":"entry-%d.go","padding":%q}`,
+			index,
+			strings.Repeat("x", 240),
+		)
+		calls = append(calls, toolCall(callID, "read_workspace", arguments))
+	}
+	messages = append(messages, schema.AssistantMessage("", calls))
+	for index := range 16 {
+		callID := fmt.Sprintf("moderate-%d", index)
+		messages = append(messages, schema.ToolMessage(
+			"ok",
+			callID,
+			schema.WithToolName("read_workspace"),
+		))
+	}
+
+	result := compactMessages(messages, 4*1024, 0.80)
+	if result.Overflow || messageBytes(result.Messages) > 4*1024 {
+		t.Fatalf("result=%+v bytes=%d", result, messageBytes(result.Messages))
+	}
+	assertValidToolProtocol(t, result.Messages)
+	for _, message := range result.Messages {
+		if message == nil || message.Role != schema.Assistant {
+			continue
+		}
+		for _, call := range message.ToolCalls {
+			if len(call.Function.Arguments) > 160 ||
+				!json.Valid([]byte(call.Function.Arguments)) {
+				t.Fatalf("call %q arguments were not bounded: %q", call.ID, call.Function.Arguments)
+			}
+		}
+	}
+}
+
+func TestCompactMessagesRejectsCheckpointThatCannotPreserveBindings(t *testing.T) {
+	calls := make([]schema.ToolCall, 0, 12)
+	messages := []*schema.Message{
+		schema.SystemMessage("system"),
+		schema.UserMessage(strings.Repeat("核对旧并行调用", 800)),
+	}
+	for index := range 12 {
+		callID := fmt.Sprintf("%s-%d", strings.Repeat("binding", 20), index)
+		calls = append(calls, toolCall(
+			callID,
+			"read_workspace",
+			fmt.Sprintf(`{"path":"entry-%d.go"}`, index),
+		))
+	}
+	messages = append(messages, schema.AssistantMessage("", calls))
+	for _, call := range calls {
+		messages = append(messages, schema.ToolMessage(
+			"ok",
+			call.ID,
+			schema.WithToolName(call.Function.Name),
+		))
+	}
+	messages = append(
+		messages,
+		schema.AssistantMessage("recent correction", nil),
+		schema.SystemMessage("submit a structured decision"),
+	)
+
+	result := compactMessages(messages, 4*1024, 0.80)
+	if !result.Overflow {
+		t.Fatalf("checkpoint silently discarded bindings: %+v", result)
+	}
+}
+
+func assertValidToolProtocol(t *testing.T, messages []*schema.Message) {
+	t.Helper()
+	pending := map[string]bool{}
+	for index, message := range messages {
+		if message == nil {
+			continue
+		}
+		switch message.Role {
+		case schema.Assistant:
+			if len(pending) != 0 {
+				t.Fatalf("assistant message %d arrived before tool results completed: %+v", index, pending)
+			}
+			for _, call := range message.ToolCalls {
+				pending[call.ID] = true
+			}
+		case schema.Tool:
+			if !pending[message.ToolCallID] {
+				t.Fatalf("tool result %q at %d has no pending assistant call", message.ToolCallID, index)
+			}
+			delete(pending, message.ToolCallID)
+		default:
+			if len(pending) != 0 {
+				t.Fatalf("message role %q at %d interrupted tool results: %+v", message.Role, index, pending)
+			}
+		}
+	}
+	if len(pending) != 0 {
+		t.Fatalf("missing tool results for calls: %+v", pending)
+	}
+}
+
+func messageHasToolCalls(messages []*schema.Message, ids ...string) bool {
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	for _, message := range messages {
+		if message == nil || message.Role != schema.Assistant {
+			continue
+		}
+		found := make(map[string]bool, len(message.ToolCalls))
+		for _, call := range message.ToolCalls {
+			found[call.ID] = true
+		}
+		all := true
+		for id := range want {
+			all = all && found[id]
+		}
+		if all {
+			return true
+		}
+	}
+	return false
+}
+
 func TestMultimodalPayloadCountsTowardBudgetAndExpiresAfterFirstTurn(
 	t *testing.T,
 ) {

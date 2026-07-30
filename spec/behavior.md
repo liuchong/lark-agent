@@ -588,7 +588,17 @@ converge. The checkpoint preserves the original task, permissions, verified
 source references, external-action receipts, explicit unknowns, and newest
 messages. It must not discard the whole work item solely because a bounded
 investigation produced too much raw output or restart broad investigation after
-compaction. Repeated Lark-context reads that return no new target-message
+compaction. One assistant turn with multiple tool calls and all corresponding
+tool-result messages is one protocol unit: compaction may bound result content
+and replace oversized historical arguments with valid JSON carrying their byte
+count and digest, or replace the whole older unit with a checkpoint, but it
+must never retain orphaned tool results, omit their assistant tool-call message,
+or insert a system progress prompt between sibling tool results. An older
+parallel unit's checkpoint preserves every call ID, tool name, bounded
+arguments, and matching result ID. The final provider request, including
+runtime progress and terminal prompts, must stay within the configured context
+limit; an irreducible protocol unit fails locally instead of being sent as an
+oversized request. Repeated Lark-context reads that return no new target-message
 context are treated as no-progress tool calls and force convergence.
 
 Multimodal text and encoded image input count toward model-visible request
@@ -1342,6 +1352,22 @@ The multi-step loop is accepted by these executable BDD scenarios:
   useful evidence already exists, then the runtime summarizes stale evidence and
   forces convergence instead of failing the whole work item only because raw
   output exceeded a bound.
+- Given one model turn requests multiple read-only tools and their combined
+  results trigger context compaction, when the next model request is built,
+  then the assistant tool-call message and every matching tool-result message
+  remain in one uninterrupted protocol unit, with any convergence prompt placed
+  after the final sibling result; the provider receives no orphaned or missing
+  tool-call identifiers.
+- Given an older parallel tool unit is replaced by a structured checkpoint,
+  when the checkpoint is built, then each sibling call and result keeps its
+  call ID, tool name, and bounded arguments so same-tool calls remain
+  distinguishable.
+- Given the latest complete tool unit has oversized arguments or many bounded
+  results, when compaction builds the next provider request, then historical
+  arguments become valid digest-bearing JSON and result text is reduced until
+  the whole request including runtime prompts fits the configured context
+  limit; if protocol identifiers alone cannot fit, the runtime fails locally
+  and does not send an oversized request.
 - Given a coding question names an exact function and a digest-backed read
   establishes every concrete field requested by the user, when the next model
   turn starts, then the model is told to submit the decision without expanding
