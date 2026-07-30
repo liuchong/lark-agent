@@ -707,6 +707,10 @@ last durable fact or failure, why owner attention is required, and an exact
 currently valid next command. `/task <work-id>` includes the latest durable
 stage and external-action uncertainty while excluding model chain-of-thought,
 credentials, raw Lark events, open IDs, and unrestricted absolute paths.
+Lark mention placeholders in task content are never copied into reply text.
+Known mentions render as `@<display-name>`; unknown placeholders render as a
+localized generic person label so the durable reply layer never rejects the
+control response as an unmapped mention.
 Completed, ignored, cancelled, and owner-acknowledged items do not appear in the
 default actionable view.
 An owner resolution closes only the work-state version that existed when the
@@ -1449,6 +1453,10 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given a resolved terminal task is explicitly resumed, when that newer work
   epoch later becomes interrupted or terminal again, then the previous
   resolution remains audit history and `/tasks` shows the task as actionable.
+- Given an actionable task contains an internal Lark mention placeholder, when
+  `/tasks` or `/task <id>` renders it, then known mentions use the stored display
+  name, unknown mentions use a localized generic label, and no `@_user_`
+  placeholder reaches the reply action.
 - Given an operator has audited interrupted historical work, when
   `queue cancel --all-interrupted` includes explicit kept work IDs and a
   non-empty reason, then every other safe interrupted item becomes cancelled,

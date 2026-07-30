@@ -37,7 +37,11 @@ func TestOwnerPrivateControlCommandsCompleteWithoutModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := old.EnqueueEvent(domain.NormalizedEvent{
-		MessageID: "om_old_target", Content: "历史中断任务",
+		MessageID: "om_old_target",
+		Content:   "@_user_1 历史中断任务",
+		Mentions: []domain.Mention{{
+			Key: "@_user_1", Name: "测试负责人",
+		}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -136,15 +140,29 @@ func TestOwnerPrivateControlCommandsCompleteWithoutModel(t *testing.T) {
 		SenderID:      "ou_owner",
 		Content:       "/tasks",
 	})
-	if len(recorder.texts) != 5 {
+	process(domain.NormalizedEvent{
+		MessageID:     "om_task_detail_after_new_failure",
+		ChatID:        "oc_private",
+		ChatType:      "p2p",
+		ChatPartnerID: "ou_bot",
+		SenderID:      "ou_owner",
+		Content:       "/task " + int64Text(target.ID),
+	})
+	if len(recorder.texts) != 6 {
 		t.Fatalf("texts=%+v", recorder.texts)
 	}
 	if !strings.Contains(recorder.texts[0], "/tasks") ||
 		!strings.Contains(recorder.texts[1], "已确认") ||
 		!strings.Contains(recorder.texts[2], "当前没有需要你处理") ||
 		!strings.Contains(recorder.texts[3], "已恢复") ||
-		!strings.Contains(recorder.texts[4], "#"+int64Text(target.ID)) {
+		!strings.Contains(recorder.texts[4], "#"+int64Text(target.ID)) ||
+		!strings.Contains(recorder.texts[4], "@测试负责人 历史中断任务") ||
+		strings.Contains(recorder.texts[4], "@_user_") {
 		t.Fatalf("texts=%+v", recorder.texts)
+	}
+	if !strings.Contains(recorder.texts[5], "@测试负责人 历史中断任务") ||
+		strings.Contains(recorder.texts[5], "@_user_") {
+		t.Fatalf("task detail=%q", recorder.texts[5])
 	}
 }
 

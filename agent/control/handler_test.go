@@ -32,3 +32,34 @@ func TestEnglishHelpAndTaskCommandsContainNoChineseExplanation(t *testing.T) {
 		t.Fatalf("english commands contain Chinese: %q", commands)
 	}
 }
+
+func TestSanitizeEventTextMapsLarkMentionPlaceholders(t *testing.T) {
+	event := domain.NormalizedEvent{
+		Content: "@_user_1 看看这个问题，顺便问 @_user_2",
+		Mentions: []domain.Mention{{
+			Key: "@_user_1", Name: "测试负责人",
+		}},
+	}
+	got := sanitizeEventText(event, 160, false)
+	if got != "@测试负责人 看看这个问题，顺便问 @某人" {
+		t.Fatalf("text=%q", got)
+	}
+	if strings.Contains(got, "@_user_") {
+		t.Fatalf("unmapped mention remained: %q", got)
+	}
+	got = sanitizeEventText(domain.NormalizedEvent{
+		Content: "ask @_user_9 to check",
+	}, 160, true)
+	if got != "ask @someone to check" {
+		t.Fatalf("english text=%q", got)
+	}
+	got = sanitizeEventText(domain.NormalizedEvent{
+		Content: "@_user_10 请检查",
+		Mentions: []domain.Mention{{
+			Key: "@_user_1", Name: "测试负责人",
+		}},
+	}, 160, false)
+	if got != "@某人 请检查" {
+		t.Fatalf("prefix-collision text=%q", got)
+	}
+}

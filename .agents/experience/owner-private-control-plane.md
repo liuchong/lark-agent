@@ -20,6 +20,11 @@ Keep the following boundaries aligned:
 - lifecycle notices omit zero categories and point nonzero work to `/tasks`;
 - configured Owner language wins; otherwise use the resolved Owner language,
   with one explanatory language per message.
+- task content must resolve Lark's internal `@_user_N` placeholders at the
+  control rendering boundary: use stored display names for known mentions and
+  a localized generic person label for unknown mentions. Never pass raw
+  placeholders into durable reply validation, because the reply will be
+  rejected instead of reaching the Owner.
 
 When extending commands, update `spec/behavior.md`, `control.HelpText`, Cobra
 help, `docs/operations.md`, parser/storage/app integration tests, and the live

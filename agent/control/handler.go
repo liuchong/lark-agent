@@ -17,6 +17,8 @@ var absolutePathPattern = regexp.MustCompile(
 	`(?:/Users|/private|/var|/tmp)/[^\s，。；！？,;!?]+|~/[^\s，。；！？,;!?]+`,
 )
 
+var larkMentionPlaceholderPattern = regexp.MustCompile(`@_user_\d+`)
+
 type Store interface {
 	QueueSummary() (domain.QueueSummary, error)
 	CurrentSession() domain.OnlineSession
@@ -214,7 +216,7 @@ func (h *Handler) tasksText(ctx context.Context, query domain.OwnerTaskQuery) (s
 
 func (h *Handler) taskSummaryText(task domain.OwnerTaskSummary) string {
 	id := task.WorkItem.ID
-	subject := sanitizeText(task.WorkItem.Event.Content, 72, h.english())
+	subject := sanitizeEventText(task.WorkItem.Event, 72, h.english())
 	state := ownerTaskStateText(task, h.ownerName())
 	next := ownerTaskCommands(task, h.english())
 	if h.english() {
@@ -265,7 +267,7 @@ func (h *Handler) taskText(ctx context.Context, workItemID int64) (string, error
 		text := fmt.Sprintf(
 			"Task #%d\nSubject: %s\nStatus: %s",
 			workItemID,
-			sanitizeText(task.WorkItem.Event.Content, 160, true),
+			sanitizeEventText(task.WorkItem.Event, 160, true),
 			state.en,
 		)
 		if state.fact != "" {
@@ -281,7 +283,7 @@ func (h *Handler) taskText(ctx context.Context, workItemID int64) (string, error
 	text := fmt.Sprintf(
 		"任务 #%d\n内容：%s\n状态：%s",
 		workItemID,
-		sanitizeText(task.WorkItem.Event.Content, 160, false),
+		sanitizeEventText(task.WorkItem.Event, 160, false),
 		state.zh,
 	)
 	if state.fact != "" {
@@ -660,8 +662,10 @@ func sanitizeText(raw string, limit int, english bool) string {
 	text := strings.Join(strings.Fields(strings.TrimSpace(raw)), " ")
 	if english {
 		text = absolutePathPattern.ReplaceAllString(text, "[path hidden]")
+		text = larkMentionPlaceholderPattern.ReplaceAllString(text, "@someone")
 	} else {
 		text = absolutePathPattern.ReplaceAllString(text, "[路径已隐藏]")
+		text = larkMentionPlaceholderPattern.ReplaceAllString(text, "@某人")
 	}
 	if text == "" {
 		if english {
@@ -675,6 +679,35 @@ func sanitizeText(raw string, limit int, english bool) string {
 		text = string(runes[:limit]) + "…"
 	}
 	return text
+}
+
+func sanitizeEventText(event domain.NormalizedEvent, limit int, english bool) string {
+	fallback := "某人"
+	if english {
+		fallback = "someone"
+	}
+	names := make(map[string]string, len(event.Mentions))
+	for _, mention := range event.Mentions {
+		key := strings.TrimSpace(mention.Key)
+		if key == "" {
+			continue
+		}
+		name := strings.Join(strings.Fields(strings.TrimSpace(mention.Name)), " ")
+		if name == "" {
+			name = fallback
+		}
+		names[key] = name
+	}
+	text := larkMentionPlaceholderPattern.ReplaceAllStringFunc(
+		event.Content,
+		func(key string) string {
+			if name, ok := names[key]; ok {
+				return "@" + name
+			}
+			return "@" + fallback
+		},
+	)
+	return sanitizeText(text, limit, english)
 }
 
 func safeActionDetail(raw string, english bool) string {
