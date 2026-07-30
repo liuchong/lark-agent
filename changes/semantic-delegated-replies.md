@@ -211,7 +211,7 @@ when the insufficient-evidence decision is normalized,
 then the runtime renders a receipt-backed not-found summary with the actual
 queries, scan counts, and truncation states,
 and never claims global nonexistence or preserves unrelated model inference;
-missing, null, wrongly typed, or negative scan metadata and more than four
+missing, null, wrongly typed, or negative scan metadata and more than sixteen
 receipts, including repeats, fall back to the fixed conservative template
 instead of inventing or hiding evidence; a bare optional code-index miss
 without a bounded scan receipt follows the same rule.

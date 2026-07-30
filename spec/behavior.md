@@ -547,7 +547,7 @@ count, and truncation state. A report is parseable for this purpose only when
 all four fields are explicit and well typed; null or negative scan metadata is
 invalid. It must not claim global
 nonexistence. Any positive match, unparseable report, or receipt set larger
-than the four-query display bound falls back to the conservative template
+than the sixteen-query display bound falls back to the conservative template
 instead of inventing metadata or silently hiding evidence. A bare optional
 code-index miss without a bounded workspace scan receipt also falls back.
 
@@ -1317,7 +1317,10 @@ The multi-step loop is accepted by these executable BDD scenarios:
   cannot be parsed, when an insufficient-evidence reply is normalized, then
   the runtime discards the model prose and keeps the fixed conservative
   evidence-limited template.
-- Given more than four zero-match search receipts are collected, including
+- Given up to sixteen zero-match search receipts are collected, when an
+  insufficient-evidence reply is normalized, then the runtime lists the full
+  deduplicated receipt set rather than discarding useful bounded evidence.
+- Given more than sixteen zero-match search receipts are collected, including
   repeated queries, when
   an insufficient-evidence reply is normalized, then the runtime keeps the
   fixed conservative template instead of hiding undisplayed receipts.

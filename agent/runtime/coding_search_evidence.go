@@ -32,7 +32,7 @@ type codingSearchReport struct {
 	DirectoriesScanned int               `json:"directories_scanned"`
 }
 
-const maxRenderedCodingSearchObservations = 4
+const maxRenderedCodingSearchObservations = 16
 
 func (e *codingSearchEvidence) Record(toolName, inputJSON, outputJSON string) {
 	switch toolName {

@@ -386,9 +386,17 @@ func TestFalsePremiseRecoversFromParallelPolicyErrorsAndMalformedPlan(t *testing
 		}),
 		schema.AssistantMessage("", []schema.ToolCall{
 			codingEvalToolCall("search", "search_workspace", `{
-				"query":"ThisFunctionDefinitelyDoesNotExist20260730",
-				"path":"Sample-Module"
-			}`),
+					"query":"ThisFunctionDefinitelyDoesNotExist20260730",
+					"path":"Sample-Module"
+				}`),
+			codingEvalToolCall("explore", "explore_workspace", `{
+					"focus":"Sample-Module exact symbol",
+					"queries":[
+						"ThisFunctionDefinitelyDoesNotExist20260730",
+						"func ThisFunctionDefinitelyDoesNotExist20260730",
+						"DefinitelyDoesNotExist20260730"
+					]
+				}`),
 		}),
 		schema.AssistantMessage("", []schema.ToolCall{
 			codingEvalToolCall("submit", "submit_decision", `{
@@ -403,6 +411,7 @@ func TestFalsePremiseRecoversFromParallelPolicyErrorsAndMalformedPlan(t *testing
 		}),
 	}}
 	searchCalls := 0
+	exploreCalls := 0
 	registry, err := agenttools.NewRegistry(
 		agenttools.Definition{
 			Info: &schema.ToolInfo{Name: "search_code_symbols"},
@@ -439,6 +448,37 @@ func TestFalsePremiseRecoversFromParallelPolicyErrorsAndMalformedPlan(t *testing
 				}`}, nil
 			},
 		},
+		agenttools.Definition{
+			Info: &schema.ToolInfo{Name: "explore_workspace"},
+			Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+				exploreCalls++
+				return agenttools.Execution{Content: `{
+					"queries":[
+						{
+							"query":"ThisFunctionDefinitelyDoesNotExist20260730",
+							"results":[],
+							"truncated":true,
+							"files_scanned":1200,
+							"directories_scanned":239
+						},
+						{
+							"query":"func ThisFunctionDefinitelyDoesNotExist20260730",
+							"results":[],
+							"truncated":true,
+							"files_scanned":1200,
+							"directories_scanned":239
+						},
+						{
+							"query":"DefinitelyDoesNotExist20260730",
+							"results":[],
+							"truncated":true,
+							"files_scanned":1200,
+							"directories_scanned":239
+						}
+					]
+				}`}, nil
+			},
+		},
 		agentruntime.SubmitInvestigationPlanDefinition(),
 		agentruntime.SubmitDecisionDefinition(),
 	)
@@ -464,13 +504,23 @@ func TestFalsePremiseRecoversFromParallelPolicyErrorsAndMalformedPlan(t *testing
 	if err != nil {
 		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
 	}
-	if decision.Kind != domain.DecisionReply || model.calls != 6 || searchCalls != 1 {
-		t.Fatalf("decision=%+v model_calls=%d search_calls=%d", decision, model.calls, searchCalls)
+	if decision.Kind != domain.DecisionReply ||
+		model.calls != 6 ||
+		searchCalls != 1 ||
+		exploreCalls != 1 {
+		t.Fatalf(
+			"decision=%+v model_calls=%d search_calls=%d explore_calls=%d",
+			decision,
+			model.calls,
+			searchCalls,
+			exploreCalls,
+		)
 	}
 	for _, want := range []string{
 		"在本次有界检查范围内没有找到匹配项",
 		"ThisFunctionDefinitelyDoesNotExist20260730",
 		"扫描了 124 个文件",
+		"扫描了 1200 个文件",
 		"扫描完整",
 	} {
 		if !strings.Contains(decision.ReplyText, want) {

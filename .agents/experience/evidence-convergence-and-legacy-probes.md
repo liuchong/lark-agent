@@ -23,9 +23,10 @@ Two live failures established reusable implementation rules.
   insufficient-evidence reply. State the actual query, scan counts, and
   truncation status only when every required receipt field is explicit,
   correctly typed, non-null, and non-negative where numeric. If the receipt set
-  is too large to display completely, count repeated receipts too and fall back
-  instead of silently truncating it. Never turn a bounded zero result into a
-  global nonexistence claim.
+  exceeds the documented display bound, count repeated receipts too and fall
+  back instead of silently truncating it. Set that bound from observed normal
+  investigation shapes, not an arbitrary number that discards otherwise useful
+  evidence. Never turn a bounded zero result into a global nonexistence claim.
 - A canonical insufficient reply is not a substitute for investigation. Require
   at least one successful workspace/code evidence tool before accepting it;
   Lark-history reads alone do not count.

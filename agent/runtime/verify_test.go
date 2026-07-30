@@ -219,7 +219,7 @@ func TestNormalizeCodingDecisionDoesNotInventMissingSearchMetadata(t *testing.T)
 	}
 }
 
-func TestNormalizeCodingDecisionDoesNotHideExcessSearchReceipts(t *testing.T) {
+func TestNormalizeCodingDecisionRendersFiveCompleteSearchReceipts(t *testing.T) {
 	searches := codingSearchEvidence{}
 	for _, query := range []string{"one", "two", "three", "four", "five"} {
 		searches.Record(
@@ -235,7 +235,8 @@ func TestNormalizeCodingDecisionDoesNotHideExcessSearchReceipts(t *testing.T) {
 		EvidenceStatus: domain.EvidenceInsufficient,
 		ReplyText:      "没有找到 NormalizeContentType。",
 	}, searches)
-	if decision.ReplyText != canonicalInsufficientCodingReply {
+	if decision.ReplyText == canonicalInsufficientCodingReply ||
+		!strings.Contains(decision.ReplyText, "查询“five”") {
 		t.Fatalf("reply=%q", decision.ReplyText)
 	}
 }
@@ -261,7 +262,7 @@ func TestNormalizeCodingDecisionDoesNotTreatBareCodeIndexMissAsBoundedScan(t *te
 
 func TestNormalizeCodingDecisionCountsDuplicateSearchReceiptsAgainstDisplayBound(t *testing.T) {
 	searches := codingSearchEvidence{}
-	for range 5 {
+	for range 17 {
 		searches.Record(
 			"search_workspace",
 			`{"query":"NormalizeContentType"}`,
