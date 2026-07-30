@@ -986,6 +986,373 @@ var unrelatedPayload = {"other":"value"}`,
 	}
 }
 
+func TestAgentLoopRecoversStructuralEvidenceBeforeEarlyInsufficientDecision(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{
+			"question":"确认 sampleContent 字符串的 JSON 具体格式",
+			"entry_points":["request.go"],
+			"symbols":["sampleContent"],
+			"tools":["read_workspace","search_workspace"],
+			"stop_conditions":["读到字段声明和具体 JSON 示例"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("read-request", "read_workspace", `{"path":"request.go"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("early-insufficient", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"insufficient",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"当前证据不足。",
+			"reason":"stop before bounded structural recovery"
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("search-structure", "search_workspace", `{"query":"sampleContent"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("read-guide", "read_workspace", `{"path":"docs/guide.md"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"结论：sampleContent 是字符串形式的 JSON，具体为 {\"content\":\"sample value\"}。依据：request.go 的字段声明和 docs/guide.md 的当前示例。未知/下一步：没有。",
+			"reason":"bounded structural recovery found and read the exact field example",
+			"source_refs":[
+				{"relative_path":"request.go","digest":"sha256:request","kind":"workspace_file"},
+				{"relative_path":"docs/guide.md","digest":"sha256:guide","kind":"workspace_file"}
+			]
+		}`)}),
+	}}
+	registry, err := agenttools.NewRegistry(
+		testTool("read_workspace", func(_ context.Context, arguments json.RawMessage) (agenttools.Execution, error) {
+			var input struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal(arguments, &input); err != nil {
+				return agenttools.Execution{}, err
+			}
+			switch input.Path {
+			case "request.go":
+				return agenttools.Execution{
+					Content: `type SampleRequest struct { sampleContent string }`,
+					Sources: []domain.SourceRef{{
+						RelativePath: "request.go",
+						Digest:       "sha256:request",
+						Kind:         "workspace_file",
+					}},
+				}, nil
+			case "docs/guide.md":
+				return agenttools.Execution{
+					Content: `sampleContent example: {"content":"sample value"}`,
+					Sources: []domain.SourceRef{{
+						RelativePath: "docs/guide.md",
+						Digest:       "sha256:guide",
+						Kind:         "workspace_file",
+					}},
+				}, nil
+			default:
+				return agenttools.Execution{}, fmt.Errorf("unexpected path %q", input.Path)
+			}
+		}),
+		testTool("search_workspace", func(_ context.Context, arguments json.RawMessage) (agenttools.Execution, error) {
+			var input struct {
+				Query string `json:"query"`
+			}
+			if err := json.Unmarshal(arguments, &input); err != nil {
+				return agenttools.Execution{}, err
+			}
+			if input.Query != "sampleContent" {
+				return agenttools.Execution{}, fmt.Errorf("unexpected query %q", input.Query)
+			}
+			return agenttools.Execution{Content: `{
+				"results":[
+					{
+						"source":{"relative_path":"request.go","digest":"sha256:request","kind":"workspace_search"},
+						"snippet":"private String sampleContent;"
+					},
+					{
+						"source":{"relative_path":"docs/guide.md","digest":"sha256:guide-search","kind":"workspace_search"},
+						"snippet":"sampleContent example: {\"content\":\"sample value\"}"
+					},
+					{
+						"source":{"relative_path":"docs/unrelated.md","digest":"sha256:unrelated","kind":"workspace_search"},
+						"snippet":"otherPayload example: {\"wrong\":true}"
+					}
+				],
+				"truncated":false,
+				"files_scanned":12,
+				"directories_scanned":3
+			}`}, nil
+		}),
+		SubmitInvestigationPlanDefinition(),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, trajectory, err := (AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 7,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_structural_early_recovery",
+			Content:   "sampleContent 字符串的 JSON 具体格式是什么？",
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
+	}
+	if decision.Kind != domain.DecisionReply || model.calls != 6 {
+		t.Fatalf("decision=%+v modelCalls=%d", decision, model.calls)
+	}
+	if got := strings.Join(model.toolNames[2], ","); got != "search_workspace" {
+		t.Fatalf("structural search tools=%q want=search_workspace", got)
+	}
+	if got := strings.Join(model.toolNames[3], ","); got != "search_workspace" {
+		t.Fatalf("structural retry tools=%q want=search_workspace", got)
+	}
+	if got := strings.Join(model.toolNames[4], ","); got != "read_workspace" {
+		t.Fatalf("structural read tools=%q want=read_workspace", got)
+	}
+	if !messagesContain(model.inputs[2], "exact field-name search") {
+		t.Fatalf("structural search prompt missing: %+v", model.inputs[2])
+	}
+	if !trajectoryContains(trajectory, "tool submit_decision is not available") {
+		t.Fatalf("early insufficient decision was not rejected: %+v", trajectory)
+	}
+	readPrompt := model.inputs[4][len(model.inputs[4])-1].Content
+	if !strings.Contains(readPrompt, "docs/guide.md") ||
+		strings.Contains(readPrompt, "docs/unrelated.md") {
+		t.Fatalf("structural read candidates are not filtered: %s", readPrompt)
+	}
+}
+
+func TestAgentLoopStructuralRecoveryDoesNotRequireEarlierPlan(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("read-request", "read_workspace", `{"path":"request.go"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("search-structure", "search_workspace", `{"query":"sampleContent"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("read-guide", "read_workspace", `{"path":"docs/guide.md"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"结论：sampleContent 是字符串形式的 JSON，具体为 {\"content\":\"sample value\"}。依据：request.go 的字段声明和 docs/guide.md 的当前示例。未知/下一步：没有。",
+			"reason":"runtime-selected structural recovery completed without a prior broad-search plan",
+			"source_refs":[
+				{"relative_path":"request.go","digest":"sha256:request","kind":"workspace_file"},
+				{"relative_path":"docs/guide.md","digest":"sha256:guide","kind":"workspace_file"}
+			]
+		}`)}),
+	}}
+	registry, err := agenttools.NewRegistry(
+		testTool("read_workspace", func(_ context.Context, arguments json.RawMessage) (agenttools.Execution, error) {
+			var input struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal(arguments, &input); err != nil {
+				return agenttools.Execution{}, err
+			}
+			switch input.Path {
+			case "request.go":
+				return agenttools.Execution{
+					Content: "type SampleRequest struct { sampleContent string }",
+					Sources: []domain.SourceRef{{
+						RelativePath: "request.go",
+						Digest:       "sha256:request",
+						Kind:         "workspace_file",
+					}},
+				}, nil
+			case "docs/guide.md":
+				return agenttools.Execution{
+					Content: `sampleContent example: {"content":"sample value"}`,
+					Sources: []domain.SourceRef{{
+						RelativePath: "docs/guide.md",
+						Digest:       "sha256:guide",
+						Kind:         "workspace_file",
+					}},
+				}, nil
+			default:
+				return agenttools.Execution{}, fmt.Errorf("unexpected path %q", input.Path)
+			}
+		}),
+		testTool("search_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			return agenttools.Execution{Content: `{"results":[{
+				"source":{"relative_path":"docs/guide.md","digest":"sha256:guide-search","kind":"workspace_search"},
+				"snippet":"sampleContent example: {\"content\":\"sample value\"}"
+			}]}`}, nil
+		}),
+		SubmitInvestigationPlanDefinition(),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, trajectory, err := (AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 5,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_structural_without_plan",
+			Content:   "sampleContent 字符串的 JSON 具体格式是什么？",
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
+	}
+	if decision.Kind != domain.DecisionReply {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if trajectoryContains(trajectory, "requires submit_investigation_plan") {
+		t.Fatalf("runtime-selected recovery was blocked by plan gate: %+v", trajectory)
+	}
+}
+
+func TestAgentLoopStructuralRecoveryBypassesGenericSourceLessSearchLimit(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{
+			"question":"确认 sampleContent 字符串的 JSON 具体格式",
+			"entry_points":["request.go"],
+			"symbols":["sampleContent"],
+			"tools":["read_workspace","search_workspace"],
+			"stop_conditions":["读到字段声明和具体 JSON 示例"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("missing-1", "search_workspace", `{"query":"missingOne"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("read-1", "read_workspace", `{"path":"one.go"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("missing-2", "search_workspace", `{"query":"missingTwo"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("read-2", "read_workspace", `{"path":"two.go"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("missing-3", "search_workspace", `{"query":"missingThree"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("read-request", "read_workspace", `{"path":"request.go"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("search-structure", "search_workspace", `{"query":"sampleContent"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("read-guide", "read_workspace", `{"path":"docs/guide.md"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"结论：sampleContent 是字符串形式的 JSON，具体为 {\"content\":\"sample value\"}。依据：request.go 的字段声明和 docs/guide.md 的当前示例。未知/下一步：没有。",
+			"reason":"dedicated structural recovery remained available",
+			"source_refs":[
+				{"relative_path":"request.go","digest":"sha256:request","kind":"workspace_file"},
+				{"relative_path":"docs/guide.md","digest":"sha256:guide","kind":"workspace_file"}
+			]
+		}`)}),
+	}}
+	searchCalls := 0
+	registry, err := agenttools.NewRegistry(
+		testTool("search_workspace", func(_ context.Context, arguments json.RawMessage) (agenttools.Execution, error) {
+			var input struct {
+				Query string `json:"query"`
+			}
+			if err := json.Unmarshal(arguments, &input); err != nil {
+				return agenttools.Execution{}, err
+			}
+			searchCalls++
+			if input.Query != "sampleContent" {
+				return agenttools.Execution{
+					Content: fmt.Sprintf(`{"results":[],"query":%q}`, input.Query),
+				}, nil
+			}
+			return agenttools.Execution{
+				Content: `{"results":[{
+					"source":{"relative_path":"docs/guide.md","digest":"sha256:guide-search","kind":"workspace_search"},
+					"snippet":"sampleContent example: {\"content\":\"sample value\"}"
+				}]}`,
+				Sources: []domain.SourceRef{{
+					RelativePath: "docs/guide.md",
+					Digest:       "sha256:guide-search",
+					Kind:         "workspace_search",
+				}},
+			}, nil
+		}),
+		testTool("read_workspace", func(_ context.Context, arguments json.RawMessage) (agenttools.Execution, error) {
+			var input struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal(arguments, &input); err != nil {
+				return agenttools.Execution{}, err
+			}
+			content := map[string]string{
+				"one.go":        "package sample\nconst one = 1",
+				"two.go":        "package sample\nconst two = 2",
+				"request.go":    "type SampleRequest struct { sampleContent string }",
+				"docs/guide.md": `sampleContent example: {"content":"sample value"}`,
+			}[input.Path]
+			if content == "" {
+				return agenttools.Execution{}, fmt.Errorf("unexpected path %q", input.Path)
+			}
+			digest := map[string]string{
+				"one.go":        "sha256:one",
+				"two.go":        "sha256:two",
+				"request.go":    "sha256:request",
+				"docs/guide.md": "sha256:guide",
+			}[input.Path]
+			return agenttools.Execution{
+				Content: content,
+				Sources: []domain.SourceRef{{
+					RelativePath: input.Path,
+					Digest:       digest,
+					Kind:         "workspace_file",
+				}},
+			}, nil
+		}),
+		SubmitInvestigationPlanDefinition(),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, trajectory, err := (AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 11, MaxToolCalls: 12,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_structural_after_generic_search_limit",
+			Content:   "sampleContent 字符串的 JSON 具体格式是什么？",
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
+	}
+	if decision.Kind != domain.DecisionReply || searchCalls != 4 {
+		t.Fatalf("decision=%+v searchCalls=%d", decision, searchCalls)
+	}
+	if trajectoryContains(
+		trajectory,
+		"search_workspace is exhausted for this work item",
+	) {
+		t.Fatalf("dedicated structural recovery was blocked: %+v", trajectory)
+	}
+}
+
 func TestAgentLoopTerminalOnlyPromptAllowsOneCorrection(t *testing.T) {
 	model := &scriptedModel{responses: []*schema.Message{
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("read_1", "read_workspace", `{"path":"account.go"}`)}),

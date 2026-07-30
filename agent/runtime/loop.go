@@ -171,6 +171,9 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	lastObservation := ""
 	forceDecision := false
 	terminalOnlyAttempts := 0
+	structuralRecoverySearchAttempted := false
+	structuralRecoveryReadAttempted := false
+	var structuralRecoveryCandidates []string
 	evidence := responseEvidence{}
 	for turn := 0; turn < l.MaxTurns; turn++ {
 		if err := ctx.Err(); err != nil {
@@ -213,20 +216,46 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		progressMessageIndex := len(requestMessages)
 		requestMessages = append(requestMessages, schema.SystemMessage(modelRunProgressPrompt(budget)))
 		structuralEvidenceCompletion := false
+		structuralEvidenceSearchRecovery := false
+		structuralEvidenceReadRecovery := false
+		structuralQuestion := bundle.Event.Content + "\n" + conversationText(bundle.Conversation)
+		missingStructuralEvidence := bundle.WorkKind == domain.WorkKindCodingQuestion &&
+			codingEvidenceAvailable &&
+			hasOpaqueSerializationDeclarationForQuestion(
+				structuralQuestion,
+				authoritativeContents,
+			) &&
+			missingStructuralSerializationEvidence(
+				structuralQuestion,
+				authoritativeContents,
+			)
 		if budget.RemainingTurns() == 0 {
 			forceDecision = true
 		}
+		if missingStructuralEvidence &&
+			!forceDecision &&
+			budget.RemainingToolCalls() > 0 {
+			switch {
+			case len(structuralRecoveryCandidates) > 0 &&
+				!structuralRecoveryReadAttempted:
+				structuralEvidenceReadRecovery = true
+			case !structuralRecoverySearchAttempted &&
+				budget.RemainingTurns() >= 2 &&
+				budget.RemainingToolCalls() >= 2 &&
+				structuralEvidenceSearchQuery(structuralQuestion) != "" &&
+				toolInfoAvailable(visibleToolInfos, "search_workspace"):
+				structuralEvidenceSearchRecovery = true
+			}
+		}
 		if bundle.WorkKind == domain.WorkKindCodingQuestion &&
 			codingEvidenceAvailable &&
-			budget.RemainingTurns() <= 1 {
+			budget.RemainingTurns() <= 1 &&
+			!structuralEvidenceReadRecovery {
 			if budget.RemainingTurns() == 1 &&
 				!forceDecision &&
 				budget.RemainingToolCalls() > 0 &&
 				toolInfoAvailable(visibleToolInfos, "read_workspace") &&
-				missingStructuralSerializationEvidence(
-					bundle.Event.Content+"\n"+conversationText(bundle.Conversation),
-					authoritativeContents,
-				) {
+				missingStructuralEvidence {
 				structuralEvidenceCompletion = true
 			} else {
 				forceDecision = true
@@ -235,6 +264,8 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		if toolCalls >= l.MaxToolCalls {
 			forceDecision = true
 			structuralEvidenceCompletion = false
+			structuralEvidenceSearchRecovery = false
+			structuralEvidenceReadRecovery = false
 		}
 		terminalOnly := forceDecision
 		turnToolInfos := visibleToolInfos
@@ -250,6 +281,18 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			turnToolInfos = submitDecisionOnly(visibleToolInfos)
 			requestMessages = append(requestMessages, schema.SystemMessage(
 				terminalOnlyPrompt(terminalOnlyAttempts, maxTerminalOnlyAttempts),
+			))
+		} else if structuralEvidenceSearchRecovery {
+			turnToolInfos = namedToolOnly(visibleToolInfos, "search_workspace")
+			requestMessages = append(requestMessages, schema.SystemMessage(
+				structuralEvidenceSearchRecoveryPrompt(
+					structuralEvidenceSearchQuery(structuralQuestion),
+				),
+			))
+		} else if structuralEvidenceReadRecovery {
+			turnToolInfos = namedToolOnly(visibleToolInfos, "read_workspace")
+			requestMessages = append(requestMessages, schema.SystemMessage(
+				structuralEvidenceReadRecoveryPrompt(structuralRecoveryCandidates),
 			))
 		} else if structuralEvidenceCompletion {
 			turnToolInfos = namedToolOnly(visibleToolInfos, "read_workspace")
@@ -310,6 +353,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		turnHadNoProgress := false
 		postToolPrompts := make([]string, 0, 2)
 		structuralEvidenceReadAttempts := 0
+		structuralEvidenceSearchAttempts := 0
 		for _, call := range assistant.ToolCalls {
 			if strings.TrimSpace(call.ID) == "" || strings.TrimSpace(call.Function.Name) == "" {
 				return domain.Decision{}, trajectory, errs.NewInternalError(errs.SubtypeInvalidResponse, "model tool call is missing id or name")
@@ -330,16 +374,28 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			var execution agenttools.Execution
 			var toolErr error
 			executionArguments := call.Function.Arguments
-			if structuralEvidenceCompletion &&
+			if (structuralEvidenceCompletion || structuralEvidenceReadRecovery) &&
 				call.Function.Name == "read_workspace" {
 				structuralEvidenceReadAttempts++
+			}
+			if structuralEvidenceSearchRecovery &&
+				call.Function.Name == "search_workspace" {
+				structuralEvidenceSearchAttempts++
 			}
 			if structuralEvidenceReadAttempts > 1 {
 				toolErr = errs.NewInternalError(
 					errs.SubtypeInvalidResponse,
 					"the penultimate structural-evidence turn permits exactly one read_workspace call; submit the verified result in the final turn",
 				)
-			} else if (terminalOnly || structuralEvidenceCompletion) &&
+			} else if structuralEvidenceSearchAttempts > 1 {
+				toolErr = errs.NewInternalError(
+					errs.SubtypeInvalidResponse,
+					"structural-evidence recovery permits exactly one field-name search_workspace call",
+				)
+			} else if (terminalOnly ||
+				structuralEvidenceCompletion ||
+				structuralEvidenceSearchRecovery ||
+				structuralEvidenceReadRecovery) &&
 				!toolInfoAvailable(turnToolInfos, call.Function.Name) {
 				toolErr = errs.NewInternalError(
 					errs.SubtypeInvalidResponse,
@@ -358,7 +414,10 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					l.MaxToolCalls,
 				)
 				forceDecision = true
-			} else if isCodingBundle(bundle) && !investigationPlanSubmitted && call.Function.Name == "search_workspace" {
+			} else if isCodingBundle(bundle) &&
+				!investigationPlanSubmitted &&
+				call.Function.Name == "search_workspace" &&
+				!structuralEvidenceSearchRecovery {
 				toolErr = errs.NewInternalError(
 					errs.SubtypeInvalidResponse,
 					"coding investigation requires submit_investigation_plan before broad workspace search; name entry points, symbols, tools, and stop conditions first",
@@ -373,6 +432,76 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					errs.SubtypeInvalidResponse,
 					"get_lark_context returned no new context for this target message; use another evidence tool or submit_decision with explicit unknowns",
 				)
+			} else if structuralEvidenceSearchRecovery {
+				toolErr = validateStructuralEvidenceSearchArguments(
+					structuralQuestion,
+					call.Function.Arguments,
+					requestedWorkspaceScope,
+				)
+				if toolErr == nil && isCodingBundle(bundle) && requestedWorkspaceScope != "" {
+					executionArguments, toolErr = prepareCodingWorkspaceToolArguments(
+						call.Function.Name,
+						call.Function.Arguments,
+						requestedWorkspaceScope,
+						codingWorkspaceRoot(bundle),
+					)
+				}
+				if toolErr == nil && isCodingBundle(bundle) && requestedWorkspaceScope != "" {
+					toolErr = validateCodingWorkspaceToolRealPath(
+						call.Function.Name,
+						executionArguments,
+						requestedWorkspaceScope,
+						codingWorkspaceRoot(bundle),
+					)
+				}
+				if toolErr == nil {
+					execution, toolErr = l.Tools.Execute(
+						toolCtx,
+						call.Function.Name,
+						json.RawMessage(executionArguments),
+					)
+					if toolErr == nil {
+						toolCalls++
+						structuralRecoverySearchAttempted = true
+						structuralRecoveryCandidates = structuralEvidenceCandidatePaths(
+							structuralQuestion,
+							execution.Content,
+						)
+					}
+				}
+			} else if structuralEvidenceReadRecovery {
+				toolErr = validateStructuralEvidenceReadArguments(
+					call.Function.Arguments,
+					requestedWorkspaceScope,
+					structuralRecoveryCandidates,
+				)
+				if toolErr == nil && isCodingBundle(bundle) && requestedWorkspaceScope != "" {
+					executionArguments, toolErr = prepareCodingWorkspaceToolArguments(
+						call.Function.Name,
+						call.Function.Arguments,
+						requestedWorkspaceScope,
+						codingWorkspaceRoot(bundle),
+					)
+				}
+				if toolErr == nil && isCodingBundle(bundle) && requestedWorkspaceScope != "" {
+					toolErr = validateCodingWorkspaceToolRealPath(
+						call.Function.Name,
+						executionArguments,
+						requestedWorkspaceScope,
+						codingWorkspaceRoot(bundle),
+					)
+				}
+				if toolErr == nil {
+					execution, toolErr = l.Tools.Execute(
+						toolCtx,
+						call.Function.Name,
+						json.RawMessage(executionArguments),
+					)
+					if toolErr == nil {
+						toolCalls++
+						structuralRecoveryReadAttempted = true
+					}
+				}
 			} else if call.Function.Name == "search_workspace" && sourceLessWorkspaceSearches >= 3 {
 				toolErr = errs.NewInternalError(
 					errs.SubtypeInvalidResponse,

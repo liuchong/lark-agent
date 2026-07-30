@@ -291,6 +291,79 @@ const unrelatedPayload = {"other":"value"};`,
 	}
 }
 
+func TestOpaqueSerializationDeclarationRequiresNamedTarget(t *testing.T) {
+	question := "sampleContent 字符串的 JSON 具体格式是什么？"
+	if !hasOpaqueSerializationDeclarationForQuestion(question, map[string]string{
+		"request": `class SampleRequest { String sampleContent; }`,
+	}) {
+		t.Fatal("named opaque declaration was not detected")
+	}
+	if hasOpaqueSerializationDeclarationForQuestion(question, map[string]string{
+		"listener": `class Listener { String callbackName; }`,
+	}) {
+		t.Fatal("unrelated opaque declaration triggered structural recovery")
+	}
+}
+
+func TestStructuralEvidenceRecoveryRejectsWrongQueryAndReadPath(t *testing.T) {
+	question := "sampleContent 字符串的 JSON 具体格式是什么？"
+	if err := validateStructuralEvidenceSearchArguments(
+		question,
+		`{"query":"onSampleEvent"}`,
+		"sample-project/sample-module",
+	); err == nil || !strings.Contains(err.Error(), `"sampleContent"`) {
+		t.Fatalf("wrong structural query err=%v", err)
+	}
+	if err := validateStructuralEvidenceSearchArguments(
+		question,
+		`{"query":"sampleContent","path":"sample-client"}`,
+		"sample-project/sample-module",
+	); err == nil || !strings.Contains(err.Error(), "exact repository scope") {
+		t.Fatalf("narrowed structural search err=%v", err)
+	}
+	if err := validateStructuralEvidenceSearchArguments(
+		question,
+		`{"query":"sampleContent","max_results":1}`,
+		"sample-project/sample-module",
+	); err == nil || !strings.Contains(err.Error(), "max_results") {
+		t.Fatalf("truncated structural search err=%v", err)
+	}
+	if err := validateStructuralEvidenceReadArguments(
+		`{"path":"sample-client/SampleListener.java"}`,
+		"sample-project/sample-module",
+		[]string{"sample-project/sample-module/docs/sample-protocol-guide.md"},
+	); err == nil || !strings.Contains(err.Error(), "not one of") {
+		t.Fatalf("wrong structural read err=%v", err)
+	}
+	if err := validateStructuralEvidenceReadArguments(
+		`{"path":"docs/sample-protocol-guide.md"}`,
+		"sample-project/sample-module",
+		[]string{"sample-project/sample-module/docs/sample-protocol-guide.md"},
+	); err != nil {
+		t.Fatalf("scoped candidate read rejected: %v", err)
+	}
+}
+
+func TestStructuralEvidenceCandidatesRejectNearbyUnrelatedJSON(t *testing.T) {
+	question := "sampleContent 字符串的 JSON 具体格式是什么？"
+	output := `{
+		"results":[
+			{
+				"source":{"relative_path":"docs/misleading.md","digest":"sha256:bad","kind":"workspace_search"},
+				"snippet":"sampleContent JSON 未在此处定义\notherPayload example: {\"wrong\":true}"
+			},
+			{
+				"source":{"relative_path":"docs/guide.md","digest":"sha256:good","kind":"workspace_search"},
+				"snippet":"sampleContent example: {\"content\":\"sample value\"}"
+			}
+		]
+	}`
+	paths := structuralEvidenceCandidatePaths(question, output)
+	if len(paths) != 1 || paths[0] != "docs/guide.md" {
+		t.Fatalf("candidates=%v want=[docs/guide.md]", paths)
+	}
+}
+
 func TestVerifyGroundedCodingReplyRejectsUnsupportedConcreteJSONExample(t *testing.T) {
 	source := domain.SourceRef{
 		RelativePath: "sample-project/sample-module/docs/sample-protocol-guide.md",

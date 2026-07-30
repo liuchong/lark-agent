@@ -1011,6 +1011,24 @@ same or another cited file does not complete the field's evidence.
 The concrete JSON example stated in the reply must also occur in that
 field-related local evidence. A matching JSON object from an unrelated cited
 source cannot support a different claimed shape.
+As soon as a current-run read proves only the opaque declaration and at least
+two model turns remain before the terminal turn, the runtime enters bounded
+structural-evidence recovery. It exposes only `search_workspace` for one exact
+field-name search across the whole already selected repository scope. The
+model may omit `path` or repeat that exact scope, but cannot narrow the search
+to a child directory and cannot supply `max_results` to truncate recovery.
+This one dedicated recovery search remains available even when earlier generic
+workspace searches have reached the source-less-search limit. Because the
+runtime itself selects this exact field-name recovery, it also remains
+executable when the model reached the opaque declaration through a direct read
+before submitting an investigation plan; the plan-first gate continues to
+apply to model-chosen broad searches. Only search
+results whose local snippet contains both that field and concrete structural
+evidence become readable recovery candidates. The following turn exposes only
+`read_workspace`, and execution accepts only one of those candidates. This
+recovery search and read happen before the model may submit an
+`evidence_status=insufficient` decision, so a voluntarily early terminal
+decision cannot discard evidence that the bounded recovery can locate.
 If this structural gap remains at the start of the penultimate model turn and
 an investigation call is still available, the runtime must reserve that turn
 for exactly one `read_workspace` call rather than switching early to
@@ -1494,6 +1512,36 @@ The multi-step loop is accepted by these executable BDD scenarios:
   field is a string, then a verified decision is rejected until a bounded
   documentation, fixture, protocol, or serialization read supplies structural
   serialization evidence.
+- Given that opaque declaration is read while at least two model turns remain
+  before the terminal turn and no field-related structural source has been
+  read, when the next model request is prepared, then only
+  `search_workspace` is exposed and exactly one search for the named field is
+  allowed across the existing exact repository scope; a differently cased
+  query, model-supplied child `path`, or model-supplied result limit is rejected
+  before execution.
+- Given earlier generic workspace searches have reached the source-less-search
+  limit but intervening reads still locate an opaque declaration of the named
+  field, when structural recovery begins, then its one dedicated exact-field
+  search executes instead of being rejected by the generic search limit.
+- Given the model directly reads an opaque declaration before submitting an
+  investigation plan, when the runtime enters structural recovery, then the
+  runtime-selected exact-field search executes instead of being rejected by the
+  plan-first gate; unrelated model-chosen broad searches still require a plan.
+- Given that structural recovery search returns several candidates, when their
+  local snippets are evaluated, then only paths whose snippet contains both
+  the named field and a concrete example or serializer become candidates; the
+  next request exposes only `read_workspace` and rejects reads outside that
+  candidate set.
+- Given a candidate snippet says that the named field's structure is unknown or
+  unavailable and a nearby line contains a different field's JSON example,
+  when candidate filtering and final grounding run, then that nearby JSON is
+  not bound to the named field and the path is not accepted as structural
+  evidence.
+- Given the model tries to submit `evidence_status=insufficient` before the
+  bounded structural recovery is complete, when the terminal gate evaluates
+  the draft, then it rejects the early conclusion and directs the model through
+  the remaining recovery search and read rather than creating an approval
+  draft.
 - Given that opaque production declaration is the only structural evidence at
   the start of the penultimate model turn and one investigation call remains,
   when the runtime prepares the model request, then only `read_workspace` is

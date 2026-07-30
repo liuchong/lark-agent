@@ -85,14 +85,32 @@ Two live failures established reusable implementation rules.
   `submit_decision` on the final turn. Enforce the per-turn tool catalog at
   execution time too; hiding a tool from the schema is not enough if a model
   emits a stale or guessed tool name.
+- Do not wait for the penultimate turn when the structural source was never
+  located. Once a current read proves the named field is opaque and at least
+  two turns remain, force one exact field-name search across the whole already
+  selected repository scope. Reject child paths and case variants instead of
+  letting model-supplied search arguments narrow the recovery, and reject a
+  model-supplied result limit that could truncate candidates. Treat this one
+  recovery search separately from the generic source-less-search limit: prior
+  locating failures must not consume the only structural recovery attempt.
+  Likewise, do not apply the plan-first broad-search gate when a direct read
+  already exposed the opaque target and the runtime itself selected this exact
+  field-name recovery; keep that gate for model-chosen broad searches.
+  Keep only result paths whose local snippet binds that field to a concrete
+  structure, then force one read from that candidate set before accepting an
+  insufficient decision. Validate the search query, full scope, result limit,
+  and read path at execution time; prompt wording alone does not stop a model
+  from spending the recovery turn on a nearby listener or callback.
 - Bind structural evidence to the concrete lower-camel field nearest the shape
   request. A JSON object or serializer elsewhere in the same concatenated read
   set is unrelated evidence. Accept a same-line field example or a field
   introduction that explicitly names JSON, schema, shape, or example and is
   followed locally by the structure in the same source; never associate
-  evidence across source boundaries. Validate the reply's exact inline JSON
-  against those same field-related local snippets, not against the union of all
-  cited source contents.
+  evidence across source boundaries. A line saying the target is unknown or
+  undefined terminates that association, and a following structural
+  introduction for another lower-camel field starts a different context.
+  Validate the reply's exact inline JSON against those same field-related local
+  snippets, not against the union of all cited source contents.
 - Validate outward repository paths against current-run `read_workspace`
   sources, not all submitted citations; a search receipt remains a locator even
   when the model copies it into `source_refs`. Validate lower-camel-case

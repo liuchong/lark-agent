@@ -1,7 +1,10 @@
 package runtime
 
 import (
+	"encoding/json"
+	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/liuchong/lark-agent/agent/domain"
@@ -37,6 +40,15 @@ var serializerOperationPattern = regexp.MustCompile(
 )
 
 var inlineJSONObjectPattern = regexp.MustCompile(`\{[^{}\n]*:[^{}\n]*\}`)
+
+type structuralSearchResult struct {
+	Source  domain.SourceRef `json:"source"`
+	Snippet string           `json:"snippet"`
+}
+
+type structuralSearchReport struct {
+	Results []structuralSearchResult `json:"results"`
+}
 
 func verifyGroundedCodingReply(
 	question string,
@@ -279,6 +291,9 @@ func structuralSerializationEvidenceContexts(
 		if !identifierSet(line)[strings.ToLower(target)] {
 			continue
 		}
+		if lineDeniesStructuralSerializationEvidence(line) {
+			continue
+		}
 		if hasStructuralSerializationEvidence(line) {
 			contexts = append(contexts, line)
 			continue
@@ -287,9 +302,23 @@ func structuralSerializationEvidenceContexts(
 			continue
 		}
 		end := min(len(lines), index+5)
-		following := strings.Join(lines[index+1:end], "\n")
-		if hasStructuralSerializationEvidence(following) {
-			contexts = append(contexts, line+"\n"+following)
+		for followingIndex := index + 1; followingIndex < end; followingIndex++ {
+			followingLine := lines[followingIndex]
+			if lineIntroducesStructuralSerializationEvidence(followingLine) &&
+				lineNamesDifferentStructuralTarget(followingLine, target) {
+				break
+			}
+			if !hasStructuralSerializationEvidence(followingLine) {
+				continue
+			}
+			if lineNamesDifferentStructuralTarget(followingLine, target) {
+				break
+			}
+			contexts = append(
+				contexts,
+				strings.Join(lines[index:followingIndex+1], "\n"),
+			)
+			break
 		}
 	}
 	return contexts
@@ -323,6 +352,35 @@ func lineIntroducesStructuralSerializationEvidence(line string) bool {
 		"request value",
 		"请求值",
 	)
+}
+
+func lineDeniesStructuralSerializationEvidence(line string) bool {
+	line = strings.ToLower(line)
+	return containsAny(
+		line,
+		"未定义",
+		"未知",
+		"没有定义",
+		"无定义",
+		"不在此处",
+		"无法提供",
+		"not defined",
+		"undefined",
+		"unknown",
+		"unavailable",
+		"not available",
+		"absent",
+		"missing",
+	)
+}
+
+func lineNamesDifferentStructuralTarget(line, target string) bool {
+	for _, identifier := range lowerCamelIdentifierPattern.FindAllString(line, -1) {
+		if !strings.EqualFold(identifier, target) {
+			return true
+		}
+	}
+	return false
 }
 
 func concreteSerializedShapeTargets(question string) []string {
@@ -409,6 +467,163 @@ func missingStructuralSerializationEvidence(
 	return !hasStructuralSerializationEvidenceInSources(
 		question,
 		contents,
+	)
+}
+
+func hasOpaqueSerializationDeclarationForQuestion(
+	question string,
+	authoritativeContents map[string]string,
+) bool {
+	targets := concreteSerializedShapeTargets(question)
+	if len(targets) == 0 {
+		return false
+	}
+	for _, content := range authoritativeContents {
+		for _, line := range strings.Split(content, "\n") {
+			lineIdentifiers := identifierSet(line)
+			lineLower := strings.ToLower(line)
+			for _, target := range targets {
+				if lineIdentifiers[strings.ToLower(target)] &&
+					containsAny(
+						lineLower,
+						"string",
+						"[]byte",
+						"byte[]",
+						"bytes",
+						"rawmessage",
+						"json.rawmessage",
+					) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func structuralEvidenceSearchQuery(question string) string {
+	targets := concreteSerializedShapeTargets(question)
+	if len(targets) == 0 {
+		return ""
+	}
+	return targets[0]
+}
+
+func structuralEvidenceSearchRecoveryPrompt(query string) string {
+	return fmt.Sprintf(
+		"The current reads prove only an opaque declaration for %s. "+
+			"Use exactly one exact field-name search_workspace call in this turn, with query exactly %q, "+
+			"inside the existing exact repository scope and omit max_results. Do not read another production "+
+			"symbol and do not submit an insufficient decision yet. The runtime will "+
+			"filter the result snippets to field-related structural candidates for the next turn.",
+		query,
+		query,
+	)
+}
+
+func structuralEvidenceReadRecoveryPrompt(candidates []string) string {
+	candidates = append([]string(nil), candidates...)
+	sort.Strings(candidates)
+	return "The bounded field-name search found structural evidence candidates. " +
+		"Use exactly one read_workspace call in this turn and read one of these exact paths: " +
+		strings.Join(candidates, ", ") +
+		". Other paths, search, listing, and submit_decision are unavailable until this read completes."
+}
+
+func validateStructuralEvidenceSearchArguments(
+	question string,
+	arguments string,
+	requestedWorkspaceScope string,
+) error {
+	var input struct {
+		Query      string `json:"query"`
+		Path       string `json:"path"`
+		MaxResults *int   `json:"max_results"`
+	}
+	if err := json.Unmarshal([]byte(arguments), &input); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"decode structural-evidence search arguments: %v",
+			err,
+		)
+	}
+	required := structuralEvidenceSearchQuery(question)
+	if required == "" || strings.TrimSpace(input.Query) != required {
+		return errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"structural-evidence recovery requires search_workspace query %q",
+			required,
+		)
+	}
+	scope := strings.Trim(strings.TrimSpace(requestedWorkspaceScope), "/")
+	searchPath := strings.Trim(strings.TrimSpace(input.Path), "/")
+	if searchPath != "" && searchPath != scope {
+		return errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"structural-evidence recovery must search the exact repository scope %q; path %q narrows or changes that scope",
+			scope,
+			input.Path,
+		)
+	}
+	if input.MaxResults != nil {
+		return errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"structural-evidence recovery must not set max_results; the runtime controls the bounded full-scope result limit",
+		)
+	}
+	return nil
+}
+
+func structuralEvidenceCandidatePaths(question, output string) []string {
+	var report structuralSearchReport
+	if json.Unmarshal([]byte(output), &report) != nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	candidates := make([]string, 0, len(report.Results))
+	for _, result := range report.Results {
+		path := strings.TrimSpace(result.Source.RelativePath)
+		snippet := normalizeEscapedSerializationText(result.Snippet)
+		if path == "" ||
+			seen[path] ||
+			!hasStructuralSerializationEvidenceForQuestion(question, snippet) {
+			continue
+		}
+		seen[path] = true
+		candidates = append(candidates, path)
+	}
+	sort.Strings(candidates)
+	return candidates
+}
+
+func validateStructuralEvidenceReadArguments(
+	arguments string,
+	requestedWorkspaceScope string,
+	candidates []string,
+) error {
+	var input struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal([]byte(arguments), &input); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"decode structural-evidence read arguments: %v",
+			err,
+		)
+	}
+	path := strings.Trim(strings.TrimSpace(input.Path), "/")
+	scope := strings.Trim(strings.TrimSpace(requestedWorkspaceScope), "/")
+	for _, candidate := range candidates {
+		candidate = strings.Trim(strings.TrimSpace(candidate), "/")
+		if path == candidate ||
+			(scope != "" && scope+"/"+path == candidate) {
+			return nil
+		}
+	}
+	return errs.NewInternalError(
+		errs.SubtypeInvalidResponse,
+		"structural-evidence recovery read path %q is not one of the field-related search candidates",
+		input.Path,
 	)
 }
 

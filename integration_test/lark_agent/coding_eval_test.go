@@ -447,37 +447,19 @@ Message exposes sampleFlag, sampleTimestamp, and sampleVersion.`,
 			"read_workspace",
 			`{"path":"sample-client/SampleRequest.java"}`,
 		)}),
-		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("premature-submit", "submit_decision", `{
-			"decision":"reply",
-			"evidence_status":"verified",
-			"relevance_confidence":0.99,
-			"reply_confidence":0.95,
-			"risk":"low",
-			"reply_text":"结论：已读取示例事件包装测试。依据：sample-project/sample-module/sample-client/SampleWrapperTest.java。未知/下一步：具体结构未知。",
-			"reason":"search-only source presented as a read",
-			"source_refs":[
-				{"relative_path":"sample-project/sample-module/sample-client/SampleRequest.java","digest":"`+digests["sample-project/sample-module/sample-client/SampleRequest.java"]+`","kind":"workspace_file"},
-				{"relative_path":"sample-project/sample-module/sample-client/SampleWrapperTest.java","digest":"`+digests["sample-project/sample-module/sample-client/SampleWrapperTest.java"]+`","kind":"workspace_search"}
-			]
-		}`)}),
-		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("opaque-submit", "submit_decision", `{
-			"decision":"reply",
-			"evidence_status":"verified",
-			"relevance_confidence":0.99,
-			"reply_confidence":0.95,
-			"risk":"low",
-			"reply_text":"结论：sampleContent 是 JSON 结构。未知/下一步：没有。",
-			"reason":"opaque String declaration treated as concrete shape evidence",
-			"source_refs":[
-				{"relative_path":"sample-project/sample-module/sample-client/SampleRequest.java","digest":"`+digests["sample-project/sample-module/sample-client/SampleRequest.java"]+`","kind":"workspace_file"}
-			]
-		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"search-structure",
+			"search_workspace",
+			`{"query":"sampleContent"}`,
+		)}),
 		schema.AssistantMessage("", []schema.ToolCall{
 			codingEvalToolCall(
 				"read-guide",
 				"read_workspace",
 				`{"path":"docs/sample-protocol-guide.md"}`,
 			),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
 			codingEvalToolCall(
 				"read-listener",
 				"read_workspace",
@@ -547,12 +529,6 @@ Message exposes sampleFlag, sampleTimestamp, and sampleVersion.`,
 			t.Fatalf("reply=%q missing=%q", decision.ReplyText, want)
 		}
 	}
-	if !codingEvalTrajectoryContains(trajectory, "not backed by a current-run read") {
-		t.Fatalf("search-only draft was not rejected: %+v", trajectory)
-	}
-	if !codingEvalTrajectoryContains(trajectory, "concrete serialized shape") {
-		t.Fatalf("opaque-only draft was not rejected: %+v", trajectory)
-	}
 	if codingEvalTrajectoryContains(trajectory, "coding evidence is complete; submit_decision is required now") {
 		t.Fatalf("multi-field investigation was closed after partial evidence: %+v", trajectory)
 	}
@@ -561,6 +537,15 @@ Message exposes sampleFlag, sampleTimestamp, and sampleVersion.`,
 	}
 	if len(model.toolNames) == 0 {
 		t.Fatal("model tool catalog was not captured")
+	}
+	if got := strings.Join(model.toolNames[5], ","); got != "search_workspace" {
+		t.Fatalf("structural search tools=%q want=search_workspace", got)
+	}
+	if got := strings.Join(model.toolNames[6], ","); got != "read_workspace" {
+		t.Fatalf("structural read tools=%q want=read_workspace", got)
+	}
+	if !codingEvalMessagesContain(model.inputs[6], "docs/sample-protocol-guide.md") {
+		t.Fatalf("structural guide was not selected from real workspace search: %+v", model.inputs[6])
 	}
 	catalog := strings.Join(model.toolNames[0], ",")
 	for _, forbidden := range []string{
@@ -591,6 +576,226 @@ Message exposes sampleFlag, sampleTimestamp, and sampleVersion.`,
 	}
 	if codingEvalTrajectoryContains(trajectory, "SIBLING_SECRET") {
 		t.Fatalf("exact scope leaked sibling content through symlink: %+v", trajectory)
+	}
+}
+
+func TestStructuralRecoveryHasDedicatedSearchAfterGenericSearchLimit(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"one.go":     "package sample\nconst one = 1",
+		"two.go":     "package sample\nconst two = 2",
+		"request.go": "package sample\ntype SampleRequest struct { sampleContent string }",
+		"docs/guide.md": `The sampleContent request value is a JSON string:
+
+{"content":"sample value"}`,
+	}
+	digests := make(map[string]string, len(files))
+	for relativePath, content := range files {
+		fullPath := filepath.Join(root, relativePath)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256([]byte(content))
+		digests[relativePath] = fmt.Sprintf(
+			"sha256:%s",
+			hex.EncodeToString(sum[:8]),
+		)
+	}
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agenttools.NewRegistry(append(
+		agenttools.WorkspaceDefinitions(scope),
+		agentruntime.SubmitInvestigationPlanDefinition(),
+		agentruntime.SubmitDecisionDefinition(),
+	)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("plan", "submit_investigation_plan", `{
+			"question":"确认 sampleContent 字符串的 JSON 具体格式",
+			"entry_points":["request.go","docs/guide.md"],
+			"symbols":["sampleContent"],
+			"tools":["search_workspace","read_workspace"],
+			"stop_conditions":["读到字段声明和具体 JSON 示例"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"missing-1", "search_workspace", `{"query":"missingOne"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-1", "read_workspace", `{"path":"one.go"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"missing-2", "search_workspace", `{"query":"missingTwo"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-2", "read_workspace", `{"path":"two.go"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"missing-3", "search_workspace", `{"query":"missingThree"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-request", "read_workspace", `{"path":"request.go"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"truncated-structure",
+			"search_workspace",
+			`{"query":"sampleContent","max_results":1}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"search-structure",
+			"search_workspace",
+			`{"query":"sampleContent"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-guide",
+			"read_workspace",
+			`{"path":"docs/guide.md"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"结论：sampleContent 是字符串形式的 JSON，具体为 {\"content\":\"sample value\"}。依据：request.go 的字段声明和 docs/guide.md 的当前示例。未知/下一步：没有。",
+			"reason":"dedicated structural recovery was not consumed by generic search failures",
+			"source_refs":[
+				{"relative_path":"request.go","digest":"`+digests["request.go"]+`","kind":"workspace_file"},
+				{"relative_path":"docs/guide.md","digest":"`+digests["docs/guide.md"]+`","kind":"workspace_file"}
+			]
+		}`)}),
+	}}
+	decision, trajectory, err := (agentruntime.AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 12, MaxToolCalls: 14,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Environment: agentcontext.EnvironmentSnapshot{
+			WorkspaceRoot:     root,
+			WorkspaceRealRoot: root,
+		},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_structural_dedicated_search",
+			Content:   "请从当前项目证据回答：sampleContent 字符串的 JSON 具体格式是什么？",
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		!strings.Contains(decision.ReplyText, `{"content":"sample value"}`) {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if !codingEvalTrajectoryContains(trajectory, "max_results") {
+		t.Fatalf("truncated recovery search was not rejected: %+v", trajectory)
+	}
+	if codingEvalTrajectoryContains(
+		trajectory,
+		"search_workspace is exhausted for this work item",
+	) {
+		t.Fatalf("generic source-less limit blocked structural recovery: %+v", trajectory)
+	}
+}
+
+func TestStructuralRecoveryWithoutPriorPlanReadsRealWorkspaceEvidence(t *testing.T) {
+	root := t.TempDir()
+	requestSource := "package sample\ntype SampleRequest struct { sampleContent string }"
+	guideSource := `The sampleContent request value is a JSON string:
+
+{"content":"sample value"}`
+	if err := os.MkdirAll(filepath.Join(root, "docs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(root, "request.go"),
+		[]byte(requestSource),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(root, "docs", "guide.md"),
+		[]byte(guideSource),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	digest := func(content string) string {
+		sum := sha256.Sum256([]byte(content))
+		return fmt.Sprintf("sha256:%s", hex.EncodeToString(sum[:8]))
+	}
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agenttools.NewRegistry(append(
+		agenttools.WorkspaceDefinitions(scope),
+		agentruntime.SubmitInvestigationPlanDefinition(),
+		agentruntime.SubmitDecisionDefinition(),
+	)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-request",
+			"read_workspace",
+			`{"path":"request.go"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"search-structure",
+			"search_workspace",
+			`{"query":"sampleContent"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-guide",
+			"read_workspace",
+			`{"path":"docs/guide.md"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"结论：sampleContent 是字符串形式的 JSON，具体为 {\"content\":\"sample value\"}。依据：request.go 的字段声明和 docs/guide.md 的当前示例。未知/下一步：没有。",
+			"reason":"runtime-selected recovery read current workspace evidence",
+			"source_refs":[
+				{"relative_path":"request.go","digest":"`+digest(requestSource)+`","kind":"workspace_file"},
+				{"relative_path":"docs/guide.md","digest":"`+digest(guideSource)+`","kind":"workspace_file"}
+			]
+		}`)}),
+	}}
+	decision, trajectory, err := (agentruntime.AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 5,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Environment: agentcontext.EnvironmentSnapshot{
+			WorkspaceRoot:     root,
+			WorkspaceRealRoot: root,
+		},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_structural_no_plan_integration",
+			Content:   "请从当前项目证据回答：sampleContent 字符串的 JSON 具体格式是什么？",
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		!strings.Contains(decision.ReplyText, `{"content":"sample value"}`) {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if codingEvalTrajectoryContains(
+		trajectory,
+		"requires submit_investigation_plan",
+	) {
+		t.Fatalf("runtime-selected recovery was blocked by plan gate: %+v", trajectory)
 	}
 }
 
