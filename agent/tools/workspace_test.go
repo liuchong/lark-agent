@@ -49,6 +49,40 @@ func TestWorkspaceDefinitionsReadSearchRulesAndSkills(t *testing.T) {
 	}
 }
 
+func TestSearchWorkspacePathConfinesResultsToRequestedSubtree(t *testing.T) {
+	root := t.TempDir()
+	writeToolFixture(
+		t,
+		filepath.Join(root, "sample-project", "sample-module", "request.kt"),
+		"class SampleRequest\nval sampleContent: String",
+	)
+	writeToolFixture(
+		t,
+		filepath.Join(root, "Sample-Module", "request.kt"),
+		"class SampleRequest\nval sampleContent: String",
+	)
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := NewRegistry(WorkspaceDefinitions(scope)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	search, err := registry.Execute(context.Background(), "search_workspace", []byte(`{
+		"query":"SampleRequest sampleContent",
+		"path":"sample-project/sample-module"
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(search.Content, "sample-project/sample-module/request.kt") ||
+		strings.Contains(search.Content, "Sample-Module/request.kt") {
+		t.Fatalf("search escaped requested subtree: %s", search.Content)
+	}
+}
+
 func TestWorkspaceDefinitionsRejectEscapesAndExcludedPaths(t *testing.T) {
 	root := t.TempDir()
 	writeToolFixture(t, filepath.Join(root, "secret.txt"), "hidden")
@@ -64,6 +98,13 @@ func TestWorkspaceDefinitionsRejectEscapesAndExcludedPaths(t *testing.T) {
 		if _, err := registry.Execute(context.Background(), "read_workspace", []byte(args)); err == nil {
 			t.Fatalf("read_workspace accepted %s", args)
 		}
+	}
+	if _, err := registry.Execute(
+		context.Background(),
+		"search_workspace",
+		[]byte(`{"query":"hidden","path":"../outside"}`),
+	); err == nil {
+		t.Fatal("search_workspace accepted parent traversal")
 	}
 }
 

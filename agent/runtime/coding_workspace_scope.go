@@ -13,11 +13,7 @@ import (
 var workspacePathTokenPattern = regexp.MustCompile(`[A-Za-z0-9._~/-]+`)
 
 func requestedCodingWorkspaceScope(bundle context.Bundle) string {
-	root := strings.TrimSpace(bundle.Environment.WorkspaceRealRoot)
-	if root == "" {
-		root = strings.TrimSpace(bundle.Environment.WorkspaceRoot)
-	}
-	root = strings.TrimSuffix(strings.ReplaceAll(root, `\`, "/"), "/")
+	root := codingWorkspaceRoot(bundle)
 	rootName := path.Base(root)
 	if root == "" || rootName == "." || rootName == "/" {
 		return ""
@@ -112,42 +108,107 @@ func referencesPriorWorkspaceContext(text string) bool {
 	return false
 }
 
-func validateCodingWorkspaceScope(toolName, arguments, scope string) error {
+func codingWorkspaceRoot(bundle context.Bundle) string {
+	root := strings.TrimSpace(bundle.Environment.WorkspaceRealRoot)
+	if root == "" {
+		root = strings.TrimSpace(bundle.Environment.WorkspaceRoot)
+	}
+	return strings.TrimSuffix(strings.ReplaceAll(root, `\`, "/"), "/")
+}
+
+func prepareCodingWorkspaceToolArguments(
+	toolName string,
+	arguments string,
+	scope string,
+	workspaceRoot string,
+) (string, error) {
 	if scope == "" {
-		return nil
+		return arguments, nil
 	}
 	switch toolName {
-	case "submit_investigation_plan":
-		var input struct {
-			EntryPoints []string `json:"entry_points"`
-		}
-		if err := json.Unmarshal([]byte(arguments), &input); err != nil {
-			return nil
-		}
-		for _, entryPoint := range input.EntryPoints {
-			if !workspacePathWithinScope(entryPoint, scope) {
-				return exactWorkspaceScopeError(scope, entryPoint)
-			}
-		}
-	case "read_workspace", "list_workspace", "search_workspace":
-		var input struct {
-			Path string `json:"path"`
-		}
-		if err := json.Unmarshal([]byte(arguments), &input); err != nil {
-			return nil
-		}
-		if !workspacePathWithinScope(input.Path, scope) {
-			return exactWorkspaceScopeError(scope, input.Path)
-		}
 	case "explore_workspace", "search_code_symbols", "trace_code_path", "shell":
-		return errs.NewValidationError(
+		return "", errs.NewValidationError(
 			errs.SubtypeInvalidArgument,
 			"tool %s cannot guarantee exact workspace scope %s; use path-scoped workspace tools",
 			toolName,
 			scope,
 		)
 	}
-	return nil
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(arguments), &payload); err != nil {
+		return arguments, nil
+	}
+	switch toolName {
+	case "submit_investigation_plan":
+		var entryPoints []string
+		if raw, ok := payload["entry_points"]; ok {
+			if err := json.Unmarshal(raw, &entryPoints); err != nil {
+				return arguments, nil
+			}
+		}
+		for index, entryPoint := range entryPoints {
+			normalized, err := normalizeCodingWorkspacePath(
+				entryPoint,
+				scope,
+				workspaceRoot,
+			)
+			if err != nil {
+				return "", err
+			}
+			entryPoints[index] = normalized
+		}
+		if len(entryPoints) > 0 {
+			payload["entry_points"], _ = json.Marshal(entryPoints)
+		}
+	case "list_workspace", "search_workspace", "read_workspace":
+		var requestedPath string
+		if raw, ok := payload["path"]; ok {
+			if err := json.Unmarshal(raw, &requestedPath); err != nil {
+				return arguments, nil
+			}
+		}
+		if strings.TrimSpace(requestedPath) == "" &&
+			(toolName == "list_workspace" || toolName == "search_workspace") {
+			requestedPath = scope
+		}
+		normalized, err := normalizeCodingWorkspacePath(
+			requestedPath,
+			scope,
+			workspaceRoot,
+		)
+		if err != nil {
+			return "", err
+		}
+		payload["path"], _ = json.Marshal(normalized)
+	default:
+		return arguments, nil
+	}
+	prepared, err := json.Marshal(payload)
+	if err != nil {
+		return arguments, nil
+	}
+	return string(prepared), nil
+}
+
+func normalizeCodingWorkspacePath(candidate, scope, workspaceRoot string) (string, error) {
+	candidate = strings.TrimSpace(strings.ReplaceAll(candidate, `\`, "/"))
+	workspaceRoot = strings.TrimSuffix(
+		strings.TrimSpace(strings.ReplaceAll(workspaceRoot, `\`, "/")),
+		"/",
+	)
+	rootName := path.Base(workspaceRoot)
+	switch {
+	case workspaceRoot != "" && strings.HasPrefix(candidate, workspaceRoot+"/"):
+		candidate = strings.TrimPrefix(candidate, workspaceRoot+"/")
+	case rootName != "" && rootName != "." && rootName != "/" &&
+		strings.HasPrefix(candidate, rootName+"/"):
+		candidate = strings.TrimPrefix(candidate, rootName+"/")
+	}
+	cleaned, ok := cleanWorkspaceScopePath(candidate)
+	if !ok || !workspacePathWithinScope(cleaned, scope) {
+		return "", exactWorkspaceScopeError(scope, candidate)
+	}
+	return cleaned, nil
 }
 
 func workspacePathWithinScope(candidate, scope string) bool {

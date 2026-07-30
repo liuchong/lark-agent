@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -115,18 +116,24 @@ func TestRequestedCodingWorkspaceScopeIgnoresUnrelatedOrOtherSenderHistory(t *te
 	}
 }
 
-func TestValidateCodingWorkspaceScopeRejectsSiblingAndUnscopedTools(t *testing.T) {
+func TestPrepareCodingWorkspaceToolArgumentsNormalizesAndConfinesPaths(t *testing.T) {
 	const scope = "sample-project/sample-module"
 	for _, test := range []struct {
-		name      string
-		tool      string
-		arguments string
-		wantError bool
+		name        string
+		tool        string
+		arguments   string
+		wantPath    string
+		wantEntries []string
+		wantError   bool
 	}{
 		{
-			name:      "scoped plan",
+			name:      "workspace-root-prefixed plan",
 			tool:      "submit_investigation_plan",
-			arguments: `{"entry_points":["sample-project/sample-module/sample-client","sample-project/sample-module/go"]}`,
+			arguments: `{"entry_points":["sample-org/sample-project/sample-module/sample-client","sample-org/sample-project/sample-module/go"]}`,
+			wantEntries: []string{
+				"sample-project/sample-module/sample-client",
+				"sample-project/sample-module/go",
+			},
 		},
 		{
 			name:      "sibling plan",
@@ -135,9 +142,10 @@ func TestValidateCodingWorkspaceScopeRejectsSiblingAndUnscopedTools(t *testing.T
 			wantError: true,
 		},
 		{
-			name:      "scoped read",
+			name:      "workspace-root-prefixed read",
 			tool:      "read_workspace",
-			arguments: `{"path":"sample-project/sample-module/sample-client/request.kt"}`,
+			arguments: `{"path":"sample-org/sample-project/sample-module/sample-client/request.kt"}`,
+			wantPath:  "sample-project/sample-module/sample-client/request.kt",
 		},
 		{
 			name:      "sibling read",
@@ -146,10 +154,10 @@ func TestValidateCodingWorkspaceScopeRejectsSiblingAndUnscopedTools(t *testing.T
 			wantError: true,
 		},
 		{
-			name:      "search requires path",
+			name:      "search inherits exact scope",
 			tool:      "search_workspace",
 			arguments: `{"query":"SampleRequest"}`,
-			wantError: true,
+			wantPath:  scope,
 		},
 		{
 			name:      "unscoped exploration",
@@ -171,12 +179,36 @@ func TestValidateCodingWorkspaceScopeRejectsSiblingAndUnscopedTools(t *testing.T
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateCodingWorkspaceScope(test.tool, test.arguments, scope)
+			prepared, err := prepareCodingWorkspaceToolArguments(
+				test.tool,
+				test.arguments,
+				scope,
+				"/workspace/sample-org",
+			)
 			if test.wantError && (err == nil || !strings.Contains(err.Error(), scope)) {
 				t.Fatalf("err=%v", err)
 			}
 			if !test.wantError && err != nil {
 				t.Fatalf("err=%v", err)
+			}
+			if err != nil || test.wantPath == "" {
+				if err != nil || len(test.wantEntries) == 0 {
+					return
+				}
+			}
+			var decoded struct {
+				Path        string   `json:"path"`
+				EntryPoints []string `json:"entry_points"`
+			}
+			if err := json.Unmarshal([]byte(prepared), &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded.Path != test.wantPath {
+				t.Fatalf("path=%q want=%q prepared=%s", decoded.Path, test.wantPath, prepared)
+			}
+			if len(test.wantEntries) > 0 &&
+				strings.Join(decoded.EntryPoints, ",") != strings.Join(test.wantEntries, ",") {
+				t.Fatalf("entry_points=%v want=%v prepared=%s", decoded.EntryPoints, test.wantEntries, prepared)
 			}
 		})
 	}

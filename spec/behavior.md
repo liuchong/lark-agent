@@ -1353,6 +1353,18 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given the user names an exact repository or workspace-relative path, when a
   coding investigation selects entry points, then it preserves the named
   spelling and case and does not substitute a similarly named sibling project.
+- Given the user names a path prefixed by the configured workspace directory
+  name, when a coding tool receives that same prefixed path, then the runtime
+  canonicalizes it to the equivalent workspace-relative path before enforcing
+  the exact subtree boundary.
+- Given an exact repository scope is active and `search_workspace` omits its
+  optional path, when the runtime prepares the tool call, then it injects the
+  exact scope and the bounded search scans only that subtree; sibling projects
+  cannot contribute candidates or source references.
+- Given a bounded workspace search contains several whitespace-separated code
+  terms, when the exact phrase is absent but every term occurs in one file,
+  then that file is returned as a candidate; files missing any term do not
+  match.
 - Given an exact repository scope is workspace-relative, when it is resolved,
   then its top-level component must match the bounded workspace directory
   snapshot and it must be the only matching workspace-relative path in that

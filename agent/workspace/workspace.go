@@ -160,6 +160,7 @@ type SearchResult struct {
 // SearchOptions bounds one workspace search.
 type SearchOptions struct {
 	Query          string `json:"query" yaml:"query"`
+	Path           string `json:"path,omitempty" yaml:"path,omitempty"`
 	MaxResults     int    `json:"max_results" yaml:"max_results"`
 	MaxFiles       int    `json:"max_files" yaml:"max_files"`
 	MaxDirectories int    `json:"max_directories" yaml:"max_directories"`
@@ -202,8 +203,33 @@ func (s *Scope) SearchTextReportContext(ctx context.Context, options SearchOptio
 	if options.MaxDirectories <= 0 {
 		options.MaxDirectories = 600
 	}
+	searchRoot := s.realRoot
+	searchRelativeRoot := "."
+	if requestedPath := strings.TrimSpace(options.Path); requestedPath != "" {
+		resolved, err := s.ResolveReadPath(requestedPath)
+		if err != nil {
+			return SearchReport{}, err
+		}
+		info, err := vfs.Stat(resolved)
+		if err != nil {
+			return SearchReport{}, errs.NewInternalError(
+				errs.SubtypeFileIO,
+				"inspect workspace search path: %s",
+				requestedPath,
+			).WithCause(err)
+		}
+		if !info.IsDir() {
+			return SearchReport{}, errs.NewValidationError(
+				errs.SubtypeInvalidArgument,
+				"search_workspace path must be a directory: %s",
+				requestedPath,
+			).WithParam("path")
+		}
+		searchRoot = resolved
+		searchRelativeRoot = filepath.ToSlash(filepath.Clean(requestedPath))
+	}
 	report := SearchReport{}
-	if err := s.searchDir(ctx, s.realRoot, ".", query, options, &report); err != nil {
+	if err := s.searchDir(ctx, searchRoot, searchRelativeRoot, query, options, &report); err != nil {
 		return SearchReport{}, err
 	}
 	return report, nil
@@ -311,7 +337,7 @@ func (s *Scope) searchDir(ctx context.Context, absDir, relDir, query string, opt
 			continue
 		}
 		lower := strings.ToLower(string(data))
-		idx := strings.Index(lower, query)
+		idx := workspaceSearchIndex(lower, query)
 		if idx < 0 {
 			continue
 		}
@@ -329,6 +355,27 @@ func (s *Scope) searchDir(ctx context.Context, absDir, relDir, query string, opt
 		})
 	}
 	return nil
+}
+
+func workspaceSearchIndex(content, query string) int {
+	if index := strings.Index(content, query); index >= 0 {
+		return index
+	}
+	terms := strings.Fields(query)
+	if len(terms) < 2 {
+		return -1
+	}
+	first := len(content)
+	for _, term := range terms {
+		index := strings.Index(content, term)
+		if index < 0 {
+			return -1
+		}
+		if index < first {
+			first = index
+		}
+	}
+	return first
 }
 
 func containsPath(root, candidate string) bool {

@@ -268,6 +268,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			toolCtx = agenttools.WithInvocationScope(toolCtx, invocationScope)
 			var execution agenttools.Execution
 			var toolErr error
+			executionArguments := call.Function.Arguments
 			if forceDecision && call.Function.Name != "submit_decision" {
 				toolErr = errs.NewInternalError(
 					errs.SubtypeInvalidResponse,
@@ -301,13 +302,14 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					"search_workspace is exhausted for this work item after repeated searches without citable sources; use list_workspace, read_workspace, a path-specific shell command, or submit_decision with explicit unknowns",
 				)
 			} else if isCodingBundle(bundle) && requestedWorkspaceScope != "" {
-				toolErr = validateCodingWorkspaceScope(
+				executionArguments, toolErr = prepareCodingWorkspaceToolArguments(
 					call.Function.Name,
 					call.Function.Arguments,
 					requestedWorkspaceScope,
+					codingWorkspaceRoot(bundle),
 				)
 				if toolErr == nil {
-					execution, toolErr = l.Tools.Execute(toolCtx, call.Function.Name, json.RawMessage(call.Function.Arguments))
+					execution, toolErr = l.Tools.Execute(toolCtx, call.Function.Name, json.RawMessage(executionArguments))
 					if toolErr == nil && call.Function.Name != "submit_decision" {
 						toolCalls++
 					}
@@ -388,7 +390,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			if toolErr == nil && execution.Decision == nil && isCodingBundle(bundle) {
 				codingSearches.Record(
 					call.Function.Name,
-					call.Function.Arguments,
+					executionArguments,
 					execution.Content,
 				)
 			}

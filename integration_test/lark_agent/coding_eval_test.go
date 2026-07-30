@@ -162,24 +162,21 @@ func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T)
 		t.Fatal(err)
 	}
 	model := &codingEvalModel{responses: []*schema.Message{
-		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("wrong-plan", "submit_investigation_plan", `{
-			"question":"核对消息修改行为",
-			"entry_points":["Sample-Module/sample-client"],
-			"symbols":["SampleRequest"],
-			"tools":["read_workspace"],
-			"stop_conditions":["找到任意同名消息修改实现"]
-		}`)}),
 		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("plan", "submit_investigation_plan", `{
 			"question":"核对 sample-project/sample-module 的请求结构、成功回调和本地收敛",
 			"entry_points":[
-				"sample-project/sample-module/sample-client/modify_request.kt",
-				"sample-project/sample-module/go/internal/item_flow/api.go",
-				"sample-project/sample-module/sample-client/message_listener.kt"
+				"sample-org/sample-project/sample-module/sample-client",
+				"sample-org/sample-project/sample-module/go"
 			],
 			"symbols":["SampleRequest","SampleOperation","onSampleEvent"],
-			"tools":["read_workspace"],
+			"tools":["search_workspace","read_workspace"],
 			"stop_conditions":["确认请求结构","确认成功回调语义","确认本地收敛事件"]
 		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"search-without-path",
+			"search_workspace",
+			`{"query":"SampleRequest"}`,
+		)}),
 		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
 			"wrong-read",
 			"read_workspace",
@@ -259,9 +256,11 @@ func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T)
 	if codingEvalTrajectoryContains(trajectory, "coding evidence is complete; submit_decision is required now") {
 		t.Fatalf("multi-field investigation was closed after partial evidence: %+v", trajectory)
 	}
+	if !codingEvalTrajectoryContains(trajectory, "sample-project/sample-module/sample-client/modify_request.kt") {
+		t.Fatalf("scoped search did not return the real project candidate: %+v", trajectory)
+	}
 	for _, want := range []string{
 		"exact workspace scope sample-project/sample-module",
-		"Sample-Module/sample-client",
 		"Sample-Module/message_manager.java",
 		"search_code_symbols cannot guarantee exact workspace scope",
 	} {

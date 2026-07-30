@@ -140,13 +140,15 @@ func listWorkspaceDefinition(scope *workspace.Scope) Definition {
 
 func searchWorkspaceDefinition(scope *workspace.Scope) Definition {
 	return Definition{
-		Info: toolInfo("search_workspace", "Search workspace text semantically chosen by you. Form a precise query, inspect snippets, then read relevant files.", map[string]*schema.ParameterInfo{
+		Info: toolInfo("search_workspace", "Search bounded workspace text by a case-insensitive literal phrase or by requiring every whitespace-separated term in one file. Set path to the exact repository or subtree when one is named, inspect snippets, then read relevant files.", map[string]*schema.ParameterInfo{
 			"query":       {Type: schema.String, Required: true},
+			"path":        {Type: schema.String},
 			"max_results": {Type: schema.Integer},
 		}),
 		Execute: func(ctx context.Context, raw json.RawMessage) (Execution, error) {
 			var args struct {
 				Query      string `json:"query"`
+				Path       string `json:"path"`
 				MaxResults int    `json:"max_results"`
 			}
 			if err := decodeArgs(raw, &args); err != nil {
@@ -160,6 +162,7 @@ func searchWorkspaceDefinition(scope *workspace.Scope) Definition {
 			}
 			report, err := scope.SearchTextReportContext(ctx, workspace.SearchOptions{
 				Query:          args.Query,
+				Path:           args.Path,
 				MaxResults:     args.MaxResults,
 				MaxFiles:       2000,
 				MaxDirectories: 600,

@@ -49,6 +49,11 @@ Two live failures established reusable implementation rules.
   Inherit a scope from conversation context only for an explicit continuation
   from the same sender. Reject global index/trace tools that cannot carry the
   exact path boundary.
+- A hard subtree boundary must remain usable. Canonicalize the configured
+  workspace directory prefix, inject the known scope into path-capable search
+  and list tools, and make the search tool expose that path in its real schema.
+  Prompt-only path requirements that the tool cannot express create a
+  guaranteed nonconvergence loop.
 - Do not require production call-site reachability when the user only asks for
   a named function's direct behavior.
 
