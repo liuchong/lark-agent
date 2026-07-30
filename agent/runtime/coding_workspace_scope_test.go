@@ -2,6 +2,9 @@ package runtime
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -148,9 +151,30 @@ func TestPrepareCodingWorkspaceToolArgumentsNormalizesAndConfinesPaths(t *testin
 			wantPath:  "sample-project/sample-module/sample-client/request.kt",
 		},
 		{
+			name:      "repository-relative read",
+			tool:      "read_workspace",
+			arguments: `{"path":"sample-client/request.kt"}`,
+			wantPath:  "sample-project/sample-module/sample-client/request.kt",
+		},
+		{
+			name:      "repository-relative plan",
+			tool:      "submit_investigation_plan",
+			arguments: `{"entry_points":["sample-client","docs/sample-event.md"]}`,
+			wantEntries: []string{
+				"sample-project/sample-module/sample-client",
+				"sample-project/sample-module/docs/sample-event.md",
+			},
+		},
+		{
 			name:      "sibling read",
 			tool:      "read_workspace",
 			arguments: `{"path":"Sample-Module/sample-client/request.kt"}`,
+			wantError: true,
+		},
+		{
+			name:      "case-mismatched full scope",
+			tool:      "read_workspace",
+			arguments: `{"path":"sample-project/Sample-Module/sample-client/request.kt"}`,
 			wantError: true,
 		},
 		{
@@ -209,6 +233,74 @@ func TestPrepareCodingWorkspaceToolArgumentsNormalizesAndConfinesPaths(t *testin
 			if len(test.wantEntries) > 0 &&
 				strings.Join(decoded.EntryPoints, ",") != strings.Join(test.wantEntries, ",") {
 				t.Fatalf("entry_points=%v want=%v prepared=%s", decoded.EntryPoints, test.wantEntries, prepared)
+			}
+		})
+	}
+}
+
+func TestValidateCodingWorkspaceToolRealPathRejectsSymlinkAndCaseEscapes(t *testing.T) {
+	root := t.TempDir()
+	for _, directory := range []string{
+		"sample-project/sample-module/sample-client",
+		"Sample-Module",
+	} {
+		if err := os.MkdirAll(filepath.Join(root, directory), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(
+		filepath.Join(root, "sample-project/sample-module/sample-client/Request.kt"),
+		[]byte("request"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(root, "Sample-Module/secret.txt"),
+		[]byte("sibling secret"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(
+		filepath.Join(root, "Sample-Module"),
+		filepath.Join(root, "sample-project/sample-module/legacy-link"),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name      string
+		path      string
+		wantError bool
+	}{
+		{
+			name: "valid exact path",
+			path: "sample-project/sample-module/sample-client/Request.kt",
+		},
+		{
+			name:      "symlink to sibling",
+			path:      "sample-project/sample-module/legacy-link/secret.txt",
+			wantError: true,
+		},
+		{
+			name:      "case-insensitive directory lookup",
+			path:      "sample-project/sample-module/Sample-Client/Request.kt",
+			wantError: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateCodingWorkspaceToolRealPath(
+				"read_workspace",
+				`{"path":`+strconv.Quote(test.path)+`}`,
+				"sample-project/sample-module",
+				root,
+			)
+			if test.wantError && err == nil {
+				t.Fatal("expected exact real-path rejection")
+			}
+			if !test.wantError && err != nil {
+				t.Fatalf("unexpected validation error: %v", err)
 			}
 		})
 	}

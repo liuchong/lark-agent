@@ -26,10 +26,19 @@ type codingEvalModel struct {
 	responses []*schema.Message
 	calls     int
 	inputs    [][]*schema.Message
+	toolNames [][]string
 }
 
-func (m *codingEvalModel) Generate(_ context.Context, input []*schema.Message, _ ...einomodel.Option) (*schema.Message, error) {
+func (m *codingEvalModel) Generate(_ context.Context, input []*schema.Message, opts ...einomodel.Option) (*schema.Message, error) {
 	m.inputs = append(m.inputs, append([]*schema.Message(nil), input...))
+	options := einomodel.GetCommonOptions(nil, opts...)
+	names := make([]string, 0, len(options.Tools))
+	for _, tool := range options.Tools {
+		if tool != nil {
+			names = append(names, tool.Name)
+		}
+	}
+	m.toolNames = append(m.toolNames, names)
 	if m.calls >= len(m.responses) {
 		return nil, errors.New("unexpected model call")
 	}
@@ -337,14 +346,22 @@ func testCodingQuestionRejectsSourceCanonicalization(
 }
 
 func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T) {
-	root := t.TempDir()
+	root := filepath.Join(t.TempDir(), "sample-org")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	sources := map[string]string{
 		"sample-project/sample-module/sample-client/modify_request.kt": `data class SampleRequest(
     val sampleContent: String,
     val expectedEditVersion: Long,
 )`,
-		"sample-project/sample-module/go/internal/item_flow/api.go": `func SampleOperation(req SampleRequest) (*SampleChangeResponse, error) {
-    return server.SampleOperation(req)
+		"sample-project/sample-module/go/internal/item_flow/api.go": `func SampleOperation(req SampleRequest, callback Callback) {
+    response, err := server.SampleOperation(req)
+    if err != nil {
+        callback.OnError(err)
+        return
+    }
+    callback.OnSuccess(response)
 }`,
 		"sample-project/sample-module/sample-client/message_listener.kt": `fun onSampleEvent(message: Message) {
     localMessages.update(message.clientMsgID, message.sampleVersion)
@@ -366,7 +383,17 @@ func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T)
 	if err := os.MkdirAll(filepath.Dir(decoy), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(decoy, []byte("class MessageManager {}"), 0o600); err != nil {
+	if err := os.WriteFile(
+		decoy,
+		[]byte(`class MessageManager { String marker = "SIBLING_SECRET"; }`),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(
+		filepath.Join(root, "Sample-Module"),
+		filepath.Join(root, "sample-project/sample-module/legacy-link"),
+	); err != nil {
 		t.Fatal(err)
 	}
 	scope, err := workspace.NewScope(root)
@@ -387,8 +414,8 @@ func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T)
 		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("plan", "submit_investigation_plan", `{
 			"question":"核对 sample-project/sample-module 的请求结构、成功回调和本地收敛",
 			"entry_points":[
-				"sample-org/sample-project/sample-module/sample-client",
-				"sample-org/sample-project/sample-module/go"
+				"sample-client",
+				"go"
 			],
 			"symbols":["SampleRequest","SampleOperation","onSampleEvent"],
 			"tools":["search_workspace","read_workspace"],
@@ -405,24 +432,24 @@ func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T)
 			`{"path":"Sample-Module/message_manager.java"}`,
 		)}),
 		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
-			"wrong-symbol-search",
-			"search_code_symbols",
-			`{"query":"MessageManager","max_results":5}`,
+			"symlink-read",
+			"read_workspace",
+			`{"path":"legacy-link/message_manager.java"}`,
 		)}),
 		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
 			"read-request",
 			"read_workspace",
-			`{"path":"sample-project/sample-module/sample-client/modify_request.kt"}`,
+			`{"path":"sample-client/modify_request.kt"}`,
 		)}),
 		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
 			"read-api",
 			"read_workspace",
-			`{"path":"sample-project/sample-module/go/internal/item_flow/api.go"}`,
+			`{"path":"go/internal/item_flow/api.go"}`,
 		)}),
 		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
 			"read-listener",
 			"read_workspace",
-			`{"path":"sample-project/sample-module/sample-client/message_listener.kt"}`,
+			`{"path":"sample-client/message_listener.kt"}`,
 		)}),
 		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
 			"decision":"reply",
@@ -443,8 +470,8 @@ func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T)
 	}).Decide(context.Background(), agentcontext.Bundle{
 		User: agentcontext.UserProfile{OpenID: "ou_owner"},
 		Environment: agentcontext.EnvironmentSnapshot{
-			WorkspaceRoot:     "/workspace/sample-org",
-			WorkspaceRealRoot: "/workspace/sample-org",
+			WorkspaceRoot:     root,
+			WorkspaceRealRoot: root,
 			Directory: []agentcontext.DirectoryEntry{{
 				Path: "sample-project",
 				Kind: "dir",
@@ -465,7 +492,7 @@ func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T)
 		WorkKind: domain.WorkKindCodingQuestion,
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
 	}
 	if decision.Kind != domain.DecisionReply || len(decision.Sources) != 3 {
 		t.Fatalf("decision=%+v", decision)
@@ -481,14 +508,38 @@ func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T)
 	if !codingEvalTrajectoryContains(trajectory, "sample-project/sample-module/sample-client/modify_request.kt") {
 		t.Fatalf("scoped search did not return the real project candidate: %+v", trajectory)
 	}
+	if len(model.toolNames) == 0 {
+		t.Fatal("model tool catalog was not captured")
+	}
+	catalog := strings.Join(model.toolNames[0], ",")
+	for _, forbidden := range []string{
+		"explore_workspace", "search_code_symbols", "trace_code_path", "shell",
+		"read_workspace_rules", "list_skills", "load_skill",
+	} {
+		if strings.Contains(catalog, forbidden) {
+			t.Fatalf("exact-scope tool catalog exposes %s: %v", forbidden, model.toolNames[0])
+		}
+	}
+	for _, want := range []string{
+		"Exact coding workspace scope: sample-project/sample-module",
+		"already a readable subtree inside the configured workspace root",
+		"at most two bounded locating searches",
+	} {
+		if !codingEvalMessagesContain(model.inputs[0], want) {
+			t.Fatalf("initial model input missing %q: %+v", want, model.inputs[0])
+		}
+	}
 	for _, want := range []string{
 		"exact workspace scope sample-project/sample-module",
 		"Sample-Module/message_manager.java",
-		"search_code_symbols cannot guarantee exact workspace scope",
+		"resolves outside exact workspace scope sample-project/sample-module",
 	} {
 		if !codingEvalTrajectoryContains(trajectory, want) {
 			t.Fatalf("trajectory missing exact-scope rejection %q: %+v", want, trajectory)
 		}
+	}
+	if codingEvalTrajectoryContains(trajectory, "SIBLING_SECRET") {
+		t.Fatalf("exact scope leaked sibling content through symlink: %+v", trajectory)
 	}
 }
 

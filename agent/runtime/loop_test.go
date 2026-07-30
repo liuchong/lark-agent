@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -22,10 +24,19 @@ type scriptedModel struct {
 	responses []*schema.Message
 	calls     int
 	inputs    [][]*schema.Message
+	toolNames [][]string
 }
 
-func (m *scriptedModel) Generate(_ context.Context, input []*schema.Message, _ ...einomodel.Option) (*schema.Message, error) {
+func (m *scriptedModel) Generate(_ context.Context, input []*schema.Message, opts ...einomodel.Option) (*schema.Message, error) {
 	m.inputs = append(m.inputs, append([]*schema.Message(nil), input...))
+	options := einomodel.GetCommonOptions(nil, opts...)
+	names := make([]string, 0, len(options.Tools))
+	for _, tool := range options.Tools {
+		if tool != nil {
+			names = append(names, tool.Name)
+		}
+	}
+	m.toolNames = append(m.toolNames, names)
 	if m.calls >= len(m.responses) {
 		return nil, errors.New("unexpected model call")
 	}
@@ -99,6 +110,15 @@ func TestAgentLoopSearchesReadsAndSubmitsDecision(t *testing.T) {
 		if !messagesContain(input, want) {
 			t.Fatalf("model call %d missing %q: %+v", i+1, want, input)
 		}
+		usedToolCalls := []int{0, 0, 1, 2}
+		want = fmt.Sprintf(
+			"Tool-call budget: %d of 16 investigation calls used, %d remaining",
+			usedToolCalls[i],
+			16-usedToolCalls[i],
+		)
+		if !messagesContain(input, want) {
+			t.Fatalf("model call %d missing %q: %+v", i+1, want, input)
+		}
 		if !messagesContain(input, "The hard model-turn limit for this run is 6") {
 			t.Fatalf("model call %d missing total budget", i+1)
 		}
@@ -113,6 +133,158 @@ func TestAgentLoopSearchesReadsAndSubmitsDecision(t *testing.T) {
 	}
 	if lastInput[len(lastInput)-2].Role != schema.Tool || lastInput[len(lastInput)-2].ToolCallID != "call_read" {
 		t.Fatalf("last input=%+v", lastInput)
+	}
+}
+
+func TestAgentLoopMakesInheritedExactScopeActionableAndHidesUnscopedTools(t *testing.T) {
+	workspaceRoot := filepath.Join(t.TempDir(), "sample-org")
+	if err := os.MkdirAll(workspaceRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	requestPath := filepath.Join(workspaceRoot, "sample-project/sample-module/sample-client/request.kt")
+	if err := os.MkdirAll(filepath.Dir(requestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(requestPath, []byte("request"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{
+			"question":"核对 Sample-Client 示例事件请求和本地收敛",
+			"entry_points":["sample-client/request.kt","sample-client/listener.kt"],
+			"symbols":["sampleContent","onSampleEvent"],
+			"tools":["search_workspace","read_workspace"],
+			"stop_conditions":["读到请求结构和编辑事件"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall(
+			"hidden-rules",
+			"read_workspace_rules",
+			`{}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall(
+			"read",
+			"read_workspace",
+			`{"path":"sample-client/request.kt"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"evidence_status":"verified",
+			"reply_text":"结论：sampleContent 是字符串消息 JSON；本地通过 onSampleEvent 收敛。依据：已读取请求生产文件。未知/下一步：没有。",
+			"reason":"exact scoped production read",
+			"source_refs":[{"relative_path":"sample-project/sample-module/sample-client/request.kt","digest":"sha256:scoped","kind":"workspace_file"}]
+		}`)}),
+	}}
+	var readPath string
+	hiddenRuleCalls := 0
+	noOp := func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+		return agenttools.Execution{Content: `{"ok":true}`}, nil
+	}
+	registry, err := agenttools.NewRegistry(
+		testTool("explore_workspace", noOp),
+		testTool("search_code_symbols", noOp),
+		testTool("trace_code_path", noOp),
+		testTool("shell", noOp),
+		testTool("read_workspace_rules", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			hiddenRuleCalls++
+			return agenttools.Execution{Content: "must not execute"}, nil
+		}),
+		testTool("list_skills", noOp),
+		testTool("load_skill", noOp),
+		testTool("list_workspace", noOp),
+		testTool("search_workspace", noOp),
+		testTool("read_workspace", func(_ context.Context, raw json.RawMessage) (agenttools.Execution, error) {
+			var input struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal(raw, &input); err != nil {
+				return agenttools.Execution{}, err
+			}
+			readPath = input.Path
+			return agenttools.Execution{
+				Content: "sampleContent string; onSampleEvent",
+				Sources: []domain.SourceRef{{
+					RelativePath: input.Path,
+					Digest:       "sha256:scoped",
+					Kind:         "workspace_file",
+				}},
+			}, nil
+		}),
+		SubmitInvestigationPlanDefinition(),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, trajectory, err := (AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 5,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		User: agentcontext.UserProfile{OpenID: "ou_owner"},
+		Environment: agentcontext.EnvironmentSnapshot{
+			WorkspaceRoot:     workspaceRoot,
+			WorkspaceRealRoot: workspaceRoot,
+			Directory: []agentcontext.DirectoryEntry{{
+				Path: "sample-project",
+				Kind: "dir",
+			}},
+		},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_follow_up",
+			SenderID:  "ou_owner",
+			Content:   "结合上一条，完整核对请求结构和本地收敛。",
+		},
+		Conversation: []domain.NormalizedEvent{{
+			MessageID: "om_scope",
+			SenderID:  "ou_owner",
+			Content:   "这次只看 sample-org/sample-project/sample-module。",
+		}},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
+	}
+	if decision.Kind != domain.DecisionReply {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if readPath != "sample-project/sample-module/sample-client/request.kt" {
+		t.Fatalf("read path=%q", readPath)
+	}
+	if hiddenRuleCalls != 0 {
+		t.Fatalf("hidden exact-scope tool executed %d times", hiddenRuleCalls)
+	}
+	if !trajectoryContains(trajectory, "cannot guarantee exact workspace scope sample-project/sample-module") {
+		t.Fatalf("hidden tool rejection missing from trajectory: %+v", trajectory)
+	}
+	if len(model.toolNames) == 0 {
+		t.Fatal("model tool catalog was not captured")
+	}
+	catalog := strings.Join(model.toolNames[0], ",")
+	for _, forbidden := range []string{
+		"explore_workspace", "search_code_symbols", "trace_code_path", "shell",
+		"read_workspace_rules", "list_skills", "load_skill",
+	} {
+		if strings.Contains(catalog, forbidden) {
+			t.Fatalf("exact-scope tool catalog exposes %s: %v", forbidden, model.toolNames[0])
+		}
+	}
+	for _, allowed := range []string{
+		"list_workspace", "search_workspace", "read_workspace",
+		"submit_investigation_plan", "submit_decision",
+	} {
+		if !strings.Contains(catalog, allowed) {
+			t.Fatalf("exact-scope tool catalog missing %s: %v", allowed, model.toolNames[0])
+		}
+	}
+	for _, want := range []string{
+		"Exact coding workspace scope: sample-project/sample-module",
+		"already a readable subtree inside the configured workspace root",
+		"at most two bounded locating searches",
+	} {
+		if !messagesContain(model.inputs[0], want) {
+			t.Fatalf("initial model input missing %q: %+v", want, model.inputs[0])
+		}
 	}
 }
 
@@ -1117,6 +1289,8 @@ func TestModelBudgetPromptIncludesTurnAndContextUrgency(t *testing.T) {
 	got := modelRunProgressPrompt(runBudget{
 		CurrentTurn:      121,
 		MaxTurns:         150,
+		ToolCalls:        12,
+		MaxToolCalls:     16,
 		ContextBytes:     54_400,
 		MaxContextBytes:  65_536,
 		Compacted:        true,
@@ -1124,10 +1298,31 @@ func TestModelBudgetPromptIncludesTurnAndContextUrgency(t *testing.T) {
 	})
 	for _, want := range []string{
 		"121", "150", "29",
+		"12", "16", "4 remaining",
 		"54400", "65536", "11136",
 		"83%", "8", "urgent",
 	} {
 		if !strings.Contains(strings.ToLower(got), strings.ToLower(want)) {
+			t.Fatalf("budget prompt missing %q: %s", want, got)
+		}
+	}
+}
+
+func TestModelBudgetPromptTreatsNearlyExhaustedToolCallsAsUrgent(t *testing.T) {
+	got := modelRunProgressPrompt(runBudget{
+		CurrentTurn:     1,
+		MaxTurns:        150,
+		ToolCalls:       15,
+		MaxToolCalls:    16,
+		ContextBytes:    4_096,
+		MaxContextBytes: 65_536,
+	})
+	for _, want := range []string{
+		"15 of 16 investigation calls used",
+		"1 remaining",
+		"Urgency: urgent",
+	} {
+		if !strings.Contains(got, want) {
 			t.Fatalf("budget prompt missing %q: %s", want, got)
 		}
 	}

@@ -54,6 +54,23 @@ Two live failures established reusable implementation rules.
   and list tools, and make the search tool expose that path in its real schema.
   Prompt-only path requirements that the tool cannot express create a
   guaranteed nonconvergence loop.
+- Make an inherited exact scope operational before the first tool call. Tell
+  the model that it is already a readable subtree of the configured workspace,
+  expose a positive allowlist of path-scoped workspace, same-chat context, and
+  terminal control tools, and accept repository-relative paths by safely
+  prefixing the exact scope. A blacklist misses workspace-rule and skill
+  readers that can still cross the requested repository boundary.
+- Lexical scoping is not enough when the configured workspace contains
+  siblings. Resolve the exact scope and candidate real paths before list,
+  search, or read execution; reject a scoped symlink that resolves into a
+  sibling, and verify each existing path component's on-disk case.
+- Preserve the differently cased sibling trap: `sample-client/...` may be relative
+  to `sample-project/sample-module`, while `Sample-Module/...` remains an explicit
+  substitution error.
+- A mandatory investigation plan is control metadata, not evidence work. Do
+  not charge it against the investigation-tool budget; report current, total,
+  and remaining investigation calls beside model-turn and context budgets so
+  multi-fact questions reserve enough calls for authoritative reads.
 - Do not require production call-site reachability when the user only asks for
   a named function's direct behavior.
 

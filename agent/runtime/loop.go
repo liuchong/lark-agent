@@ -118,11 +118,20 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		ChatID:          bundle.Event.ChatID,
 		GitHubReference: bundle.GitHubReference,
 	}
+	requestedWorkspaceScope := requestedCodingWorkspaceScope(bundle)
 	visibleToolInfos := l.Tools.InfosFor(invocationScope)
+	if requestedWorkspaceScope != "" {
+		visibleToolInfos = exactScopeToolInfos(visibleToolInfos)
+	}
 	bundle = filterBundleTools(bundle, visibleToolInfos, invocationScope)
 	messages := []*schema.Message{
 		schema.SystemMessage(l.SystemPrompt),
 		initialUserMessage(bundle),
+	}
+	if requestedWorkspaceScope != "" {
+		messages = append(messages, schema.SystemMessage(
+			exactCodingWorkspaceScopePrompt(requestedWorkspaceScope, l.MaxToolCalls),
+		))
 	}
 	var runID string
 	runFinished := false
@@ -150,7 +159,6 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	totalToolBytes := 0
 	repeatedCalls := map[string]int{}
 	sourceLessWorkspaceSearches := 0
-	requestedWorkspaceScope := requestedCodingWorkspaceScope(bundle)
 	toolBudgetConvergencePrompted := false
 	codingEvidenceConvergencePrompted := false
 	codingEvidenceAvailable := false
@@ -193,6 +201,8 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		budget := runBudget{
 			CurrentTurn:      turn + 1,
 			MaxTurns:         l.MaxTurns,
+			ToolCalls:        toolCalls,
+			MaxToolCalls:     l.MaxToolCalls,
 			ContextBytes:     messageBytes(messages),
 			MaxContextBytes:  l.MaxContextBytes,
 			Compacted:        compaction.Compacted,
@@ -340,14 +350,22 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					codingWorkspaceRoot(bundle),
 				)
 				if toolErr == nil {
+					toolErr = validateCodingWorkspaceToolRealPath(
+						call.Function.Name,
+						executionArguments,
+						requestedWorkspaceScope,
+						codingWorkspaceRoot(bundle),
+					)
+				}
+				if toolErr == nil {
 					execution, toolErr = l.Tools.Execute(toolCtx, call.Function.Name, json.RawMessage(executionArguments))
-					if toolErr == nil && call.Function.Name != "submit_decision" {
+					if toolErr == nil && consumesInvestigationToolBudget(call.Function.Name) {
 						toolCalls++
 					}
 				}
 			} else {
 				execution, toolErr = l.Tools.Execute(toolCtx, call.Function.Name, json.RawMessage(call.Function.Arguments))
-				if toolErr == nil && call.Function.Name != "submit_decision" {
+				if toolErr == nil && consumesInvestigationToolBudget(call.Function.Name) {
 					toolCalls++
 				}
 			}
@@ -573,6 +591,8 @@ func modelTurnProgressPrompt(currentTurn, maxTurns int) string {
 type runBudget struct {
 	CurrentTurn      int
 	MaxTurns         int
+	ToolCalls        int
+	MaxToolCalls     int
 	ContextBytes     int
 	MaxContextBytes  int
 	Compacted        bool
@@ -582,6 +602,14 @@ type runBudget struct {
 
 func (b runBudget) RemainingTurns() int {
 	remaining := b.MaxTurns - b.CurrentTurn
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func (b runBudget) RemainingToolCalls() int {
+	remaining := b.MaxToolCalls - b.ToolCalls
 	if remaining < 0 {
 		return 0
 	}
@@ -598,16 +626,22 @@ func modelRunProgressPrompt(budget runBudget) string {
 		percent = budget.ContextBytes * 100 / budget.MaxContextBytes
 	}
 	urgency := "normal"
-	if percent >= 80 || budget.RemainingTurns()*5 <= budget.MaxTurns {
+	if percent >= 80 ||
+		budget.RemainingTurns()*5 <= budget.MaxTurns ||
+		(budget.MaxToolCalls > 0 && budget.ToolCalls*5 >= budget.MaxToolCalls*4) {
 		urgency = "urgent"
 	}
 	return fmt.Sprintf(
-		"%s Context budget: %d of %d bytes used (%d%%), %d bytes remaining. "+
+		"%s Tool-call budget: %d of %d investigation calls used, %d remaining. "+
+			"Context budget: %d of %d bytes used (%d%%), %d bytes remaining. "+
 			"Automatic compaction: %t; replaced old messages: %d. Urgency: %s. "+
 			"Required outward language: %s; use that language for all explanatory prose. "+
 			"When urgency is urgent, stop broad investigation, preserve explicit unknowns, "+
 			"and converge on submit_decision.",
 		modelTurnProgressPrompt(budget.CurrentTurn, budget.MaxTurns),
+		budget.ToolCalls,
+		budget.MaxToolCalls,
+		budget.RemainingToolCalls(),
 		budget.ContextBytes,
 		budget.MaxContextBytes,
 		percent,
@@ -617,6 +651,10 @@ func modelRunProgressPrompt(budget runBudget) string {
 		urgency,
 		budget.TargetLanguage,
 	)
+}
+
+func consumesInvestigationToolBudget(toolName string) bool {
+	return toolName != "submit_decision" && toolName != "submit_investigation_plan"
 }
 
 func resolvedBundleLanguage(bundle agentcontext.Bundle) agentlocale.Language {

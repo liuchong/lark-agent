@@ -1414,6 +1414,38 @@ The multi-step loop is accepted by these executable BDD scenarios:
   exact repository scope is inherited, then it comes from the most recent
   bounded same-sender message; unrelated history, another sender, or a bot
   message cannot impose a hard workspace scope.
+- Given an exact repository scope is inherited from bounded same-chat context,
+  when a coding run starts, then the model is explicitly told that the scope is
+  already a readable subtree inside the configured workspace root, every path
+  must stay inside that subtree, and changing the workspace root is neither
+  necessary nor an acceptable substitute for investigation.
+- Given an exact repository scope is active, when the model selects coding
+  tools, then only path-scoped workspace discovery and read tools remain
+  visible together with same-chat context and terminal control tools; global
+  symbol, call-path, exploratory, shell, workspace-rule, and skill readers are
+  omitted because they cannot prove the exact subtree boundary.
+- Given an exact repository scope is active and a path-scoped tool supplies a
+  path relative to that repository, when the runtime prepares the call, then it
+  prefixes the exact scope before execution. A differently cased similarly
+  named repository remains an explicit sibling substitution error and is never
+  rewritten into the requested project.
+- Given a path inside the exact repository scope is a symbolic link to a
+  sibling project elsewhere in the configured workspace, when list, search, or
+  read prepares to execute, then the runtime resolves the real scope and target
+  paths and rejects the call before any sibling content reaches the model.
+- Given a path relies on case-insensitive filesystem lookup, when any existing
+  path component differs from its on-disk spelling, then the exact-scope gate
+  rejects the call instead of allowing a differently cased repository or file.
+- Given a coding question asks for several related facts in one real project,
+  when the exact scope is active, then the run is instructed to use at most two
+  bounded locating searches before reading the candidate production files and
+  to reserve enough tool and model budget to answer every requested field or
+  state the exact remaining unknown.
+- Given a coding run submits its required bounded investigation plan, when the
+  runtime reports the current tool-call budget, then the plan is control
+  metadata and does not consume an investigation call; every model turn sees
+  the current and maximum investigation-call counts together with the remaining
+  model-turn and context budgets.
 - Given an exact repository scope is active, when the model calls a workspace
   tool that cannot carry that path boundary, including global symbol search or
   call-path tracing, then the runtime rejects it and requires a path-scoped
