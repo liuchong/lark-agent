@@ -171,6 +171,8 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	lastObservation := ""
 	forceDecision := false
 	terminalOnlyAttempts := 0
+	groundingCorrectionPending := false
+	groundingCorrectionGranted := false
 	structuralRecoverySearchAttempted := false
 	structuralRecoveryReadAttempted := false
 	var structuralRecoveryCandidates []string
@@ -270,17 +272,21 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		terminalOnly := forceDecision
 		turnToolInfos := visibleToolInfos
 		if terminalOnly {
-			if terminalOnlyAttempts >= maxTerminalOnlyAttempts {
+			terminalAttemptLimit := maxTerminalOnlyAttempts
+			if groundingCorrectionGranted {
+				terminalAttemptLimit++
+			}
+			if terminalOnlyAttempts >= terminalAttemptLimit {
 				return domain.Decision{}, trajectory, errs.NewInternalError(
 					errs.SubtypeModelNonConvergence,
 					"model did not submit a terminal decision after %d attempts",
-					maxTerminalOnlyAttempts,
+					terminalAttemptLimit,
 				)
 			}
 			terminalOnlyAttempts++
 			turnToolInfos = submitDecisionOnly(visibleToolInfos)
 			requestMessages = append(requestMessages, schema.SystemMessage(
-				terminalOnlyPrompt(terminalOnlyAttempts, maxTerminalOnlyAttempts),
+				terminalOnlyPrompt(terminalOnlyAttempts, terminalAttemptLimit),
 			))
 		} else if structuralEvidenceSearchRecovery {
 			turnToolInfos = namedToolOnly(visibleToolInfos, "search_workspace")
@@ -551,6 +557,17 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					execution.Decision = nil
 				}
 			}
+			if toolErr == nil &&
+				execution.Decision != nil &&
+				groundingCorrectionPending &&
+				execution.Decision.EvidenceStatus == domain.EvidenceInsufficient &&
+				claimsRuntimeEvidenceWasLost(*execution.Decision) {
+				toolErr = errs.NewInternalError(
+					errs.SubtypeInvalidResponse,
+					"a prior verified coding draft failed only reply-local grounding; exact current-run reads remain retained by the runtime, so context compaction did not erase that evidence. You must not downgrade to insufficient by claiming those reads were lost. Remove or rephrase unsupported reply wording and resubmit a narrower verified answer with the same valid sources; a genuinely new evidence gap may still be stated precisely",
+				)
+				execution.Decision = nil
+			}
 			if toolErr == nil && execution.Decision != nil {
 				normalized := normalizeCodingDecisionWithSearchEvidence(
 					bundle,
@@ -583,8 +600,25 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					*execution.Decision,
 					authoritativeContents,
 				); err != nil {
-					toolErr = err
+					toolErr = errs.NewInternalError(
+						errs.SubtypeInvalidResponse,
+						"%v. This is a reply-local grounding correction, not evidence loss: exact current-run reads remain retained outside the compacted model transcript. Remove or rephrase only the unsupported path, identifier, callback, field, or serialized example and resubmit a narrower verified answer; do not downgrade supported facts to insufficient",
+						err,
+					)
 					execution.Decision = nil
+					groundingCorrectionPending = true
+					forceDecision = true
+					if !groundingCorrectionGranted {
+						l.MaxTurns++
+						groundingCorrectionGranted = true
+						postToolPrompts = append(
+							postToolPrompts,
+							fmt.Sprintf(
+								"One dedicated submit-only grounding-correction turn has been added. The total model-turn limit is now %d. Runtime-held authoritative reads remain available to validation even if older model messages were compacted. Correct only the rejected reply wording and preserve supported facts.",
+								l.MaxTurns,
+							),
+						)
+					}
 				}
 			}
 			if toolErr == nil && execution.Decision == nil && call.Function.Name == "search_workspace" && len(execution.Sources) == 0 {
@@ -862,6 +896,30 @@ func toolBudgetConvergencePrompt() string {
 }
 
 const maxTerminalOnlyAttempts = 3
+
+func claimsRuntimeEvidenceWasLost(decision domain.Decision) bool {
+	text := strings.ToLower(decision.Reason + "\n" + decision.ReplyText)
+	for _, marker := range []string{
+		"compaction",
+		"compacted",
+		"compressed context",
+		"evidence was lost",
+		"evidence lost",
+		"source content was lost",
+		"cannot recheck",
+		"上下文压缩",
+		"压缩后",
+		"证据丢失",
+		"来源丢失",
+		"无法再次核验",
+		"无法重新核验",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 func terminalOnlyPrompt(attempt, maxAttempts int) string {
 	return fmt.Sprintf(

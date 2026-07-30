@@ -118,6 +118,14 @@ Two live failures established reusable implementation rules.
   target's local evidence. Comparing response, push, or local-state JSON
   directly against a `sampleContent`-only snippet creates false insufficiency;
   checking only the union permits unrelated JSON to masquerade as the target.
+- Final grounding failures are reply-local corrections, not evidence loss. Keep
+  one bounded submit-only correction turn outside the investigation budget,
+  retain authoritative read contents in runtime state, and reject an immediate
+  downgrade that falsely blames context compaction. Still permit a precisely
+  stated, genuinely new evidence gap to converge as insufficient. This lets the
+  model remove an unsupported identifier such as `eventCode` and preserve the
+  supported fact "notification 9001" without reopening tools or weakening
+  identifier checks.
 - Validate outward repository paths against current-run `read_workspace`
   sources, not all submitted citations; a search receipt remains a locator even
   when the model copies it into `source_refs`. Validate lower-camel-case

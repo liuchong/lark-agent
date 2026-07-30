@@ -889,6 +889,158 @@ func TestAgentLoopReservesFinalTwoTurnsAfterCitableEvidence(t *testing.T) {
 	}
 }
 
+func TestAgentLoopPreservesEvidenceForGroundingCorrection(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{
+			"question":"确认示例事件通知、回调和字段",
+			"entry_points":["sample-client/SampleEvent.java"],
+			"symbols":["onSampleEvent","sampleFlag","sampleTimestamp","sampleVersion"],
+			"tools":["read_workspace"],
+			"stop_conditions":["读到通知编号、回调和字段"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("read", "read_workspace", `{"path":"sample-client/SampleEvent.java"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("unsupported", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"结论：WebSocket eventCode 为 9001，回调 onSampleEvent 更新 sampleFlag、sampleTimestamp 和 sampleVersion。依据：sample-client/SampleEvent.java。未知/下一步：没有。",
+			"reason":"authoritative read completed",
+			"source_refs":[{"relative_path":"sample-client/SampleEvent.java","digest":"sha256:sample-event","kind":"workspace_file"}]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("downgrade", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"insufficient",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"上下文已经压缩，无法再次核验。",
+			"reason":"the cited evidence was lost after compaction",
+			"source_refs":[{"relative_path":"sample-client/SampleEvent.java","digest":"sha256:sample-event","kind":"workspace_file"}]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("corrected", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"结论：WebSocket 通知编号为 9001，回调 onSampleEvent 更新 sampleFlag、sampleTimestamp 和 sampleVersion。依据：sample-client/SampleEvent.java。未知/下一步：没有。",
+			"reason":"removed the unsupported identifier while preserving cited facts",
+			"source_refs":[{"relative_path":"sample-client/SampleEvent.java","digest":"sha256:sample-event","kind":"workspace_file"}]
+		}`)}),
+	}}
+	registry, err := agenttools.NewRegistry(
+		testTool("read_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			return agenttools.Execution{
+				Content: "WebSocket notification 9001 fires onSampleEvent and updates sampleFlag, sampleTimestamp, and sampleVersion.",
+				Sources: []domain.SourceRef{{
+					RelativePath: "sample-client/SampleEvent.java",
+					Digest:       "sha256:sample-event",
+					Kind:         "workspace_file",
+				}},
+			}, nil
+		}),
+		SubmitInvestigationPlanDefinition(),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, trajectory, err := (AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 4,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_grounding_correction",
+			Content:   "检查当前项目的示例事件通知编号、回调和字段",
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		decision.EvidenceStatus != domain.EvidenceVerified ||
+		model.calls != 5 ||
+		!strings.Contains(decision.ReplyText, "通知编号为 9001") {
+		t.Fatalf("decision=%+v modelCalls=%d trajectory=%+v", decision, model.calls, trajectory)
+	}
+	if !trajectoryContains(trajectory, "must not downgrade") {
+		t.Fatalf("trajectory missing evidence-preserving correction rejection: %+v", trajectory)
+	}
+	if !messagesContain(model.inputs[4], "Only submit_decision is available now") {
+		t.Fatalf("correction turn exposed non-terminal tools: %+v", model.inputs[4])
+	}
+	if !messagesContain(model.inputs[4], "Current model turn: 5 of 5") {
+		t.Fatalf("correction turn did not report its expanded total budget: %+v", model.inputs[4])
+	}
+}
+
+func TestAgentLoopAllowsGenuineInsufficientAfterGroundingFailure(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{
+			"question":"确认通知使用的协议字段名",
+			"entry_points":["sample-client/SampleEvent.java"],
+			"symbols":["eventCode"],
+			"tools":["read_workspace"],
+			"stop_conditions":["读到协议字段名或确认来源未定义"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("read", "read_workspace", `{"path":"sample-client/SampleEvent.java"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("unsupported", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"结论：协议字段 eventCode 的值为 9001。依据：sample-client/SampleEvent.java。未知/下一步：没有。",
+			"reason":"assumed a field name from the notification number",
+			"source_refs":[{"relative_path":"sample-client/SampleEvent.java","digest":"sha256:sample-event","kind":"workspace_file"}]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("insufficient", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"insufficient",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"当前来源只确认通知编号 9001，没有定义承载该编号的协议字段名。",
+			"reason":"the authoritative source names the notification number but does not define the requested protocol field",
+			"source_refs":[{"relative_path":"sample-client/SampleEvent.java","digest":"sha256:sample-event","kind":"workspace_file"}]
+		}`)}),
+	}}
+	registry, err := agenttools.NewRegistry(
+		testTool("read_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			return agenttools.Execution{
+				Content: "WebSocket notification 9001 triggers message edit convergence.",
+				Sources: []domain.SourceRef{{
+					RelativePath: "sample-client/SampleEvent.java",
+					Digest:       "sha256:sample-event",
+					Kind:         "workspace_file",
+				}},
+			}, nil
+		}),
+		SubmitInvestigationPlanDefinition(),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, _, err := (AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 4,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_genuine_gap",
+			Content:   "检查当前项目里通知 9001 使用的协议字段名",
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.EvidenceStatus != domain.EvidenceInsufficient || model.calls != 4 {
+		t.Fatalf("decision=%+v modelCalls=%d", decision, model.calls)
+	}
+}
+
 func TestAgentLoopReservesPenultimateTurnForStructuralEvidenceRead(t *testing.T) {
 	model := &scriptedModel{responses: []*schema.Message{
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{

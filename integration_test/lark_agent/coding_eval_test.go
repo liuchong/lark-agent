@@ -1929,6 +1929,101 @@ func TestReplyWithoutConfidenceIsRepairedInsteadOfApproved(t *testing.T) {
 	}
 }
 
+func TestCodingQuestionCorrectsGroundingWordingWithoutDiscardingEvidence(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "sample-project", "sample-module", "sample-client", "SampleEvent.java")
+	if err := os.MkdirAll(filepath.Dir(sourcePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sourceContent := "WebSocket notification 9001 fires onSampleEvent and updates sampleFlag, sampleTimestamp, and sampleVersion."
+	if err := os.WriteFile(sourcePath, []byte(sourceContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(sourceContent))
+	digest := fmt.Sprintf("sha256:%s", hex.EncodeToString(sum[:8]))
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("plan", "submit_investigation_plan", `{
+			"question":"确认示例事件通知、回调和字段",
+			"entry_points":["sample-project/sample-module/sample-client/SampleEvent.java"],
+			"symbols":["onSampleEvent","sampleFlag","sampleTimestamp","sampleVersion"],
+			"tools":["read_workspace"],
+			"stop_conditions":["读到通知编号、回调和字段"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("read", "read_workspace", `{
+			"path":"sample-project/sample-module/sample-client/SampleEvent.java"
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("unsupported", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"结论：WebSocket eventCode 为 9001，回调 onSampleEvent 更新 sampleFlag、sampleTimestamp 和 sampleVersion。依据：sample-project/sample-module/sample-client/SampleEvent.java。未知/下一步：没有。",
+			"reason":"authoritative project read completed",
+			"source_refs":[{"relative_path":"sample-project/sample-module/sample-client/SampleEvent.java","digest":"`+digest+`","kind":"workspace_file"}]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("downgrade", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"insufficient",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"上下文已经压缩，无法再次核验。",
+			"reason":"the source content was lost after compaction",
+			"source_refs":[{"relative_path":"sample-project/sample-module/sample-client/SampleEvent.java","digest":"`+digest+`","kind":"workspace_file"}]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("corrected", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"结论：WebSocket 通知编号为 9001，回调 onSampleEvent 更新 sampleFlag、sampleTimestamp 和 sampleVersion。依据：sample-project/sample-module/sample-client/SampleEvent.java。未知/下一步：没有。",
+			"reason":"reply wording now matches the authoritative project read",
+			"source_refs":[{"relative_path":"sample-project/sample-module/sample-client/SampleEvent.java","digest":"`+digest+`","kind":"workspace_file"}]
+		}`)}),
+	}}
+	registry, err := agenttools.NewRegistry(append(
+		agenttools.WorkspaceDefinitions(scope),
+		agentruntime.SubmitInvestigationPlanDefinition(),
+		agentruntime.SubmitDecisionDefinition(),
+	)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, trajectory, err := (agentruntime.AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 4,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_grounding_wording",
+			Content:   "请检查当前项目的示例事件通知编号、回调和字段",
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		decision.EvidenceStatus != domain.EvidenceVerified ||
+		model.calls != 5 ||
+		!strings.Contains(decision.ReplyText, "通知编号为 9001") {
+		t.Fatalf("decision=%+v calls=%d", decision, model.calls)
+	}
+	if !codingEvalTrajectoryContains(trajectory, "must not downgrade") {
+		t.Fatalf("trajectory did not preserve verified evidence: %+v", trajectory)
+	}
+	if !codingEvalMessagesContain(model.inputs[4], "Only submit_decision is available now") {
+		t.Fatalf("correction turn exposed non-terminal tools: %+v", model.inputs[4])
+	}
+	if !codingEvalMessagesContain(model.inputs[4], "Current model turn: 5 of 5") {
+		t.Fatalf("correction turn did not report its expanded total budget: %+v", model.inputs[4])
+	}
+}
+
 func codingEvalToolCall(id, name, arguments string) schema.ToolCall {
 	return schema.ToolCall{
 		ID:   id,

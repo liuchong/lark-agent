@@ -1025,6 +1025,17 @@ source-snippet extraction over a whole line. A standard `unknown/next step`
 suffix after an example does not erase the binding, and a later response,
 push, notification, or local-state fact marker ends the earlier field binding
 even when several JSON examples share one line.
+If a verified coding draft reaches final grounding but fails only because its
+reply text contains an uncited path, identifier, callback, field, or serialized
+example, the runtime preserves one bounded submit-only correction turn outside
+the investigation budget. The model must narrow or rephrase the answer against
+the authoritative current-run reads retained by the runtime. It must not
+reinterpret a reply-local grounding rejection or context compaction as loss of
+the underlying evidence and downgrade to `insufficient` for that false reason.
+A newly identified, precisely stated evidence gap may still converge to the
+normal fixed insufficient reply instead of being forced into a verified claim.
+The correction turn exposes no investigation or external-action tools, does
+not expand Workspace scope, and is granted at most once.
 As soon as a current-run read proves only the opaque declaration and at least
 two model turns remain before the terminal turn, the runtime enters bounded
 structural-evidence recovery. It exposes only `search_workspace` for one exact
@@ -1565,6 +1576,12 @@ The multi-step loop is accepted by these executable BDD scenarios:
   field JSON, when reply-side field binding runs, then each JSON keeps its own
   fact association: the response JSON is not compared as the field shape and
   the suffix does not allow unrelated evidence to masquerade as that shape.
+- Given a verified coding draft cites authoritative reads but introduces an
+  unsupported reply-local identifier such as `eventCode` for a source that
+  only says notification `9001`, when final grounding rejects that wording,
+  then the runtime grants one submit-only correction turn, rejects an immediate
+  evidence-loss downgrade, and accepts a corrected verified answer that says
+  notification `9001` while preserving the cited callback and message fields.
 - Given the model tries to submit `evidence_status=insufficient` before the
   bounded structural recovery is complete, when the terminal gate evaluates
   the draft, then it rejects the early conclusion and directs the model through
