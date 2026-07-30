@@ -974,6 +974,49 @@ func TestOwnerNotificationTextUsesConcretePreReplyAction(t *testing.T) {
 	if strings.Contains(text, "direct_mention") {
 		t.Fatalf("notification leaked internal reason: %s", text)
 	}
+	if strings.Contains(text, "并将发送") {
+		t.Fatalf("pre-reply notification claimed an unchecked send: %s", text)
+	}
+}
+
+func TestApprovalNotificationTextIncludesExactPrivateCommands(t *testing.T) {
+	item := domain.NewWorkItem(domain.NormalizedEvent{MessageID: "om_approval"})
+	text := approvalNotificationText(item, domain.Decision{
+		Kind:        domain.DecisionRequestApproval,
+		Relevance:   domain.RelevanceDirectMention,
+		ReplyText:   "我已核对上下文，但还不能确认具体组织。",
+		OwnerAction: "确认具体 OpenAI 组织",
+	}, domain.Action{ID: 355, Status: domain.ActionAwaitingApproval}, "测试负责人", "zh-CN")
+	for _, want := range []string{
+		"审批 #355",
+		"尚未发送",
+		"我已核对上下文",
+		"确认具体 OpenAI 组织",
+		"/approval approve 355 confirm",
+		"/approval reject 355 <原因>",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("approval notification missing %q: %s", want, text)
+		}
+	}
+}
+
+func TestApprovalNotificationTextPreservesAssistantRequestIdentity(t *testing.T) {
+	item := domain.NewWorkItem(domain.NormalizedEvent{MessageID: "om_assistant_approval"})
+	text := approvalNotificationText(item, domain.Decision{
+		Kind:        domain.DecisionRequestApproval,
+		Relevance:   domain.RelevanceAssistantRequest,
+		ReplyText:   "这是等待确认的助手答复。",
+		OwnerAction: "确认是否发送",
+	}, domain.Action{ID: 356, Status: domain.ActionAwaitingApproval}, "测试负责人", "zh-CN")
+	for _, want := range []string{"助手答复草稿", "审批 #356", "尚未发送"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("assistant approval notification missing %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "代回复草稿") {
+		t.Fatalf("assistant approval was mislabeled as delegated: %s", text)
+	}
 }
 
 func TestOwnerNotificationTextDoesNotPasteEnglishModelReason(t *testing.T) {
@@ -994,6 +1037,7 @@ func TestOwnerNotificationTextDoesNotPasteEnglishModelReason(t *testing.T) {
 
 type capturingOwnerMessenger struct {
 	notification string
+	key          string
 }
 
 func (m *capturingOwnerMessenger) ReplyAsUser(
@@ -1008,7 +1052,44 @@ func (m *capturingOwnerMessenger) NotifyOwner(
 	request agenttools.NotifyRequest,
 ) error {
 	m.notification = request.Text
+	m.key = request.IdempotencyKey
 	return nil
+}
+
+func TestLiveOwnerNotifierSendsIdempotentExactApprovalNotice(t *testing.T) {
+	messenger := &capturingOwnerMessenger{}
+	notifier := liveOwnerNotifier{
+		messenger: messenger,
+		ownerName: "测试负责人",
+		preferred: agentlocale.LanguageChinese,
+		fallback:  agentlocale.LanguageChinese,
+	}
+	err := notifier.HandleApprovalNotification(
+		context.Background(),
+		domain.NewWorkItem(domain.NormalizedEvent{MessageID: "om_approval"}),
+		domain.Decision{
+			Kind:        domain.DecisionRequestApproval,
+			ReplyText:   "我已核对上下文，但还不能确认具体组织。",
+			OwnerAction: "确认具体 OpenAI 组织",
+		},
+		domain.Action{ID: 355, Status: domain.ActionAwaitingApproval},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messenger.key != "owner-approval-notice:355" {
+		t.Fatalf("idempotency key=%q", messenger.key)
+	}
+	for _, want := range []string{
+		"审批 #355",
+		"尚未发送",
+		"/approval approve 355 confirm",
+		"/approval reject 355 <原因>",
+	} {
+		if !strings.Contains(messenger.notification, want) {
+			t.Fatalf("notification missing %q: %s", want, messenger.notification)
+		}
+	}
 }
 
 func TestAutoOwnerNoticeUsesResolvedDecisionLanguage(t *testing.T) {
@@ -1036,7 +1117,7 @@ func TestAutoOwnerNoticeUsesResolvedDecisionLanguage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Liu Chong", "will send this reply", "I verified"} {
+	for _, want := range []string{"Liu Chong", "is preparing this reply", "I verified"} {
 		if !strings.Contains(messenger.notification, want) {
 			t.Fatalf("notification missing %q: %s", want, messenger.notification)
 		}

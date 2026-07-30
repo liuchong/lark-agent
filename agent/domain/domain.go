@@ -584,6 +584,7 @@ const (
 
 // Action describes an auditable side effect.
 type Action struct {
+	ID           int64        `json:"id,omitempty" yaml:"id,omitempty"`
 	Status       ActionStatus `json:"status" yaml:"status"`
 	Kind         string       `json:"kind" yaml:"kind"`
 	Idempotency  string       `json:"idempotency,omitempty" yaml:"idempotency,omitempty"`

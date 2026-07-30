@@ -2057,6 +2057,39 @@ func (n liveOwnerNotifier) HandleNotification(
 	})
 }
 
+func (n liveOwnerNotifier) HandleApprovalNotification(
+	ctx context.Context,
+	item domain.WorkItem,
+	decision domain.Decision,
+	action domain.Action,
+) error {
+	if action.ID <= 0 || action.Status != domain.ActionAwaitingApproval {
+		return errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"reply approval notification requires a persisted awaiting approval action",
+		)
+	}
+	language := agentlocale.Language(decision.Language)
+	if language != agentlocale.LanguageChinese && language != agentlocale.LanguageEnglish {
+		language = agentlocale.Resolve(
+			n.preferred,
+			n.fallback,
+			item.Event.Content,
+			decision.ReplyText,
+		)
+	}
+	return (agenttools.NotifyOwnerTool{Messenger: n.messenger}).Execute(ctx, agenttools.NotifyRequest{
+		Text: approvalNotificationText(
+			item,
+			decision,
+			action,
+			n.ownerName,
+			string(language),
+		),
+		IdempotencyKey: fmt.Sprintf("owner-approval-notice:%d", action.ID),
+	})
+}
+
 func ownerNotificationText(item domain.WorkItem, decision domain.Decision, ownerName, language string) string {
 	resolved := agentlocale.Language(language)
 	if resolved != agentlocale.LanguageEnglish {
@@ -2081,7 +2114,7 @@ func ownerNotificationText(item domain.WorkItem, decision domain.Decision, owner
 		}
 		if resolved == agentlocale.LanguageEnglish {
 			return fmt.Sprintf(
-				"%s, the intelligent assistant received a delegated request for message %s and will send this reply:\n\n%s\n\nYour next action: %s",
+				"%s, the intelligent assistant received a delegated request for message %s and is preparing this reply:\n\n%s\n\nYour next action: %s",
 				ownerName,
 				item.Event.MessageID,
 				decision.ReplyText,
@@ -2089,7 +2122,7 @@ func ownerNotificationText(item domain.WorkItem, decision domain.Decision, owner
 			)
 		}
 		return fmt.Sprintf(
-			"%s，智能助手已收到消息 %s 的代回复请求，并将发送以下答复：\n\n%s\n\n仍需你处理：%s。",
+			"%s，智能助手已收到消息 %s 的代回复请求，正在准备以下答复：\n\n%s\n\n仍需你处理：%s。",
 			ownerName,
 			item.Event.MessageID,
 			decision.ReplyText,
@@ -2113,6 +2146,73 @@ func ownerNotificationText(item domain.WorkItem, decision domain.Decision, owner
 		reason,
 		item.Event.MessageID,
 	)
+}
+
+func approvalNotificationText(
+	item domain.WorkItem,
+	decision domain.Decision,
+	action domain.Action,
+	ownerName,
+	language string,
+) string {
+	resolved := agentlocale.Language(language)
+	if resolved != agentlocale.LanguageEnglish {
+		resolved = agentlocale.LanguageChinese
+	}
+	ownerName = strings.TrimSpace(ownerName)
+	if ownerName == "" {
+		if resolved == agentlocale.LanguageEnglish {
+			ownerName = "Owner"
+		} else {
+			ownerName = "负责人"
+		}
+	}
+	ownerAction := strings.TrimSpace(decision.OwnerAction)
+	if ownerAction == "" || agentlocale.ValidateProse(ownerAction, resolved) != nil {
+		if resolved == agentlocale.LanguageEnglish {
+			ownerAction = "Review the exact draft and decide whether it may be sent."
+		} else {
+			ownerAction = "查看完整草稿，并决定是否允许发送"
+		}
+	}
+	delegated := isDelegatedApprovalRelevance(decision.Relevance)
+	if resolved == agentlocale.LanguageEnglish {
+		draftRole := "assistant reply draft"
+		if delegated {
+			draftRole = "delegated reply draft"
+		}
+		return fmt.Sprintf(
+			"%s, the %s for message %s is waiting for your approval (#%d) and has not been sent:\n\n%s\n\nYour next action: %s\n\nApprove: `/approval approve %d confirm`\nReject: `/approval reject %d <reason>`",
+			ownerName,
+			draftRole,
+			item.Event.MessageID,
+			action.ID,
+			decision.ReplyText,
+			ownerAction,
+			action.ID,
+			action.ID,
+		)
+	}
+	draftRole := "助手答复草稿"
+	if delegated {
+		draftRole = "代回复草稿"
+	}
+	return fmt.Sprintf(
+		"%s，消息 %s 的%s正在等待你确认（审批 #%d），尚未发送：\n\n%s\n\n仍需你处理：%s\n\n批准：`/approval approve %d confirm`\n拒绝：`/approval reject %d <原因>`",
+		ownerName,
+		item.Event.MessageID,
+		draftRole,
+		action.ID,
+		decision.ReplyText,
+		ownerAction,
+		action.ID,
+		action.ID,
+	)
+}
+
+func isDelegatedApprovalRelevance(relevance domain.Relevance) bool {
+	return relevance == domain.RelevanceDirectMention ||
+		relevance == domain.RelevancePrivateMessage
 }
 
 func (p larkToolContext) RecentMessages(

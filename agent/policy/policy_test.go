@@ -89,6 +89,29 @@ func TestLowRiskDirectMentionReplyUsesConfiguredConfidenceFloor(t *testing.T) {
 	}
 }
 
+func TestRequiresApprovalPredictsOnlyConfidenceAndModeHolds(t *testing.T) {
+	auto := NewReplyGate(Config{
+		Mode:               domain.ModeAuto,
+		ReplyConfidenceMin: 0.85,
+	}, fakeThreadState{})
+	if auto.RequiresApproval(domain.Decision{
+		Kind: domain.DecisionReply, Confidence: 0.92,
+	}) {
+		t.Fatal("high-confidence auto reply unexpectedly requires approval")
+	}
+	if !auto.RequiresApproval(domain.Decision{
+		Kind: domain.DecisionReply, Confidence: 0.72,
+	}) {
+		t.Fatal("low-confidence reply did not require approval")
+	}
+	approval := NewReplyGate(Config{Mode: domain.ModeApproval}, fakeThreadState{})
+	if !approval.RequiresApproval(domain.Decision{
+		Kind: domain.DecisionReply, Confidence: 0.99,
+	}) {
+		t.Fatal("approval mode did not require approval")
+	}
+}
+
 func TestMediumRiskDirectMentionStillRequiresApprovalBelowConfidenceFloor(t *testing.T) {
 	gate := NewReplyGate(Config{Mode: domain.ModeAuto, ReplyConfidenceMin: 0.85}, fakeThreadState{})
 	action, err := gate.Prepare(context.Background(), domain.WorkItem{}, domain.Decision{

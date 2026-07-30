@@ -11,6 +11,16 @@ Keep the following boundaries aligned:
   never fall through to the model;
 - task lists are bounded and action-oriented, and each actionable item exposes
   an exact next command;
+- creating a durable reply approval is not enough: the first actionable private
+  notice must say the draft is unsent and include the typed approval action ID,
+  exact draft, remaining owner work, and exact approve/reject commands; use an
+  action-derived idempotency key so notification retries do not create noise,
+  and label assistant-facing drafts separately from delegated reply drafts;
+- a high-confidence delegated reply remains autonomous: notify the owner before
+  the sender-facing reply, then send immediately without waiting for approval;
+- an approved delegated draft is no longer awaiting approval: even when the
+  global gate is configured in approval mode, notify the owner before consuming
+  the exact approval and sending the sender-facing reply;
 - a command message ID journals the command, validation, mutation, and rendered
   result in one SQLite transaction so duplicate Lark delivery is idempotent;
 - interrupted external actions with uncertain results are reconciled by an

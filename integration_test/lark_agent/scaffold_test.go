@@ -609,19 +609,47 @@ func TestPrivateOwnerAutoReplyWithDurableStoreDoesNotRequireApprovalHistory(t *t
 }
 
 func TestApprovedAssistantReplyResumesWithBotIdentity(t *testing.T) {
-	testApprovedReplyOutcome(t, domain.RelevanceAssistantRequest, false, "ou_owner", false)
+	testApprovedReplyOutcome(
+		t,
+		domain.RelevanceAssistantRequest,
+		false,
+		"ou_owner",
+		false,
+		domain.ModeAuto,
+	)
 }
 
 func TestLegacyApprovedAssistantReplyResumesWithBotIdentity(t *testing.T) {
-	testApprovedReplyOutcome(t, domain.RelevanceAssistantRequest, true, "ou_owner", false)
+	testApprovedReplyOutcome(
+		t,
+		domain.RelevanceAssistantRequest,
+		true,
+		"ou_owner",
+		false,
+		domain.ModeAuto,
+	)
 }
 
 func TestApprovedDelegatedReplyNotifiesOwnerThenResumesWithUserIdentity(t *testing.T) {
-	testApprovedReplyOutcome(t, domain.RelevanceDirectMention, false, "ou_requester", false)
+	testApprovedReplyOutcome(
+		t,
+		domain.RelevanceDirectMention,
+		false,
+		"ou_requester",
+		false,
+		domain.ModeApproval,
+	)
 }
 
 func TestApprovedNonOwnerAssistantReplyIsBlockedAfterAuthorizationChange(t *testing.T) {
-	testApprovedReplyOutcome(t, domain.RelevanceAssistantRequest, false, "ou_requester", true)
+	testApprovedReplyOutcome(
+		t,
+		domain.RelevanceAssistantRequest,
+		false,
+		"ou_requester",
+		true,
+		domain.ModeAuto,
+	)
 }
 
 func testApprovedReplyOutcome(
@@ -630,6 +658,7 @@ func testApprovedReplyOutcome(
 	legacy bool,
 	senderID string,
 	wantBlocked bool,
+	gateMode domain.Mode,
 ) {
 	t.Helper()
 	statePath := filepath.Join(t.TempDir(), "state.db")
@@ -708,7 +737,7 @@ func testApprovedReplyOutcome(
 		}),
 		app.WithReplyHandler(reply.NewController(
 			policy.NewReplyGate(policy.Config{
-				Mode:        domain.ModeAuto,
+				Mode:        gateMode,
 				OwnerOpenID: "ou_owner",
 			}, privateReplyThreadState{}),
 			messenger,

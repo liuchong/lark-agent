@@ -444,10 +444,13 @@ func TestDaemonDeadLettersModelNonConvergenceWithoutRetry(t *testing.T) {
 }
 
 type fakeReplyHandler struct {
-	called bool
-	text   string
-	status domain.ActionStatus
-	events *[]string
+	called           bool
+	text             string
+	status           domain.ActionStatus
+	actionID         int64
+	idempotency      string
+	events           *[]string
+	approvalExpected bool
 }
 
 func (h *fakeReplyHandler) Handle(_ context.Context, _ domain.WorkItem, decision domain.Decision) (reply.Result, error) {
@@ -460,7 +463,15 @@ func (h *fakeReplyHandler) Handle(_ context.Context, _ domain.WorkItem, decision
 	if status == "" {
 		status = domain.ActionCompleted
 	}
-	return reply.Result{Action: domain.Action{Status: status}}, nil
+	return reply.Result{Action: domain.Action{
+		ID:          h.actionID,
+		Status:      status,
+		Idempotency: h.idempotency,
+	}}, nil
+}
+
+func (h *fakeReplyHandler) RequiresApproval(domain.Decision) bool {
+	return h.approvalExpected || h.status == domain.ActionAwaitingApproval
 }
 
 type fakeOwnerActivity struct {
@@ -726,10 +737,26 @@ type fakePoller struct {
 }
 
 type fakeNotifier struct {
-	called   bool
-	decision domain.Decision
-	key      string
-	events   *[]string
+	called         bool
+	approvalCalled bool
+	decision       domain.Decision
+	approvalAction domain.Action
+	key            string
+	events         *[]string
+}
+
+type genericOnlyNotifier struct {
+	called bool
+}
+
+func (n *genericOnlyNotifier) HandleNotification(
+	context.Context,
+	domain.WorkItem,
+	domain.Decision,
+	string,
+) error {
+	n.called = true
+	return nil
 }
 
 func (n *fakeNotifier) HandleNotification(
@@ -743,6 +770,21 @@ func (n *fakeNotifier) HandleNotification(
 	n.key = key
 	if n.events != nil {
 		*n.events = append(*n.events, "notify")
+	}
+	return nil
+}
+
+func (n *fakeNotifier) HandleApprovalNotification(
+	_ context.Context,
+	_ domain.WorkItem,
+	decision domain.Decision,
+	action domain.Action,
+) error {
+	n.approvalCalled = true
+	n.decision = decision
+	n.approvalAction = action
+	if n.events != nil {
+		*n.events = append(*n.events, "approval_notify")
 	}
 	return nil
 }
@@ -926,6 +968,114 @@ func TestDaemonNotifiesOwnerBeforeDelegatedReply(t *testing.T) {
 	}
 	if !result.Processed || notifier.decision.OwnerAction != decision.OwnerAction {
 		t.Fatalf("result=%+v notifier=%+v", result, notifier)
+	}
+}
+
+func TestDaemonNotifiesOwnerWithExactActionWhenDelegatedReplyAwaitsApproval(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_low_confidence",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	var events []string
+	replier := &fakeReplyHandler{
+		status:      domain.ActionAwaitingApproval,
+		actionID:    355,
+		idempotency: "approval:355",
+		events:      &events,
+	}
+	notifier := &fakeNotifier{events: &events}
+	daemon := NewDaemon(q, router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(&fakeDecider{decision: domain.Decision{
+			Kind:        domain.DecisionReply,
+			Relevance:   domain.RelevanceDirectMention,
+			Confidence:  0.72,
+			Risk:        domain.RiskLow,
+			ReplyText:   "我已核对上下文，但还不能确认具体组织。",
+			OwnerAction: "确认具体 OpenAI 组织",
+		}}),
+		WithReplyHandler(replier),
+		WithNotificationHandler(notifier),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || result.Decision.Kind != domain.DecisionRequestApproval {
+		t.Fatalf("result=%+v", result)
+	}
+	if !notifier.approvalCalled || notifier.approvalAction.ID != 355 {
+		t.Fatalf("notifier=%+v", notifier)
+	}
+	if got, want := strings.Join(events, ","), "reply,approval_notify"; got != want {
+		t.Fatalf("action order=%q want %q", got, want)
+	}
+}
+
+func TestDaemonRejectsNonActionableApprovalNotifier(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_non_actionable_approval",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	replier := &fakeReplyHandler{
+		status:      domain.ActionAwaitingApproval,
+		actionID:    357,
+		idempotency: "approval:357",
+	}
+	notifier := &genericOnlyNotifier{}
+	daemon := NewDaemon(q, router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(&fakeDecider{decision: domain.Decision{
+			Kind:       domain.DecisionReply,
+			Relevance:  domain.RelevanceDirectMention,
+			Confidence: 0.72,
+			Risk:       domain.RiskLow,
+			ReplyText:  "待审批的精确草稿",
+		}}),
+		WithReplyHandler(replier),
+		WithNotificationHandler(notifier),
+	)
+	if _, err := daemon.RunOnce(context.Background()); err == nil {
+		t.Fatal("non-actionable approval notifier was accepted")
+	}
+	if notifier.called {
+		t.Fatal("approval silently degraded to a generic notification")
+	}
+}
+
+func TestDaemonApprovedDelegatedReplyStillNotifiesBeforeSending(t *testing.T) {
+	approved := domain.Decision{
+		Kind:        domain.DecisionReply,
+		Mode:        domain.ModeApproval,
+		Relevance:   domain.RelevanceDirectMention,
+		Confidence:  1,
+		Risk:        domain.RiskLow,
+		ReplyText:   "已批准的精确答复",
+		OwnerAction: "核对后续处理",
+	}
+	q := &fakeQueue{
+		ok:       true,
+		item:     domain.NewWorkItem(domain.NormalizedEvent{MessageID: "om_approved"}),
+		approved: &approved,
+	}
+	var events []string
+	replier := &fakeReplyHandler{events: &events, approvalExpected: true}
+	notifier := &fakeNotifier{events: &events}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeApproval}),
+		WithReplyHandler(replier),
+		WithNotificationHandler(notifier),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || result.Decision.Kind != domain.DecisionReply {
+		t.Fatalf("result=%+v", result)
+	}
+	if got, want := strings.Join(events, ","), "notify,reply"; got != want {
+		t.Fatalf("approved action order=%q want %q", got, want)
 	}
 }
 

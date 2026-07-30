@@ -98,6 +98,19 @@ type NotificationHandler interface {
 	HandleNotification(context.Context, domain.WorkItem, domain.Decision, string) error
 }
 
+type approvalNotificationHandler interface {
+	HandleApprovalNotification(
+		context.Context,
+		domain.WorkItem,
+		domain.Decision,
+		domain.Action,
+	) error
+}
+
+type replyApprovalPredictor interface {
+	RequiresApproval(domain.Decision) bool
+}
+
 // TerminalFailureHandler sends one durable owner resolution summary after a
 // work item actually reaches dead letter.
 type TerminalFailureHandler interface {
@@ -357,7 +370,7 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 			return Result{}, err
 		}
 		if found {
-			return d.finishDecision(ctx, item, approved)
+			return d.finishApprovedDecision(ctx, item, approved)
 		}
 	}
 	decision, err := d.router.Route(ctx, item)
@@ -588,6 +601,23 @@ func (d *Daemon) startLeaseHeartbeat(
 }
 
 func (d *Daemon) finishDecision(ctx context.Context, item domain.WorkItem, decision domain.Decision) (Result, error) {
+	return d.finishDecisionWithApprovalState(ctx, item, decision, false)
+}
+
+func (d *Daemon) finishApprovedDecision(
+	ctx context.Context,
+	item domain.WorkItem,
+	decision domain.Decision,
+) (Result, error) {
+	return d.finishDecisionWithApprovalState(ctx, item, decision, true)
+}
+
+func (d *Daemon) finishDecisionWithApprovalState(
+	ctx context.Context,
+	item domain.WorkItem,
+	decision domain.Decision,
+	approvalGranted bool,
+) (Result, error) {
 	if err := d.ensureLease(ctx, item); err != nil {
 		d.markRetry(item, err)
 		return Result{}, err
@@ -609,6 +639,7 @@ func (d *Daemon) finishDecision(ctx context.Context, item domain.WorkItem, decis
 	ownerNotified := false
 	if decision.Kind == domain.DecisionReply &&
 		!isAssistantFacingRequest(decision.Relevance) &&
+		(approvalGranted || !replyRequiresApproval(d.replier, decision)) &&
 		d.notifier != nil {
 		if notifications, ok := d.queue.(postReplyNotificationStore); ok {
 			if err := d.ensureOwnerNotification(ctx, item, decision, notifications); err != nil {
@@ -642,6 +673,10 @@ func (d *Daemon) finishDecision(ctx context.Context, item domain.WorkItem, decis
 		case domain.ActionAwaitingApproval:
 			decision.Kind = domain.DecisionRequestApproval
 			decision.Reason = appendReason(decision.Reason, replyResult.Action.CancelReason)
+			if err := d.notifyReplyApproval(ctx, item, decision, replyResult.Action); err != nil {
+				d.markRetry(item, err)
+				return Result{}, err
+			}
 		case domain.ActionCancelled, domain.ActionBlocked:
 			decision.Kind = domain.DecisionIgnore
 			decision.Reason = appendReason(decision.Reason, replyResult.Action.CancelReason)
@@ -671,6 +706,29 @@ func (d *Daemon) finishDecision(ctx context.Context, item domain.WorkItem, decis
 		return Result{}, err
 	}
 	return Result{Processed: true, Decision: decision}, nil
+}
+
+func replyRequiresApproval(handler ReplyHandler, decision domain.Decision) bool {
+	predictor, ok := handler.(replyApprovalPredictor)
+	return ok && predictor.RequiresApproval(decision)
+}
+
+func (d *Daemon) notifyReplyApproval(
+	ctx context.Context,
+	item domain.WorkItem,
+	decision domain.Decision,
+	action domain.Action,
+) error {
+	if d.notifier == nil {
+		return nil
+	}
+	if notifier, ok := d.notifier.(approvalNotificationHandler); ok {
+		return notifier.HandleApprovalNotification(ctx, item, decision, action)
+	}
+	return errs.NewInternalError(
+		errs.SubtypeFailedPrecondition,
+		"approval notification handler is not configured",
+	)
 }
 
 func (d *Daemon) ensureLease(ctx context.Context, item domain.WorkItem) error {

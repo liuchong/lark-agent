@@ -52,6 +52,11 @@ func NewController(gate *policy.ReplyGate, messenger tools.Messenger, approvals 
 	return controller
 }
 
+// RequiresApproval reports deterministic holds before owner pre-notification.
+func (c *Controller) RequiresApproval(decision domain.Decision) bool {
+	return c.gate.RequiresApproval(decision)
+}
+
 // Handle gates, sends, and notifies for a proposed reply.
 func (c *Controller) Handle(ctx context.Context, item domain.WorkItem, decision domain.Decision) (Result, error) {
 	action, err := c.gate.Prepare(ctx, item, decision)
@@ -112,6 +117,7 @@ func (c *Controller) Handle(ctx context.Context, item domain.WorkItem, decision 
 			if err != nil {
 				return result, err
 			}
+			result.Action.ID = approvalID
 			result.Action.Idempotency = fmt.Sprintf("approval:%d", approvalID)
 			return result, nil
 		}

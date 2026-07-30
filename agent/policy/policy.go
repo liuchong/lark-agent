@@ -127,6 +127,14 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 	return action, nil
 }
 
+// RequiresApproval reports deterministic approval holds that can be known
+// before the final live thread-state checks run.
+func (g *ReplyGate) RequiresApproval(decision domain.Decision) bool {
+	return decision.Kind == domain.DecisionReply &&
+		(decision.Confidence < g.replyConfidenceMin(decision) ||
+			g.cfg.Mode == domain.ModeApproval)
+}
+
 func (g *ReplyGate) replyConfidenceMin(decision domain.Decision) float64 {
 	return g.cfg.ReplyConfidenceMin
 }

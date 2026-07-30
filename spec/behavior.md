@@ -220,6 +220,17 @@ that draft with bot identity and does not create a delegated owner notice.
 Approving a delegated owner mention first delivers the owner notice and then
 sends the exact draft with user identity. Approval may authorize the content and
 commitment, but it never changes who the original request addressed.
+When a reply action enters durable approval, the bot privately tells the owner
+that the draft has not been sent. That notice includes the approval action ID,
+the exact proposed reply, the remaining owner action, and exact private-chat
+approve and reject commands. The approval ID is carried as typed reply-action
+data rather than parsed from display text. Retrying the same approval uses a
+stable notification idempotency key and does not produce duplicate notices.
+The notice names the original role correctly: delegated work is a delegated
+reply draft, while an assistant request or private owner request is an
+assistant reply draft. A globally configured approval mode does not suppress
+the delegated owner notice after approval: an approved delegated draft still
+delivers that notice before the sender-facing reply.
 For an approval written by an older version before relevance was embedded in
 the action request, the daemon restores relevance from the work item's durable
 decision and consumes the legacy exact-draft idempotency key. It never guesses
@@ -1208,6 +1219,19 @@ The multi-step loop is accepted by these executable BDD scenarios:
   approved and resumed, then the persisted direct-mention relevance selects
   user identity, completes the delegated owner notice, and only then sends the
   sender-facing reply with the delegated robot prefix.
+- Given a delegated reply is held because its confidence is below policy or the
+  model explicitly requests approval, when the durable approval is created,
+  then the owner receives a private notice saying the draft has not been sent
+  and showing the approval ID, exact draft, remaining owner action,
+  `/approval approve <id> confirm`, and `/approval reject <id> <reason>`;
+  it does not first send a separate generic preparation notice.
+- Given an unanswered delegated reply meets or exceeds the configured confidence
+  threshold and has no approval-only commitment or policy risk, when the final
+  reply gate passes, then the agent privately notifies the owner and immediately
+  sends the sender-facing reply without waiting for owner confirmation.
+- Given delivery of that approval notice is retried, when the same durable
+  approval action is observed again, then the stable notification idempotency
+  key prevents a duplicate private message.
 - Given an ordinary auto-mode reply has no current or legacy approved draft,
   when the reply controller checks for a reusable approval, then the storage
   layer returns "not found" without requiring a persisted legacy relevance and
@@ -1357,7 +1381,7 @@ The multi-step loop is accepted by these executable BDD scenarios:
   marker.
 - Given the group reply is blocked, cancelled, awaiting approval, or fails, when
   reply execution stops, then the owner notice must not claim that the agent
-  already replied.
+  already replied or will send without approval.
 - Given the group reply succeeds and the following private owner notice fails,
   when the work item retries, then it resumes the persisted owner notice with
   the same idempotency key without rerunning the model or group reply.

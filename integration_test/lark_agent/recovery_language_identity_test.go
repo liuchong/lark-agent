@@ -14,6 +14,7 @@ import (
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
 	agentlocale "github.com/liuchong/lark-agent/agent/locale"
+	"github.com/liuchong/lark-agent/agent/policy"
 	"github.com/liuchong/lark-agent/agent/reply"
 	"github.com/liuchong/lark-agent/agent/router"
 	agentruntime "github.com/liuchong/lark-agent/agent/runtime"
@@ -115,7 +116,8 @@ func (r *capturingReply) Handle(
 }
 
 type orderedOwnerNotifier struct {
-	order *[]string
+	order          *[]string
+	approvalAction domain.Action
 }
 
 func (n orderedOwnerNotifier) HandleNotification(
@@ -125,6 +127,17 @@ func (n orderedOwnerNotifier) HandleNotification(
 	_ string,
 ) error {
 	*n.order = append(*n.order, "owner_notice")
+	return nil
+}
+
+func (n *orderedOwnerNotifier) HandleApprovalNotification(
+	_ context.Context,
+	_ domain.WorkItem,
+	_ domain.Decision,
+	action domain.Action,
+) error {
+	n.approvalAction = action
+	*n.order = append(*n.order, "approval_notice")
 	return nil
 }
 
@@ -173,6 +186,79 @@ func TestDelegatedReplyNotifiesNamedOwnerBeforeSenderFacingAssistantReply(t *tes
 	}
 	if strings.Contains(captured.decision.ReplyText, "用户") {
 		t.Fatalf("generic user identity leaked: %s", captured.decision.ReplyText)
+	}
+}
+
+type lowConfidenceDelegatedDecision struct{}
+
+func (lowConfidenceDelegatedDecision) Decide(
+	context.Context,
+	agentcontext.Bundle,
+) (domain.Decision, error) {
+	return domain.Decision{
+		Kind:        domain.DecisionReply,
+		Relevance:   domain.RelevanceDirectMention,
+		Confidence:  0.72,
+		Risk:        domain.RiskLow,
+		Language:    string(agentlocale.LanguageChinese),
+		ReplyText:   "我已核对群聊上下文，但还不能确认具体 OpenAI 组织。",
+		OwnerAction: "确认是 API key 组织还是企业版组织",
+	}, nil
+}
+
+func TestLowConfidenceDelegatedReplyPrivatelyReportsExactApprovalAction(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	event := domain.NormalizedEvent{
+		MessageID: "om_low_confidence",
+		ChatID:    "oc_group",
+		SenderID:  "ou_teammate",
+		Content:   "@测试负责人 请确认具体 OpenAI 组织",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner", Name: "测试负责人"}},
+	}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	notifier := &orderedOwnerNotifier{order: &order}
+	messenger := &privateReplyMessenger{}
+	daemon := app.NewDaemon(
+		store,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		app.WithContextBuilder(convergenceContextBuilder{}),
+		app.WithDecider(lowConfidenceDelegatedDecision{}),
+		app.WithReplyHandler(reply.NewController(
+			policy.NewReplyGate(policy.Config{
+				Mode:               domain.ModeAuto,
+				ReplyConfidenceMin: 0.85,
+			}, privateReplyThreadState{}),
+			messenger,
+			store,
+		)),
+		app.WithNotificationHandler(notifier),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || result.Decision.Kind != domain.DecisionRequestApproval {
+		t.Fatalf("result=%+v", result)
+	}
+	if messenger.userReplies != 0 || notifier.approvalAction.ID == 0 {
+		t.Fatalf("messenger=%+v notifier=%+v", messenger, notifier)
+	}
+	pending, err := store.ListPendingOwnerApprovals(context.Background(), 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending.Items) != 1 || pending.Items[0].ID != notifier.approvalAction.ID {
+		t.Fatalf("pending=%+v notifier=%+v", pending, notifier)
+	}
+	if got, want := strings.Join(order, ","), "approval_notice"; got != want {
+		t.Fatalf("notification order=%q want %q", got, want)
 	}
 }
 
