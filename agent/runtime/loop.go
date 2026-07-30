@@ -815,7 +815,7 @@ func SubmitDecisionDefinition() agenttools.Definition {
 					Type:     schema.String,
 					Required: true,
 					Enum:     []string{"ignore", "record", "notify", "reply", "request_approval"},
-					Desc:     "ignore only irrelevant content; record an owner-relevant update that needs no response; reply only with a useful evidence-backed response; delegated assignments and coordination requests require completed bounded read work plus a concise initial finding, not an acknowledgement or restatement; direct owner mentions may notify when no useful sender-facing response is possible without exposing private context or inventing work; assistant_request and owner_request cannot finish as notify only; coding questions must finish as reply and cannot use ignore, record, notify, or request_approval; request_approval is only for a non-coding risky response or personal commitment with an exact proposed reply_text",
+					Desc:     "ignore only irrelevant non-delegated content; record a non-delegated owner-relevant update that needs no response; delegated direct_mention or private_message work has already passed a semantic unanswered gate and must finish as a useful sender-facing reply or request_approval with exact reply_text; delegated assignments and coordination requests require completed bounded read work plus a concise initial finding, not an acknowledgement or restatement; assistant_request and owner_request cannot finish as notify only; coding questions must finish as reply and cannot use ignore, record, notify, or request_approval; request_approval is only for a non-coding risky response or personal commitment with an exact proposed reply_text",
 				},
 				"relevance_confidence": {Type: schema.Number, Required: true},
 				"reply_confidence": {
@@ -984,6 +984,26 @@ func validateDecisionSources(decision domain.Decision, allowed map[string]bool) 
 }
 
 func validateTerminalDecision(bundle agentcontext.Bundle, decision domain.Decision) error {
+	delegated := isDelegatedInvocation(bundle)
+	if delegated &&
+		decision.Kind == domain.DecisionNotify &&
+		domain.IsCodingQuestion(bundle.Event.Content) {
+		return errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"coding question cannot finish as notify; delegated work requires a useful sender-facing reply with completed checks and explicit unknowns",
+		)
+	}
+	if delegated {
+		switch decision.Kind {
+		case domain.DecisionReply, domain.DecisionRequestApproval:
+		case domain.DecisionIgnore, domain.DecisionRecord, domain.DecisionNotify:
+			return errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"delegated work cannot finish as %s after the semantic gate found it unanswered; submit a useful sender-facing reply or request_approval with exact reply_text",
+				decision.Kind,
+			)
+		}
+	}
 	if decision.Kind == domain.DecisionReply || decision.Kind == domain.DecisionRequestApproval {
 		language := agentlocale.Language(decision.Language)
 		if language != agentlocale.LanguageChinese && language != agentlocale.LanguageEnglish {
@@ -998,18 +1018,6 @@ func validateTerminalDecision(bundle agentcontext.Bundle, decision domain.Decisi
 	}
 	if decision.Kind != domain.DecisionNotify {
 		return nil
-	}
-	if isDelegatedInvocation(bundle) {
-		if domain.IsCodingQuestion(bundle.Event.Content) {
-			return errs.NewInternalError(
-				errs.SubtypeInvalidResponse,
-				"coding question cannot finish as notify; delegated work requires a useful sender-facing reply with completed checks and explicit unknowns",
-			)
-		}
-		return errs.NewInternalError(
-			errs.SubtypeInvalidResponse,
-			"delegated work cannot finish as owner notification only; submit a useful sender-facing reply with completed checks and explicit unknowns",
-		)
 	}
 	return errs.NewInternalError(
 		errs.SubtypeInvalidResponse,

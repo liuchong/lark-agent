@@ -269,15 +269,20 @@ information was passed to the owner. Merely saying that the owner was reminded,
 paraphrasing the request, or promising future work is not useful work and is
 rejected before sending.
 
-When no useful sender-facing response can be produced without exposing private
-context, inventing work, or making an owner commitment, the model may choose
-`record` or `notify`; a direct mention is not forced to produce filler.
-`request_approval` holds an exact commitment or risky response that needs the
-owner's approval. An automatic delegated reply never says that the owner or
-team will later deliver, coordinate, or report back unless that exact commitment
-has been approved. Shell output may locate evidence but is not itself a citable
-source; before replying from a shell-discovered file, the model reads that file
-through `read_workspace` to obtain a digest-backed source reference.
+When the durable semantic gate admits a `direct_mention` or `private_message`
+as still unanswered, the model must finish with a useful sender-facing `reply`
+or an exact `request_approval`. It cannot override that gate with `ignore`,
+`record`, or `notify`. If useful facts are unavailable without exposing private
+context or inventing work, the reply states the completed bounded check and the
+specific unknown or refusal instead of fabricating an answer. Withdrawal,
+validated owner handling, and ordinary private continuations that need no reply
+finish before the main model runs. `request_approval` holds an exact commitment
+or risky response that needs the owner's approval. An automatic delegated reply
+never says that the owner or team will later deliver, coordinate, or report back
+unless that exact commitment has been approved. Shell output may locate evidence
+but is not itself a citable source; before replying from a shell-discovered file,
+the model reads that file through `read_workspace` to obtain a digest-backed
+source reference.
 
 Availability checks and simple greetings from the configured owner to the
 assistant bot, including "在吗", are fast-path work. The bot replies immediately
@@ -1053,6 +1058,14 @@ The multi-step loop is accepted by these executable BDD scenarios:
   resolution runs, then `no_reply_needed` is invalid for that target; only a
   validated owner handling, withdrawal, or the existing policy gates may
   suppress the delegated workflow.
+- Given the owner participated before a newer group message explicitly
+  mentions the owner with substantive declarative feedback, when semantic
+  resolution runs, then the older owner message does not count as handling the
+  newer target and the target remains unanswered.
+- Given a delegated group mention or human private message passed the semantic
+  gate as unanswered, when the main model submits `ignore`, `record`, or
+  `notify`, then the runtime rejects that terminal decision and requires a
+  useful sender-facing `reply` or an exact `request_approval`.
 - Given `policy.reply_scope` is `all_groups` and another sender directly
   mentions the owner in a group that does not match `--chat-query`, when the
   reply passes all other policy checks, then the agent may reply as the owner
@@ -1217,9 +1230,9 @@ The multi-step loop is accepted by these executable BDD scenarios:
   and remaining turns from that runtime value rather than a duplicated literal.
 - Given a human message directly mentions the owner with a status update,
   coordination request, commitment, or follow-up, when the model triages it,
-  then it treats the message as addressed to the owner workflow and chooses
-  among record, notify, reply, or approval instead of dismissing it as “not
-  addressed to the assistant”.
+  then it treats the message as addressed to the owner workflow and, after the
+  semantic gate finds it unanswered, chooses a useful reply or exact approval
+  instead of dismissing or silently recording it.
 - Given the configured owner privately messages the assistant chat, when the
   message is polled, then it enters the model as an owner-request work item and
   the assistant replies with bot identity without a redundant owner notice.
@@ -1280,10 +1293,11 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given the owner name is unavailable, when delegated rendering is attempted,
   then the action fails explicitly with a configuration instruction and never
   substitutes the generic word "user".
-- Given a direct owner question and bounded evidence cannot support a useful
-  sender-facing response without exposing private context or inventing work,
-  when it chooses a terminal action, then it may record or notify instead of
-  sending filler.
+- Given a delegated owner message and bounded evidence cannot support a
+  specific factual answer without exposing private context or inventing work,
+  when it chooses a terminal action, then it sends a concise response stating
+  the completed check and exact unknown or refusal, or requests approval for an
+  exact risky response; it cannot silently record or notify.
 - Given any reply has confidence below `policy.reply_confidence_min`, when the
   final gate runs, then direct owner mentions and assistant-facing requests
   enter approval just like other replies and do not use a hidden lower floor.

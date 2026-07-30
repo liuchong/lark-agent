@@ -1408,7 +1408,9 @@ func TestOwnerAssistantContractIsSharedByPromptAndDecisionTool(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"ignore only irrelevant content",
+		"ignore only irrelevant non-delegated content",
+		"passed a semantic unanswered gate",
+		"must finish as a useful sender-facing reply or request_approval",
 		"completed bounded read work",
 		"assistant_request",
 		"owner_request",

@@ -14,6 +14,12 @@ Reusable verified rules:
   owner-authored, post-target messages. The semantic matcher has no tools.
 - Re-read before the external reply action. Lark has no compare-and-send
   primitive, so the final semantic read is the last enforceable boundary.
+- Once that semantic gate classifies an exact target as unanswered and admits
+  it to the main model, terminal validation must reject `ignore`, `record`, and
+  `notify`. Otherwise a later model can silently override the exact-target
+  decision by treating pre-target owner participation as current handling.
+  Legitimate withdrawal, owner handling, and no-reply private continuations
+  converge before the main model runs.
 - Use the target's trusted update time as a new grace-period origin. Exact
   target hydration must enforce this even when polling does not rediscover the
   edit.

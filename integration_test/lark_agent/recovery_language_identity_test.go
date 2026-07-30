@@ -259,6 +259,84 @@ func TestChineseLanguageGateRepairsEnglishReplyAndReportsBudgets(t *testing.T) {
 	}
 }
 
+func TestUnansweredDelegatedWorkCannotFinishAsRecord(t *testing.T) {
+	groupTarget := domain.NormalizedEvent{
+		MessageID: "om_feedback",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_teammate",
+		Content:   "@测试负责人 应该是示例视觉层级的问题，群聊之间需要明显分隔线，消息提示也别那么挤",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner", Name: "测试负责人"}},
+	}
+	cases := map[string]agentcontext.Bundle{
+		"group_mention_after_older_owner_participation": {
+			Event:    groupTarget,
+			WorkKind: domain.WorkKindDirectMention,
+			Conversation: []domain.NormalizedEvent{
+				{
+					MessageID: "om_owner_before_target",
+					ChatID:    "oc_group",
+					ChatType:  "group",
+					SenderID:  "ou_owner",
+					Content:   "应该是字体文字之类的问题吧",
+				},
+				groupTarget,
+			},
+		},
+		"human_private_message": {
+			Event: domain.NormalizedEvent{
+				MessageID: "om_private_request",
+				ChatID:    "oc_private",
+				ChatType:  "p2p",
+				SenderID:  "ou_teammate",
+				Content:   "字体和示例内容密度这两点也需要优化，你怎么看？",
+			},
+			WorkKind: domain.WorkKindDirectMention,
+		},
+	}
+	for name, bundle := range cases {
+		t.Run(name, func(t *testing.T) {
+			model := &languageRepairModel{responses: []*schema.Message{
+				schema.AssistantMessage("", []schema.ToolCall{integrationToolCall(
+					"silent_record",
+					"submit_decision",
+					`{"decision":"record","relevance_confidence":0.86,"risk":"low","reason":"owner participated earlier in the discussion"}`,
+				)}),
+				schema.AssistantMessage("", []schema.ToolCall{integrationToolCall(
+					"useful_reply",
+					"submit_decision",
+					`{"decision":"reply","relevance_confidence":0.95,"reply_confidence":0.92,"risk":"low","reply_text":"我把这条反馈整理成了三点：字体层级、示例分隔样式和示例内容密度，已作为界面可读性问题通知测试负责人；目前还没有确认具体改版方案。","owner_action":"界面反馈包含示例视觉层级、示例分隔样式和示例内容密度三项，请确认后续设计方案。","reason":"尚未处理的代回复消息需要有效回应"}`,
+				)}),
+			}}
+			registry, err := agenttools.NewRegistry(agentruntime.SubmitDecisionDefinition())
+			if err != nil {
+				t.Fatal(err)
+			}
+			bundle.User = agentcontext.UserProfile{
+				OpenID:            "ou_owner",
+				Name:              "测试负责人",
+				Language:          string(agentlocale.LanguageChinese),
+				PreferredLanguage: string(agentlocale.LanguageChinese),
+				FallbackLanguage:  string(agentlocale.LanguageChinese),
+			}
+			decision, trajectory, err := (agentruntime.AgentLoop{
+				Model:    model,
+				Tools:    registry,
+				MaxTurns: 3,
+			}).Decide(context.Background(), bundle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decision.Kind != domain.DecisionReply || model.index != 2 {
+				t.Fatalf("decision=%+v model_calls=%d", decision, model.index)
+			}
+			if !integrationTrajectoryContains(trajectory, "delegated work cannot finish") {
+				t.Fatalf("record decision was not rejected: %+v", trajectory)
+			}
+		})
+	}
+}
+
 func integrationToolCall(id, name, arguments string) schema.ToolCall {
 	return schema.ToolCall{
 		ID:   id,

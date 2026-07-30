@@ -223,6 +223,44 @@ func TestTerminalDecisionRejectsNotifyOnlyForDelegatedPrivateMessage(t *testing.
 	}
 }
 
+func TestTerminalDecisionRejectsSilentOutcomesForUnansweredDelegatedWork(t *testing.T) {
+	bundles := map[string]agentcontext.Bundle{
+		"group_mention": {
+			WorkKind: domain.WorkKindDirectMention,
+			User:     agentcontext.UserProfile{OpenID: "ou_owner"},
+			Event: domain.NormalizedEvent{
+				ChatType: "group",
+				SenderID: "ou_teammate",
+				Content:  "@测试负责人 这里的示例视觉层级、示例分隔样式和示例内容密度都需要优化",
+				Mentions: []domain.Mention{{OpenID: "ou_owner", Name: "测试负责人"}},
+			},
+		},
+		"human_private_message": {
+			WorkKind: domain.WorkKindDirectMention,
+			User:     agentcontext.UserProfile{OpenID: "ou_owner"},
+			Event: domain.NormalizedEvent{
+				ChatType: "p2p",
+				SenderID: "ou_teammate",
+				Content:  "能否确认这里的字体和示例内容密度怎么调整？",
+			},
+		},
+	}
+	for name, bundle := range bundles {
+		for _, kind := range []domain.DecisionKind{
+			domain.DecisionIgnore,
+			domain.DecisionRecord,
+			domain.DecisionNotify,
+		} {
+			t.Run(name+"/"+string(kind), func(t *testing.T) {
+				err := validateTerminalDecision(bundle, domain.Decision{Kind: kind})
+				if err == nil || !strings.Contains(err.Error(), "delegated work cannot finish") {
+					t.Fatalf("kind=%s err=%v", kind, err)
+				}
+			})
+		}
+	}
+}
+
 func TestAgentLoopRecoversPlainTextAfterRejectedTerminalDecision(t *testing.T) {
 	model := &scriptedModel{responses: []*schema.Message{
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("call_notify", "submit_decision", `{
