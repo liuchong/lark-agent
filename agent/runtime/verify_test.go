@@ -265,6 +265,32 @@ func TestVerifyGroundedCodingReplyRejectsOpaqueDeclarationForConcreteShape(t *te
 	}
 }
 
+func TestVerifyGroundedCodingReplyRejectsUnrelatedStructuralEvidence(t *testing.T) {
+	source := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/sample-client/SampleRequest.java",
+		Digest:       "sha256:request",
+		Kind:         "workspace_file",
+	}
+	err := verifyGroundedCodingReply(
+		"Sample-Client SampleRequest 的 sampleContent 是什么结构？",
+		domain.Decision{
+			Kind:           domain.DecisionReply,
+			EvidenceStatus: domain.EvidenceVerified,
+			ReplyText:      `结论：sampleContent 具体为 {"content":"invented"}。`,
+			Sources:        []domain.SourceRef{source},
+		},
+		map[string]string{
+			sourceKey(source): `class SampleRequest {
+    private String sampleContent;
+}
+const unrelatedPayload = {"other":"value"};`,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "concrete serialized shape") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestVerifyGroundedCodingReplyRejectsUnsupportedConcreteJSONExample(t *testing.T) {
 	source := domain.SourceRef{
 		RelativePath: "sample-project/sample-module/docs/sample-protocol-guide.md",
@@ -281,6 +307,35 @@ func TestVerifyGroundedCodingReplyRejectsUnsupportedConcreteJSONExample(t *testi
 		},
 		map[string]string{
 			sourceKey(source): `sampleContent example: {\"content\":\"sample value\"}`,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "unsupported serialized example") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestVerifyGroundedCodingReplyRejectsExampleFromUnrelatedSource(t *testing.T) {
+	guide := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/docs/sample-protocol-guide.md",
+		Digest:       "sha256:guide",
+		Kind:         "workspace_file",
+	}
+	unrelated := domain.SourceRef{
+		RelativePath: "sample-project/sample-module/docs/other-example.md",
+		Digest:       "sha256:other",
+		Kind:         "workspace_file",
+	}
+	err := verifyGroundedCodingReply(
+		"Sample-Client SampleRequest 的 sampleContent 是什么结构？",
+		domain.Decision{
+			Kind:           domain.DecisionReply,
+			EvidenceStatus: domain.EvidenceVerified,
+			ReplyText:      `结论：sampleContent 具体为 {"text":"invented"}。`,
+			Sources:        []domain.SourceRef{guide, unrelated},
+		},
+		map[string]string{
+			sourceKey(guide):     `sampleContent example: {"content":"sample value"}`,
+			sourceKey(unrelated): `otherPayload example: {"text":"invented"}`,
 		},
 	)
 	if err == nil || !strings.Contains(err.Error(), "unsupported serialized example") {
@@ -333,7 +388,7 @@ func TestVerifyGroundedCodingReplyAcceptsCitedPathsAndIdentifiers(t *testing.T) 
     long sampleTimestamp;
     long sampleVersion;
 }
-Example payload: {"content":"sample value"}`,
+sampleContent example: {"content":"sample value"}`,
 		},
 	)
 	if err != nil {

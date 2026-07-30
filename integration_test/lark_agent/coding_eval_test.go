@@ -356,6 +356,7 @@ func TestCodingQuestionCollectsAllRealProjectFactsBeforeConverging(t *testing.T)
     long expectedEditVersion;
 }`,
 		"sample-project/sample-module/docs/sample-protocol-guide.md": `Sample-Client sends:
+sampleContent example: {"content":"sample value"}
 new SampleRequest("conversation", 42L, "{\"content\":\"sample value\"}", 0L)
 The success callback means server acceptance only.
 Local state converges after WebSocket notification 9001 through onSampleEvent.
@@ -1178,6 +1179,118 @@ func GetType(value string) string {
 	}
 	if !codingEvalTrajectoryContains(trajectory, "remaining turn") {
 		t.Fatalf("late search was not rejected to preserve a correction turn: %+v", trajectory)
+	}
+}
+
+func TestCodingQuestionUsesPenultimateTurnForConcreteShapeEvidence(t *testing.T) {
+	root := t.TempDir()
+	requestSource := `package message
+
+type SampleRequest struct {
+	sampleContent string
+}`
+	guideSource := `# Message edit
+
+The sampleContent request value is a JSON string:
+
+{"content":"sample value"}
+`
+	if err := os.WriteFile(
+		filepath.Join(root, "request.go"),
+		[]byte(requestSource),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "docs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(root, "docs", "sample-protocol-guide.md"),
+		[]byte(guideSource),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	digestFor := func(content string) string {
+		sum := sha256.Sum256([]byte(content))
+		return fmt.Sprintf("sha256:%s", hex.EncodeToString(sum[:8]))
+	}
+	requestDigest := digestFor(requestSource)
+	guideDigest := digestFor(guideSource)
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agenttools.NewRegistry(append(
+		agenttools.CodeIndexDefinitions(scope, nil),
+		append(agenttools.WorkspaceDefinitions(scope),
+			agentruntime.SubmitInvestigationPlanDefinition(),
+			agentruntime.SubmitDecisionDefinition(),
+		)...,
+	)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("plan", "submit_investigation_plan", `{
+			"question":"确认 sampleContent 字符串的 JSON 具体格式",
+			"entry_points":["request.go","docs/sample-protocol-guide.md"],
+			"symbols":["sampleContent"],
+			"tools":["read_workspace"],
+			"stop_conditions":["读取字段声明和具体 JSON 示例"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-request",
+			"read_workspace",
+			`{"path":"request.go"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-guide",
+			"read_workspace",
+			`{"path":"docs/sample-protocol-guide.md"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.99,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"结论：sampleContent 是字符串形式的 JSON，具体为 {\"content\":\"sample value\"}。依据：request.go 的字段声明和 docs/sample-protocol-guide.md 的当前示例。未知/下一步：没有。",
+			"reason":"the reserved read completed the missing structural evidence",
+			"source_refs":[
+				{"relative_path":"request.go","digest":"`+requestDigest+`","kind":"workspace_file"},
+				{"relative_path":"docs/sample-protocol-guide.md","digest":"`+guideDigest+`","kind":"workspace_file"}
+			]
+		}`)}),
+	}}
+	decision, trajectory, err := (agentruntime.AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 4,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_structural_evidence_completion",
+			Content:   "请从当前项目证据回答：sampleContent 字符串的 JSON 具体格式是什么？",
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		!strings.Contains(decision.ReplyText, `{"content":"sample value"}`) {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if got := strings.Join(model.toolNames[2], ","); got != "read_workspace" {
+		t.Fatalf("penultimate tools=%q want=read_workspace", got)
+	}
+	if got := strings.Join(model.toolNames[3], ","); got != "submit_decision" {
+		t.Fatalf("final tools=%q want=submit_decision", got)
+	}
+	if !codingEvalMessagesContain(
+		model.inputs[2],
+		"exactly one targeted read_workspace",
+	) {
+		t.Fatalf("penultimate input missing completion prompt: %+v", model.inputs[2])
 	}
 }
 

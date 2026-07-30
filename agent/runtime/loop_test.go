@@ -889,6 +889,103 @@ func TestAgentLoopReservesFinalTwoTurnsAfterCitableEvidence(t *testing.T) {
 	}
 }
 
+func TestAgentLoopReservesPenultimateTurnForStructuralEvidenceRead(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{
+			"question":"确认 sampleContent 字符串的 JSON 具体格式",
+			"entry_points":["request.go","docs/guide.md"],
+			"symbols":["sampleContent"],
+			"tools":["read_workspace"],
+			"stop_conditions":["读到字段声明和具体 JSON 示例"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("read-request", "read_workspace", `{"path":"request.go"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{
+			toolCall("read-guide", "read_workspace", `{"path":"docs/guide.md"}`),
+		}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.96,
+			"risk":"low",
+			"reply_text":"结论：sampleContent 是字符串形式的 JSON，具体为 {\"content\":\"sample value\"}。依据：request.go 的字段声明和 docs/guide.md 的当前示例。未知/下一步：没有。",
+			"reason":"the reserved evidence-completion read supplied the concrete shape",
+			"source_refs":[
+				{"relative_path":"request.go","digest":"sha256:request","kind":"workspace_file"},
+				{"relative_path":"docs/guide.md","digest":"sha256:guide","kind":"workspace_file"}
+			]
+		}`)}),
+	}}
+	registry, err := agenttools.NewRegistry(
+		testTool("read_workspace", func(_ context.Context, arguments json.RawMessage) (agenttools.Execution, error) {
+			var input struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal(arguments, &input); err != nil {
+				return agenttools.Execution{}, err
+			}
+			switch input.Path {
+			case "request.go":
+				return agenttools.Execution{
+					Content: `type SampleRequest struct { sampleContent string }
+var unrelatedPayload = {"other":"value"}`,
+					Sources: []domain.SourceRef{{
+						RelativePath: "request.go",
+						Digest:       "sha256:request",
+						Kind:         "workspace_file",
+					}},
+				}, nil
+			case "docs/guide.md":
+				return agenttools.Execution{
+					Content: `sampleContent example: {"content":"sample value"}`,
+					Sources: []domain.SourceRef{{
+						RelativePath: "docs/guide.md",
+						Digest:       "sha256:guide",
+						Kind:         "workspace_file",
+					}},
+				}, nil
+			default:
+				return agenttools.Execution{}, fmt.Errorf("unexpected path %q", input.Path)
+			}
+		}),
+		testTool("search_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			t.Fatal("broad search must not be exposed during structural evidence completion")
+			return agenttools.Execution{}, nil
+		}),
+		SubmitInvestigationPlanDefinition(),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, trajectory, err := (AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 4,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_structural_final_two",
+			Content:   "sampleContent 字符串的 JSON 具体格式是什么？",
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
+	}
+	if decision.Kind != domain.DecisionReply || model.calls != 4 {
+		t.Fatalf("decision=%+v modelCalls=%d", decision, model.calls)
+	}
+	if got := strings.Join(model.toolNames[2], ","); got != "read_workspace" {
+		t.Fatalf("penultimate tools=%q want=read_workspace", got)
+	}
+	if got := strings.Join(model.toolNames[3], ","); got != "submit_decision" {
+		t.Fatalf("final tools=%q want=submit_decision", got)
+	}
+	if !messagesContain(model.inputs[2], "exactly one targeted read_workspace") {
+		t.Fatalf("penultimate input missing evidence-completion prompt: %+v", model.inputs[2])
+	}
+}
+
 func TestAgentLoopTerminalOnlyPromptAllowsOneCorrection(t *testing.T) {
 	model := &scriptedModel{responses: []*schema.Message{
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("read_1", "read_workspace", `{"path":"account.go"}`)}),

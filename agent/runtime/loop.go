@@ -212,16 +212,29 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		}
 		progressMessageIndex := len(requestMessages)
 		requestMessages = append(requestMessages, schema.SystemMessage(modelRunProgressPrompt(budget)))
+		structuralEvidenceCompletion := false
 		if budget.RemainingTurns() == 0 {
 			forceDecision = true
 		}
 		if bundle.WorkKind == domain.WorkKindCodingQuestion &&
 			codingEvidenceAvailable &&
 			budget.RemainingTurns() <= 1 {
-			forceDecision = true
+			if budget.RemainingTurns() == 1 &&
+				!forceDecision &&
+				budget.RemainingToolCalls() > 0 &&
+				toolInfoAvailable(visibleToolInfos, "read_workspace") &&
+				missingStructuralSerializationEvidence(
+					bundle.Event.Content+"\n"+conversationText(bundle.Conversation),
+					authoritativeContents,
+				) {
+				structuralEvidenceCompletion = true
+			} else {
+				forceDecision = true
+			}
 		}
 		if toolCalls >= l.MaxToolCalls {
 			forceDecision = true
+			structuralEvidenceCompletion = false
 		}
 		terminalOnly := forceDecision
 		turnToolInfos := visibleToolInfos
@@ -237,6 +250,11 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			turnToolInfos = submitDecisionOnly(visibleToolInfos)
 			requestMessages = append(requestMessages, schema.SystemMessage(
 				terminalOnlyPrompt(terminalOnlyAttempts, maxTerminalOnlyAttempts),
+			))
+		} else if structuralEvidenceCompletion {
+			turnToolInfos = namedToolOnly(visibleToolInfos, "read_workspace")
+			requestMessages = append(requestMessages, schema.SystemMessage(
+				structuralEvidenceCompletionPrompt(),
 			))
 		}
 		for range 4 {
@@ -291,6 +309,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		turnMadeProgress := false
 		turnHadNoProgress := false
 		postToolPrompts := make([]string, 0, 2)
+		structuralEvidenceReadAttempts := 0
 		for _, call := range assistant.ToolCalls {
 			if strings.TrimSpace(call.ID) == "" || strings.TrimSpace(call.Function.Name) == "" {
 				return domain.Decision{}, trajectory, errs.NewInternalError(errs.SubtypeInvalidResponse, "model tool call is missing id or name")
@@ -311,7 +330,23 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			var execution agenttools.Execution
 			var toolErr error
 			executionArguments := call.Function.Arguments
-			if forceDecision && call.Function.Name != "submit_decision" {
+			if structuralEvidenceCompletion &&
+				call.Function.Name == "read_workspace" {
+				structuralEvidenceReadAttempts++
+			}
+			if structuralEvidenceReadAttempts > 1 {
+				toolErr = errs.NewInternalError(
+					errs.SubtypeInvalidResponse,
+					"the penultimate structural-evidence turn permits exactly one read_workspace call; submit the verified result in the final turn",
+				)
+			} else if (terminalOnly || structuralEvidenceCompletion) &&
+				!toolInfoAvailable(turnToolInfos, call.Function.Name) {
+				toolErr = errs.NewInternalError(
+					errs.SubtypeInvalidResponse,
+					"tool %s is not available in this model turn; use the remaining turn budget and the tools currently exposed by the runtime",
+					call.Function.Name,
+				)
+			} else if forceDecision && call.Function.Name != "submit_decision" {
 				toolErr = errs.NewInternalError(
 					errs.SubtypeInvalidResponse,
 					"investigation must converge because the remaining turn, no-progress, or tool budget requires a terminal decision; submit_decision now with verified facts and explicit unknowns",
@@ -713,13 +748,33 @@ func codingEvidenceConvergencePrompt() string {
 	return "Citable workspace evidence is now available. If it answers every concrete field the user asked for, call submit_decision now. A declaration that only shows an opaque String, bytes, raw JSON, or generic container does not prove its concrete serialized shape: use a remaining bounded read for current docs, tests, protocol definitions, or serialization code before claiming that shape is verified. Do not expand into unrelated Lark history, repository-wide searches, or production call-site proof unless the user explicitly asked about reachability. For an exact function's direct behavior, its digest-backed definition is sufficient; preserve explicit unknowns instead of over-investigating."
 }
 
+func structuralEvidenceCompletionPrompt() string {
+	return "The question asks for a concrete serialized shape, but current-run reads still prove only an opaque container. Use exactly one targeted read_workspace call in this penultimate turn. Read one already-known current documentation, fixture, protocol, or serializer path that directly exposes the structure. Candidate search, listing, shell, Lark history, and submit_decision are unavailable now. The final turn is reserved exclusively for submit_decision."
+}
+
 func submitDecisionOnly(infos []*schema.ToolInfo) []*schema.ToolInfo {
+	if selected := namedToolOnly(infos, "submit_decision"); len(selected) > 0 {
+		return selected
+	}
+	return infos
+}
+
+func namedToolOnly(infos []*schema.ToolInfo, name string) []*schema.ToolInfo {
 	for _, info := range infos {
-		if info != nil && info.Name == "submit_decision" {
+		if info != nil && info.Name == name {
 			return []*schema.ToolInfo{info}
 		}
 	}
-	return infos
+	return nil
+}
+
+func toolInfoAvailable(infos []*schema.ToolInfo, name string) bool {
+	for _, info := range infos {
+		if info != nil && info.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 type compactionResult struct {

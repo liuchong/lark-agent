@@ -102,8 +102,17 @@ func verifyGroundedCodingReply(
 		)
 	}
 	if asksConcreteSerializedShape(question) {
-		normalizedContent := normalizeEscapedSerializationText(combinedContent)
-		if !hasStructuralSerializationEvidence(normalizedContent) {
+		normalizedContents := make([]string, 0, len(citedContents))
+		for _, content := range citedContents {
+			normalizedContents = append(
+				normalizedContents,
+				normalizeEscapedSerializationText(content),
+			)
+		}
+		if !hasStructuralSerializationEvidenceInSources(
+			question,
+			normalizedContents,
+		) {
 			return errs.NewInternalError(
 				errs.SubtypeInvalidResponse,
 				"verified coding reply claims a concrete serialized shape but cited reads contain only opaque declarations; read and cite a current example, protocol, or serializer",
@@ -111,7 +120,10 @@ func verifyGroundedCodingReply(
 		}
 		if unsupported := unsupportedConcreteJSONExample(
 			normalizeEscapedSerializationText(decision.ReplyText),
-			normalizedContent,
+			structuralSerializationEvidenceForQuestion(
+				question,
+				normalizedContents,
+			),
 		); unsupported != "" {
 			return errs.NewInternalError(
 				errs.SubtypeInvalidResponse,
@@ -216,6 +228,188 @@ func hasStructuralSerializationEvidence(content string) bool {
 	return concreteJSONObjectPattern.MatchString(content) ||
 		concreteJSONArrayPattern.MatchString(content) ||
 		serializerOperationPattern.MatchString(content)
+}
+
+func hasStructuralSerializationEvidenceForQuestion(
+	question string,
+	content string,
+) bool {
+	if !hasStructuralSerializationEvidence(content) {
+		return false
+	}
+	targets := concreteSerializedShapeTargets(question)
+	if len(targets) == 0 {
+		return true
+	}
+	for _, target := range targets {
+		if len(structuralSerializationEvidenceContexts(content, target)) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func structuralSerializationEvidenceForQuestion(
+	question string,
+	contents []string,
+) string {
+	targets := concreteSerializedShapeTargets(question)
+	if len(targets) == 0 {
+		return strings.Join(contents, "\n")
+	}
+	contexts := make([]string, 0, len(contents))
+	for _, content := range contents {
+		for _, target := range targets {
+			contexts = append(
+				contexts,
+				structuralSerializationEvidenceContexts(content, target)...,
+			)
+		}
+	}
+	return strings.Join(contexts, "\n")
+}
+
+func structuralSerializationEvidenceContexts(
+	content string,
+	target string,
+) []string {
+	lines := strings.Split(content, "\n")
+	contexts := make([]string, 0, 1)
+	for index, line := range lines {
+		if !identifierSet(line)[strings.ToLower(target)] {
+			continue
+		}
+		if hasStructuralSerializationEvidence(line) {
+			contexts = append(contexts, line)
+			continue
+		}
+		if !lineIntroducesStructuralSerializationEvidence(line) {
+			continue
+		}
+		end := min(len(lines), index+5)
+		following := strings.Join(lines[index+1:end], "\n")
+		if hasStructuralSerializationEvidence(following) {
+			contexts = append(contexts, line+"\n"+following)
+		}
+	}
+	return contexts
+}
+
+func hasStructuralSerializationEvidenceInSources(
+	question string,
+	contents []string,
+) bool {
+	for _, content := range contents {
+		if hasStructuralSerializationEvidenceForQuestion(question, content) {
+			return true
+		}
+	}
+	return false
+}
+
+func lineIntroducesStructuralSerializationEvidence(line string) bool {
+	line = strings.ToLower(line)
+	return containsAny(
+		line,
+		"json",
+		"结构",
+		"格式",
+		"形状",
+		"示例",
+		"样例",
+		"example",
+		"schema",
+		"payload",
+		"request value",
+		"请求值",
+	)
+}
+
+func concreteSerializedShapeTargets(question string) []string {
+	locations := lowerCamelIdentifierPattern.FindAllStringIndex(question, -1)
+	if len(locations) == 0 {
+		return nil
+	}
+	anchors := serializationShapeAnchorLocations(strings.ToLower(question))
+	if len(anchors) == 0 {
+		return nil
+	}
+	bestDistance := len(question) + 1
+	distances := make([]int, len(locations))
+	for index, location := range locations {
+		distance := len(question) + 1
+		for _, anchor := range anchors {
+			distance = min(distance, intervalDistance(location, anchor))
+		}
+		distances[index] = distance
+		bestDistance = min(bestDistance, distance)
+	}
+	targets := make([]string, 0, len(locations))
+	seen := make(map[string]bool)
+	for index, location := range locations {
+		if distances[index] > bestDistance+24 {
+			continue
+		}
+		target := question[location[0]:location[1]]
+		key := strings.ToLower(target)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		targets = append(targets, target)
+	}
+	return targets
+}
+
+func serializationShapeAnchorLocations(question string) [][2]int {
+	anchors := make([][2]int, 0, 8)
+	for _, marker := range []string{
+		"结构", "格式", "形状", "长什么样", "怎么传", "如何传",
+		"具体内容", "具体值", "json", "序列化", "字符串", "字节",
+		"请求体", "payload", "body", "string", "bytes", "rawmessage",
+	} {
+		offset := 0
+		for {
+			index := strings.Index(question[offset:], marker)
+			if index < 0 {
+				break
+			}
+			start := offset + index
+			anchors = append(anchors, [2]int{start, start + len(marker)})
+			offset = start + len(marker)
+		}
+	}
+	return anchors
+}
+
+func intervalDistance(left []int, right [2]int) int {
+	if left[1] < right[0] {
+		return right[0] - left[1]
+	}
+	if right[1] < left[0] {
+		return left[0] - right[1]
+	}
+	return 0
+}
+
+func missingStructuralSerializationEvidence(
+	question string,
+	authoritativeContents map[string]string,
+) bool {
+	if !asksConcreteSerializedShape(question) {
+		return false
+	}
+	contents := make([]string, 0, len(authoritativeContents))
+	for _, content := range authoritativeContents {
+		contents = append(
+			contents,
+			normalizeEscapedSerializationText(content),
+		)
+	}
+	return !hasStructuralSerializationEvidenceInSources(
+		question,
+		contents,
+	)
 }
 
 func unsupportedConcreteJSONExample(reply, evidence string) string {

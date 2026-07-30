@@ -78,6 +78,21 @@ Two live failures established reusable implementation rules.
   documentation, fixture, protocol, or serializer read available when shape is
   part of the question, and enforce structural evidence at the terminal gate
   instead of relying on prompt compliance alone.
+- Do not let the generic final-two-turn convergence rule consume that bounded
+  structural read. If the penultimate turn starts with only opaque evidence,
+  expose exactly one `read_workspace` call for an already-known current
+  documentation, fixture, protocol, or serializer path, then expose only
+  `submit_decision` on the final turn. Enforce the per-turn tool catalog at
+  execution time too; hiding a tool from the schema is not enough if a model
+  emits a stale or guessed tool name.
+- Bind structural evidence to the concrete lower-camel field nearest the shape
+  request. A JSON object or serializer elsewhere in the same concatenated read
+  set is unrelated evidence. Accept a same-line field example or a field
+  introduction that explicitly names JSON, schema, shape, or example and is
+  followed locally by the structure in the same source; never associate
+  evidence across source boundaries. Validate the reply's exact inline JSON
+  against those same field-related local snippets, not against the union of all
+  cited source contents.
 - Validate outward repository paths against current-run `read_workspace`
   sources, not all submitted citations; a search receipt remains a locator even
   when the model copies it into `source_refs`. Validate lower-camel-case

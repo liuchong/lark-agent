@@ -102,9 +102,16 @@ call-site proof, or repository-wide searches. An exact function definition is
 sufficient evidence for that function's direct return behavior unless the user
 also asks whether it is reachable from a production entry point. When useful
 evidence exists and the coding run reaches its final two turns, the runtime
-reserves those turns for `submit_decision`: additional investigation calls are
-rejected so the model can return a truthful answer, explicit unknown, or
-clarification without exhausting the run and retrying the whole investigation.
+normally reserves those turns for `submit_decision`: additional investigation
+calls are rejected so the model can return a truthful answer, explicit unknown,
+or clarification without exhausting the run and retrying the whole
+investigation. A concrete serialized-shape request has one narrower exception.
+If current-run reads still contain only an opaque declaration, the penultimate
+turn exposes only one targeted `read_workspace` call so the model can read a
+known current documentation example, fixture, protocol definition, or
+serializer. The final turn then exposes only `submit_decision`. Broad search,
+listing, shell, Lark-history, and unrelated code-index tools remain unavailable
+during that reserved evidence-completion turn.
 
 `submit_decision` is the only terminal model tool. It has no external side
 effect. Its structured output is validated by Go and then passed to the normal
@@ -997,6 +1004,20 @@ protocol definition, or serialization implementation that exposes structural
 serialization evidence such as a concrete object example or serializer
 operation. A verified answer to that request is rejected when its cited
 current-run reads contain only opaque declarations.
+When the question names a concrete code field such as `sampleContent`, the
+structural example or serializer operation must occur in the local evidence
+context of that field. An unrelated JSON object or serializer elsewhere in the
+same or another cited file does not complete the field's evidence.
+The concrete JSON example stated in the reply must also occur in that
+field-related local evidence. A matching JSON object from an unrelated cited
+source cannot support a different claimed shape.
+If this structural gap remains at the start of the penultimate model turn and
+an investigation call is still available, the runtime must reserve that turn
+for exactly one `read_workspace` call rather than switching early to
+terminal-only mode. The evidence-completion prompt identifies the missing
+structural fact and requires a known path; it does not reopen candidate
+discovery. After that read, or when no investigation call remains, the final
+turn is terminal-only and must submit verified facts with explicit unknowns.
 
 A verified reply may mention repository-relative file or directory paths only
 when those paths identify cited sources returned by `read_workspace` in the
@@ -1473,6 +1494,26 @@ The multi-step loop is accepted by these executable BDD scenarios:
   field is a string, then a verified decision is rejected until a bounded
   documentation, fixture, protocol, or serialization read supplies structural
   serialization evidence.
+- Given that opaque production declaration is the only structural evidence at
+  the start of the penultimate model turn and one investigation call remains,
+  when the runtime prepares the model request, then only `read_workspace` is
+  exposed and the model is told to spend exactly that turn reading one known
+  current documentation, fixture, protocol, or serializer path; broad locating
+  tools and `submit_decision` are unavailable until the final turn.
+- Given the current reads contain an unrelated JSON object or serializer but
+  no structural evidence in the local context of the field named by the
+  question, when convergence and final verification evaluate the evidence,
+  then the unrelated structure does not suppress the reserved read and cannot
+  support a verified answer for that field.
+- Given one cited source contains a valid field-related example while another
+  cited source contains a different unrelated JSON object, when the verified
+  reply claims the unrelated object as that field's concrete shape, then final
+  verification rejects the claimed example even though its bytes occur
+  somewhere in the cited source set.
+- Given the targeted evidence-completion read has run, or structural
+  serialization evidence was already available, when the final model turn
+  starts, then only `submit_decision` is exposed and the answer must cite the
+  current-run reads or state the exact remaining unknown without invention.
 - Given a verified coding draft names a repository-relative path that was not
   cited from a current-run read, including a search-only path, directory, or
   extensionless repository file, or names a lower-camel-case code identifier
@@ -1491,7 +1532,8 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given a coding run has citable workspace evidence and enters its final two
   model turns, when the model attempts another investigation tool, then the
   runtime rejects that tool call and preserves the final turn for
-  `submit_decision` instead of failing and retrying the entire run.
+  `submit_decision` instead of failing and retrying the entire run, except for
+  the single structural-evidence completion read defined above.
 - Given repeated `get_lark_context` calls return no new target-message context,
   when the model asks again, then the runtime rejects the no-progress call and
   requires a decision or a different evidence tool.
