@@ -104,7 +104,9 @@ func referencesPriorWorkspaceContext(text string) bool {
 	lower := strings.ToLower(text)
 	for _, marker := range []string{
 		"上一条", "上面", "前面", "前文", "刚才", "结合", "继续",
+		"当前项目", "这个项目", "该项目",
 		"previous", "above", "earlier", "continue",
+		"current project", "this project", "the project",
 	} {
 		if strings.Contains(lower, marker) {
 			return true

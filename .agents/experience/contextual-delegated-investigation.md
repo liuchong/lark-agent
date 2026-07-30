@@ -7,6 +7,12 @@ short pre-target conversation direction, the exact target, post-target
 clarifications through a fixed cutoff, sender display names, message types, and
 typed attachment readability.
 
+Natural follow-ups such as "当前项目", "这个项目", "该项目", "current project",
+or "this project" are explicit references to the most recent same-sender
+repository path in that bounded window. Scope extraction must recognize these
+phrases before the model sees tools; otherwise the model can read the right
+chat context yet still search a similarly named sibling repository.
+
 For delegated investigation:
 
 - classify the concrete subject from the whole snapshot, not the last noun in

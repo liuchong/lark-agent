@@ -92,6 +92,36 @@ func TestRequestedCodingWorkspaceScopeUsesMostRecentBoundedConversationPath(t *t
 	}
 }
 
+func TestRequestedCodingWorkspaceScopeTreatsCurrentProjectAsPriorContextReference(t *testing.T) {
+	bundle := agentcontext.Bundle{
+		Environment: agentcontext.EnvironmentSnapshot{
+			WorkspaceRoot:     "/workspace/sample-org",
+			WorkspaceRealRoot: "/workspace/sample-org",
+			Directory: []agentcontext.DirectoryEntry{
+				{Path: "sample-project", Kind: "dir"},
+				{Path: "Sample-Module", Kind: "dir"},
+			},
+		},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_question",
+			SenderID:  "ou_owner",
+			Content:   "请从当前项目证据回答示例事件链路。",
+		},
+		Conversation: []domain.NormalizedEvent{{
+			MessageID: "om_scope",
+			SenderID:  "ou_owner",
+			Content:   "这次只看 sample-org/sample-project/sample-module，不要看同名旧项目。",
+		}},
+	}
+	if got := requestedCodingWorkspaceScope(bundle); got != "sample-project/sample-module" {
+		t.Fatalf("scope=%q", got)
+	}
+	bundle.Conversation[0].SenderID = "ou_other"
+	if got := requestedCodingWorkspaceScope(bundle); got != "" {
+		t.Fatalf("scope inherited from another sender: %q", got)
+	}
+}
+
 func TestRequestedCodingWorkspaceScopeIgnoresUnrelatedOrOtherSenderHistory(t *testing.T) {
 	base := agentcontext.Bundle{
 		Environment: agentcontext.EnvironmentSnapshot{

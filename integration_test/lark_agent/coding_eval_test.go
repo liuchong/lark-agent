@@ -519,7 +519,7 @@ Message exposes sampleFlag, sampleTimestamp, and sampleVersion.`,
 		Event: domain.NormalizedEvent{
 			MessageID: "om_real_project_multi_fact",
 			SenderID:  "ou_owner",
-			Content:   "结合上一条：Sample-Client SampleRequest 的 sampleContent 是什么结构，成功回调代表什么，本地如何收敛？",
+			Content:   "请从当前项目证据回答：Sample-Client SampleRequest 的 sampleContent 是什么结构，成功回调代表什么，本地如何收敛？",
 		},
 		Conversation: []domain.NormalizedEvent{
 			{

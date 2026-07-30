@@ -1450,6 +1450,12 @@ The multi-step loop is accepted by these executable BDD scenarios:
   prefixes the exact scope before execution. A differently cased similarly
   named repository remains an explicit sibling substitution error and is never
   rewritten into the requested project.
+- Given the Owner names an exact repository in one same-chat message and the
+  next message from that Owner asks to answer from "the current project",
+  "this project", or the equivalent Chinese wording, when the runtime resolves
+  the coding scope, then it treats that wording as a reference to the most
+  recent same-sender repository path and activates the exact-scope boundary.
+  A same-chat path from another sender is never inherited.
 - Given a path inside the exact repository scope is a symbolic link to a
   sibling project elsewhere in the configured workspace, when list, search, or
   read prepares to execute, then the runtime resolves the real scope and target
