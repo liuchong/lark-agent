@@ -17,6 +17,15 @@ Two live failures established reusable implementation rules.
 - Do not infer insufficient evidence from free-form reply substrings. Require a
   structured evidence status, and canonicalize insufficient coding replies so
   an unknown phrase cannot carry an unsupported definite inference.
+- Preserve a useful negative search result only from runtime-parsed tool
+  receipts: every parsed bounded search must report zero matches, while any
+  positive match or unparseable report falls back to the canonical
+  insufficient-evidence reply. State the actual query, scan counts, and
+  truncation status only when every required receipt field is explicit,
+  correctly typed, non-null, and non-negative where numeric. If the receipt set
+  is too large to display completely, count repeated receipts too and fall back
+  instead of silently truncating it. Never turn a bounded zero result into a
+  global nonexistence claim.
 - A canonical insufficient reply is not a substitute for investigation. Require
   at least one successful workspace/code evidence tool before accepting it;
   Lark-history reads alone do not count.

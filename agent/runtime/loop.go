@@ -153,6 +153,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	// Initial rules and memories are citable context, but only a fresh successful
 	// tool result may close a coding investigation.
 	codingEvidenceAvailable := false
+	var codingSearches codingSearchEvidence
 	investigationPlanSubmitted := false
 	noProgressLarkContext := false
 	toolCalls := 0
@@ -323,7 +324,11 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				}
 			}
 			if toolErr == nil && execution.Decision != nil {
-				normalized := normalizeCodingDecision(bundle, *execution.Decision)
+				normalized := normalizeCodingDecisionWithSearchEvidence(
+					bundle,
+					*execution.Decision,
+					codingSearches,
+				)
 				execution.Decision = &normalized
 			}
 			if toolErr == nil && execution.Decision != nil {
@@ -368,6 +373,13 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				isCodingBundle(bundle) &&
 				isCodingEvidenceTool(call.Function.Name) {
 				codingEvidenceReads++
+			}
+			if toolErr == nil && execution.Decision == nil && isCodingBundle(bundle) {
+				codingSearches.Record(
+					call.Function.Name,
+					call.Function.Arguments,
+					execution.Content,
+				)
 			}
 			content := toolResultContent(execution, toolErr)
 			observation := callSignature + "\x00" + content
@@ -1183,10 +1195,26 @@ const canonicalInsufficientCodingReply = "结论：当前证据不足，不能�
 	"未知/下一步：相关符号是否存在及实际行为仍未核实，我不会据此推测。"
 
 func normalizeCodingDecision(bundle agentcontext.Bundle, decision domain.Decision) domain.Decision {
+	return normalizeCodingDecisionWithSearchEvidence(
+		bundle,
+		decision,
+		codingSearchEvidence{},
+	)
+}
+
+func normalizeCodingDecisionWithSearchEvidence(
+	bundle agentcontext.Bundle,
+	decision domain.Decision,
+	searches codingSearchEvidence,
+) domain.Decision {
 	if isCodingBundle(bundle) &&
 		decision.Kind == domain.DecisionReply &&
 		decision.EvidenceStatus == domain.EvidenceInsufficient {
-		decision.ReplyText = canonicalInsufficientCodingReply
+		if searches.canRenderNegativeResult() {
+			decision.ReplyText = searches.renderNegativeResult(bundle)
+		} else {
+			decision.ReplyText = canonicalInsufficientCodingReply
+		}
 	}
 	return decision
 }

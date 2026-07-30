@@ -538,6 +538,19 @@ a free-form `plan` field or otherwise malformed arguments, the rejection names
 the required fields so the model can correct the call within the same bounded
 run.
 
+An insufficient-evidence coding reply normally uses a fixed conservative
+template instead of model-authored prose. One narrower negative-search case is
+rendered from tool receipts rather than model text: when every successfully
+parsed bounded code/workspace search reports zero matches, the runtime may say
+that no match was found within those bounded checks and list each query, scan
+count, and truncation state. A report is parseable for this purpose only when
+all four fields are explicit and well typed; null or negative scan metadata is
+invalid. It must not claim global
+nonexistence. Any positive match, unparseable report, or receipt set larger
+than the four-query display bound falls back to the conservative template
+instead of inventing metadata or silently hiding evidence. A bare optional
+code-index miss without a bounded workspace scan receipt also falls back.
+
 The coding investigation is read-only by default. Plan-mode coding work may
 write only the active plan artifact; production code edits, shell writes,
 commits, pushes, deployments, and direct Lark sends remain denied or routed
@@ -1295,6 +1308,22 @@ The multi-step loop is accepted by these executable BDD scenarios:
   after earlier policy rejections, when the plan tool rejects them, then the
   rejection names all required structured fields and a corrected plan plus
   bounded workspace search can still finish within the original run.
+- Given a false-premise coding question receives only successfully parsed
+  zero-match bounded search reports, when an insufficient-evidence reply is
+  normalized, then the runtime says no match was found in those checks and
+  lists the actual queries, scan counts, and truncation state without claiming
+  that the symbol globally cannot exist.
+- Given any successful code search reports a candidate match or a search report
+  cannot be parsed, when an insufficient-evidence reply is normalized, then
+  the runtime discards the model prose and keeps the fixed conservative
+  evidence-limited template.
+- Given more than four zero-match search receipts are collected, including
+  repeated queries, when
+  an insufficient-evidence reply is normalized, then the runtime keeps the
+  fixed conservative template instead of hiding undisplayed receipts.
+- Given the optional code index returns an empty result without bounded scan
+  metadata, when an insufficient-evidence reply is normalized, then the runtime
+  keeps the fixed conservative template rather than inventing scan coverage.
 - Given a coding investigation is in plan mode, when the model attempts to edit
   production code, run a write shell command, commit, push, deploy, or send
   Lark messages directly, then the runtime denies that operation until the plan

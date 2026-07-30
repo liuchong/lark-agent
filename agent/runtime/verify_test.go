@@ -156,3 +156,145 @@ func TestNormalizeCodingDecisionCanonicalizesInsufficientMixedClaim(t *testing.T
 		t.Fatalf("reply=%q", decision.ReplyText)
 	}
 }
+
+func TestNormalizeCodingDecisionDoesNotRenderNegativeResultAfterAnyMatch(t *testing.T) {
+	searches := codingSearchEvidence{}
+	searches.Record(
+		"search_workspace",
+		`{"query":"NormalizeContentType"}`,
+		`{"results":[],"truncated":false,"files_scanned":40,"directories_scanned":8}`,
+	)
+	searches.Record(
+		"search_workspace",
+		`{"query":"NormalizeContentType definition"}`,
+		`{"results":[{"source":{"relative_path":"content.go"}}],"truncated":false,"files_scanned":40,"directories_scanned":8}`,
+	)
+	decision := normalizeCodingDecisionWithSearchEvidence(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{Content: "请检查生产源码是否存在 NormalizeContentType"},
+	}, domain.Decision{
+		Kind:           domain.DecisionReply,
+		EvidenceStatus: domain.EvidenceInsufficient,
+		ReplyText:      "没有找到 NormalizeContentType。",
+	}, searches)
+	if decision.ReplyText != canonicalInsufficientCodingReply {
+		t.Fatalf("reply=%q", decision.ReplyText)
+	}
+}
+
+func TestNormalizeCodingDecisionDoesNotTrustUnparseableSearchReport(t *testing.T) {
+	searches := codingSearchEvidence{}
+	searches.Record(
+		"search_workspace",
+		`{"query":"NormalizeContentType"}`,
+		`{"unexpected":"shape"}`,
+	)
+	decision := normalizeCodingDecisionWithSearchEvidence(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{Content: "请检查生产源码是否存在 NormalizeContentType"},
+	}, domain.Decision{
+		Kind:           domain.DecisionReply,
+		EvidenceStatus: domain.EvidenceInsufficient,
+		ReplyText:      "没有找到 NormalizeContentType。",
+	}, searches)
+	if decision.ReplyText != canonicalInsufficientCodingReply {
+		t.Fatalf("reply=%q", decision.ReplyText)
+	}
+}
+
+func TestNormalizeCodingDecisionDoesNotInventMissingSearchMetadata(t *testing.T) {
+	searches := codingSearchEvidence{}
+	searches.Record(
+		"search_workspace",
+		`{"query":"NormalizeContentType"}`,
+		`{"results":[],"files_scanned":40,"directories_scanned":8}`,
+	)
+	decision := normalizeCodingDecisionWithSearchEvidence(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{Content: "请检查生产源码是否存在 NormalizeContentType"},
+	}, domain.Decision{
+		Kind:           domain.DecisionReply,
+		EvidenceStatus: domain.EvidenceInsufficient,
+		ReplyText:      "没有找到 NormalizeContentType。",
+	}, searches)
+	if decision.ReplyText != canonicalInsufficientCodingReply {
+		t.Fatalf("reply=%q", decision.ReplyText)
+	}
+}
+
+func TestNormalizeCodingDecisionDoesNotHideExcessSearchReceipts(t *testing.T) {
+	searches := codingSearchEvidence{}
+	for _, query := range []string{"one", "two", "three", "four", "five"} {
+		searches.Record(
+			"search_workspace",
+			`{"query":"`+query+`"}`,
+			`{"results":[],"truncated":false,"files_scanned":40,"directories_scanned":8}`,
+		)
+	}
+	decision := normalizeCodingDecisionWithSearchEvidence(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{Content: "请检查生产源码是否存在 NormalizeContentType"},
+	}, domain.Decision{
+		Kind:           domain.DecisionReply,
+		EvidenceStatus: domain.EvidenceInsufficient,
+		ReplyText:      "没有找到 NormalizeContentType。",
+	}, searches)
+	if decision.ReplyText != canonicalInsufficientCodingReply {
+		t.Fatalf("reply=%q", decision.ReplyText)
+	}
+}
+
+func TestNormalizeCodingDecisionDoesNotTreatBareCodeIndexMissAsBoundedScan(t *testing.T) {
+	searches := codingSearchEvidence{}
+	searches.Record(
+		"search_code_symbols",
+		`{"query":"NormalizeContentType"}`,
+		`{"index_available":true,"query":"NormalizeContentType","results":[]}`,
+	)
+	decision := normalizeCodingDecisionWithSearchEvidence(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{Content: "请检查生产源码是否存在 NormalizeContentType"},
+	}, domain.Decision{
+		Kind:           domain.DecisionReply,
+		EvidenceStatus: domain.EvidenceInsufficient,
+		ReplyText:      "没有找到 NormalizeContentType。",
+	}, searches)
+	if decision.ReplyText != canonicalInsufficientCodingReply {
+		t.Fatalf("reply=%q", decision.ReplyText)
+	}
+}
+
+func TestNormalizeCodingDecisionCountsDuplicateSearchReceiptsAgainstDisplayBound(t *testing.T) {
+	searches := codingSearchEvidence{}
+	for range 5 {
+		searches.Record(
+			"search_workspace",
+			`{"query":"NormalizeContentType"}`,
+			`{"results":[],"truncated":false,"files_scanned":40,"directories_scanned":8}`,
+		)
+	}
+	decision := normalizeCodingDecisionWithSearchEvidence(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{Content: "请检查生产源码是否存在 NormalizeContentType"},
+	}, domain.Decision{
+		Kind:           domain.DecisionReply,
+		EvidenceStatus: domain.EvidenceInsufficient,
+		ReplyText:      "没有找到 NormalizeContentType。",
+	}, searches)
+	if decision.ReplyText != canonicalInsufficientCodingReply {
+		t.Fatalf("reply=%q", decision.ReplyText)
+	}
+}
+
+func TestNormalizeCodingDecisionDoesNotAcceptNullSearchMetadata(t *testing.T) {
+	searches := codingSearchEvidence{}
+	searches.Record(
+		"search_workspace",
+		`{"query":"NormalizeContentType"}`,
+		`{"results":[],"truncated":null,"files_scanned":40,"directories_scanned":8}`,
+	)
+	decision := normalizeCodingDecisionWithSearchEvidence(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{Content: "请检查生产源码是否存在 NormalizeContentType"},
+	}, domain.Decision{
+		Kind:           domain.DecisionReply,
+		EvidenceStatus: domain.EvidenceInsufficient,
+		ReplyText:      "没有找到 NormalizeContentType。",
+	}, searches)
+	if decision.ReplyText != canonicalInsufficientCodingReply {
+		t.Fatalf("reply=%q", decision.ReplyText)
+	}
+}

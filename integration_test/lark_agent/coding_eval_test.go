@@ -407,7 +407,16 @@ func TestFalsePremiseRecoversFromParallelPolicyErrorsAndMalformedPlan(t *testing
 		agenttools.Definition{
 			Info: &schema.ToolInfo{Name: "search_code_symbols"},
 			Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
-				return agenttools.Execution{Content: `{"index_available":false,"fallback":{"results":null,"truncated":true}}`}, nil
+				return agenttools.Execution{Content: `{
+					"index_available":false,
+					"query":"ThisFunctionDefinitelyDoesNotExist20260730",
+					"fallback":{
+						"results":null,
+						"truncated":true,
+						"files_scanned":2000,
+						"directories_scanned":451
+					}
+				}`}, nil
 			},
 		},
 		agenttools.Definition{
@@ -422,7 +431,12 @@ func TestFalsePremiseRecoversFromParallelPolicyErrorsAndMalformedPlan(t *testing
 			Info: &schema.ToolInfo{Name: "search_workspace"},
 			Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
 				searchCalls++
-				return agenttools.Execution{Content: `{"results":[],"truncated":false,"files_scanned":124}`}, nil
+				return agenttools.Execution{Content: `{
+					"results":[],
+					"truncated":false,
+					"files_scanned":124,
+					"directories_scanned":31
+				}`}, nil
 			},
 		},
 		agentruntime.SubmitInvestigationPlanDefinition(),
@@ -452,6 +466,16 @@ func TestFalsePremiseRecoversFromParallelPolicyErrorsAndMalformedPlan(t *testing
 	}
 	if decision.Kind != domain.DecisionReply || model.calls != 6 || searchCalls != 1 {
 		t.Fatalf("decision=%+v model_calls=%d search_calls=%d", decision, model.calls, searchCalls)
+	}
+	for _, want := range []string{
+		"在本次有界检查范围内没有找到匹配项",
+		"ThisFunctionDefinitelyDoesNotExist20260730",
+		"扫描了 124 个文件",
+		"扫描完整",
+	} {
+		if !strings.Contains(decision.ReplyText, want) {
+			t.Fatalf("reply missing %q: %s", want, decision.ReplyText)
+		}
 	}
 	for _, want := range []string{
 		"unbounded shell search is not allowed",

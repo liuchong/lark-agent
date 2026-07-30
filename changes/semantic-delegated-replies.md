@@ -205,6 +205,17 @@ when the plan tool rejects it,
 then the error names the required structured fields,
 and a corrected plan plus bounded search can complete in the same run.
 
+Given all successfully parsed bounded searches for a false-premise coding
+question return zero matches,
+when the insufficient-evidence decision is normalized,
+then the runtime renders a receipt-backed not-found summary with the actual
+queries, scan counts, and truncation states,
+and never claims global nonexistence or preserves unrelated model inference;
+missing, null, wrongly typed, or negative scan metadata and more than four
+receipts, including repeats, fall back to the fixed conservative template
+instead of inventing or hiding evidence; a bare optional code-index miss
+without a bounded scan receipt follows the same rule.
+
 ### Scenario: Every inbound human private message is evaluated
 
 Given an inbound human P2P message to the owner that is not the assistant chat,
