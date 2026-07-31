@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/liuchong/lark-agent/agent/domain"
+	"github.com/liuchong/lark-agent/agent/memory"
 	errs "github.com/liuchong/lark-agent/internal/apperr"
 )
 
@@ -26,6 +27,7 @@ type Store interface {
 	InspectWork(context.Context, domain.WorkInspectionQuery) (domain.WorkInspection, error)
 	ListPendingOwnerApprovals(context.Context, int, int) (domain.OwnerApprovalPage, error)
 	GetActionAttempt(int64) (domain.ActionAttempt, error)
+	ListMemories(context.Context, string, bool, int) ([]memory.Record, error)
 	ExecuteOwnerMutation(
 		context.Context,
 		string,
@@ -101,6 +103,8 @@ func (h *Handler) execute(
 		return h.tasksText(ctx, domain.OwnerTaskQuery{
 			View: domain.OwnerTaskViewRecent, Page: 1, PageSize: count,
 		})
+	case domain.OwnerControlMemoryList:
+		return h.memoriesText(ctx, command.Page)
 	case domain.OwnerControlVersion:
 		version := strings.TrimSpace(h.cfg.Version)
 		if version == "" {
@@ -123,6 +127,46 @@ func (h *Handler) execute(
 		}
 		return h.mutationText(result), nil
 	}
+}
+
+func (h *Handler) memoriesText(ctx context.Context, page int) (string, error) {
+	if page <= 0 {
+		page = 1
+	}
+	records, err := h.store.ListMemories(ctx, "global", false, page*defaultPageSize)
+	if err != nil {
+		return "", err
+	}
+	start := (page - 1) * defaultPageSize
+	if start >= len(records) {
+		if h.english() {
+			return fmt.Sprintf("No memories on page %d. Add one with `/memory add <kind> <content>`.", page), nil
+		}
+		return fmt.Sprintf("记忆第 %d 页没有内容。可用 `/memory add <类型> <内容>` 添加。", page), nil
+	}
+	end := min(start+defaultPageSize, len(records))
+	var out strings.Builder
+	if h.english() {
+		fmt.Fprintf(&out, "Memories, page %d:\n", page)
+	} else {
+		fmt.Fprintf(&out, "记忆，第 %d 页：\n", page)
+	}
+	for _, record := range records[start:end] {
+		fmt.Fprintf(
+			&out,
+			"- #%s [%s/%s/%s] %s\n",
+			record.ID,
+			record.Status,
+			record.Kind,
+			record.Scope,
+			sanitizeText(record.Text, 240, h.english()),
+		)
+		if record.Status == memory.StatusCandidate {
+			fmt.Fprintf(&out, "  `/memory feedback %s confirm`\n", record.ID)
+		}
+		fmt.Fprintf(&out, "  `/memory delete %s confirm`\n", record.ID)
+	}
+	return strings.TrimSpace(out.String()), nil
 }
 
 func (h *Handler) statusText(ctx context.Context) (string, error) {
@@ -408,6 +452,12 @@ func (h *Handler) mutationText(result domain.OwnerMutationResult) string {
 			return fmt.Sprintf("Approval #%d was approved.%s", result.ActionID, replay)
 		case domain.OwnerControlApprovalReject:
 			return fmt.Sprintf("Approval #%d was rejected. Reason: %s.%s", result.ActionID, result.Reason, replay)
+		case domain.OwnerControlMemoryAdd:
+			return fmt.Sprintf("Memory #%s was saved and confirmed.%s", result.MemoryID, replay)
+		case domain.OwnerControlMemoryDelete:
+			return fmt.Sprintf("Memory #%s was deleted.%s", result.MemoryID, replay)
+		case domain.OwnerControlMemoryFeedback:
+			return fmt.Sprintf("Feedback %s was recorded for memory #%s.%s", result.Reason, result.MemoryID, replay)
 		}
 	}
 	switch result.Name {
@@ -430,6 +480,12 @@ func (h *Handler) mutationText(result domain.OwnerMutationResult) string {
 		return fmt.Sprintf("审批 #%d 已批准。%s", result.ActionID, replay)
 	case domain.OwnerControlApprovalReject:
 		return fmt.Sprintf("审批 #%d 已拒绝，原因：%s。%s", result.ActionID, result.Reason, replay)
+	case domain.OwnerControlMemoryAdd:
+		return fmt.Sprintf("记忆 #%s 已保存并确认。%s", result.MemoryID, replay)
+	case domain.OwnerControlMemoryDelete:
+		return fmt.Sprintf("记忆 #%s 已删除。%s", result.MemoryID, replay)
+	case domain.OwnerControlMemoryFeedback:
+		return fmt.Sprintf("已记录记忆 #%s 的“%s”反馈。%s", result.MemoryID, result.Reason, replay)
 	default:
 		return "命令已完成。" + replay
 	}
@@ -492,20 +548,21 @@ func HelpText(language, topic string) string {
 			return detail
 		}
 	}
+	lines := make([]string, 0, len(commandCatalog)+2)
 	if english {
-		return strings.Join([]string{
-			"Owner-private commands:",
-			"Queries: `/status`, `/doctor`, `/tasks [action|running|recent|all] [page]`, `/task <id>`, `/approvals`, `/approval <id>`, `/recent [count]`, `/version`, `/ping`.",
-			"Actions: `/task retry|resume|cancel|acknowledge|reconcile ...`, `/approval approve|reject ...`.",
-			"Use `/help task` or `/help approval` for exact safe syntax. Commands work only in the assistant's private chat.",
-		}, "\n")
+		lines = append(lines, "Owner-private commands:")
+		for _, spec := range commandCatalog {
+			lines = append(lines, fmt.Sprintf("- `%s`: %s.", spec.UsageEN, spec.PurposeEN))
+		}
+		lines = append(lines, "Natural-language equivalents are accepted only in the owner's assistant private chat when context identifies one exact command.")
+		return strings.Join(lines, "\n")
 	}
-	return strings.Join([]string{
-		"智能助手私聊命令：",
-		"查询：`/status`、`/doctor`、`/tasks [action|running|recent|all] [页码]`、`/task <工作号>`、`/approvals`、`/approval <动作号>`、`/recent [数量]`、`/version`、`/ping`。",
-		"处理：`/task retry|resume|cancel|acknowledge|reconcile ...`、`/approval approve|reject ...`。",
-		"发送 `/help task` 或 `/help approval` 查看准确安全用法。控制命令只在智能助手私聊中生效。",
-	}, "\n")
+	lines = append(lines, "智能助手私聊命令：")
+	for _, spec := range commandCatalog {
+		lines = append(lines, fmt.Sprintf("- `%s`：%s。", spec.UsageZH, spec.PurposeZH))
+	}
+	lines = append(lines, "只有用户与智能助手私聊且上下文能唯一确定命令时，才接受自然语言等价表达。")
+	return strings.Join(lines, "\n")
 }
 
 func detailedHelp(english bool, topic string) string {
@@ -553,6 +610,25 @@ func detailedHelp(english bool, topic string) string {
 			"`/approval <动作号>`",
 			"`/approval approve <动作号> confirm`",
 			"`/approval reject <动作号> <原因>`",
+		}, "\n")
+	case "memory", "记忆":
+		if english {
+			return strings.Join([]string{
+				"Memory commands:",
+				"`/memory list [page]`",
+				"`/memory add fact|preference|project|response_feedback <content>`",
+				"`/memory delete <memory-id> confirm`",
+				"`/memory feedback <memory-id> confirm|reject|helpful|unhelpful [note]`",
+				"Only confirmed, non-deleted memories enter later model context.",
+			}, "\n")
+		}
+		return strings.Join([]string{
+			"记忆命令：",
+			"`/memory list [页码]`",
+			"`/memory add fact|preference|project|response_feedback <内容>`",
+			"`/memory delete <记忆号> confirm`",
+			"`/memory feedback <记忆号> confirm|reject|helpful|unhelpful [说明]`",
+			"只有已确认且未删除的记忆会进入后续模型上下文。",
 		}, "\n")
 	default:
 		return ""

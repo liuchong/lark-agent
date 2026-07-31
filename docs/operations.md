@@ -65,6 +65,10 @@ inspect 会显示接收回执、工作项、最近模型步骤、最近外部动
 /approvals [页码]
 /approval 动作号
 /recent [数量]
+/memory list [页码]
+/memory add fact|preference|project|response_feedback 内容
+/memory delete 记忆号 confirm
+/memory feedback 记忆号 confirm|reject|helpful|unhelpful [说明]
 /version
 /ping
 ```
@@ -80,6 +84,22 @@ inspect 会显示接收回执、工作项、最近模型步骤、最近外部动
 /approval approve 动作号 confirm
 /approval reject 动作号 原因
 ```
+
+这些命令共用一份命令目录，显式解析、`/help` 和语义判断不会各维护一套清单。
+Owner 在智能助手私聊中可以用“确认”“拒绝这条”“看看最近任务”等自然语言操作，
+但必须由相邻助手通知和当前持久化候选唯一确定动作；不唯一时只询问准确的任务号、
+动作号或记忆号。普通业务提问即使包含“确认”“状态”“任务”等词也不会被当成命令。
+
+本地记忆命令与机器人私聊落到同一个 SQLite 状态库：
+
+```bash
+lark-agent memory list
+lark-agent memory add project "示例事件服务位于 sample-service"
+lark-agent memory feedback MEMORY_ID helpful "项目定位正确"
+lark-agent memory delete MEMORY_ID --confirm
+```
+
+删除采用可审计墓碑，不会进入后续模型上下文；凭据样式内容会被拒绝。
 
 Owner 在群聊中发送这些命令时只收到转到私聊的提示，群里不展示任务数量和内容。
 非 Owner 私聊机器人或直接 `@机器人` 仍然静默。
@@ -310,13 +330,18 @@ run 的 PR 头，不下载 artifacts，不执行外部贡献代码。
 代回复交办或调研请求时，运行记录中应至少出现一次成功的相关读取，回复正文应简要
 说明“检查了什么、初步发现或未知是什么、给 Owner 传递了什么”。如果 inspect 里只有
 `submit_decision`，正文又只是“已提醒”或后续承诺，发送前质量门禁应将其打回。
-`reply_confidence` 低于 `policy.reply_confidence_min` 时统一进入审批，不再对直接
-@Owner 的低风险草稿使用隐藏的较低阈值。
+低风险答复的 `reply_confidence` 达到 `policy.reply_confidence_min`（默认 `0.70`）
+时会先私聊通知 Owner，再立即代回复，不等待 Owner 确认；低于阈值进入审批。
+中高风险、承诺、删除修改和结果不确定的外部动作即使可信度很高也不会直接发送。
 
 明确要求检查源码、生产入口、代码入口、API、处理函数或数据库依据的消息会进入
 `coding_question` 代码调查链路，而不是简单问答链路。单独提到 Workspace 或业务
 仓库不会触发代码调查。该链路允许受 Workspace 边界约束的代码检索和精读，并要求
 最终结论引用实际读取到的生产代码或明确写出未知项。
+初始上下文包含最多五层的有界目录和优先项目清单；模型还可用
+`inspect_git_history` 读取 Workspace 内仓库最近的本地提交。该工具不会联网、fetch、
+checkout 或修改仓库，Git 元数据或 alternates 逃出 Workspace 时直接拒绝；继承的
+`GIT_*` 仓库、对象库和配置重定向变量会在子进程启动前清除。
 代码索引和工作区搜索只用于定位候选文件，不会触发收敛；`read_workspace` 真正读取
 并返回可引用的生产源码后，模型会对照原问题和调查计划逐项判断。一个文件只覆盖部分
 问题时，剩余的有界代码工具仍可继续使用；全部字段已有证据时应立即提交结论。除下述

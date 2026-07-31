@@ -30,7 +30,9 @@
 - Owner 发给其他真人的私聊消息不会进入代回复队列，也不会因为出现业务关键词而让
   Agent 回答 Owner 自己的问题。
 - 编程问题可在配置的 Workspace 内使用有边界的代码搜索、文件读取和 shell
-  工具。路径逃逸、符号链接逃逸、秘密文件和无边界搜索会被代码拒绝。
+  工具。初始上下文包含最多五层的有界目录和项目清单，也可以读取 Workspace 内
+  仓库最近的本地 Git 提交；不会执行 fetch、checkout 或其他网络和写操作。路径逃逸、
+  Git 元数据逃逸、符号链接逃逸、秘密文件和无边界搜索会被代码拒绝。
 - 非 Owner 触发的群内请求只能读取当前群上下文和 Workspace 业务证据，不能执行
   shell、跨群搜索、修改、删除、提交或部署。环境刺探和工作目录外路径请求在模型
   调研前直接拒绝。
@@ -45,6 +47,9 @@
 - 每次模型调用都会收到当前/总计/剩余轮次、有效调查调用次数和上下文容量。必需的
   调查计划不占有效调查调用额度；接近任一上限时，旧证据会压缩成保留来源与动作回执
   的检查点，模型必须尽快提交结论。
+- Owner 可保存事实、偏好、项目知识和回复评价。记忆持久化在 SQLite 中，重启后仍
+  可检索；只有已确认且未删除的有界内容会进入模型上下文，原始聊天、凭据和模型推测
+  不会被自动当作记忆。
 - 对外语言优先使用 `owner.preferred_language`；`auto` 会按当前 Lark 会话判断，
   判断不清时使用 `owner.fallback_language`。一条消息不会混用中英文解释性正文。
 
@@ -113,12 +118,18 @@ lark-agent queue acknowledge --work-id 123 --reason "reviewed and closed"
 lark-agent queue reconcile --work-id 456 --result unknown --reason "external result could not be verified"
 lark-agent queue cancel --work-id 123 --reason "superseded"
 lark-agent queue cancel --all-interrupted --keep-work-id 456 --reason "audited stale work"
+lark-agent memory list
+lark-agent memory add preference "优先使用中文回复"
+lark-agent memory feedback MEMORY_ID helpful "这条经验有效"
+lark-agent memory delete MEMORY_ID --confirm
 lark-agent github auth status
 ```
 
 Owner 还可以在智能助手私聊中发送 `/help` 查看控制命令，用 `/status` 查看当前会话，
 用 `/tasks` 查看需要人工处理的任务，用 `/task 工作号` 查看调查主题、状态、上下文
-证据和最近错误，并按每条任务返回的精确命令继续处理。群聊中的
+证据和最近错误，并用 `/memory` 管理持久记忆。私聊中的自然语言只有在当前上下文
+能唯一对应某个控制命令时才会执行，例如紧跟唯一审批通知发送“确认”；普通业务问题
+即使包含“确认”“状态”等词也仍按问题回答。群聊中的
 控制命令只会提示转到私聊，不会泄露队列内容；非 Owner 私聊或群聊控制命令保持静默。
 
 安全的中断工作会在新会话 ready 后自动续跑。`queue resume` 用于经过人工核对的

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/liuchong/lark-agent/agent/domain"
+	"github.com/liuchong/lark-agent/agent/memory"
 	errs "github.com/liuchong/lark-agent/internal/apperr"
 )
 
@@ -402,7 +403,10 @@ func isOwnerMutation(name domain.OwnerControlName) bool {
 		domain.OwnerControlTaskAcknowledge,
 		domain.OwnerControlTaskReconcile,
 		domain.OwnerControlApprovalApprove,
-		domain.OwnerControlApprovalReject:
+		domain.OwnerControlApprovalReject,
+		domain.OwnerControlMemoryAdd,
+		domain.OwnerControlMemoryDelete,
+		domain.OwnerControlMemoryFeedback:
 		return true
 	default:
 		return false
@@ -488,6 +492,120 @@ func (s *Store) executeOwnerMutationTx(
 		result.WorkItemID = workID
 		result.Changed = 1
 		return err
+	case domain.OwnerControlMemoryAdd:
+		record := memory.Record{
+			Kind:       memory.Kind(command.MemoryKind),
+			Scope:      command.MemoryScope,
+			Status:     memory.StatusConfirmed,
+			Text:       command.MemoryContent,
+			Confidence: 1,
+		}
+		if err := validateMemoryRecord(record); err != nil {
+			return err
+		}
+		id, err := randomID()
+		if err != nil {
+			return err
+		}
+		scope := firstNonEmptyMemoryScope(record.Scope)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO memory_entries(
+			id, kind, scope, content, status, source_message_id,
+			confidence, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			id,
+			record.Kind,
+			scope,
+			strings.TrimSpace(record.Text),
+			record.Status,
+			commandMessageID,
+			record.Confidence,
+			now,
+			now,
+		); err != nil {
+			return errs.NewInternalError(errs.SubtypeStorage, "insert owner memory").WithCause(err)
+		}
+		result.MemoryID = id
+		result.Changed = 1
+		return nil
+	case domain.OwnerControlMemoryDelete:
+		if !command.Confirm {
+			return errs.NewValidationError(errs.SubtypeFailedPrecondition, "memory deletion requires confirm")
+		}
+		update, err := tx.ExecContext(ctx, `UPDATE memory_entries
+			SET deleted_at = ?, updated_at = ?
+			WHERE id = ? AND deleted_at IS NULL`, now, now, command.MemoryID)
+		if err != nil {
+			return errs.NewInternalError(errs.SubtypeStorage, "delete owner memory").WithCause(err)
+		}
+		changed, err := update.RowsAffected()
+		if err != nil {
+			return errs.NewInternalError(errs.SubtypeStorage, "read owner memory deletion result").WithCause(err)
+		}
+		if changed != 1 {
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "memory entry not found: %s", command.MemoryID)
+		}
+		result.MemoryID = command.MemoryID
+		result.Changed = int(changed)
+		return nil
+	case domain.OwnerControlMemoryFeedback:
+		feedback := memory.Feedback{
+			MemoryEntryID:   command.MemoryID,
+			Verdict:         memory.FeedbackVerdict(command.MemoryVerdict),
+			Note:            command.MemoryFeedback,
+			SourceMessageID: commandMessageID,
+		}
+		if !validMemoryFeedbackVerdict(feedback.Verdict) {
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid memory feedback verdict: %s", feedback.Verdict)
+		}
+		if len(feedback.Note) > maxMemoryNoteBytes || containsCredentialLikeContent(feedback.Note) {
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid memory feedback note")
+		}
+		var deletedAt sql.NullString
+		if err := tx.QueryRowContext(
+			ctx,
+			`SELECT deleted_at FROM memory_entries WHERE id = ?`,
+			feedback.MemoryEntryID,
+		).Scan(&deletedAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "memory entry not found: %s", feedback.MemoryEntryID)
+			}
+			return errs.NewInternalError(errs.SubtypeStorage, "locate owner memory").WithCause(err)
+		}
+		if deletedAt.Valid && feedback.Verdict != memory.FeedbackConfirm {
+			return errs.NewValidationError(errs.SubtypeFailedPrecondition, "memory entry is deleted: %s", feedback.MemoryEntryID)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO memory_feedback(
+			memory_entry_id, verdict, note, source_message_id, created_at
+		) VALUES (?, ?, ?, ?, ?)`,
+			feedback.MemoryEntryID,
+			feedback.Verdict,
+			strings.TrimSpace(feedback.Note),
+			commandMessageID,
+			now,
+		); err != nil {
+			return errs.NewInternalError(errs.SubtypeStorage, "insert owner memory feedback").WithCause(err)
+		}
+		var updateErr error
+		switch feedback.Verdict {
+		case memory.FeedbackConfirm:
+			_, updateErr = tx.ExecContext(ctx, `UPDATE memory_entries
+				SET status = 'confirmed', deleted_at = NULL, updated_at = ?
+				WHERE id = ?`, now, feedback.MemoryEntryID)
+		case memory.FeedbackReject:
+			_, updateErr = tx.ExecContext(ctx, `UPDATE memory_entries
+				SET deleted_at = ?, updated_at = ?
+				WHERE id = ?`, now, now, feedback.MemoryEntryID)
+		default:
+			_, updateErr = tx.ExecContext(ctx, `UPDATE memory_entries
+				SET updated_at = ? WHERE id = ?`, now, feedback.MemoryEntryID)
+		}
+		if updateErr != nil {
+			return errs.NewInternalError(errs.SubtypeStorage, "apply owner memory feedback").WithCause(updateErr)
+		}
+		result.MemoryID = feedback.MemoryEntryID
+		result.Changed = 1
+		result.Reason = string(feedback.Verdict)
+		return nil
 	default:
 		return errs.NewValidationError(
 			errs.SubtypeInvalidArgument,

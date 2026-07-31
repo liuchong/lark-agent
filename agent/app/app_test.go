@@ -149,6 +149,7 @@ func (f *fakeInvestigationProgress) Block(
 
 type fakeControlHandler struct {
 	called   bool
+	command  domain.OwnerControlCommand
 	decision domain.Decision
 	err      error
 }
@@ -156,10 +157,27 @@ type fakeControlHandler struct {
 func (h *fakeControlHandler) Handle(
 	_ context.Context,
 	_ domain.WorkItem,
-	_ domain.OwnerControlCommand,
+	command domain.OwnerControlCommand,
 ) (domain.Decision, error) {
 	h.called = true
+	h.command = command
 	return h.decision, h.err
+}
+
+type fakeSemanticControlResolver struct {
+	called     bool
+	resolution SemanticControlResolution
+	bundle     agentcontext.Bundle
+}
+
+func (r *fakeSemanticControlResolver) Resolve(
+	_ context.Context,
+	_ domain.WorkItem,
+	bundle agentcontext.Bundle,
+) (SemanticControlResolution, error) {
+	r.called = true
+	r.bundle = bundle
+	return r.resolution, nil
 }
 
 func TestDaemonExecutesOwnerControlBeforeModel(t *testing.T) {
@@ -205,6 +223,64 @@ func TestDaemonExecutesOwnerControlBeforeModel(t *testing.T) {
 	if result.Decision.Relevance != domain.RelevanceOwnerRequest ||
 		result.Decision.WorkKind != domain.WorkKindOwnerControl {
 		t.Fatalf("route identity was not preserved: %+v", result.Decision)
+	}
+}
+
+func TestDaemonExecutesContextualSemanticOwnerCommandBeforeGeneralModel(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:     "om_owner_confirm",
+		ChatID:        "oc_private",
+		ChatType:      "p2p",
+		ChatPartnerID: "ou_bot",
+		SenderID:      "ou_owner",
+		Content:       "确认",
+	})}
+	builder := &fakeBuilder{}
+	semantic := &fakeSemanticControlResolver{resolution: SemanticControlResolution{
+		Kind: SemanticControlCommand,
+		Command: &domain.OwnerControlCommand{
+			Name:     domain.OwnerControlApprovalApprove,
+			ActionID: 453,
+			Confirm:  true,
+		},
+	}}
+	handler := &fakeControlHandler{decision: domain.Decision{
+		Kind:       domain.DecisionReply,
+		Confidence: 1,
+		Risk:       domain.RiskLow,
+		Reason:     "owner_control_approval_approve",
+		ReplyText:  "已批准动作 #453",
+	}}
+	decider := &fakeDecider{}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{
+			OwnerOpenID:      "ou_owner",
+			AssistantOpenIDs: []string{"ou_bot"},
+			Mode:             domain.ModeAuto,
+		}),
+		WithContextBuilder(builder),
+		WithSemanticControlResolver(semantic),
+		WithControlHandler(handler),
+		WithDecider(decider),
+		WithReplyHandler(replier),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || !semantic.called || !builder.called ||
+		!handler.called || decider.called || !replier.called {
+		t.Fatalf(
+			"result=%+v semantic=%+v builder=%+v handler=%+v decider=%+v replier=%+v",
+			result, semantic, builder, handler, decider, replier,
+		)
+	}
+	if handler.command.Name != domain.OwnerControlApprovalApprove ||
+		handler.command.ActionID != 453 {
+		t.Fatalf("command=%+v", handler.command)
 	}
 }
 

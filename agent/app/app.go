@@ -4,6 +4,7 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
@@ -111,6 +112,10 @@ type replyApprovalPredictor interface {
 	RequiresApproval(domain.Decision) bool
 }
 
+type replyPreflighter interface {
+	Preflight(context.Context, domain.WorkItem, domain.Decision) (domain.Action, error)
+}
+
 // TerminalFailureHandler sends one durable owner resolution summary after a
 // work item actually reaches dead letter.
 type TerminalFailureHandler interface {
@@ -158,6 +163,27 @@ type ControlHandler interface {
 	) (domain.Decision, error)
 }
 
+type SemanticControlKind = domain.SemanticControlKind
+
+const (
+	SemanticControlNotCommand = domain.SemanticControlNotCommand
+	SemanticControlCommand    = domain.SemanticControlCommand
+	SemanticControlAmbiguous  = domain.SemanticControlAmbiguous
+)
+
+// SemanticControlResolution is a constrained owner-private command decision.
+type SemanticControlResolution = domain.SemanticControlResolution
+
+// SemanticControlResolver maps contextual owner-private language to one typed
+// command without granting the general answer model control authority.
+type SemanticControlResolver interface {
+	Resolve(
+		context.Context,
+		domain.WorkItem,
+		agentcontext.Bundle,
+	) (domain.SemanticControlResolution, error)
+}
+
 type ownerActivityRecoverer interface {
 	Recover(context.Context) error
 }
@@ -179,6 +205,7 @@ type Daemon struct {
 	presenter             DecisionPresenter
 	activity              OwnerActivityHandler
 	control               ControlHandler
+	semanticControl       SemanticControlResolver
 	poller                Poller
 	workLeases            map[domain.WorkKind]time.Duration
 	lane                  domain.SchedulerLane
@@ -300,6 +327,11 @@ func WithOwnerActivityHandler(handler OwnerActivityHandler) Option {
 
 func WithControlHandler(handler ControlHandler) Option {
 	return func(d *Daemon) { d.control = handler }
+}
+
+// WithSemanticControlResolver enables contextual owner-private commands.
+func WithSemanticControlResolver(resolver SemanticControlResolver) Option {
+	return func(d *Daemon) { d.semanticControl = resolver }
 }
 
 // WithPoller wires live user-message intake into the daemon.
@@ -535,6 +567,62 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 		controlDecision = inheritRouteFields(controlDecision, decision)
 		return d.finishDecision(ctx, item, controlDecision)
 	}
+	var preparedBundle *agentcontext.Bundle
+	if decision.Relevance == domain.RelevanceOwnerRequest &&
+		d.semanticControl != nil &&
+		d.builder != nil {
+		bundle, err := d.builder.Build(item)
+		if err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+		preparedBundle = &bundle
+		resolution, err := d.semanticControl.Resolve(ctx, item, bundle)
+		if err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+		switch resolution.Kind {
+		case SemanticControlNotCommand:
+		case SemanticControlCommand:
+			if d.control == nil || resolution.Command == nil {
+				err := errs.NewInternalError(
+					errs.SubtypeFailedPrecondition,
+					"semantic owner control handler is not configured",
+				)
+				d.markRetry(item, err)
+				return Result{}, err
+			}
+			controlDecision, err := d.control.Handle(ctx, item, *resolution.Command)
+			if err != nil {
+				d.markRetry(item, err)
+				return Result{}, err
+			}
+			controlDecision = inheritRouteFields(controlDecision, decision)
+			controlDecision.WorkKind = domain.WorkKindOwnerControl
+			return d.finishDecision(ctx, item, controlDecision)
+		case SemanticControlAmbiguous:
+			text := strings.TrimSpace(resolution.Clarification)
+			if text == "" {
+				text = "这句话可能对应多项操作，请说明要处理的任务号或动作号。"
+			}
+			return d.finishDecision(ctx, item, inheritRouteFields(domain.Decision{
+				Kind:       domain.DecisionReply,
+				Confidence: 1,
+				Risk:       domain.RiskLow,
+				Reason:     "semantic_owner_control_ambiguous",
+				ReplyText:  text,
+			}, decision))
+		default:
+			err := errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"invalid semantic control resolution %q",
+				resolution.Kind,
+			)
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+	}
 	goalTurnsRemaining := 0
 	goalBudgetExhausted := false
 	if item.WorkKind == domain.WorkKindCodingGoal {
@@ -570,10 +658,16 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 		decision.ReplyText = "CodingGoal 调查预算已耗尽；请缩小问题范围，或明确批准继续调查。"
 		decision.OwnerAction = "CodingGoal 调查预算已耗尽，需要缩小范围或明确批准继续。"
 	} else if d.shouldAskModel(decision) {
-		bundle, err := d.builder.Build(item)
-		if err != nil {
-			d.markRetry(item, err)
-			return Result{}, err
+		var bundle agentcontext.Bundle
+		if preparedBundle != nil {
+			bundle = *preparedBundle
+		} else {
+			var err error
+			bundle, err = d.builder.Build(item)
+			if err != nil {
+				d.markRetry(item, err)
+				return Result{}, err
+			}
 		}
 		if goalTurnsRemaining > 0 {
 			bundle.MaxTurns = goalTurnsRemaining
@@ -768,16 +862,28 @@ func (d *Daemon) finishDecisionWithApprovalState(
 		!isAssistantFacingRequest(decision.Relevance) &&
 		(approvalGranted || !replyRequiresApproval(d.replier, decision)) &&
 		d.notifier != nil {
-		if notifications, ok := d.queue.(postReplyNotificationStore); ok {
-			if err := d.ensureOwnerNotification(ctx, item, decision, notifications); err != nil {
+		notifyReady := true
+		if preflighter, ok := d.replier.(replyPreflighter); ok {
+			action, err := preflighter.Preflight(ctx, item, decision)
+			if err != nil {
 				d.markRetry(item, err)
 				return Result{}, err
 			}
-		} else if err := d.notifier.HandleNotification(ctx, item, decision, ""); err != nil {
-			d.markRetry(item, err)
-			return Result{}, err
+			notifyReady = action.Status == domain.ActionReady ||
+				(approvalGranted && action.Status == domain.ActionAwaitingApproval)
 		}
-		ownerNotified = true
+		if notifyReady {
+			if notifications, ok := d.queue.(postReplyNotificationStore); ok {
+				if err := d.ensureOwnerNotification(ctx, item, decision, notifications); err != nil {
+					d.markRetry(item, err)
+					return Result{}, err
+				}
+			} else if err := d.notifier.HandleNotification(ctx, item, decision, ""); err != nil {
+				d.markRetry(item, err)
+				return Result{}, err
+			}
+			ownerNotified = true
+		}
 	}
 	if decision.Kind == domain.DecisionReply || decision.Kind == domain.DecisionRequestApproval {
 		if err := d.ensureLease(ctx, item); err != nil {

@@ -14,6 +14,7 @@ import (
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
 	agentlocale "github.com/liuchong/lark-agent/agent/locale"
+	"github.com/liuchong/lark-agent/agent/memory"
 	"github.com/liuchong/lark-agent/agent/replymatch"
 	"github.com/liuchong/lark-agent/agent/storage"
 	agenttools "github.com/liuchong/lark-agent/agent/tools"
@@ -447,6 +448,83 @@ func TestApprovalCommandsListAndApproveExactAction(t *testing.T) {
 	}
 }
 
+func TestMemoryCommandsPersistAddListFeedbackAndConfirmedDelete(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+
+	run := func(args ...string) (string, string, int) {
+		t.Helper()
+		var out, errOut bytes.Buffer
+		code := Execute(
+			strings.NewReader(""),
+			&out,
+			&errOut,
+			append([]string{"--state", statePath, "memory"}, args...),
+		)
+		return out.String(), errOut.String(), code
+	}
+
+	addOut, addErr, code := run("add", string(memory.KindPreference), "优先使用中文回复")
+	if code != 0 {
+		t.Fatalf("add code=%d stderr=%s", code, addErr)
+	}
+	if !strings.Contains(addOut, `"status":"confirmed"`) {
+		t.Fatalf("add output=%s", addOut)
+	}
+
+	store, err := storage.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.ListMemories(context.Background(), "global", false, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records=%+v", records)
+	}
+	memoryID := records[0].ID
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	listOut, listErr, code := run("list")
+	if code != 0 {
+		t.Fatalf("list code=%d stderr=%s", code, listErr)
+	}
+	if !strings.Contains(listOut, memoryID) || !strings.Contains(listOut, "优先使用中文回复") {
+		t.Fatalf("list output=%s", listOut)
+	}
+
+	feedbackOut, feedbackErr, code := run("feedback", memoryID, string(memory.FeedbackHelpful), "回复语言正确")
+	if code != 0 {
+		t.Fatalf("feedback code=%d stderr=%s", code, feedbackErr)
+	}
+	if !strings.Contains(feedbackOut, `"verdict":"helpful"`) {
+		t.Fatalf("feedback output=%s", feedbackOut)
+	}
+
+	_, deleteErr, code := run("delete", memoryID)
+	if code == 0 || !strings.Contains(deleteErr, "--confirm") {
+		t.Fatalf("delete without confirm code=%d stderr=%s", code, deleteErr)
+	}
+
+	deleteOut, deleteErr, code := run("delete", memoryID, "--confirm")
+	if code != 0 {
+		t.Fatalf("delete code=%d stderr=%s", code, deleteErr)
+	}
+	if !strings.Contains(deleteOut, `"deleted":true`) {
+		t.Fatalf("delete output=%s", deleteOut)
+	}
+
+	listOut, listErr, code = run("list")
+	if code != 0 {
+		t.Fatalf("list after delete code=%d stderr=%s", code, listErr)
+	}
+	if strings.Contains(listOut, memoryID) {
+		t.Fatalf("deleted memory remains visible: %s", listOut)
+	}
+}
+
 type configuredPollerIM struct {
 	message serviceim.Message
 }
@@ -695,7 +773,7 @@ func TestLiveOptionsWithoutUserTokenDoNotExposeUserContextTools(t *testing.T) {
 	if info["user_polling"] != false || info["user_context"] != false || info["user_token"] != "missing" {
 		t.Fatalf("info=%+v", info)
 	}
-	if info["agent_tools"] != 12 {
+	if info["agent_tools"] != 13 {
 		t.Fatalf("agent tool count=%v; user-token-only context tools leaked", info["agent_tools"])
 	}
 	if len(options) == 0 {
@@ -1012,7 +1090,8 @@ func TestOwnerNotificationTextUsesConcretePreReplyAction(t *testing.T) {
 	for _, want := range []string{
 		"已收到消息 om_coordination 的代回复请求",
 		"我已完成接口契约核对",
-		"仍需你处理",
+		"即将自动发送",
+		"发送后仍需你处理",
 		"确认示例状态变更通知契约并同步 示例客户端回调",
 	} {
 		if !strings.Contains(text, want) {
@@ -1022,8 +1101,26 @@ func TestOwnerNotificationTextUsesConcretePreReplyAction(t *testing.T) {
 	if strings.Contains(text, "direct_mention") {
 		t.Fatalf("notification leaked internal reason: %s", text)
 	}
-	if strings.Contains(text, "并将发送") {
-		t.Fatalf("pre-reply notification claimed an unchecked send: %s", text)
+	if strings.Contains(text, "请查看智能助手的回复，并确认") {
+		t.Fatalf("automatic pre-reply notification asked for unnecessary confirmation: %s", text)
+	}
+}
+
+func TestOwnerNotificationTextSaysAutomaticReplyNeedsNoOwnerAction(t *testing.T) {
+	item := domain.NewWorkItem(domain.NormalizedEvent{MessageID: "om_auto_reply"})
+	text := ownerNotificationText(item, domain.Decision{
+		Kind:      domain.DecisionReply,
+		ReplyText: "已完成只读核对，当前配置已经生效。",
+	}, "测试负责人", "zh-CN")
+	for _, want := range []string{"测试负责人", "即将自动发送", "当前无需你操作"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("notification missing %q: %s", want, text)
+		}
+	}
+	for _, forbidden := range []string{"正在准备", "请查看", "确认是否"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("automatic notification contains %q: %s", forbidden, text)
+		}
 	}
 }
 
@@ -1430,7 +1527,7 @@ func TestAutoOwnerNoticeUsesResolvedDecisionLanguage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Liu Chong", "is preparing this reply", "I verified"} {
+	for _, want := range []string{"Liu Chong", "send this reply automatically", "I verified"} {
 		if !strings.Contains(messenger.notification, want) {
 			t.Fatalf("notification missing %q: %s", want, messenger.notification)
 		}

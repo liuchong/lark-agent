@@ -1042,6 +1042,7 @@ func TestHelpContract(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit=%d stderr=%s", code, stderr)
 	}
+	normalizedStdout := strings.Join(strings.Fields(stdout), " ")
 	for _, want := range []string{
 		"lark-agent",
 		"daemon",
@@ -1069,7 +1070,7 @@ func TestHelpContract(t *testing.T) {
 		"approval",
 		"paused",
 	} {
-		if !strings.Contains(stdout, want) {
+		if !strings.Contains(normalizedStdout, strings.Join(strings.Fields(want), " ")) {
 			t.Fatalf("help output missing %q\nstdout:\n%s", want, stdout)
 		}
 	}

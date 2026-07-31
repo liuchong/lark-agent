@@ -1732,6 +1732,7 @@ func isRelevantEvidenceTool(name string) bool {
 		"explore_workspace",
 		"search_workspace",
 		"read_workspace",
+		"inspect_git_history",
 		"search_code_symbols",
 		"trace_code_path":
 		return true

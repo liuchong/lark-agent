@@ -141,6 +141,86 @@ func (n *orderedOwnerNotifier) HandleApprovalNotification(
 	return nil
 }
 
+type orderedDelegatedMessenger struct {
+	order *[]string
+	text  string
+}
+
+func (m *orderedDelegatedMessenger) ReplyAsUser(
+	_ context.Context,
+	request agenttools.ReplyRequest,
+) (agenttools.ReplyResult, error) {
+	m.text = request.Text
+	*m.order = append(*m.order, "sender_reply")
+	return agenttools.ReplyResult{MessageID: "om_auto_sender_reply"}, nil
+}
+
+func (*orderedDelegatedMessenger) NotifyOwner(
+	context.Context,
+	agenttools.NotifyRequest,
+) error {
+	return nil
+}
+
+type ownerAlreadyRepliedState struct{}
+
+func (ownerAlreadyRepliedState) OwnerAlreadyReplied(context.Context, domain.WorkItem) (bool, error) {
+	return true, nil
+}
+
+func (ownerAlreadyRepliedState) MessageWithdrawn(context.Context, domain.WorkItem) (bool, error) {
+	return false, nil
+}
+
+func TestDelegatedReplyRechecksOwnerStateBeforePreReplyNotice(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_owner_already_replied",
+		ChatID:    "oc_group",
+		SenderID:  "ou_teammate",
+		Content:   "@测试负责人 请核对当前入口",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner", Name: "测试负责人"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	messenger := &orderedDelegatedMessenger{order: &order}
+	daemon := app.NewDaemon(
+		store,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		app.WithContextBuilder(convergenceContextBuilder{}),
+		app.WithDecider(fixedDelegatedDecision{}),
+		app.WithDecisionPresenter(agentlocale.DelegatedPresenter{
+			OwnerOpenID: "ou_owner",
+			OwnerName:   "测试负责人",
+			Preferred:   agentlocale.LanguageChinese,
+			Fallback:    agentlocale.LanguageChinese,
+		}),
+		app.WithReplyHandler(reply.NewController(
+			policy.NewReplyGate(policy.Config{
+				Mode:               domain.ModeAuto,
+				ReplyConfidenceMin: 0.70,
+			}, ownerAlreadyRepliedState{}),
+			messenger,
+			store,
+		)),
+		app.WithNotificationHandler(orderedOwnerNotifier{order: &order}),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 0 ||
+		result.Decision.Kind != domain.DecisionIgnore ||
+		!strings.Contains(result.Decision.Reason, "owner_already_replied") {
+		t.Fatalf("result=%+v order=%v", result, order)
+	}
+}
+
 func TestDelegatedReplyNotifiesNamedOwnerBeforeSenderFacingAssistantReply(t *testing.T) {
 	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -186,6 +266,67 @@ func TestDelegatedReplyNotifiesNamedOwnerBeforeSenderFacingAssistantReply(t *tes
 	}
 	if strings.Contains(captured.decision.ReplyText, "用户") {
 		t.Fatalf("generic user identity leaked: %s", captured.decision.ReplyText)
+	}
+}
+
+func TestSeventyPercentLowRiskDelegatedReplySendsWithoutOwnerApproval(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_auto_seventy",
+		ChatID:    "oc_group",
+		SenderID:  "ou_teammate",
+		Content:   "@测试负责人 请核对当前只读状态",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner", Name: "测试负责人"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	messenger := &orderedDelegatedMessenger{order: &order}
+	daemon := app.NewDaemon(
+		store,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		app.WithContextBuilder(convergenceContextBuilder{}),
+		app.WithDecider(lowConfidenceDelegatedDecision{}),
+		app.WithDecisionPresenter(agentlocale.DelegatedPresenter{
+			OwnerOpenID: "ou_owner",
+			OwnerName:   "测试负责人",
+			Preferred:   agentlocale.LanguageChinese,
+			Fallback:    agentlocale.LanguageChinese,
+		}),
+		app.WithReplyHandler(reply.NewController(
+			policy.NewReplyGate(policy.Config{
+				Mode:               domain.ModeAuto,
+				ReplyConfidenceMin: 0.70,
+			}, privateReplyThreadState{}),
+			messenger,
+			store,
+		)),
+		app.WithNotificationHandler(orderedOwnerNotifier{order: &order}),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || result.Decision.Kind != domain.DecisionReply {
+		t.Fatalf("result=%+v", result)
+	}
+	if got, want := strings.Join(order, ","), "owner_notice,sender_reply"; got != want {
+		t.Fatalf("delivery order=%q want %q", got, want)
+	}
+	if !strings.Contains(messenger.text, "🤖 智能助手：") ||
+		!strings.Contains(messenger.text, "已将处理结果通知测试负责人") {
+		t.Fatalf("sender reply=%q", messenger.text)
+	}
+	pending, err := store.ListPendingOwnerApprovals(context.Background(), 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.Total != 0 {
+		t.Fatalf("unexpected pending approval=%+v", pending)
 	}
 }
 

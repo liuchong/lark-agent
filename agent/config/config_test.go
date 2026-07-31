@@ -155,6 +155,13 @@ func TestDefaultReplyScopeAllowsAllGroups(t *testing.T) {
 	}
 }
 
+func TestDefaultDelegatedReplyConfidenceSendsVerifiedLowRiskReplies(t *testing.T) {
+	cfg := Default()
+	if cfg.Policy.ReplyConfidenceMin != 0.70 {
+		t.Fatalf("reply confidence min=%v, want 0.70", cfg.Policy.ReplyConfidenceMin)
+	}
+}
+
 func TestValidateRejectsInvalidSemanticOwnerReplyPolicy(t *testing.T) {
 	cfg := validConfigForTest(t)
 	cfg.Policy.OwnerReplyConfidenceMin = 1.1

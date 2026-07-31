@@ -74,10 +74,15 @@ next tool until it calls `submit_decision`.
 
 The initial snapshot contains the operating system, configured workspace,
 available tools and common commands, a depth- and size-bounded directory
-overview, workspace rule paths, skill summaries, the current Lark message, and
-recent conversation context. It does not pre-guess code-search terms from the
-message. Code questions are investigated by the model using search, read,
-rules, skills, Lark-context, and shell tools.
+overview, a bounded project catalog, workspace rule paths, skill summaries,
+the current Lark message, and recent conversation context. The directory
+overview reaches at most five levels, 600 entries, 80 entries per directory,
+and 16 KiB of serialized prompt text. The project catalog is derived from
+bounded manifest and repository markers inside that same scan and is retained
+before lower-value directory entries when the prompt is compacted. It does not
+pre-guess code-search terms from the message. Code questions are investigated
+by the model using search, read, rules, skills, Lark-context, local Git history,
+and shell tools.
 
 The loop has hard limits for model turns, elapsed time, individual and
 cumulative tool output, and repeated no-progress model turns. Multiple tool
@@ -361,6 +366,15 @@ incomplete selection with a non-secret reason and continues with the current
 message. A history lookup failure must not make the working reaction disappear
 and leave the owner request silently waiting for retry.
 
+The configured owner's private chat with the assistant is a trusted control
+conversation. Its adjacent context keeps bounded owner messages and messages
+sent by the current assistant application, including the actionable assistant
+notice immediately preceding a short owner response such as "确认". App
+messages remain filtered as noise in ordinary group and delegated contexts
+unless they are explicitly pinned by a reply/root relation. Trusting the
+current assistant's private-chat messages does not trust other applications or
+allow a model instruction to widen the context policy.
+
 User-identity Lark calls use the current Keychain credentials. If a cached
 user_access_token is rejected as expired, the client serializes recovery,
 reloads any newer Keychain token, and otherwise uses the current refresh_token
@@ -500,9 +514,12 @@ paths, `..`, absolute paths outside the root, and symlinks escaping the root are
 rejected before any model call or file read. Rules are loaded only from
 `AGENTS.md` and `.agents/` inside the workspace.
 
-Workspace directory, rule, and skill discovery is deterministic and bounded.
-The first snapshot lists at most three directory levels and reports when entry
-or byte limits truncate the result. Skills are listed by metadata and loaded in
+Workspace directory, project, rule, and skill discovery is deterministic and
+bounded. The first snapshot lists at most five directory levels, 600 entries,
+80 entries per directory, and 16 KiB of serialized directory/project text, and
+reports when entry or byte limits truncate the result. A bounded project
+catalog derived from repository and manifest markers is retained before raw
+leaf entries during compaction. Skills are listed by metadata and loaded in
 full only when the model asks for one. Rules applicable to a discovered target
 path are loaded on demand and may never traverse above the configured real
 workspace root.
@@ -529,6 +546,17 @@ result that tells the model to use `search_workspace`, `search_code_symbols`,
 `trace_code_path`, or `explore_workspace`. A shell command that is read-only in
 Unix terms can still be denied when it would consume unbounded workspace or
 turn budget.
+
+Local Git history is exposed through a dedicated read-only tool rather than
+shell. It accepts only a workspace-relative repository path whose resolved
+repository and Git metadata stay inside the configured real workspace root.
+Inherited `GIT_*` variables cannot redirect the repository, object database,
+configuration, worktree, index, namespace, or replacement objects outside that
+validated repository.
+It returns at most 20 local commits and 8 KiB. It never fetches, checks out,
+writes refs or the working tree, invokes hooks, contacts a remote, or exposes
+credentials. A delegated non-owner run may use this tool because it is
+read-only; this does not widen any write or external-side-effect authority.
 
 ## Coding Assistance
 
@@ -816,6 +844,23 @@ the model. Mutation commands require exact work or action IDs and use the same
 storage transitions as their CLI equivalents. An owner command in a group only
 receives a private-control redirect; a non-owner command remains silent.
 
+One canonical command catalog drives explicit parsing, `/help`, detailed help,
+and the semantic-control prompt. Each catalog entry declares aliases, localized
+usage, read-only or mutation risk, required typed arguments, and whether one
+exact durable candidate is required. Contract tests fail when any of those
+surfaces diverge.
+
+A non-slash owner message in the assistant's private chat first passes through
+a constrained semantic command resolver with the bounded current-assistant
+conversation and typed eligible task/approval candidates. It returns
+`not_command`, one validated catalog command, or `ambiguous`. Read-only
+commands require at least `0.85` confidence. Mutations require at least `0.95`,
+one exact eligible durable candidate, and normal typed command validation.
+Model-produced IDs outside the supplied candidate set are rejected. Ambiguity
+asks for an exact ID and performs no mutation. Ordinary questions such as
+"确认一下这个修复是否上线了" remain ordinary owner requests. Explicit slash
+commands remain deterministic and never use the resolver.
+
 `/tasks` defaults to a bounded actionable view instead of dumping historical
 storage status maps. Every listed item gives a localized semantic state, its
 last durable fact or failure, why owner attention is required, and an exact
@@ -1072,6 +1117,41 @@ the reply must occur as complete identifiers in the cited authoritative reads;
 this prevents a nearby but different field or callback name from being
 presented as verified.
 
+## Durable Memory And Feedback
+
+Agent memory is durable SQLite state, not a process-local slice. Each entry has
+a stable ID, kind (`fact`, `preference`, `project`, or `response_feedback`),
+scope (`global` or a workspace-relative project key), bounded content, optional
+source work/message identity, confidence, timestamps, and an optional deletion
+tombstone. Feedback records an owner verdict and bounded note against an entry.
+
+Raw chat transcripts, credentials, model chain-of-thought, host descriptions,
+and unverified model guesses are never stored as memory. Owner-authored
+corrections and explicit owner-private `/memory add` commands may create
+prompt-visible entries. Automatic extraction creates only a candidate until
+the owner confirms it. Automatic extraction accepts at most one bounded stable
+fact, preference, project fact, or response evaluation from the current
+owner-authored assistant-private message. It discards credential-like content
+and exact duplicate candidates; it never copies the surrounding transcript or
+assistant-authored text.
+
+Memory retrieval is bounded by scope, query terms, confidence, recency, count,
+and serialized bytes. Deleted and unconfirmed entries are excluded from model
+context. `/memory list`, `/memory add`, `/memory delete`, and
+`/memory feedback` use the same typed owner-private control catalog and journal
+as other commands. Restart preserves accepted entries and feedback.
+
+- Given an ordinary owner business question contains no stable correction or
+  preference, when semantic command classification runs, then it creates no
+  memory.
+- Given the owner states one stable correction or preference without a slash
+  command, when semantic classification returns a bounded memory candidate,
+  then the candidate is persisted once with the current message as its source
+  but remains absent from later model context until the owner confirms it.
+- Given memory content contains a common provider token, cloud access key,
+  private key, or password/secret assignment, when any bot or local memory
+  command validates it, then no plaintext memory row is written.
+
 ## Reply Policy
 
 The owner profile contains a concrete display name and language policy.
@@ -1094,14 +1174,23 @@ interrupted notification with an uncertain result is never replayed.
 Before replying as the owner, the runtime must:
 
 1. build a source-backed draft;
-2. check risk and policy gates;
-3. wait for the configured owner-response window;
+2. wait for the configured owner-response window;
+3. check identity, blocked-target, and configured-scope gates;
 4. re-read or re-check the thread state;
 5. cancel if the owner already replied, the message was withdrawn, or the
-   question was solved;
-6. send with a stable idempotency key;
-7. notify the owner through the bot with the reason, sources, and rollback
-   options.
+   question was solved, before considering confidence or approval;
+6. check risk, confidence, and approval policy;
+7. notify the owner through the bot with the exact intended reply and whether
+   any owner action remains;
+8. immediately recheck terminal thread state and send with a stable
+   idempotency key only when it is still unanswered.
+
+The default installed delegated reply confidence floor is `0.70`. A verified
+low-risk reply at or above that floor sends automatically in auto mode.
+Medium/high risk, personal commitments, destructive operations, insufficient
+evidence, or approval mode still hold or block the exact action. Pending
+approvals repeat the owner-handled/withdrawn/solved recheck before execution;
+a stale approval is cancelled and audited instead of sending an old draft.
 
 Reply decisions must include non-empty model-authored text. There is no generic
 acknowledgement fallback. `notify` performs a real owner notification,

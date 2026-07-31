@@ -126,7 +126,10 @@ func TestBuilderIncludesBoundedEnvironmentContext(t *testing.T) {
 	mustWriteFile(t, filepath.Join(root, "AGENTS.md"), "reply briefly")
 	mustWriteFile(t, filepath.Join(root, "service", "router.go"), "package service")
 	mustWriteFile(t, filepath.Join(root, "service", "internal", "repo.go"), "package internal")
-	mustWriteFile(t, filepath.Join(root, "service", "internal", "deep", "skip.go"), "package deep")
+	mustWriteFile(t, filepath.Join(root, "service", "internal", "deep", "project", "go.mod"), "module example.com/deep")
+	mustWriteFile(t, filepath.Join(root, "service", "internal", "deep", "project", "src", "skip.go"), "package deep")
+	mustWriteFile(t, filepath.Join(root, "bare-repository", ".git", "HEAD"), "ref: refs/heads/main")
+	mustWriteFile(t, filepath.Join(root, "bare-repository", "README.md"), "repository without a language manifest")
 	mustWriteFile(t, filepath.Join(root, ".agents", "skills", "intent", "SKILL.md"), "intent skill")
 	mustWriteFile(t, filepath.Join(root, "service", "AGENTS.md"), "service rules")
 	mustWriteFile(t, filepath.Join(root, "service", ".agents", "skills", "backend", "SKILL.md"), "backend skill")
@@ -163,11 +166,20 @@ func TestBuilderIncludesBoundedEnvironmentContext(t *testing.T) {
 	if !containsDirEntry(bundle.Environment.Directory, "service/internal", "dir") {
 		t.Fatalf("directory=%+v", bundle.Environment.Directory)
 	}
-	if containsDirEntry(bundle.Environment.Directory, "service/internal/deep/skip.go", "file") {
-		t.Fatalf("directory should be depth bounded: %+v", bundle.Environment.Directory)
+	if !containsDirEntry(bundle.Environment.Directory, "service/internal/deep/project/go.mod", "file") {
+		t.Fatalf("directory should include five levels: %+v", bundle.Environment.Directory)
+	}
+	if !containsProject(bundle.Environment.Projects, "service/internal/deep/project", "go") {
+		t.Fatalf("project catalog=%+v", bundle.Environment.Projects)
+	}
+	if !containsProject(bundle.Environment.Projects, "bare-repository", "git") {
+		t.Fatalf("bare Git repository missing from catalog=%+v", bundle.Environment.Projects)
+	}
+	if containsDirEntry(bundle.Environment.Directory, "service/internal/deep/project/src/skip.go", "file") {
+		t.Fatalf("directory should remain bounded after five levels: %+v", bundle.Environment.Directory)
 	}
 	prompt := Prompt(bundle)
-	for _, want := range []string{"Environment:", "Available tools:", "Directory overview:", "search_code_symbols", "search_workspace", ".agents/skills/intent/SKILL.md"} {
+	for _, want := range []string{"Environment:", "Available tools:", "Project catalog:", "Directory overview:", "search_code_symbols", "search_workspace", ".agents/skills/intent/SKILL.md"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
@@ -284,6 +296,15 @@ func containsString(values []string, want string) bool {
 func containsDirEntry(entries []DirectoryEntry, path, kind string) bool {
 	for _, entry := range entries {
 		if entry.Path == path && entry.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func containsProject(projects []ProjectEntry, path, kind string) bool {
+	for _, project := range projects {
+		if project.Path == path && project.Kind == kind {
 			return true
 		}
 	}

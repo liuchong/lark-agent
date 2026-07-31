@@ -20,32 +20,111 @@ func Parse(raw string) (domain.OwnerControlCommand, bool, error) {
 	}
 	name := strings.ToLower(strings.TrimPrefix(fields[0], "/"))
 	args := fields[1:]
-	switch name {
-	case "help", "帮助":
+	commandName, found := commandForAlias(name)
+	if !found {
+		return domain.OwnerControlCommand{}, true, fmt.Errorf("unknown command /%s", name)
+	}
+	switch commandName {
+	case domain.OwnerControlHelp:
 		return domain.OwnerControlCommand{
 			Name:  domain.OwnerControlHelp,
 			Topic: firstArg(args),
 		}, true, nil
-	case "status", "状态":
+	case domain.OwnerControlStatus:
 		return noArgs(domain.OwnerControlStatus, args)
-	case "doctor", "诊断":
+	case domain.OwnerControlDoctor:
 		return noArgs(domain.OwnerControlDoctor, args)
-	case "tasks", "任务":
+	case domain.OwnerControlTasks:
 		return parseTasks(args)
-	case "task":
+	case domain.OwnerControlTask:
 		return parseTask(args)
-	case "approvals", "审批":
+	case domain.OwnerControlApprovals:
 		return parsePaged(domain.OwnerControlApprovals, args)
-	case "approval":
+	case domain.OwnerControlApproval:
 		return parseApproval(args)
-	case "recent", "最近":
+	case domain.OwnerControlRecent:
 		return parseRecent(args)
-	case "version", "版本":
+	case domain.OwnerControlMemoryList:
+		return parseMemory(args)
+	case domain.OwnerControlVersion:
 		return noArgs(domain.OwnerControlVersion, args)
-	case "ping":
+	case domain.OwnerControlPing:
 		return noArgs(domain.OwnerControlPing, args)
 	default:
-		return domain.OwnerControlCommand{}, true, fmt.Errorf("unknown command /%s", name)
+		return domain.OwnerControlCommand{}, true, fmt.Errorf("unsupported command /%s", name)
+	}
+}
+
+func parseMemory(args []string) (domain.OwnerControlCommand, bool, error) {
+	if len(args) == 0 {
+		return domain.OwnerControlCommand{
+			Name: domain.OwnerControlMemoryList,
+			Page: 1,
+		}, true, nil
+	}
+	switch operation := strings.ToLower(args[0]); operation {
+	case "list":
+		command, _, err := parsePaged(domain.OwnerControlMemoryList, args[1:])
+		if command.Page == 0 {
+			command.Page = 1
+		}
+		return command, true, err
+	case "add":
+		if len(args) < 3 {
+			return domain.OwnerControlCommand{}, true, fmt.Errorf(
+				"/memory add requires a kind and content",
+			)
+		}
+		kind := strings.ToLower(args[1])
+		switch kind {
+		case "fact", "preference", "project", "response_feedback":
+		default:
+			return domain.OwnerControlCommand{}, true, fmt.Errorf(
+				"memory kind must be fact, preference, project, or response_feedback",
+			)
+		}
+		return domain.OwnerControlCommand{
+			Name:          domain.OwnerControlMemoryAdd,
+			MemoryKind:    kind,
+			MemoryScope:   "global",
+			MemoryContent: joinedTail(args, 2),
+		}, true, nil
+	case "delete":
+		if len(args) != 3 || strings.ToLower(args[2]) != "confirm" {
+			return domain.OwnerControlCommand{}, true, fmt.Errorf(
+				"/memory delete requires an id and confirm",
+			)
+		}
+		return domain.OwnerControlCommand{
+			Name:     domain.OwnerControlMemoryDelete,
+			MemoryID: args[1],
+			Confirm:  true,
+		}, true, nil
+	case "feedback":
+		if len(args) < 3 {
+			return domain.OwnerControlCommand{}, true, fmt.Errorf(
+				"/memory feedback requires an id and verdict",
+			)
+		}
+		verdict := strings.ToLower(args[2])
+		switch verdict {
+		case "confirm", "reject", "helpful", "unhelpful":
+		default:
+			return domain.OwnerControlCommand{}, true, fmt.Errorf(
+				"memory verdict must be confirm, reject, helpful, or unhelpful",
+			)
+		}
+		return domain.OwnerControlCommand{
+			Name:           domain.OwnerControlMemoryFeedback,
+			MemoryID:       args[1],
+			MemoryVerdict:  verdict,
+			MemoryFeedback: joinedTail(args, 3),
+		}, true, nil
+	default:
+		return domain.OwnerControlCommand{}, true, fmt.Errorf(
+			"unknown /memory operation %s",
+			operation,
+		)
 	}
 }
 

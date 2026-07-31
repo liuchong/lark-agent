@@ -138,6 +138,7 @@ func exactScopeToolAllowed(toolName string) bool {
 	case "list_workspace",
 		"search_workspace",
 		"read_workspace",
+		"inspect_git_history",
 		"get_lark_context",
 		"submit_investigation_plan",
 		"submit_decision":
@@ -202,7 +203,7 @@ func prepareCodingWorkspaceToolArguments(
 		if len(entryPoints) > 0 {
 			payload["entry_points"], _ = json.Marshal(entryPoints)
 		}
-	case "list_workspace", "search_workspace", "read_workspace":
+	case "list_workspace", "search_workspace", "read_workspace", "inspect_git_history":
 		var requestedPath string
 		if raw, ok := payload["path"]; ok {
 			if err := json.Unmarshal(raw, &requestedPath); err != nil {
@@ -210,7 +211,7 @@ func prepareCodingWorkspaceToolArguments(
 			}
 		}
 		if strings.TrimSpace(requestedPath) == "" &&
-			(toolName == "list_workspace" || toolName == "search_workspace") {
+			(toolName == "list_workspace" || toolName == "search_workspace" || toolName == "inspect_git_history") {
 			requestedPath = scope
 		}
 		normalized, err := normalizeCodingWorkspacePath(
@@ -239,7 +240,7 @@ func validateCodingWorkspaceToolRealPath(
 	workspaceRoot string,
 ) error {
 	switch toolName {
-	case "list_workspace", "search_workspace", "read_workspace":
+	case "list_workspace", "search_workspace", "read_workspace", "inspect_git_history":
 	default:
 		return nil
 	}

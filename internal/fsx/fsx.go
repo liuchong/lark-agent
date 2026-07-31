@@ -127,6 +127,7 @@ func WriteFile(path string, data []byte, perm os.FileMode) error {
 }
 func ReadFile(path string) ([]byte, error)       { return os.ReadFile(path) }
 func Stat(path string) (fs.FileInfo, error)      { return os.Stat(path) }
+func Lstat(path string) (fs.FileInfo, error)     { return os.Lstat(path) }
 func Remove(path string) error                   { return os.Remove(path) }
 func EvalSymlinks(path string) (string, error)   { return filepath.EvalSymlinks(path) }
 func ReadDir(path string) ([]fs.DirEntry, error) { return os.ReadDir(path) }

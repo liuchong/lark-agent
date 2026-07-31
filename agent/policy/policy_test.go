@@ -37,6 +37,28 @@ func TestAutoReplyCancelsWhenOwnerAlreadyReplied(t *testing.T) {
 	}
 }
 
+func TestOwnerHandledStateWinsBeforeLowConfidenceApproval(t *testing.T) {
+	gate := NewReplyGate(Config{
+		Mode:               domain.ModeAuto,
+		ReplyConfidenceMin: 0.85,
+	}, fakeThreadState{ownerReplied: true})
+	action, err := gate.Prepare(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_handled_low_confidence",
+	}), domain.Decision{
+		Kind:       domain.DecisionReply,
+		Relevance:  domain.RelevanceDirectMention,
+		Confidence: 0.20,
+		Risk:       domain.RiskLow,
+		ReplyText:  "不应发送",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Status != domain.ActionCancelled || action.CancelReason != "owner_already_replied" {
+		t.Fatalf("action=%+v", action)
+	}
+}
+
 func TestOwnerRequestDoesNotCancelBecauseOwnerSentPrompt(t *testing.T) {
 	gate := NewReplyGate(Config{
 		Mode: domain.ModeAuto, OwnerOpenID: "ou_owner",
@@ -89,6 +111,46 @@ func TestLowRiskDirectMentionReplyUsesConfiguredConfidenceFloor(t *testing.T) {
 	}
 }
 
+func TestDefaultGateSendsVerifiedLowRiskReplyAtSeventyPercent(t *testing.T) {
+	gate := NewReplyGate(Config{Mode: domain.ModeAuto}, fakeThreadState{})
+	action, err := gate.Prepare(context.Background(), domain.WorkItem{}, domain.Decision{
+		Kind:       domain.DecisionReply,
+		Relevance:  domain.RelevanceDirectMention,
+		Confidence: 0.70,
+		Risk:       domain.RiskLow,
+		ReplyText:  "已完成只读核对，结论如下。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Status != domain.ActionReady {
+		t.Fatalf("action=%+v", action)
+	}
+}
+
+func TestMediumAndHighRiskRepliesRequireApprovalEvenAtHighConfidence(t *testing.T) {
+	for _, risk := range []domain.Risk{domain.RiskMedium, domain.RiskHigh} {
+		gate := NewReplyGate(Config{
+			Mode:               domain.ModeAuto,
+			ReplyConfidenceMin: 0.70,
+		}, fakeThreadState{})
+		action, err := gate.Prepare(context.Background(), domain.WorkItem{}, domain.Decision{
+			Kind:       domain.DecisionReply,
+			Relevance:  domain.RelevanceDirectMention,
+			Confidence: 0.99,
+			Risk:       risk,
+			ReplyText:  "需要代表负责人作出承诺。",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if action.Status != domain.ActionAwaitingApproval ||
+			action.CancelReason != "risk_requires_approval" {
+			t.Fatalf("risk=%s action=%+v", risk, action)
+		}
+	}
+}
+
 func TestRequiresApprovalPredictsOnlyConfidenceAndModeHolds(t *testing.T) {
 	auto := NewReplyGate(Config{
 		Mode:               domain.ModeAuto,
@@ -124,7 +186,7 @@ func TestMediumRiskDirectMentionStillRequiresApprovalBelowConfidenceFloor(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if action.Status != domain.ActionAwaitingApproval || action.CancelReason != "low_confidence" {
+	if action.Status != domain.ActionAwaitingApproval || action.CancelReason != "risk_requires_approval" {
 		t.Fatalf("action=%+v", action)
 	}
 }

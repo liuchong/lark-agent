@@ -93,6 +93,14 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 			args: []string{"github", "auth", "--help"},
 			want: []string{"login", "status", "Keychain", "stdin"},
 		},
+		{
+			args: []string{"memory", "--help"},
+			want: []string{"list", "add", "delete", "feedback", "confirmed"},
+		},
+		{
+			args: []string{"memory", "delete", "--help"},
+			want: []string{"ID", "--confirm", "tombstone"},
+		},
 	}
 	for _, testCase := range cases {
 		code, stdout, stderr := runAgent(t, bin, testCase.args...)
@@ -139,6 +147,7 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"policy.reply_scope",
 		"policy.private_reply_scope",
 		"policy.owner_wait",
+		"lark-agent memory list",
 		"all_groups",
 		"all_private",
 		"非 Owner 私聊机器人或直接 @机器人时保持静默",
@@ -157,6 +166,8 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"agent.max_context_images",
 		"max_context_image_bytes",
 		"max_context_image_total_bytes",
+		"reply_confidence_min: 0.70",
+		"inspect_git_history",
 	} {
 		if !strings.Contains(string(configuration), want) {
 			t.Fatalf("configuration docs missing %q", want)
@@ -169,6 +180,8 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 	for _, want := range []string{
 		"/tasks",
 		"/task",
+		"/memory",
+		"语义判断",
 		"调查主题",
 		"调查状态",
 		"上下文证据",

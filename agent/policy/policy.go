@@ -42,7 +42,7 @@ func NewReplyGate(cfg Config, state ThreadState) *ReplyGate {
 		cfg.AssistantReplyScope = domain.ReplyScopeAllGroups
 	}
 	if cfg.ReplyConfidenceMin == 0 {
-		cfg.ReplyConfidenceMin = 0.85
+		cfg.ReplyConfidenceMin = 0.70
 	}
 	return &ReplyGate{cfg: cfg, state: state}
 }
@@ -69,11 +69,6 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 	if decision.Risk == domain.RiskForbidden {
 		action.Status = domain.ActionBlocked
 		action.CancelReason = "forbidden_risk"
-		return action, nil
-	}
-	if decision.Confidence < g.replyConfidenceMin(decision) {
-		action.Status = domain.ActionAwaitingApproval
-		action.CancelReason = "low_confidence"
 		return action, nil
 	}
 	if contains(g.cfg.BlockChats, item.Event.ChatID) || contains(g.cfg.BlockUsers, item.Event.SenderID) {
@@ -118,6 +113,16 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 			}
 		}
 	}
+	if decision.Risk == domain.RiskMedium || decision.Risk == domain.RiskHigh {
+		action.Status = domain.ActionAwaitingApproval
+		action.CancelReason = "risk_requires_approval"
+		return action, nil
+	}
+	if decision.Confidence < g.replyConfidenceMin(decision) {
+		action.Status = domain.ActionAwaitingApproval
+		action.CancelReason = "low_confidence"
+		return action, nil
+	}
 	if g.cfg.Mode == domain.ModeApproval {
 		action.Status = domain.ActionAwaitingApproval
 		return action, nil
@@ -131,7 +136,9 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 // before the final live thread-state checks run.
 func (g *ReplyGate) RequiresApproval(decision domain.Decision) bool {
 	return decision.Kind == domain.DecisionReply &&
-		(decision.Confidence < g.replyConfidenceMin(decision) ||
+		(decision.Risk == domain.RiskMedium ||
+			decision.Risk == domain.RiskHigh ||
+			decision.Confidence < g.replyConfidenceMin(decision) ||
 			g.cfg.Mode == domain.ModeApproval)
 }
 

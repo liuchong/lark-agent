@@ -1,6 +1,7 @@
 package control
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/liuchong/lark-agent/agent/domain"
@@ -95,6 +96,58 @@ func TestParseMutationCommands(t *testing.T) {
 	}
 }
 
+func TestParseMemoryCommands(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want domain.OwnerControlCommand
+	}{
+		{
+			raw: "/memory list 2",
+			want: domain.OwnerControlCommand{
+				Name: domain.OwnerControlMemoryList,
+				Page: 2,
+			},
+		},
+		{
+			raw: "/memory add project 示例修复已合入测试分支",
+			want: domain.OwnerControlCommand{
+				Name:          domain.OwnerControlMemoryAdd,
+				MemoryKind:    "project",
+				MemoryScope:   "global",
+				MemoryContent: "示例修复已合入测试分支",
+			},
+		},
+		{
+			raw: "/memory delete mem-1 confirm",
+			want: domain.OwnerControlCommand{
+				Name:     domain.OwnerControlMemoryDelete,
+				MemoryID: "mem-1",
+				Confirm:  true,
+			},
+		},
+		{
+			raw: "/memory feedback mem-1 helpful 避免了重复调查",
+			want: domain.OwnerControlCommand{
+				Name:           domain.OwnerControlMemoryFeedback,
+				MemoryID:       "mem-1",
+				MemoryVerdict:  "helpful",
+				MemoryFeedback: "避免了重复调查",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			got, matched, err := Parse(tt.raw)
+			if err != nil || !matched {
+				t.Fatalf("matched=%v err=%v", matched, err)
+			}
+			if got != tt.want {
+				t.Fatalf("got=%+v want=%+v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseUnknownSlashCommandMatchesWithoutEnteringModel(t *testing.T) {
 	got, matched, err := Parse("/unknown")
 	if !matched || err == nil {
@@ -102,5 +155,47 @@ func TestParseUnknownSlashCommandMatchesWithoutEnteringModel(t *testing.T) {
 	}
 	if _, matched, err := Parse("帮我看看任务"); matched || err != nil {
 		t.Fatalf("free-form message matched=%v err=%v", matched, err)
+	}
+}
+
+func TestCommandCatalogDrivesParserHelpAndSemanticPrompt(t *testing.T) {
+	specs := Catalog()
+	if len(specs) == 0 {
+		t.Fatal("empty command catalog")
+	}
+	help := HelpText("zh-CN", "")
+	prompt := SemanticCatalog("zh-CN")
+	for _, spec := range specs {
+		if spec.UsageZH == "" || spec.PurposeZH == "" {
+			t.Fatalf("incomplete localized command spec: %+v", spec)
+		}
+		if !strings.Contains(help, spec.UsageZH) {
+			t.Fatalf("help missing catalog usage %q:\n%s", spec.UsageZH, help)
+		}
+		if !strings.Contains(prompt, spec.UsageZH) || !strings.Contains(prompt, spec.PurposeZH) {
+			t.Fatalf("semantic prompt missing catalog spec %+v:\n%s", spec, prompt)
+		}
+	}
+}
+
+func TestSemanticMutationValidationRejectsInventedApproval(t *testing.T) {
+	_, err := ValidateSemanticCommand(
+		"/approval approve 999 confirm",
+		0.99,
+		SemanticCandidates{ApprovalIDs: []int64{453}},
+	)
+	if err == nil {
+		t.Fatal("invented approval ID should be rejected")
+	}
+	command, err := ValidateSemanticCommand(
+		"/approval approve 453 confirm",
+		0.99,
+		SemanticCandidates{ApprovalIDs: []int64{453}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command.Name != domain.OwnerControlApprovalApprove || command.ActionID != 453 {
+		t.Fatalf("command=%+v", command)
 	}
 }

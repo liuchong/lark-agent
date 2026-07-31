@@ -130,15 +130,16 @@ const (
 
 // MessageContextRequest asks for the latest context around a message.
 type MessageContextRequest struct {
-	Mode             ContextMode
-	ChatID           string
-	MessageID        string
-	RootMessageID    string
-	ReplyToMessageID string
-	ThreadID         string
-	CreatedAt        time.Time
-	Limit            int
-	After            time.Time
+	Mode               ContextMode
+	ChatID             string
+	MessageID          string
+	RootMessageID      string
+	ReplyToMessageID   string
+	ThreadID           string
+	CreatedAt          time.Time
+	Limit              int
+	After              time.Time
+	IncludeAppMessages bool
 }
 
 // ContextSelection records the bounded relation-aware context decision.
@@ -1596,7 +1597,9 @@ func compactMessages(messages []Message, req MessageContextRequest, limit int) (
 	}
 	filtered := make([]Message, 0, len(messages))
 	for _, message := range messages {
-		if isAppContextMessage(message) && !pinned[message.MessageID] {
+		if isAppContextMessage(message) &&
+			!req.IncludeAppMessages &&
+			!pinned[message.MessageID] {
 			continue
 		}
 		filtered = append(filtered, message)

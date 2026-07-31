@@ -313,7 +313,7 @@ func Default() Config {
 			OwnerReplyConfidenceMin: 0.85,
 			OwnerReplyRetry:         30 * time.Second,
 			MentionPoll:             30 * time.Second,
-			ReplyConfidenceMin:      0.85,
+			ReplyConfidenceMin:      0.70,
 			InvestigationProgress:   "enabled",
 		},
 		Workspace: WorkspaceConfig{

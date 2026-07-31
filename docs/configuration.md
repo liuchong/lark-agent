@@ -59,6 +59,8 @@ lark-agent config show
   `disabled` 时关闭。
 - `policy.owner_wait`、`owner_reply_confidence_min`、`owner_reply_retry`：
   本人优先回复窗口、语义判断最低置信度和不确定结果的重试间隔。
+- `policy.reply_confidence_min`：低风险代回复自动发送的最低可信度，默认 `0.70`。
+  中高风险、承诺、删除修改和不确定外部动作不因高可信度绕过审批。
 - `policy.investigation_progress`：`enabled` 或 `disabled`，默认 `enabled`。开启后，
   高置信度的调查或代码问题会先持久化任务、通知具体姓名的 Owner，再用智能助手身份
   在原会话发送一次进度；该任务随后必须以结果、本人已处理或明确阻塞收口。
@@ -167,6 +169,7 @@ policy:
   owner_wait: 3m
   owner_reply_confidence_min: 0.85
   owner_reply_retry: 30s
+  reply_confidence_min: 0.70
 ```
 
 这些字段相互独立：
@@ -182,6 +185,8 @@ policy:
   到期后才读取目标前后有界的同一会话并逐条做语义判断。
 - `policy.owner_reply_confidence_min` 是“本人已处理/无需回复/尚未回答”的最低可信度；
   `policy.owner_reply_retry` 是判断不清、上下文不完整或模型异常后的静默重试间隔。
+- `policy.reply_confidence_min` 是主模型完成只读核对后自动代回复的最低可信度。
+  达到 `0.70` 的低风险答复会先私聊通知 Owner，再直接发送，不会等待 Owner 在线。
 
 它们只放开“群范围”这一道门。黑名单、模型相关性与风险判断、置信度和审批模式、
 撤回检查与幂等发送仍然生效。Owner 等待和语义复核只适用于代回复，不适用于直接
@@ -214,3 +219,24 @@ Workspace 是 Agent 唯一可以操作的本地业务目录。路径解析会拒
 - 未建立 macOS 沙箱时的 shell 执行。
 
 这些限制由 Go 代码和操作系统沙箱执行，不依赖模型遵守提示词。
+
+初始模型上下文会列出 Workspace 内最多五层、600 个条目的有界目录，并优先给出
+Go、Rust、Zig、Node、Python、Java 等项目清单。`inspect_git_history` 只读取
+Workspace 内仓库最近最多 20 条本地提交和 8 KiB 结果；仓库、`.git`、common dir
+或 alternates 逃出 Workspace 时会在执行 Git 前拒绝。继承的 `GIT_DIR`、
+`GIT_WORK_TREE` 等 `GIT_*` 重定向变量会在子进程启动前清除。
+
+## 持久记忆
+
+Owner 可以通过智能助手私聊或本地命令保存、评价和删除记忆：
+
+```text
+/memory list
+/memory add fact|preference|project|response_feedback 内容
+/memory feedback 记忆号 confirm|reject|helpful|unhelpful [说明]
+/memory delete 记忆号 confirm
+```
+
+本地等价命令为 `lark-agent memory list|add|feedback|delete`。明确添加的内容直接标为
+已确认；候选内容必须经 Owner 确认后才进入模型上下文。检索受作用域、关键词、可信度、
+数量和字节上限约束。原始聊天记录、凭据、模型思维过程和未经验证的推测不会作为记忆。

@@ -32,3 +32,8 @@ Acceptance must include a real project source question and a false-premise
 trap. A current-source conclusion may identify a deployment-version mismatch
 as the next check, but it must not claim a production deployment fact that was
 not observed.
+
+When local Git history is exposed as bounded evidence, validate repository and
+metadata paths before execution and remove every inherited `GIT_*` variable
+before adding the fixed read-only child environment. `git -C` alone does not
+prevent `GIT_DIR`, `GIT_WORK_TREE`, or object-database redirects.

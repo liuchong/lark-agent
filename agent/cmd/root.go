@@ -93,12 +93,14 @@ after forced convergence by default. One interactive
 worker is reserved from the foreground pool, while CodingGoal work uses
 background workers. Time, date, ping, status, doctor, queue summary, and help
 use a deterministic fast path before any model loop.
-The configured owner can use /help, /status, /tasks, /task, /approvals, and
-/approval in the assistant's private chat to inspect and safely close durable
-work without invoking the model. Group commands disclose no queue details and
-redirect the owner to private chat; non-owner commands remain silent. Local
-operators can use queue tasks, queue acknowledge, and queue reconcile for the
-same bounded task views and durable closure rules.
+The configured owner can use /help, /status, /tasks, /task, /approvals,
+/approval, and /memory in the assistant's private chat to inspect and safely
+close durable work or curate bounded persistent memory. Contextual natural
+language maps to these commands only when the adjacent assistant notice and
+eligible durable state identify one exact operation. Group commands disclose
+no queue details and redirect the owner to private chat; non-owner commands
+remain silent. Local operators can use queue tasks, queue acknowledge, queue
+reconcile, and memory commands for the same bounded state and closure rules.
 After restart, safe read-only and model work is automatically re-evaluated in
 the new ready session. Exact approval waits are preserved and privately
 reported. An interrupted external action is never replayed: it is terminalized
@@ -131,7 +133,7 @@ Modes:
 		newQueueCommand(out, &configPath, &statePath),
 		newSubscriptionCommand(out, &statePath),
 		newApprovalCommand(out, &statePath),
-		newMemoryCommand(out),
+		newMemoryCommand(out, &statePath),
 		newRulesCommand(out, &configPath),
 		newGitHubCommand(in, out, &configPath),
 		newDoctorCommand(out, &configPath, &statePath),
@@ -1513,7 +1515,7 @@ func buildLiveOptions(
 		base: agentcontext.Builder{
 			Scope:  scope,
 			Rules:  ruleSet,
-			Memory: memory.NewStore(),
+			Memory: store,
 			User: agentcontext.UserProfile{
 				OpenID:            cfg.Owner.OpenID,
 				Name:              cfg.Owner.Name,
@@ -1560,6 +1562,7 @@ func buildLiveOptions(
 		}
 		definitions := append([]agenttools.Definition{}, agenttools.CodeIndexDefinitions(scope, nil)...)
 		definitions = append(definitions, agenttools.WorkspaceDefinitions(scope)...)
+		definitions = append(definitions, agenttools.GitDefinitions(scope)...)
 		if userContextEnabled {
 			definitions = append(definitions, agenttools.LarkContextDefinitions(larkToolContext{svc: imSvc})...)
 		}
@@ -1587,6 +1590,13 @@ func buildLiveOptions(
 			Model:   model,
 			Timeout: cfg.Model.Timeout,
 		}
+		options = append(options, app.WithSemanticControlResolver(
+			control.NewSemanticResolver(
+				modelAdapter,
+				store,
+				string(resolveConfiguredLanguage(cfg.Owner)),
+			),
+		))
 		loopModelAdapter := modelAdapter
 		if visionModel := strings.TrimSpace(cfg.Agent.VisionModel); visionModel != "" {
 			loopModelAdapter = &agentruntime.OpenAICompatibleModel{
@@ -2332,28 +2342,32 @@ func ownerNotificationText(item domain.WorkItem, decision domain.Decision, owner
 	}
 	if decision.Kind == domain.DecisionReply {
 		ownerAction := strings.TrimSpace(decision.OwnerAction)
-		if ownerAction == "" || agentlocale.ValidateProse(ownerAction, resolved) != nil {
-			if resolved == agentlocale.LanguageEnglish {
-				ownerAction = "Please review the assistant reply and decide whether follow-up is needed."
-			} else {
-				ownerAction = "请查看智能助手的回复，并确认是否还需要后续处理"
-			}
+		if ownerAction != "" && agentlocale.ValidateProse(ownerAction, resolved) != nil {
+			ownerAction = ""
 		}
 		if resolved == agentlocale.LanguageEnglish {
+			nextAction := "No action is required from you."
+			if ownerAction != "" {
+				nextAction = "After the reply is sent, you still need to: " + ownerAction
+			}
 			return fmt.Sprintf(
-				"%s, the intelligent assistant received a delegated request for message %s and is preparing this reply:\n\n%s\n\nYour next action: %s",
+				"%s, the intelligent assistant received a delegated request for message %s and will now send this reply automatically:\n\n%s\n\n%s",
 				ownerName,
 				item.Event.MessageID,
 				decision.ReplyText,
-				ownerAction,
+				nextAction,
 			)
 		}
+		nextAction := "当前无需你操作"
+		if ownerAction != "" {
+			nextAction = "答复发送后仍需你处理：" + ownerAction
+		}
 		return fmt.Sprintf(
-			"%s，智能助手已收到消息 %s 的代回复请求，正在准备以下答复：\n\n%s\n\n仍需你处理：%s。",
+			"%s，智能助手已收到消息 %s 的代回复请求，即将自动发送以下答复：\n\n%s\n\n%s。",
 			ownerName,
 			item.Event.MessageID,
 			decision.ReplyText,
-			ownerAction,
+			nextAction,
 		)
 	}
 	reason := agentlocale.LocalizedReason(resolved, decision.Reason)
@@ -2577,6 +2591,8 @@ func (b *conversationBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, 
 				ThreadID:         item.Event.ThreadID,
 				CreatedAt:        item.Event.CreatedAt,
 				Limit:            30,
+				IncludeAppMessages: item.Event.ChatType == "p2p" &&
+					item.Event.SenderID == b.base.User.OpenID,
 			})
 			messages = messageContext.Messages
 			selection = messageContext.Selection
@@ -3569,19 +3585,133 @@ func parseApprovalID(raw string) (int64, error) {
 	return id, nil
 }
 
-func newMemoryCommand(out io.Writer) *cobra.Command {
-	cmd := &cobra.Command{Use: "memory", Short: "Inspect or delete explicit memory"}
-	for _, name := range []string{"list", "delete"} {
-		n := name
-		cmd.AddCommand(&cobra.Command{
-			Use:   n,
-			Short: n + " memory",
-			RunE: func(cmd *cobra.Command, args []string) error {
-				return writeData(out, map[string]any{"action": n, "items": []any{}})
-			},
-		})
+func newMemoryCommand(out io.Writer, statePath *string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "memory",
+		Short: "Manage durable explicit memory",
+		Long: "List, add, review, or delete bounded durable memory. " +
+			"Only confirmed, non-deleted entries are supplied to the model.",
 	}
+	cmd.AddCommand(
+		newMemoryListCommand(out, statePath),
+		newMemoryAddCommand(out, statePath),
+		newMemoryDeleteCommand(out, statePath),
+		newMemoryFeedbackCommand(out, statePath),
+	)
 	return cmd
+}
+
+func newMemoryListCommand(out io.Writer, statePath *string) *cobra.Command {
+	var scope string
+	var includeDeleted bool
+	var limit int
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List bounded memory entries",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := storage.OpenInspection(resolveStatePath(*statePath))
+			if err != nil {
+				return err
+			}
+			defer store.Close() //nolint:errcheck
+			records, err := store.ListMemories(cmd.Context(), scope, includeDeleted, limit)
+			if err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"memories": records})
+		},
+	}
+	cmd.Flags().StringVar(&scope, "scope", "global", "exact memory scope")
+	cmd.Flags().BoolVar(&includeDeleted, "include-deleted", false, "include tombstoned entries")
+	cmd.Flags().IntVar(&limit, "limit", 20, "maximum entries to return (1-100)")
+	return cmd
+}
+
+func newMemoryAddCommand(out io.Writer, statePath *string) *cobra.Command {
+	var scope string
+	cmd := &cobra.Command{
+		Use:   "add KIND CONTENT",
+		Short: "Add one confirmed explicit memory",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := storage.OpenInspection(resolveStatePath(*statePath))
+			if err != nil {
+				return err
+			}
+			defer store.Close() //nolint:errcheck
+			record, err := store.AddMemory(cmd.Context(), memory.Record{
+				Kind:       memory.Kind(args[0]),
+				Scope:      scope,
+				Status:     memory.StatusConfirmed,
+				Text:       args[1],
+				Confidence: 1,
+			})
+			if err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"memory": record})
+		},
+	}
+	cmd.Flags().StringVar(&scope, "scope", "global", "exact memory scope")
+	return cmd
+}
+
+func newMemoryDeleteCommand(out io.Writer, statePath *string) *cobra.Command {
+	var confirm bool
+	cmd := &cobra.Command{
+		Use:   "delete ID",
+		Short: "Tombstone one exact memory entry",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !confirm {
+				return errs.NewValidationError(
+					errs.SubtypeFailedPrecondition,
+					"memory delete requires --confirm",
+				).WithParam("confirm")
+			}
+			store, err := storage.OpenInspection(resolveStatePath(*statePath))
+			if err != nil {
+				return err
+			}
+			defer store.Close() //nolint:errcheck
+			deleted, err := store.DeleteMemory(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"deleted": deleted, "id": args[0]})
+		},
+	}
+	cmd.Flags().BoolVar(&confirm, "confirm", false, "confirm the irreversible tombstone")
+	return cmd
+}
+
+func newMemoryFeedbackCommand(out io.Writer, statePath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "feedback ID VERDICT [NOTE]",
+		Short: "Record confirm, reject, helpful, or unhelpful owner feedback",
+		Args:  cobra.RangeArgs(2, 3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			note := ""
+			if len(args) == 3 {
+				note = args[2]
+			}
+			store, err := storage.OpenInspection(resolveStatePath(*statePath))
+			if err != nil {
+				return err
+			}
+			defer store.Close() //nolint:errcheck
+			feedback, err := store.RecordMemoryFeedback(cmd.Context(), memory.Feedback{
+				MemoryEntryID: args[0],
+				Verdict:       memory.FeedbackVerdict(args[1]),
+				Note:          note,
+			})
+			if err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"feedback": feedback})
+		},
+	}
 }
 
 func newRulesCommand(out io.Writer, configPath *string) *cobra.Command {

@@ -2,10 +2,12 @@
 package context
 
 import (
+	stdcontext "context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -186,6 +188,13 @@ type ToolSpec struct {
 // DirectoryEntry is an alias kept with the prompt-facing environment model.
 type DirectoryEntry = workspace.DirectoryEntry
 
+// ProjectEntry identifies a bounded project root without reading project files.
+type ProjectEntry struct {
+	Path   string `json:"path" yaml:"path"`
+	Kind   string `json:"kind" yaml:"kind"`
+	Marker string `json:"marker" yaml:"marker"`
+}
+
 // EnvironmentSnapshot gives the first model turn bounded situational context.
 type EnvironmentSnapshot struct {
 	OS                string           `json:"os" yaml:"os"`
@@ -198,6 +207,7 @@ type EnvironmentSnapshot struct {
 	Commands          []string         `json:"commands,omitempty" yaml:"commands,omitempty"`
 	RuleFiles         []string         `json:"rule_files,omitempty" yaml:"rule_files,omitempty"`
 	SkillFiles        []string         `json:"skill_files,omitempty" yaml:"skill_files,omitempty"`
+	Projects          []ProjectEntry   `json:"projects,omitempty" yaml:"projects,omitempty"`
 	Directory         []DirectoryEntry `json:"directory,omitempty" yaml:"directory,omitempty"`
 	Truncated         bool             `json:"truncated,omitempty" yaml:"truncated,omitempty"`
 	Omitted           int              `json:"omitted,omitempty" yaml:"omitted,omitempty"`
@@ -228,7 +238,7 @@ type Bundle struct {
 type Builder struct {
 	Scope            *workspace.Scope
 	Rules            rules.Set
-	Memory           *memory.Store
+	Memory           memory.Reader
 	User             UserProfile
 	Conversation     []domain.NormalizedEvent
 	ContextSelection domain.ContextSelection
@@ -244,7 +254,10 @@ func (b Builder) Build(item domain.WorkItem) (Bundle, error) {
 	query := contextQuery(item)
 	var memories []memory.Record
 	if b.Memory != nil {
-		memories = searchMemory(b.Memory, query, 8)
+		memories, err = searchMemory(b.Memory, query, 8)
+		if err != nil {
+			return Bundle{}, err
+		}
 	}
 	bundle := Bundle{
 		Event:            item.Event,
@@ -290,14 +303,15 @@ func (b Builder) buildEnvironment() (EnvironmentSnapshot, error) {
 	environment.WorkspaceRealRoot = snapshot.RealRoot
 	environment.WorkspaceVersion = snapshot.Version
 	directory, err := b.Scope.ListDirectory(workspace.DirectoryOptions{
-		MaxDepth:   3,
-		MaxEntries: 400,
-		MaxPerDir:  60,
+		MaxDepth:   5,
+		MaxEntries: 600,
+		MaxPerDir:  80,
 	})
 	if err != nil {
 		return EnvironmentSnapshot{}, err
 	}
 	environment.Directory = directory.Entries
+	environment.Projects = discoverProjects(b.Scope, directory.Entries)
 	environment.Truncated = directory.Truncated
 	environment.Omitted = directory.Omitted
 	controlFiles, err := b.Scope.DiscoverControlFiles(6, 256)
@@ -308,6 +322,75 @@ func (b Builder) buildEnvironment() (EnvironmentSnapshot, error) {
 	environment.SkillFiles = uniqueSorted(append(environment.SkillFiles, controlFiles.SkillFiles...))
 	environment.Truncated = environment.Truncated || controlFiles.Truncated
 	return environment, nil
+}
+
+func discoverProjects(scope *workspace.Scope, entries []DirectoryEntry) []ProjectEntry {
+	markers := map[string]string{
+		"go.mod":         "go",
+		"Cargo.toml":     "rust",
+		"build.zig":      "zig",
+		"package.json":   "node",
+		"pyproject.toml": "python",
+		"pom.xml":        "java",
+		"build.gradle":   "gradle",
+	}
+	seen := make(map[string]struct{})
+	projects := make([]ProjectEntry, 0)
+	for _, entry := range entries {
+		if entry.Kind != "file" {
+			continue
+		}
+		marker := path.Base(filepath.ToSlash(entry.Path))
+		kind, ok := markers[marker]
+		if !ok {
+			continue
+		}
+		projectPath := path.Dir(filepath.ToSlash(entry.Path))
+		if projectPath == "." {
+			projectPath = ""
+		}
+		key := projectPath + "\x00" + kind
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		projects = append(projects, ProjectEntry{
+			Path:   projectPath,
+			Kind:   kind,
+			Marker: marker,
+		})
+	}
+	directories := []string{""}
+	for _, entry := range entries {
+		if entry.Kind == "dir" {
+			directories = append(directories, entry.Path)
+		}
+	}
+	for _, projectPath := range directories {
+		if !scope.HasGitRepositoryMarker(projectPath) {
+			continue
+		}
+		key := projectPath + "\x00git"
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		projects = append(projects, ProjectEntry{
+			Path:   filepath.ToSlash(projectPath),
+			Kind:   "git",
+			Marker: ".git",
+		})
+	}
+	sort.Slice(projects, func(i, j int) bool {
+		if projects[i].Path == projects[j].Path {
+			return projects[i].Kind < projects[j].Kind
+		}
+		return projects[i].Path < projects[j].Path
+	})
+	if len(projects) > 100 {
+		projects = projects[:100]
+	}
+	return projects
 }
 
 func uniqueSorted(values []string) []string {
@@ -336,6 +419,7 @@ func defaultToolSpecs() []ToolSpec {
 		{Name: "read_workspace_rules", Description: "Load workspace rules applicable to a path", Available: true},
 		{Name: "list_skills", Description: "List workspace-local skills", Available: true},
 		{Name: "load_skill", Description: "Load one workspace-local skill", Available: true},
+		{Name: "inspect_git_history", Description: "Inspect bounded local commit history for a workspace repository", Available: true},
 		{Name: "get_lark_context", Description: "Read bounded same-chat nearby, quoted reply, or thread context", Available: true},
 		{Name: "get_github_context", Description: "Read bounded facts from a verified quoted GitHub notification", Available: true},
 		{Name: "search_lark_messages", Description: "Search owner-visible Lark messages", Available: true},
@@ -384,7 +468,7 @@ func Prompt(bundle Bundle) string {
 	out.WriteString("Allowed decision values: ignore, record, notify, reply, request_approval. Allowed risk values: low, medium, high, forbidden.\n")
 	out.WriteString("When the message asks about code or workspace behavior and listed sources are sufficient, prefer a concise factual reply based on those sources. Do not choose notify only because the owner was mentioned.\n")
 	out.WriteString("Never expand workspace access, change target chat, or bypass policy.\n\n")
-	out.WriteString(environmentPrompt(bundle.Environment, 12*1024))
+	out.WriteString(environmentPrompt(bundle.Environment, 16*1024))
 	out.WriteString("\n")
 	out.WriteString("Owner:\n")
 	out.WriteString(fmt.Sprintf("- open_id: %s\n- name: %s\n- title: %s\n- projects: %s\n\n",
@@ -457,6 +541,16 @@ func environmentPrompt(environment EnvironmentSnapshot, maxBytes int) string {
 	if len(environment.SkillFiles) > 0 {
 		out.WriteString("- skill files: " + strings.Join(environment.SkillFiles, ", ") + "\n")
 	}
+	if len(environment.Projects) > 0 {
+		out.WriteString("Project catalog:\n")
+		for _, project := range environment.Projects {
+			path := project.Path
+			if path == "" {
+				path = "."
+			}
+			out.WriteString(fmt.Sprintf("- %s (%s; marker=%s)\n", path, project.Kind, project.Marker))
+		}
+	}
 	out.WriteString("Directory overview:\n")
 	for _, entry := range environment.Directory {
 		out.WriteString(fmt.Sprintf("- %s (%s)\n", entry.Path, entry.Kind))
@@ -487,33 +581,15 @@ func contextQuery(item domain.WorkItem) string {
 	return strings.TrimSpace(strings.Join(fields, " "))
 }
 
-func searchMemory(store *memory.Store, query string, limit int) []memory.Record {
-	var out []memory.Record
-	for _, term := range queryTerms(query) {
-		out = append(out, store.Search(term, limit-len(out))...)
-		if len(out) >= limit {
-			break
-		}
-	}
-	return out
-}
-
-func queryTerms(query string) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, field := range strings.Fields(query) {
-		term := strings.Trim(field, " \t\r\n,.?!:;()[]{}\"'")
-		if len([]rune(term)) < 3 {
-			continue
-		}
-		lower := strings.ToLower(term)
-		if seen[lower] {
-			continue
-		}
-		seen[lower] = true
-		out = append(out, term)
-	}
-	return out
+func searchMemory(store memory.Reader, query string, limit int) ([]memory.Record, error) {
+	return store.SearchMemories(stdcontext.Background(), memory.Query{
+		Text:          query,
+		Scopes:        []string{"global"},
+		Status:        memory.StatusConfirmed,
+		MinConfidence: 0.60,
+		Limit:         limit,
+		MaxBytes:      8 * 1024,
+	})
 }
 
 func collectSources(ruleSet rules.Set, memories []memory.Record, hits []workspace.SearchResult) []domain.SourceRef {

@@ -1419,6 +1419,26 @@ func TestCompactMessagesDropsUnreferencedAppNoise(t *testing.T) {
 	}
 }
 
+func TestCompactMessagesKeepsCurrentAssistantPrivateContextWhenRequested(t *testing.T) {
+	messages := []Message{
+		{MessageID: "om_owner_1", SenderType: "user", Content: "前一个问题", CreateTime: "2026-07-31T00:50:00Z"},
+		{MessageID: "om_assistant_notice", SenderType: "app", Content: "审批 #453，批准命令如下", CreateTime: "2026-07-31T00:51:00Z"},
+		{MessageID: "om_owner_confirm", SenderType: "user", Content: "确认", CreateTime: "2026-07-31T00:52:00Z"},
+	}
+	compacted, truncated := compactMessages(messages, MessageContextRequest{
+		MessageID:          "om_owner_confirm",
+		IncludeAppMessages: true,
+	}, 30)
+	if truncated {
+		t.Fatalf("trusted private context should not be marked truncated: %v", messageIDs(compacted))
+	}
+	for _, want := range []string{"om_owner_1", "om_assistant_notice", "om_owner_confirm"} {
+		if !containsMessage(compacted, want) {
+			t.Fatalf("wanted message %s missing: %v", want, messageIDs(compacted))
+		}
+	}
+}
+
 func messageIDs(messages []Message) []string {
 	ids := make([]string, 0, len(messages))
 	for _, message := range messages {

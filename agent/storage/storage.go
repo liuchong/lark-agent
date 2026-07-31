@@ -428,6 +428,42 @@ func (s *Store) migrate() error {
 			`ALTER TABLE delegated_investigations
 			 ADD COLUMN context_messages_json TEXT NOT NULL DEFAULT '[]'`,
 		}},
+		{version: 15, statements: []string{
+			`CREATE TABLE IF NOT EXISTS memory_entries (
+				id TEXT PRIMARY KEY,
+				kind TEXT NOT NULL CHECK (
+					kind IN ('fact', 'preference', 'project', 'response_feedback')
+				),
+				scope TEXT NOT NULL,
+				content TEXT NOT NULL,
+				status TEXT NOT NULL CHECK (status IN ('candidate', 'confirmed')),
+				source_work_item_id INTEGER REFERENCES work_items(id),
+				source_message_id TEXT,
+				confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				deleted_at TEXT
+			)`,
+			`CREATE TABLE IF NOT EXISTS memory_feedback (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				memory_entry_id TEXT NOT NULL REFERENCES memory_entries(id),
+				verdict TEXT NOT NULL CHECK (
+					verdict IN ('confirm', 'reject', 'helpful', 'unhelpful')
+				),
+				note TEXT NOT NULL DEFAULT '',
+				source_message_id TEXT,
+				created_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_memory_entries_retrieval
+			 ON memory_entries(status, scope, deleted_at, updated_at DESC)`,
+			`CREATE INDEX IF NOT EXISTS idx_memory_entries_source
+			 ON memory_entries(source_work_item_id, source_message_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_memory_feedback_entry
+			 ON memory_feedback(memory_entry_id, created_at DESC)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_feedback_message
+			 ON memory_feedback(memory_entry_id, source_message_id)
+			 WHERE source_message_id IS NOT NULL AND source_message_id <> ''`,
+		}},
 	}
 	for _, migration := range migrations {
 		if version >= migration.version {

@@ -806,6 +806,10 @@ const (
 	OwnerControlRecent          OwnerControlName = "recent"
 	OwnerControlVersion         OwnerControlName = "version"
 	OwnerControlPing            OwnerControlName = "ping"
+	OwnerControlMemoryList      OwnerControlName = "memory_list"
+	OwnerControlMemoryAdd       OwnerControlName = "memory_add"
+	OwnerControlMemoryDelete    OwnerControlName = "memory_delete"
+	OwnerControlMemoryFeedback  OwnerControlName = "memory_feedback"
 )
 
 type OwnerTaskView string
@@ -827,16 +831,36 @@ const (
 )
 
 type OwnerControlCommand struct {
-	Name        OwnerControlName           `json:"name" yaml:"name"`
-	Topic       string                     `json:"topic,omitempty" yaml:"topic,omitempty"`
-	View        OwnerTaskView              `json:"view,omitempty" yaml:"view,omitempty"`
-	Page        int                        `json:"page,omitempty" yaml:"page,omitempty"`
-	Count       int                        `json:"count,omitempty" yaml:"count,omitempty"`
-	WorkItemID  int64                      `json:"work_item_id,omitempty" yaml:"work_item_id,omitempty"`
-	ActionID    int64                      `json:"action_id,omitempty" yaml:"action_id,omitempty"`
-	Confirm     bool                       `json:"confirm,omitempty" yaml:"confirm,omitempty"`
-	Disposition OwnerResolutionDisposition `json:"disposition,omitempty" yaml:"disposition,omitempty"`
-	Reason      string                     `json:"reason,omitempty" yaml:"reason,omitempty"`
+	Name           OwnerControlName           `json:"name" yaml:"name"`
+	Topic          string                     `json:"topic,omitempty" yaml:"topic,omitempty"`
+	View           OwnerTaskView              `json:"view,omitempty" yaml:"view,omitempty"`
+	Page           int                        `json:"page,omitempty" yaml:"page,omitempty"`
+	Count          int                        `json:"count,omitempty" yaml:"count,omitempty"`
+	WorkItemID     int64                      `json:"work_item_id,omitempty" yaml:"work_item_id,omitempty"`
+	ActionID       int64                      `json:"action_id,omitempty" yaml:"action_id,omitempty"`
+	Confirm        bool                       `json:"confirm,omitempty" yaml:"confirm,omitempty"`
+	Disposition    OwnerResolutionDisposition `json:"disposition,omitempty" yaml:"disposition,omitempty"`
+	Reason         string                     `json:"reason,omitempty" yaml:"reason,omitempty"`
+	MemoryID       string                     `json:"memory_id,omitempty" yaml:"memory_id,omitempty"`
+	MemoryKind     string                     `json:"memory_kind,omitempty" yaml:"memory_kind,omitempty"`
+	MemoryScope    string                     `json:"memory_scope,omitempty" yaml:"memory_scope,omitempty"`
+	MemoryContent  string                     `json:"memory_content,omitempty" yaml:"memory_content,omitempty"`
+	MemoryVerdict  string                     `json:"memory_verdict,omitempty" yaml:"memory_verdict,omitempty"`
+	MemoryFeedback string                     `json:"memory_feedback,omitempty" yaml:"memory_feedback,omitempty"`
+}
+
+type SemanticControlKind string
+
+const (
+	SemanticControlNotCommand SemanticControlKind = "not_command"
+	SemanticControlCommand    SemanticControlKind = "command"
+	SemanticControlAmbiguous  SemanticControlKind = "ambiguous"
+)
+
+type SemanticControlResolution struct {
+	Kind          SemanticControlKind  `json:"kind" yaml:"kind"`
+	Command       *OwnerControlCommand `json:"command,omitempty" yaml:"command,omitempty"`
+	Clarification string               `json:"clarification,omitempty" yaml:"clarification,omitempty"`
 }
 
 type OwnerWorkResolution struct {
@@ -889,6 +913,7 @@ type OwnerMutationResult struct {
 	Changed          int                        `json:"changed" yaml:"changed"`
 	Disposition      OwnerResolutionDisposition `json:"disposition,omitempty" yaml:"disposition,omitempty"`
 	Reason           string                     `json:"reason,omitempty" yaml:"reason,omitempty"`
+	MemoryID         string                     `json:"memory_id,omitempty" yaml:"memory_id,omitempty"`
 	Replayed         bool                       `json:"replayed" yaml:"replayed"`
 }
 
