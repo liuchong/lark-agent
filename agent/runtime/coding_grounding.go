@@ -25,6 +25,10 @@ var lowerCamelIdentifierPattern = regexp.MustCompile(
 
 var codeIdentifierPattern = regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*\b`)
 
+var serializedShapeTargetTokenPattern = regexp.MustCompile(
+	`(?:^|[^a-z0-9_])(?:json|payload|body|string|bytes?|rawmessage|samplecontent)(?:$|[^a-z0-9_])`,
+)
+
 var concreteJSONObjectPattern = regexp.MustCompile(
 	`\{\s*["'][^"']+["']\s*:`,
 )
@@ -213,7 +217,12 @@ func identifierSet(content string) map[string]bool {
 
 func asksConcreteSerializedShape(question string) bool {
 	question = strings.ToLower(question)
-	hasShapeIntent := containsAny(
+	return hasSerializedShapeIntent(question) &&
+		hasSerializedShapeTarget(question)
+}
+
+func hasSerializedShapeIntent(question string) bool {
+	return containsAny(
 		question,
 		"结构",
 		"格式",
@@ -227,21 +236,75 @@ func asksConcreteSerializedShape(question string) bool {
 		"schema",
 		"format",
 	)
-	hasSerializedTarget := containsAny(
+}
+
+func asksContextualSerializedShape(question string) bool {
+	question = strings.ToLower(strings.TrimSpace(question))
+	return hasSerializedShapeIntent(question) &&
+		!hasSerializedShapeTarget(question) &&
+		!isResponsePresentationRequest(question)
+}
+
+func isResponsePresentationRequest(question string) bool {
+	hasPresentationTarget := containsAny(
 		question,
-		"json",
+		"回答",
+		"回复",
+		"答复",
+		"输出",
+		"结论",
+		"第一行",
+		"分点",
+		"列表",
+		"排版",
+		"response",
+		"answer",
+		"output",
+		"conclusion",
+	)
+	hasPresentationInstruction := containsAny(
+		question,
+		"按",
+		"按照",
+		"依照",
+		"采用",
+		"使用",
+		"用这个",
+		"用如下",
+		"以这个",
+		"以下格式",
+		"如下格式",
+		"排版",
+		"组织",
+		"放在",
+		"列成",
+		"分点",
+		"列表",
+		"format the response",
+		"format your response",
+		"format the answer",
+		"format your answer",
+		"use the",
+		"using the",
+		"following format",
+		"lay out",
+		"layout",
+		"arrange",
+		"put the",
+		"list the",
+	)
+	return hasPresentationTarget && hasPresentationInstruction
+}
+
+func hasSerializedShapeTarget(question string) bool {
+	question = strings.ToLower(question)
+	return containsAny(
+		question,
 		"序列化",
 		"字符串",
 		"字节",
 		"请求体",
-		"payload",
-		"body",
-		"string",
-		"bytes",
-		"rawmessage",
-		"samplecontent",
-	)
-	return hasShapeIntent && hasSerializedTarget
+	) || serializedShapeTargetTokenPattern.MatchString(question)
 }
 
 func normalizeEscapedSerializationText(content string) string {

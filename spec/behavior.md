@@ -1061,6 +1061,21 @@ protocol definition, or serialization implementation that exposes structural
 serialization evidence such as a concrete object example or serializer
 operation. A verified answer to that request is rejected when its cited
 current-run reads contain only opaque declarations.
+Concrete-shape intent is evaluated within one business-message semantic unit.
+The current request can use one explicitly linked or clearly continued prior
+message to resolve a referent, but unrelated conversation entries are never
+concatenated into one keyword bag. A shape word in one historical message and
+`String`, JSON, or another serialization word in a different message cannot
+turn a current field-declaration or symbol-existence question into a
+serialized-shape request.
+A request to format, lay out, or reorder the assistant's response is not a
+serialized-shape question merely because it contains the word `format`. Such a
+presentation instruction never borrows a serialized target from conversation
+history. A context-dependent shape follow-up must itself ask to inspect,
+explain, show, supplement, or otherwise determine the missing structure or
+format. English container terms such as `String`, `body`, and `payload` are
+matched as complete lexical tokens; identifiers such as `StringUtils` do not
+become serialized targets merely because they contain one of those terms.
 When the question names a concrete code field such as `sampleContent`, the
 structural example or serializer operation must occur in the local evidence
 context of that field. An unrelated JSON object or serializer elsewhere in the
@@ -1638,6 +1653,21 @@ The multi-step loop is accepted by these executable BDD scenarios:
   field is a string, then a verified decision is rejected until a bounded
   documentation, fixture, protocol, or serialization read supplies structural
   serialization evidence.
+- Given prior conversation messages separately mention JSON shape and a
+  `String` field, but the current coding question asks only which fields a
+  production class declares and whether a named symbol exists, when structural
+  intent and final grounding are evaluated, then keywords from those unrelated
+  messages are not combined and a correctly cited field answer is accepted.
+- Given the preceding message mentions a serialized `String` target but the
+  current coding request only instructs the assistant to use a response format
+  or layout, when structural intent is evaluated, then that presentation
+  instruction does not borrow the preceding target and a cited field answer
+  does not require unrelated serialized-shape evidence.
+- Given a context-dependent shape follow-up uses an imperative such as
+  "supplement the concrete structure", when its explicitly linked or nearest
+  valid message names a serialized target, then structural evidence remains
+  required; an unrelated identifier such as `StringUtils` does not resolve that
+  target.
 - Given that opaque declaration is read while at least two model turns remain
   before the terminal turn and no field-related structural source has been
   read, when the next model request is prepared, then only

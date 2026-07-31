@@ -1500,6 +1500,404 @@ The sampleContent request value is a JSON string:
 	}
 }
 
+func TestCodingResponseFormattingDoesNotBorrowSerializedShapeTarget(t *testing.T) {
+	root := t.TempDir()
+	requestSource := `package message
+
+type SampleRequest struct {
+	sampleContent string
+}`
+	if err := os.WriteFile(
+		filepath.Join(root, "request.go"),
+		[]byte(requestSource),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(requestSource))
+	digest := fmt.Sprintf("sha256:%s", hex.EncodeToString(sum[:8]))
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agenttools.NewRegistry(append(
+		agenttools.WorkspaceDefinitions(scope),
+		agentruntime.SubmitDecisionDefinition(),
+	)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-request",
+			"read_workspace",
+			`{"path":"request.go"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.99,
+			"reply_confidence":0.97,
+			"risk":"low",
+			"reply_text":"结论：sampleContent 直接声明为 string。依据：本轮读取了 request.go。",
+			"reason":"the production declaration answers the field question",
+			"source_refs":[{"relative_path":"request.go","digest":"`+digest+`","kind":"workspace_file"}]
+		}`)}),
+	}}
+	decision, trajectory, err := (agentruntime.AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 2,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_response_format",
+			SenderID:  "ou_owner",
+			Content:   "请按如下格式给出回答，并把字段核对结论放在第一行。",
+		},
+		Conversation: []domain.NormalizedEvent{{
+			MessageID: "om_serialized_target",
+			SenderID:  "ou_owner",
+			Content:   "sampleContent 在 Java 中声明为 String",
+		}},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		!strings.Contains(decision.ReplyText, "直接声明为 string") {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if model.calls != 2 {
+		t.Fatalf("model calls=%d want=2", model.calls)
+	}
+}
+
+func TestCodingShapeFollowUpUsesBoundedConversationTargetInFullLoop(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		configure   func(*domain.NormalizedEvent)
+		historyID   string
+		historyText string
+		currentText string
+	}{
+		{
+			name:        "explicit_reply",
+			historyID:   "om_reply_target",
+			historyText: "sampleContent 在 Java 中声明为 String",
+			currentText: "补充具体结构",
+			configure: func(event *domain.NormalizedEvent) {
+				event.ReplyToMessageID = "om_reply_target"
+			},
+		},
+		{
+			name:        "thread_root",
+			historyID:   "om_root_target",
+			historyText: "sampleContent 在 Java 中声明为 String",
+			currentText: "那具体格式是什么？",
+			configure: func(event *domain.NormalizedEvent) {
+				event.RootMessageID = "om_root_target"
+			},
+		},
+		{
+			name:        "adjacent_message",
+			historyID:   "om_adjacent_target",
+			historyText: "sampleContent 在 Java 中声明为 String",
+			currentText: "那具体格式是什么？",
+			configure:   func(*domain.NormalizedEvent) {},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			root := t.TempDir()
+			requestSource := `package message
+
+type SampleRequest struct {
+	sampleContent string
+}`
+			guideSource := `# Message edit
+
+The sampleContent request value is a JSON string:
+
+{"content":"sample value"}
+`
+			if err := os.WriteFile(
+				filepath.Join(root, "request.go"),
+				[]byte(requestSource),
+				0o600,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(root, "docs"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(
+				filepath.Join(root, "docs", "sample-protocol-guide.md"),
+				[]byte(guideSource),
+				0o600,
+			); err != nil {
+				t.Fatal(err)
+			}
+			digestFor := func(content string) string {
+				sum := sha256.Sum256([]byte(content))
+				return fmt.Sprintf("sha256:%s", hex.EncodeToString(sum[:8]))
+			}
+			requestDigest := digestFor(requestSource)
+			guideDigest := digestFor(guideSource)
+			scope, err := workspace.NewScope(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			registry, err := agenttools.NewRegistry(append(
+				agenttools.WorkspaceDefinitions(scope),
+				agentruntime.SubmitInvestigationPlanDefinition(),
+				agentruntime.SubmitDecisionDefinition(),
+			)...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			model := &codingEvalModel{responses: []*schema.Message{
+				schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("plan", "submit_investigation_plan", `{
+					"question":"确认上一条所指 sampleContent 字符串的 JSON 具体格式",
+					"entry_points":["request.go","docs/sample-protocol-guide.md"],
+					"symbols":["sampleContent"],
+					"tools":["read_workspace"],
+					"stop_conditions":["读取字段声明和具体 JSON 示例"]
+				}`)}),
+				schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+					"read-request",
+					"read_workspace",
+					`{"path":"request.go"}`,
+				)}),
+				schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+					"read-guide",
+					"read_workspace",
+					`{"path":"docs/sample-protocol-guide.md"}`,
+				)}),
+				schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
+					"decision":"reply",
+					"evidence_status":"verified",
+					"relevance_confidence":0.99,
+					"reply_confidence":0.96,
+					"risk":"low",
+					"reply_text":"结论：sampleContent 是字符串形式的 JSON，具体为 {\"content\":\"sample value\"}。依据：request.go 的字段声明和 docs/sample-protocol-guide.md 的当前示例。",
+					"reason":"the bounded conversation target and current reads establish the concrete shape",
+					"source_refs":[
+						{"relative_path":"request.go","digest":"`+requestDigest+`","kind":"workspace_file"},
+						{"relative_path":"docs/sample-protocol-guide.md","digest":"`+guideDigest+`","kind":"workspace_file"}
+					]
+				}`)}),
+			}}
+			event := domain.NormalizedEvent{
+				MessageID: "om_shape_follow_up",
+				SenderID:  "ou_owner",
+				Content:   testCase.currentText,
+			}
+			testCase.configure(&event)
+			decision, trajectory, err := (agentruntime.AgentLoop{
+				Model: model, Tools: registry, MaxTurns: 4,
+			}).Decide(context.Background(), agentcontext.Bundle{
+				Event: event,
+				Conversation: []domain.NormalizedEvent{{
+					MessageID: testCase.historyID,
+					SenderID:  "ou_owner",
+					Content:   testCase.historyText,
+				}},
+				WorkKind: domain.WorkKindCodingQuestion,
+			})
+			if err != nil {
+				t.Fatalf("err=%v trajectory=%+v", err, trajectory)
+			}
+			if decision.Kind != domain.DecisionReply ||
+				!strings.Contains(decision.ReplyText, `{"content":"sample value"}`) {
+				t.Fatalf("decision=%+v", decision)
+			}
+			if model.calls != 4 {
+				t.Fatalf("model calls=%d want=4", model.calls)
+			}
+			if got := strings.Join(model.toolNames[2], ","); got != "read_workspace" {
+				t.Fatalf("penultimate tools=%q want=read_workspace", got)
+			}
+		})
+	}
+}
+
+func TestCodingShapeFollowUpDoesNotCrossUnrelatedNearestMessageInFullLoop(t *testing.T) {
+	root := t.TempDir()
+	requestSource := `package message
+
+type SampleRequest struct {
+	sampleContent string
+}`
+	if err := os.WriteFile(
+		filepath.Join(root, "request.go"),
+		[]byte(requestSource),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agenttools.NewRegistry(append(
+		agenttools.WorkspaceDefinitions(scope),
+		agentruntime.SubmitDecisionDefinition(),
+	)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-request",
+			"read_workspace",
+			`{"path":"request.go"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"insufficient",
+			"relevance_confidence":0.99,
+			"reply_confidence":0.95,
+			"risk":"low",
+			"reply_text":"当前追问缺少明确对象，不能从更早且已被其他话题隔开的消息推断具体格式。",
+			"reason":"the nearest business message does not resolve a serialized target"
+		}`)}),
+	}}
+	decision, trajectory, err := (agentruntime.AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 3,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_ambiguous_shape_follow_up",
+			SenderID:  "ou_owner",
+			Content:   "那具体格式是什么？",
+		},
+		Conversation: []domain.NormalizedEvent{
+			{
+				MessageID: "om_old_target",
+				SenderID:  "ou_owner",
+				Content:   "sampleContent 在 Java 中声明为 String",
+			},
+			{
+				MessageID: "om_unrelated_nearest",
+				SenderID:  "ou_owner",
+				Content:   "这是另一个已经结束的话题",
+			},
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		decision.EvidenceStatus != domain.EvidenceInsufficient {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if model.calls != 2 {
+		t.Fatalf("model calls=%d want=2", model.calls)
+	}
+	if got := strings.Join(model.toolNames[1], ","); got == "read_workspace" {
+		t.Fatalf("unrelated older target triggered structural recovery: %q", got)
+	}
+}
+
+func TestCodingFieldQuestionIgnoresUnrelatedHistoricalSerializedShapeIntent(t *testing.T) {
+	root := t.TempDir()
+	relativePath := filepath.Join(
+		"Sample-Module",
+		"sample-client",
+		"openim",
+		"src",
+		"main",
+		"java",
+		"io",
+		"openim",
+		"sample-client",
+		"sdk",
+		"models",
+		"QuoteElem.java",
+	)
+	source := `package io.openim.sample-client.sdk.models;
+
+public class QuoteElem {
+    private String text;
+    private Message quoteMessage;
+}`
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(root, relativePath)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, relativePath), []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(source))
+	digest := fmt.Sprintf("sha256:%s", hex.EncodeToString(sum[:8]))
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agenttools.NewRegistry(append(
+		agenttools.WorkspaceDefinitions(scope),
+		agentruntime.SubmitInvestigationPlanDefinition(),
+		agentruntime.SubmitDecisionDefinition(),
+	)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &codingEvalModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("plan", "submit_investigation_plan", `{
+			"question":"核对 QuoteElem 直接声明的字段并搜索不存在的符号",
+			"entry_points":["`+filepath.ToSlash(relativePath)+`"],
+			"symbols":["QuoteElem","ThisFunctionDefinitelyDoesNotExist20260731"],
+			"tools":["search_workspace","read_workspace"],
+			"stop_conditions":["读取 QuoteElem 声明","完成精确符号搜索"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"search-missing",
+			"search_workspace",
+			`{"query":"ThisFunctionDefinitelyDoesNotExist20260731"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall(
+			"read-quote",
+			"read_workspace",
+			`{"path":"`+filepath.ToSlash(relativePath)+`"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{codingEvalToolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"verified",
+			"relevance_confidence":0.99,
+			"reply_confidence":0.97,
+			"risk":"low",
+			"reply_text":"结论：QuoteElem 直接声明 text 和 quoteMessage 两个字段；精确搜索未找到 ThisFunctionDefinitelyDoesNotExist20260731。依据：本轮读取了 `+filepath.ToSlash(relativePath)+` 并执行了精确符号搜索。",
+			"reason":"the production declaration and bounded zero-match search answer both requested facts",
+			"source_refs":[{"relative_path":"`+filepath.ToSlash(relativePath)+`","digest":"`+digest+`","kind":"workspace_file"}]
+		}`)}),
+	}}
+	decision, trajectory, err := (agentruntime.AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 4,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_quote_fields",
+			SenderID:  "ou_owner",
+			Content: "请只读核对 QuoteElem.java 直接声明了哪些字段；同时检查 " +
+				"ThisFunctionDefinitelyDoesNotExist20260731 是否存在。",
+		},
+		Conversation: []domain.NormalizedEvent{
+			{
+				MessageID: "om_unrelated_shape",
+				SenderID:  "ou_other",
+				Content:   "另一个问题：sampleContent 这个 String 的 JSON 具体格式是什么？",
+			},
+		},
+		WorkKind: domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		!strings.Contains(decision.ReplyText, "text 和 quoteMessage") {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if model.calls != 4 {
+		t.Fatalf("model calls=%d want=4", model.calls)
+	}
+}
+
 func TestCodingQuestionMemorySourceDoesNotSkipFreshProductionRead(t *testing.T) {
 	root := t.TempDir()
 	source := `package content_type

@@ -236,6 +236,133 @@ const result = "image/jpeg"`,
 	}
 }
 
+func TestCodingStructuralQuestionDoesNotCombineUnrelatedHistory(t *testing.T) {
+	current := "请核对 QuoteElem.java 直接声明了哪些字段，并检查命名符号是否存在"
+	got := codingStructuralQuestion(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_current",
+			Content:   current,
+		},
+		Conversation: []domain.NormalizedEvent{{
+			MessageID: "om_history",
+			Content:   "另一个问题：sampleContent 这个 String 的 JSON 具体格式是什么？",
+		}},
+	})
+	if got != current {
+		t.Fatalf("structural question=%q want current message only", got)
+	}
+}
+
+func TestCodingStructuralQuestionDoesNotTreatResponseFormattingAsShapeIntent(t *testing.T) {
+	current := "请按这个格式回答，并把结论放在第一行"
+	got := codingStructuralQuestion(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_current",
+			Content:   current,
+		},
+		Conversation: []domain.NormalizedEvent{{
+			MessageID: "om_history",
+			Content:   "sampleContent 在 Java 中声明为 String",
+		}},
+	})
+	if got != current {
+		t.Fatalf("response formatting request became a serialized-shape question: %q", got)
+	}
+}
+
+func TestCodingStructuralQuestionDoesNotTreatResponseFormattingVariantAsShapeIntent(t *testing.T) {
+	current := "请按如下格式给出回答，并把结论放在第一行"
+	got := codingStructuralQuestion(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_current",
+			Content:   current,
+		},
+		Conversation: []domain.NormalizedEvent{{
+			MessageID: "om_history",
+			Content:   "sampleContent 在 Java 中声明为 String",
+		}},
+	})
+	if got != current {
+		t.Fatalf("response formatting variant became a serialized-shape question: %q", got)
+	}
+}
+
+func TestCodingStructuralQuestionRecognizesImperativeShapeFollowUp(t *testing.T) {
+	got := codingStructuralQuestion(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID:        "om_current",
+			ReplyToMessageID: "om_history",
+			Content:          "补充具体结构",
+		},
+		Conversation: []domain.NormalizedEvent{{
+			MessageID: "om_history",
+			Content:   "sampleContent 在 Java 中声明为 String",
+		}},
+	})
+	if !asksConcreteSerializedShape(got) ||
+		!strings.Contains(got, "sampleContent") {
+		t.Fatalf("imperative shape follow-up lost linked target: %q", got)
+	}
+}
+
+func TestCodingStructuralQuestionDoesNotTreatIdentifierSubstringAsShapeTarget(t *testing.T) {
+	current := "那具体格式是什么？"
+	got := codingStructuralQuestion(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_current",
+			Content:   current,
+		},
+		Conversation: []domain.NormalizedEvent{{
+			MessageID: "om_history",
+			Content:   "StringUtils 负责普通文本格式化",
+		}},
+	})
+	if got != current {
+		t.Fatalf("identifier substring became a serialized-shape target: %q", got)
+	}
+}
+
+func TestCodingStructuralQuestionResolvesExplicitShapeFollowUp(t *testing.T) {
+	got := codingStructuralQuestion(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID:        "om_current",
+			ReplyToMessageID: "om_history",
+			Content:          "那具体格式是什么？",
+		},
+		Conversation: []domain.NormalizedEvent{{
+			MessageID: "om_history",
+			Content:   "sampleContent 在 Java 中声明为 String",
+		}},
+	})
+	if !asksConcreteSerializedShape(got) ||
+		!strings.Contains(got, "sampleContent") {
+		t.Fatalf("shape follow-up lost linked target: %q", got)
+	}
+}
+
+func TestCodingStructuralQuestionDoesNotSkipAcrossAnUnrelatedNearestMessage(t *testing.T) {
+	current := "那具体格式是什么？"
+	got := codingStructuralQuestion(agentcontext.Bundle{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_current",
+			Content:   current,
+		},
+		Conversation: []domain.NormalizedEvent{
+			{
+				MessageID: "om_old_shape",
+				Content:   "sampleContent 在 Java 中声明为 String",
+			},
+			{
+				MessageID: "om_nearest",
+				Content:   "这是另一个已经结束的话题",
+			},
+		},
+	})
+	if got != current {
+		t.Fatalf("structural question crossed an unrelated message: %q", got)
+	}
+}
+
 func TestVerifyGroundedCodingReplyRejectsOpaqueDeclarationForConcreteShape(t *testing.T) {
 	source := domain.SourceRef{
 		RelativePath: "sample-project/sample-module/sample-client/SampleRequest.java",

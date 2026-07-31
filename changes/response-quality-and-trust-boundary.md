@@ -322,6 +322,25 @@ when the model immediately submits `evidence_status=insufficient`,
 then the runtime rejects it and requires a bounded relevant code search or read
 before accepting the canonical evidence-limited answer.
 
+Given unrelated earlier conversation messages separately contain a shape word
+and a serialization/container word,
+when the current coding question only asks for production field declarations
+and a bounded symbol-existence check,
+then the runtime evaluates concrete-shape intent per semantic message unit and
+does not combine those historical keywords to reject a cited field answer.
+
+Given the preceding message mentions a serialized `String` target,
+when the current coding request only tells the assistant how to format or lay
+out its response,
+then the runtime does not borrow that target or demand unrelated structural
+serialization evidence.
+
+Given the current message imperatively asks to supplement a concrete structure,
+when one explicitly linked or nearest valid message names the serialized target,
+then the runtime preserves the structural evidence gate; English target terms
+must be complete tokens, so an identifier such as `StringUtils` does not count
+as a `String` container.
+
 Given the current work is a `coding_question`,
 when the model attempts to finish with `ignore`, `record`, `notify`, or
 `request_approval`,

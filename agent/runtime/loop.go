@@ -220,7 +220,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		structuralEvidenceCompletion := false
 		structuralEvidenceSearchRecovery := false
 		structuralEvidenceReadRecovery := false
-		structuralQuestion := bundle.Event.Content + "\n" + conversationText(bundle.Conversation)
+		structuralQuestion := codingStructuralQuestion(bundle)
 		missingStructuralEvidence := bundle.WorkKind == domain.WorkKindCodingQuestion &&
 			codingEvidenceAvailable &&
 			hasOpaqueSerializationDeclarationForQuestion(
@@ -596,7 +596,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			}
 			if toolErr == nil && execution.Decision != nil {
 				if err := verifyGroundedCodingReply(
-					bundle.Event.Content+"\n"+conversationText(bundle.Conversation),
+					structuralQuestion,
 					*execution.Decision,
 					authoritativeContents,
 				); err != nil {
@@ -1618,6 +1618,56 @@ func conversationText(events []domain.NormalizedEvent) string {
 		text.WriteByte('\n')
 	}
 	return text.String()
+}
+
+func codingStructuralQuestion(bundle agentcontext.Bundle) string {
+	current := strings.TrimSpace(bundle.Event.Content)
+	if current == "" ||
+		asksConcreteSerializedShape(current) ||
+		!asksContextualSerializedShape(current) {
+		return current
+	}
+	if linked := linkedStructuralContext(bundle.Event, bundle.Conversation); linked != "" {
+		return current + "\n" + linked
+	}
+	for index := len(bundle.Conversation) - 1; index >= 0; index-- {
+		candidate := bundle.Conversation[index]
+		if candidate.MessageID != "" && candidate.MessageID == bundle.Event.MessageID {
+			continue
+		}
+		if strings.TrimSpace(candidate.Content) == "" {
+			continue
+		}
+		if hasSerializedShapeTarget(strings.ToLower(candidate.Content)) {
+			return current + "\n" + candidate.Content
+		}
+		break
+	}
+	return current
+}
+
+func linkedStructuralContext(
+	current domain.NormalizedEvent,
+	conversation []domain.NormalizedEvent,
+) string {
+	linkedIDs := map[string]bool{
+		current.ReplyToMessageID: true,
+		current.RootMessageID:    true,
+	}
+	delete(linkedIDs, "")
+	if len(linkedIDs) == 0 {
+		return ""
+	}
+	for index := len(conversation) - 1; index >= 0; index-- {
+		candidate := conversation[index]
+		if !linkedIDs[candidate.MessageID] {
+			continue
+		}
+		if hasSerializedShapeTarget(strings.ToLower(candidate.Content)) {
+			return candidate.Content
+		}
+	}
+	return ""
 }
 
 func verifyCodingDecision(

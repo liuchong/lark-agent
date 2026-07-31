@@ -78,6 +78,17 @@ Two live failures established reusable implementation rules.
   documentation, fixture, protocol, or serializer read available when shape is
   part of the question, and enforce structural evidence at the terminal gate
   instead of relying on prompt compliance alone.
+- Detect shape intent per business-message semantic unit, not by concatenating
+  an entire conversation into one keyword bag. Historical `String`/JSON words
+  must not combine with an unrelated current field-declaration question. Use
+  prior context only when the current message itself explicitly asks for
+  structure/format and needs one linked or nearest relevant message to resolve
+  the serialized target. Distinguish that semantic request from instructions
+  about response formatting or layout; presentation instructions never borrow
+  a serialized target from history. Treat imperative requests such as
+  "supplement the concrete structure" as real shape follow-ups, and match
+  English container words as complete tokens so identifiers such as
+  `StringUtils` do not become accidental targets.
 - Do not let the generic final-two-turn convergence rule consume that bounded
   structural read. If the penultimate turn starts with only opaque evidence,
   expose exactly one `read_workspace` call for an already-known current
