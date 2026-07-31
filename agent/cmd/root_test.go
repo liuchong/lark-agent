@@ -10,11 +10,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/liuchong/lark-agent/agent/app"
 	"github.com/liuchong/lark-agent/agent/config"
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
 	agentlocale "github.com/liuchong/lark-agent/agent/locale"
 	"github.com/liuchong/lark-agent/agent/memory"
+	"github.com/liuchong/lark-agent/agent/reply"
 	"github.com/liuchong/lark-agent/agent/replymatch"
 	"github.com/liuchong/lark-agent/agent/storage"
 	agenttools "github.com/liuchong/lark-agent/agent/tools"
@@ -30,9 +32,77 @@ func TestRootDoesNotExposeCopiedInternalEventBus(t *testing.T) {
 	}
 }
 
+func TestRuntimePolicySnapshotUsesValidatedActiveConfiguration(t *testing.T) {
+	cfg := config.Default()
+	cfg.Policy.Mode = domain.ModeAuto
+	cfg.Assistant.ReplyScope = domain.ReplyScopeAllGroups
+	cfg.Policy.ReplyScope = domain.ReplyScopeAllGroups
+	cfg.Policy.PrivateReplyScope = domain.PrivateReplyScopeAll
+	cfg.Policy.OwnerWait = 3 * time.Minute
+	cfg.Policy.OwnerReplyConfidenceMin = 0.85
+	cfg.Policy.OwnerReplyRetry = 5 * time.Minute
+	cfg.Policy.ReplyConfidenceMin = 0.70
+	cfg.Policy.InvestigationProgress = "enabled"
+
+	got := runtimePolicySnapshot(cfg)
+	if got.Mode != domain.ModeAuto ||
+		got.AssistantReplyScope != domain.ReplyScopeAllGroups ||
+		got.DelegatedReplyScope != domain.ReplyScopeAllGroups ||
+		got.PrivateReplyScope != domain.PrivateReplyScopeAll ||
+		got.OwnerWait != (3*time.Minute).String() ||
+		got.OwnerReplyConfidenceMin != 0.85 ||
+		got.OwnerReplyRetry != (5*time.Minute).String() ||
+		got.ReplyConfidenceMin != 0.70 ||
+		got.InvestigationProgress != "enabled" ||
+		!got.Authoritative ||
+		!got.MustNotInferFromRules {
+		t.Fatalf("runtime policy snapshot=%+v", got)
+	}
+}
+
 type fakeSemanticContextReader struct {
 	result serviceim.SemanticReplyContext
 	err    error
+}
+
+type runtimePolicyCaptureDecider struct {
+	bundle agentcontext.Bundle
+	prompt string
+}
+
+func (d *runtimePolicyCaptureDecider) Decide(
+	_ context.Context,
+	bundle agentcontext.Bundle,
+) (domain.Decision, error) {
+	d.bundle = bundle
+	d.prompt = agentcontext.AgentUserPrompt(bundle)
+	return domain.Decision{
+		Kind:       domain.DecisionReply,
+		Relevance:  domain.RelevanceOwnerRequest,
+		Confidence: 0.99,
+		Risk:       domain.RiskLow,
+		ReplyText:  "当前低风险代回复直接发送阈值是 0.70。",
+	}, nil
+}
+
+type completedRuntimePolicyReplyHandler struct{}
+
+func (completedRuntimePolicyReplyHandler) Handle(
+	context.Context,
+	domain.WorkItem,
+	domain.Decision,
+) (reply.Result, error) {
+	return reply.Result{Action: domain.Action{Status: domain.ActionCompleted}}, nil
+}
+
+type notCommandSemanticResolver struct{}
+
+func (notCommandSemanticResolver) Resolve(
+	context.Context,
+	domain.WorkItem,
+	agentcontext.Bundle,
+) (domain.SemanticControlResolution, error) {
+	return domain.SemanticControlResolution{Kind: domain.SemanticControlNotCommand}, nil
 }
 
 func (r fakeSemanticContextReader) GetSemanticReplyContext(
@@ -778,6 +848,95 @@ func TestLiveOptionsWithoutUserTokenDoNotExposeUserContextTools(t *testing.T) {
 	}
 	if len(options) == 0 {
 		t.Fatal("expected daemon options")
+	}
+}
+
+func TestLiveOptionsCarryRuntimePolicyThroughCompactedModelPrompt(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_MODEL", "test-model")
+	t.Setenv("LARK_AGENT_APP_SECRET", "secret")
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close() //nolint:errcheck
+
+	cfg := config.Default()
+	cfg.Workspace.Root = t.TempDir()
+	cfg.Lark.AppID = "cli_a"
+	cfg.Lark.KeychainService = "lark-agent-test-" + strings.ReplaceAll(t.Name(), "/", "-")
+	cfg.Owner.OpenID = "ou_owner"
+	cfg.Owner.Name = "测试负责人"
+	cfg.Assistant.OpenIDs = []string{"ou_bot"}
+	cfg.Assistant.Names = []string{"Assistant Bot"}
+	cfg.Policy.OwnerWait = 3 * time.Minute
+	cfg.Policy.OwnerReplyConfidenceMin = 0.85
+	cfg.Policy.OwnerReplyRetry = 5 * time.Minute
+	cfg.Policy.ReplyConfidenceMin = 0.70
+
+	agentRouter := newAgentRouter(cfg, store)
+	options, _, _, _, err := buildLiveOptions(
+		context.Background(),
+		cfg,
+		store,
+		agentRouter,
+		true,
+		false,
+		"Example Group",
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &runtimePolicyCaptureDecider{}
+	options = append(options,
+		app.WithSemanticControlResolver(notCommandSemanticResolver{}),
+		app.WithDecider(capture),
+		app.WithReplyHandler(completedRuntimePolicyReplyHandler{}),
+	)
+
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:     "om_live_policy",
+		ChatID:        "oc_assistant_private",
+		ChatType:      "p2p",
+		ChatPartnerID: "ou_bot",
+		SenderID:      "ou_owner",
+		Content:       "再确认一下：0.85 和 0.70 分别管什么？",
+	})
+	item.WorkKind = domain.WorkKindSimpleQuestion
+	for i := 0; i < 40; i++ {
+		item.ResolvedContext = append(item.ResolvedContext, domain.NormalizedEvent{
+			MessageID: "om_context_" + strconv.Itoa(i),
+			ChatID:    item.Event.ChatID,
+			SenderID:  "ou_owner",
+			Content:   strings.Repeat("历史上下文", 1200),
+		})
+	}
+	item.ResolvedContext = append(item.ResolvedContext, item.Event)
+	if _, err := store.EnqueueWorkItem(item); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.NewDaemon(store, agentRouter, options...).RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if capture.bundle.RuntimePolicy != runtimePolicySnapshot(cfg) {
+		t.Fatalf("runtime policy was lost before the decider: %+v", capture.bundle.RuntimePolicy)
+	}
+	for _, want := range []string{
+		`"runtime_policy":{"authoritative":true`,
+		`"owner_wait":"3m0s"`,
+		`"owner_reply_confidence_min":0.85`,
+		`"owner_reply_retry":"5m0s"`,
+		`"reply_confidence_min":0.7`,
+		`"must_not_infer_from_workspace_rules":true`,
+	} {
+		if !strings.Contains(capture.prompt, want) {
+			t.Fatalf("compacted production prompt missing %q:\n%s", want, capture.prompt)
+		}
+	}
+	if len(capture.prompt) > 49*1024 {
+		t.Fatalf("production prompt was not compacted: bytes=%d", len(capture.prompt))
 	}
 }
 

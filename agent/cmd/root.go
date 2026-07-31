@@ -1513,9 +1513,10 @@ func buildLiveOptions(
 		allowedRepositories: append([]string(nil), cfg.GitHub.AllowedRepositories...),
 		githubEnabled:       cfg.GitHub.Enabled,
 		base: agentcontext.Builder{
-			Scope:  scope,
-			Rules:  ruleSet,
-			Memory: store,
+			Scope:         scope,
+			Rules:         ruleSet,
+			Memory:        store,
+			RuntimePolicy: runtimePolicySnapshot(cfg),
 			User: agentcontext.UserProfile{
 				OpenID:            cfg.Owner.OpenID,
 				Name:              cfg.Owner.Name,
@@ -1706,6 +1707,22 @@ func buildLiveOptions(
 		}
 	}
 	return options, realtimeSource, imSvc, info, nil
+}
+
+func runtimePolicySnapshot(cfg config.Config) agentcontext.RuntimePolicySnapshot {
+	return agentcontext.RuntimePolicySnapshot{
+		Authoritative:           true,
+		MustNotInferFromRules:   true,
+		Mode:                    cfg.Policy.Mode,
+		AssistantReplyScope:     cfg.Assistant.ReplyScope,
+		DelegatedReplyScope:     cfg.Policy.ReplyScope,
+		PrivateReplyScope:       cfg.Policy.PrivateReplyScope,
+		OwnerWait:               cfg.Policy.OwnerWait.String(),
+		OwnerReplyConfidenceMin: cfg.Policy.OwnerReplyConfidenceMin,
+		OwnerReplyRetry:         cfg.Policy.OwnerReplyRetry.String(),
+		ReplyConfidenceMin:      cfg.Policy.ReplyConfidenceMin,
+		InvestigationProgress:   cfg.Policy.InvestigationProgress,
+	}
 }
 
 func validateLiveReplyScope(scope domain.ReplyScope, chatQuery string) error {

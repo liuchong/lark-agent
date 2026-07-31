@@ -861,6 +861,18 @@ asks for an exact ID and performs no mutation. Ordinary questions such as
 "确认一下这个修复是否上线了" remain ordinary owner requests. Explicit slash
 commands remain deterministic and never use the resolver.
 
+Every ordinary model run receives a trusted, non-secret runtime-policy
+snapshot assembled from the validated active configuration. The snapshot
+includes mode, assistant/delegated/private reply scopes, owner wait, semantic
+owner-answer threshold, delegated direct-send threshold, retry interval, and
+investigation-progress mode. It is authoritative for questions about the
+assistant's current behavior. Workspace rules govern project investigation and
+must never be used to infer or override these runtime facts. The model must
+distinguish `policy.owner_reply_confidence_min`, which decides whether observed
+conversation evidence is strong enough to classify the owner's own response,
+from `policy.reply_confidence_min`, which decides whether a low-risk delegated
+draft may send automatically.
+
 `/tasks` defaults to a bounded actionable view instead of dumping historical
 storage status maps. Every listed item gives a localized semantic state, its
 last durable fact or failure, why owner attention is required, and an exact
@@ -1782,6 +1794,12 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given a non-fast-path owner request has already been received and bounded Lark
   history loading fails, when context is built, then the current message still
   reaches the model and the bundle marks its context selection incomplete.
+- Given `policy.owner_reply_confidence_min` is `0.85` and
+  `policy.reply_confidence_min` is `0.70`, when the owner asks an ordinary
+  question containing "确认" about the assistant's current thresholds, then
+  semantic control returns `not_command`, the model receives both trusted
+  values with their distinct meanings, and it does not infer current runtime
+  policy from workspace project rules.
 - Given a user-identity Lark request rejects the cached access token as expired
   and Keychain contains a newer token, when the request recovers, then it reloads
   and replays once without consuming the refresh token.

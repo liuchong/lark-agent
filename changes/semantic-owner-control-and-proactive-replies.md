@@ -88,6 +88,22 @@ to the ordinary question path instead of asking a control-plane clarification.
 High-confidence ambiguity uses deterministic candidate-ID text rather than
 model-authored prose.
 
+### Trusted Runtime Policy
+
+Every ordinary answer bundle contains a non-secret snapshot of the validated
+active runtime policy: mode, assistant/delegated/private scopes, owner wait,
+owner-answer semantic threshold, delegated direct-send threshold, retry
+interval, and investigation-progress mode. The snapshot is authoritative for
+questions about the assistant itself. Workspace rules remain untrusted
+project-investigation input and cannot redefine or stand in for runtime
+configuration.
+
+The prompt names the two confidence values by behavior. In particular,
+`owner_reply_confidence_min: 0.85` is the minimum confidence for deciding
+whether the owner already answered a pending message, while
+`reply_confidence_min: 0.70` is the low-risk delegated draft's automatic-send
+floor. The bounded bundle preserves this snapshot during context compaction.
+
 ### Trusted Private Context
 
 `MessageContextRequest` carries an explicit app-message retention policy.
@@ -216,6 +232,12 @@ continues.
 Given a model emits a command-shaped result below confidence `0.85`, when
 semantic resolution runs, then no control clarification or mutation occurs and
 the ordinary business-question path continues.
+
+Given the owner asks an ordinary question containing "确认" about current
+automatic-send behavior, when the question reaches the answer model, then its
+bundle includes the exact configured `0.85` owner-answer threshold and `0.70`
+direct-send threshold with distinct meanings, and workspace rules cannot be
+used to infer different runtime values.
 
 Given a new command is added to the catalog, when parser/help/prompt contract
 tests run, then its aliases, usage, and semantic description appear from that

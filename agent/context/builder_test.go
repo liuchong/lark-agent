@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/liuchong/lark-agent/agent/domain"
@@ -121,6 +122,50 @@ func TestLegacyPromptIncludesRulesConversationAndJSONContract(t *testing.T) {
 	}
 }
 
+func TestPromptIncludesAuthoritativeRuntimePolicy(t *testing.T) {
+	policy := RuntimePolicySnapshot{
+		Authoritative:           true,
+		MustNotInferFromRules:   true,
+		Mode:                    domain.ModeAuto,
+		AssistantReplyScope:     domain.ReplyScopeAllGroups,
+		DelegatedReplyScope:     domain.ReplyScopeAllGroups,
+		PrivateReplyScope:       domain.PrivateReplyScopeAll,
+		OwnerWait:               (3 * time.Minute).String(),
+		OwnerReplyConfidenceMin: 0.85,
+		OwnerReplyRetry:         (5 * time.Minute).String(),
+		ReplyConfidenceMin:      0.70,
+		InvestigationProgress:   "enabled",
+	}
+	bundle, err := (Builder{RuntimePolicy: policy}).Build(domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_policy",
+		Content:   "确认一下当前高置信度自动发送的具体阈值是多少？",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundle.RuntimePolicy != policy {
+		t.Fatalf("runtime policy=%+v", bundle.RuntimePolicy)
+	}
+	for name, prompt := range map[string]string{
+		"legacy": Prompt(bundle),
+		"agent":  AgentUserPrompt(bundle),
+	} {
+		for _, want := range []string{
+			"runtime_policy",
+			"owner_reply_confidence_min",
+			"0.85",
+			"reply_confidence_min",
+			"0.7",
+			"authoritative",
+			"must not be inferred from workspace rules",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("%s prompt missing %q:\n%s", name, want, prompt)
+			}
+		}
+	}
+}
+
 func TestBuilderIncludesBoundedEnvironmentContext(t *testing.T) {
 	root := t.TempDir()
 	mustWriteFile(t, filepath.Join(root, "AGENTS.md"), "reply briefly")
@@ -228,6 +273,11 @@ func TestAgentSystemPromptDefinesAssistantAndDelegatedOwnerRoles(t *testing.T) {
 	prompt := AgentSystemPrompt()
 	for _, want := range []string{
 		"two explicit Lark roles",
+		"runtime_policy object",
+		"authoritative for questions about this assistant's current behavior",
+		"Never infer current runtime policy from workspace rules",
+		"owner_reply_confidence_min is the semantic threshold",
+		"reply_confidence_min is the final automatic-send threshold",
 		"assistant_request",
 		"answer the configured owner as the assistant bot",
 		"directly mentions the owner",

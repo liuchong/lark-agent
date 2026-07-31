@@ -23,6 +23,7 @@ import (
 func AgentSystemPrompt() string {
 	return `You are a personal AI assistant operating inside a strictly bounded workspace.
 You have two explicit Lark roles. For assistant_request work, the configured owner natively mentioned the assistant bot in an allowed group, so answer the configured owner as the assistant bot. For direct_mention work, a human mentioned the configured owner, so act on behalf of that owner under the delegated-reply policy.
+A runtime_policy object in the user context is a trusted, non-secret snapshot of the validated active configuration and is authoritative for questions about this assistant's current behavior. Never infer current runtime policy from workspace rules. owner_reply_confidence_min is the semantic threshold for deciding whether conversation evidence shows that the owner already answered; reply_confidence_min is the final automatic-send threshold for a verified low-risk delegated draft.
 A message that directly mentions the owner is addressed to this owner workflow even when it is a status update, coordination request, commitment, or follow-up rather than a grammatical question.
 When the configured owner privately invokes the assistant, treat it as an owner_request and answer the owner's prompt as the bot. A non-owner private message is not an assistant_request.
 When the configured owner natively mentions the assistant bot in an allowed group, treat it as an assistant_request and answer the owner's prompt as the bot. Never answer a non-owner direct assistant invocation; non-owner private messages and native assistant mentions must remain silent.
@@ -69,7 +70,7 @@ func AgentUserPrompt(bundle Bundle) string {
 	if err != nil {
 		return `{"error":"failed to encode bounded agent context"}`
 	}
-	return "Evaluate this Lark message using the available tools and finish with submit_decision:\n" + string(data)
+	return "Evaluate this Lark message using the available tools and finish with submit_decision. The runtime_policy object is authoritative; current runtime policy must not be inferred from workspace rules:\n" + string(data)
 }
 
 func boundedAgentBundle(bundle Bundle) Bundle {
@@ -213,6 +214,22 @@ type EnvironmentSnapshot struct {
 	Omitted           int              `json:"omitted,omitempty" yaml:"omitted,omitempty"`
 }
 
+// RuntimePolicySnapshot exposes only non-secret active policy facts needed for
+// the model to explain and apply the assistant's current behavior.
+type RuntimePolicySnapshot struct {
+	Authoritative           bool                     `json:"authoritative" yaml:"authoritative"`
+	MustNotInferFromRules   bool                     `json:"must_not_infer_from_workspace_rules" yaml:"must_not_infer_from_workspace_rules"`
+	Mode                    domain.Mode              `json:"mode" yaml:"mode"`
+	AssistantReplyScope     domain.ReplyScope        `json:"assistant_reply_scope" yaml:"assistant_reply_scope"`
+	DelegatedReplyScope     domain.ReplyScope        `json:"delegated_reply_scope" yaml:"delegated_reply_scope"`
+	PrivateReplyScope       domain.PrivateReplyScope `json:"private_reply_scope" yaml:"private_reply_scope"`
+	OwnerWait               string                   `json:"owner_wait" yaml:"owner_wait"`
+	OwnerReplyConfidenceMin float64                  `json:"owner_reply_confidence_min" yaml:"owner_reply_confidence_min"`
+	OwnerReplyRetry         string                   `json:"owner_reply_retry" yaml:"owner_reply_retry"`
+	ReplyConfidenceMin      float64                  `json:"reply_confidence_min" yaml:"reply_confidence_min"`
+	InvestigationProgress   string                   `json:"investigation_progress" yaml:"investigation_progress"`
+}
+
 // Bundle is the bounded context for a single work item.
 type Bundle struct {
 	Event            domain.NormalizedEvent   `json:"event" yaml:"event"`
@@ -224,6 +241,7 @@ type Bundle struct {
 	MaxTurns         int                      `json:"max_turns,omitempty" yaml:"max_turns,omitempty"`
 	User             UserProfile              `json:"user" yaml:"user"`
 	Environment      EnvironmentSnapshot      `json:"environment" yaml:"environment"`
+	RuntimePolicy    RuntimePolicySnapshot    `json:"runtime_policy" yaml:"runtime_policy"`
 	Rules            rules.Set                `json:"rules" yaml:"rules"`
 	Memories         []memory.Record          `json:"memories" yaml:"memories"`
 	WorkspaceHits    []workspace.SearchResult `json:"workspace_hits" yaml:"workspace_hits"`
@@ -240,6 +258,7 @@ type Builder struct {
 	Rules            rules.Set
 	Memory           memory.Reader
 	User             UserProfile
+	RuntimePolicy    RuntimePolicySnapshot
 	Conversation     []domain.NormalizedEvent
 	ContextSelection domain.ContextSelection
 	GitHubReference  *domain.GitHubReference
@@ -268,6 +287,7 @@ func (b Builder) Build(item domain.WorkItem) (Bundle, error) {
 		Priority:         item.Priority,
 		User:             b.User,
 		Environment:      environment,
+		RuntimePolicy:    b.RuntimePolicy,
 		Rules:            b.Rules,
 		Memories:         memories,
 		ContextSelection: b.ContextSelection,
@@ -470,6 +490,8 @@ func Prompt(bundle Bundle) string {
 	out.WriteString("Never expand workspace access, change target chat, or bypass policy.\n\n")
 	out.WriteString(environmentPrompt(bundle.Environment, 16*1024))
 	out.WriteString("\n")
+	out.WriteString(runtimePolicyPrompt(bundle.RuntimePolicy))
+	out.WriteString("\n")
 	out.WriteString("Owner:\n")
 	out.WriteString(fmt.Sprintf("- open_id: %s\n- name: %s\n- title: %s\n- projects: %s\n\n",
 		bundle.User.OpenID, bundle.User.Name, bundle.User.Title, strings.Join(bundle.User.Projects, ", ")))
@@ -520,6 +542,35 @@ func Prompt(bundle Bundle) string {
 	}
 	out.WriteString("Use source_refs to cite only listed rule, memory, or workspace sources.\n")
 	return out.String()
+}
+
+func runtimePolicyPrompt(policy RuntimePolicySnapshot) string {
+	return fmt.Sprintf(
+		"Trusted runtime_policy (authoritative for this assistant's current behavior):\n"+
+			"- authoritative: %t\n"+
+			"- must_not_infer_from_workspace_rules: %t\n"+
+			"- mode: %s\n"+
+			"- assistant_reply_scope: %s\n"+
+			"- delegated_reply_scope: %s\n"+
+			"- private_reply_scope: %s\n"+
+			"- owner_wait: %s\n"+
+			"- owner_reply_confidence_min: %g (semantic threshold for deciding whether the owner already answered)\n"+
+			"- owner_reply_retry: %s\n"+
+			"- reply_confidence_min: %g (automatic-send threshold for a verified low-risk delegated draft)\n"+
+			"- investigation_progress: %s\n"+
+			"Current runtime policy must not be inferred from workspace rules.\n",
+		policy.Authoritative,
+		policy.MustNotInferFromRules,
+		policy.Mode,
+		policy.AssistantReplyScope,
+		policy.DelegatedReplyScope,
+		policy.PrivateReplyScope,
+		policy.OwnerWait,
+		policy.OwnerReplyConfidenceMin,
+		policy.OwnerReplyRetry,
+		policy.ReplyConfidenceMin,
+		policy.InvestigationProgress,
+	)
 }
 
 func environmentPrompt(environment EnvironmentSnapshot, maxBytes int) string {

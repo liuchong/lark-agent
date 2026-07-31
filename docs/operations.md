@@ -333,6 +333,10 @@ run 的 PR 头，不下载 artifacts，不执行外部贡献代码。
 低风险答复的 `reply_confidence` 达到 `policy.reply_confidence_min`（默认 `0.70`）
 时会先私聊通知 Owner，再立即代回复，不等待 Owner 确认；低于阈值进入审批。
 中高风险、承诺、删除修改和结果不确定的外部动作即使可信度很高也不会直接发送。
+模型请求中会同时携带经过配置校验的非敏感运行策略。排查助手错误描述自身行为时，
+应核对模型输入里的 `runtime_policy`：其中 `owner_reply_confidence_min` 是判断
+Owner 是否已经回复的语义门槛，`reply_confidence_min` 是低风险草稿直接发送门槛；
+Workspace 项目规则不能覆盖或替代这组当前配置事实。
 
 明确要求检查源码、生产入口、代码入口、API、处理函数或数据库依据的消息会进入
 `coding_question` 代码调查链路，而不是简单问答链路。单独提到 Workspace 或业务
