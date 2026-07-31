@@ -203,6 +203,7 @@ type PolicyConfig struct {
 	OwnerWait               time.Duration            `json:"owner_wait" yaml:"owner_wait"`
 	OwnerReplyConfidenceMin float64                  `json:"owner_reply_confidence_min" yaml:"owner_reply_confidence_min"`
 	OwnerReplyRetry         time.Duration            `json:"owner_reply_retry" yaml:"owner_reply_retry"`
+	OwnerReplyMaxRetries    int                      `json:"owner_reply_max_retries" yaml:"owner_reply_max_retries"`
 	MentionPoll             time.Duration            `json:"mention_poll" yaml:"mention_poll"`
 	ReplyConfidenceMin      float64                  `json:"reply_confidence_min" yaml:"reply_confidence_min"`
 	InvestigationProgress   string                   `json:"investigation_progress" yaml:"investigation_progress"`
@@ -312,6 +313,7 @@ func Default() Config {
 			OwnerWait:               3 * time.Minute,
 			OwnerReplyConfidenceMin: 0.85,
 			OwnerReplyRetry:         30 * time.Second,
+			OwnerReplyMaxRetries:    3,
 			MentionPoll:             30 * time.Second,
 			ReplyConfidenceMin:      0.70,
 			InvestigationProgress:   "enabled",
@@ -438,6 +440,12 @@ func (c Config) Validate() error {
 			errs.SubtypeInvalidConfig,
 			"policy.owner_reply_retry must be positive",
 		).WithField("policy.owner_reply_retry")
+	}
+	if c.Policy.OwnerReplyMaxRetries <= 0 {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"policy.owner_reply_max_retries must be positive",
+		).WithField("policy.owner_reply_max_retries")
 	}
 	if c.Policy.MentionPoll <= 0 {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "policy.mention_poll must be positive").WithField("policy.mention_poll")

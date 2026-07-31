@@ -63,6 +63,38 @@ Examples, tests, fixtures, and docs are supporting evidence only. Do not claim a
 Never invent an owner or team commitment, completion state, delivery time, promise to coordinate later, or promise to report back.`
 }
 
+// AgentTaskProcessPrompt renders the task-specific process separately from the
+// stable identity and authority contract.
+func AgentTaskProcessPrompt(bundle Bundle) string {
+	role := "unclassified"
+	switch {
+	case bundle.Event.MentionsUser(bundle.User.OpenID):
+		role = string(domain.RelevanceDirectMention)
+	case bundle.User.OpenID != "" && bundle.Event.SenderID == bundle.User.OpenID:
+		role = string(domain.RelevanceOwnerRequest)
+	case strings.EqualFold(strings.TrimSpace(bundle.Event.ChatType), "p2p"):
+		role = string(domain.RelevancePrivateMessage)
+	}
+	workKind := string(bundle.WorkKind)
+	if workKind == "" {
+		workKind = string(domain.WorkKindGeneric)
+	}
+	process := fmt.Sprintf(
+		"Task process for work_kind=%s relevance=%s: understand the exact request; choose a direct answer, clarification, or bounded investigation; gather only minimum sufficient evidence; separate verified claims from unknowns; then call submit_decision with reply_outcome=complete, partial, or clarification and structured progress.",
+		workKind,
+		role,
+	)
+	if bundle.WorkKind == domain.WorkKindCodingQuestion ||
+		bundle.TaskClass == domain.TaskClassCoding {
+		process += " For coding_question work, call submit_investigation_plan before broad search, locate candidate sources, read authoritative production code, stop when the requested facts are covered, and keep every definite code claim grounded in current-run source_refs."
+	} else if bundle.TaskClass == domain.TaskClassInvestigation {
+		process += " For investigation work, perform the smallest relevant read set, preserve a useful initial finding, and name remaining unknowns instead of promising future work."
+	} else {
+		process += " For a simple question, answer directly when current context is sufficient and do not add unnecessary investigation."
+	}
+	return process
+}
+
 // AgentUserPrompt serializes the bounded initial environment and message context.
 func AgentUserPrompt(bundle Bundle) string {
 	bounded := boundedAgentBundle(bundle)
@@ -226,6 +258,7 @@ type RuntimePolicySnapshot struct {
 	OwnerWait               string                   `json:"owner_wait" yaml:"owner_wait"`
 	OwnerReplyConfidenceMin float64                  `json:"owner_reply_confidence_min" yaml:"owner_reply_confidence_min"`
 	OwnerReplyRetry         string                   `json:"owner_reply_retry" yaml:"owner_reply_retry"`
+	OwnerReplyMaxRetries    int                      `json:"owner_reply_max_retries" yaml:"owner_reply_max_retries"`
 	ReplyConfidenceMin      float64                  `json:"reply_confidence_min" yaml:"reply_confidence_min"`
 	InvestigationProgress   string                   `json:"investigation_progress" yaml:"investigation_progress"`
 }
@@ -556,6 +589,7 @@ func runtimePolicyPrompt(policy RuntimePolicySnapshot) string {
 			"- owner_wait: %s\n"+
 			"- owner_reply_confidence_min: %g (semantic threshold for deciding whether the owner already answered)\n"+
 			"- owner_reply_retry: %s\n"+
+			"- owner_reply_max_retries: %d (context-only semantic rechecks; the main answer model is not rerun)\n"+
 			"- reply_confidence_min: %g (automatic-send threshold for a verified low-risk delegated draft)\n"+
 			"- investigation_progress: %s\n"+
 			"Current runtime policy must not be inferred from workspace rules.\n",
@@ -568,6 +602,7 @@ func runtimePolicyPrompt(policy RuntimePolicySnapshot) string {
 		policy.OwnerWait,
 		policy.OwnerReplyConfidenceMin,
 		policy.OwnerReplyRetry,
+		policy.OwnerReplyMaxRetries,
 		policy.ReplyConfidenceMin,
 		policy.InvestigationProgress,
 	)

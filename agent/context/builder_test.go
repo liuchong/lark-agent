@@ -315,6 +315,27 @@ func TestAgentSystemPromptDefinesAssistantAndDelegatedOwnerRoles(t *testing.T) {
 	}
 }
 
+func TestAgentTaskProcessPromptSeparatesCodingFlowAndTypedOutcomes(t *testing.T) {
+	prompt := AgentTaskProcessPrompt(Bundle{
+		WorkKind:  domain.WorkKindCodingQuestion,
+		TaskClass: domain.TaskClassCoding,
+		Event:     domain.NormalizedEvent{Content: "请核对接口返回结构"},
+	})
+	for _, want := range []string{
+		"coding_question",
+		"submit_investigation_plan",
+		"minimum sufficient evidence",
+		"complete",
+		"partial",
+		"clarification",
+		"structured progress",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("task process prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func mustWriteFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

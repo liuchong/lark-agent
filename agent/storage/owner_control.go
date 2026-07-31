@@ -625,7 +625,8 @@ func (s *Store) retryOwnerWorkTx(
 		ctx,
 		`UPDATE work_items
 		 SET status = ?, decision_json = NULL, lease_by = NULL, lease_time = NULL,
-		     retry_count = 0, next_attempt_at = NULL, updated_at = ?
+		     retry_count = 0, owner_reply_retry_count = 0,
+		     next_attempt_at = NULL, updated_at = ?
 		 WHERE id = ? AND status = ? AND session_id = ?
 		   AND NOT EXISTS (
 			SELECT 1 FROM action_attempts a
@@ -731,7 +732,8 @@ func (s *Store) resumeOwnerWorkTx(
 		ctx,
 		`UPDATE work_items
 		 SET status = ?, session_id = ?, decision_json = NULL, lease_by = NULL,
-		     lease_time = NULL, retry_count = 0, next_attempt_at = NULL, updated_at = ?
+		     lease_time = NULL, retry_count = 0, owner_reply_retry_count = 0,
+		     next_attempt_at = NULL, updated_at = ?
 		 WHERE id = ?`,
 		domain.StatusReceived,
 		s.session.ID,
@@ -753,6 +755,23 @@ func (s *Store) resumeOwnerWorkTx(
 		return 0, errs.NewInternalError(
 			errs.SubtypeStorage,
 			"close owner-selected interruption",
+		).WithCause(err)
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		`UPDATE work_reply_candidates
+		 SET status = ?, hold_reason = ?, updated_at = ?
+		 WHERE work_item_id = ? AND status IN (?, ?)`,
+		domain.ReplyCandidateCancelled,
+		"explicit owner resume starts a new investigation",
+		now,
+		workItemID,
+		domain.ReplyCandidatePending,
+		domain.ReplyCandidateHeld,
+	); err != nil {
+		return 0, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"cancel reply candidate before owner resume",
 		).WithCause(err)
 	}
 	return 1, nil

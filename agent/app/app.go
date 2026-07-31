@@ -73,6 +73,18 @@ type approvedReplySource interface {
 	ReadyApprovedReply(workItemID int64) (domain.Decision, bool, error)
 }
 
+type replyCandidateStore interface {
+	ReadyWorkReplyCandidate(workItemID int64) (domain.WorkReplyCandidate, bool, error)
+	SaveWorkReplyCandidate(workItemID int64, leaseToken string, decision domain.Decision) error
+	HoldWorkReplyCandidate(workItemID int64, leaseToken, reason string) error
+	ConsumeWorkReplyCandidate(workItemID int64, leaseToken string) error
+	CancelWorkReplyCandidate(workItemID int64, leaseToken, reason string) error
+}
+
+type replyCandidateCompleter interface {
+	CompleteReplyCandidateClaim(id int64, leaseToken string, decision domain.Decision) error
+}
+
 type postReplyNotificationStore interface {
 	BeginPostReplyNotification(context.Context, string, domain.Decision) (int64, string, bool, error)
 	ReadyPostReplyNotification(int64) (int64, string, domain.Decision, bool, error)
@@ -422,6 +434,33 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 			return d.finishApprovedDecision(ctx, item, approved)
 		}
 	}
+	if candidates, supported := d.queue.(replyCandidateStore); supported {
+		candidate, found, err := candidates.ReadyWorkReplyCandidate(item.ID)
+		if err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+		if found {
+			currentRoute, routeErr := d.router.Route(ctx, item)
+			if routeErr != nil {
+				d.markRetry(item, routeErr)
+				return Result{}, routeErr
+			}
+			if currentRoute.Kind != domain.DecisionNotify ||
+				!isDelegatedReply(currentRoute.Relevance) {
+				if cancelErr := candidates.CancelWorkReplyCandidate(
+					item.ID,
+					item.LeaseBy,
+					"current routing policy no longer permits the held candidate",
+				); cancelErr != nil {
+					d.markRetry(item, cancelErr)
+					return Result{}, cancelErr
+				}
+				return d.finishDecision(ctx, item, currentRoute)
+			}
+			return d.resolveHeldReplyCandidate(ctx, item, candidate, candidates)
+		}
+	}
 	decision, err := d.router.Route(ctx, item)
 	if err != nil {
 		d.markRetry(item, err)
@@ -687,14 +726,53 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 		d.markRetry(item, err)
 		return Result{}, err
 	}
+	var candidates replyCandidateStore
+	candidateSaved := false
+	if item.InvestigationActive && decision.Kind == domain.DecisionReply {
+		var supported bool
+		candidates, supported = d.queue.(replyCandidateStore)
+		if supported {
+			if err := candidates.SaveWorkReplyCandidate(item.ID, item.LeaseBy, decision); err != nil {
+				d.markRetry(item, err)
+				return Result{}, err
+			}
+			candidateSaved = true
+		}
+	}
 	if item.InvestigationActive && d.replyResolver != nil {
 		latest, err := d.replyResolver.Resolve(ctx, item)
 		if err != nil {
+			if candidateSaved {
+				if holdErr := candidates.HoldWorkReplyCandidate(
+					item.ID,
+					item.LeaseBy,
+					"investigation_final_resolution_failed",
+				); holdErr != nil {
+					d.markRetry(item, holdErr)
+					return Result{}, holdErr
+				}
+				return d.deferDelegatedReply(
+					item,
+					decision,
+					"investigation_final_resolution_failed",
+					d.replyResolutionRetry,
+				)
+			}
 			d.markRetry(item, err)
 			return Result{}, err
 		}
 		if latest.Confidence < d.replyConfidenceMin ||
 			latest.Result == replymatch.ResultAmbiguous {
+			if candidateSaved {
+				if err := candidates.HoldWorkReplyCandidate(
+					item.ID,
+					item.LeaseBy,
+					"investigation_final_context_ambiguous",
+				); err != nil {
+					d.markRetry(item, err)
+					return Result{}, err
+				}
+			}
 			return d.deferDelegatedReply(
 				item,
 				decision,
@@ -704,22 +782,62 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 		}
 		switch latest.Result {
 		case replymatch.ResultAnswered:
+			if candidateSaved {
+				if err := candidates.CancelWorkReplyCandidate(
+					item.ID,
+					item.LeaseBy,
+					"owner answered",
+				); err != nil {
+					d.markRetry(item, err)
+					return Result{}, err
+				}
+			}
 			decision.Kind = domain.DecisionIgnore
 			decision.Reason = "owner_semantically_replied_during_investigation"
 			decision.ReplyText = ""
 			decision.OwnerAction = ""
 		case replymatch.ResultNoReplyNeeded:
+			if candidateSaved {
+				if err := candidates.CancelWorkReplyCandidate(
+					item.ID,
+					item.LeaseBy,
+					"reply no longer needed",
+				); err != nil {
+					d.markRetry(item, err)
+					return Result{}, err
+				}
+			}
 			decision.Kind = domain.DecisionIgnore
 			decision.Reason = "delegated_reply_no_longer_needed_during_investigation"
 			decision.ReplyText = ""
 			decision.OwnerAction = ""
 		case replymatch.ResultWithdrawn:
+			if candidateSaved {
+				if err := candidates.CancelWorkReplyCandidate(
+					item.ID,
+					item.LeaseBy,
+					"source message withdrawn",
+				); err != nil {
+					d.markRetry(item, err)
+					return Result{}, err
+				}
+			}
 			decision.Kind = domain.DecisionIgnore
 			decision.Reason = "message_withdrawn_during_investigation"
 			decision.ReplyText = ""
 			decision.OwnerAction = ""
 		case replymatch.ResultUnanswered:
 		default:
+			if candidateSaved {
+				if err := candidates.HoldWorkReplyCandidate(
+					item.ID,
+					item.LeaseBy,
+					"investigation_final_context_invalid",
+				); err != nil {
+					d.markRetry(item, err)
+					return Result{}, err
+				}
+			}
 			return d.deferDelegatedReply(
 				item,
 				decision,
@@ -734,7 +852,100 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 			return Result{}, err
 		}
 	}
+	if candidateSaved && decision.Kind == domain.DecisionReply {
+		return d.finishCandidateDecision(ctx, item, decision, candidates)
+	}
 	return d.finishDecision(ctx, item, decision)
+}
+
+func (d *Daemon) resolveHeldReplyCandidate(
+	ctx context.Context,
+	item domain.WorkItem,
+	candidate domain.WorkReplyCandidate,
+	candidates replyCandidateStore,
+) (Result, error) {
+	if d.replyResolver == nil {
+		err := errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"held reply candidate requires delegated reply resolver",
+		)
+		if !d.markPermanentFailure(item, err) {
+			d.markRetry(item, err)
+		}
+		return Result{}, err
+	}
+	resolution, err := d.replyResolver.Resolve(ctx, item)
+	if err != nil {
+		if holdErr := candidates.HoldWorkReplyCandidate(
+			item.ID,
+			item.LeaseBy,
+			"candidate_resolution_failed",
+		); holdErr != nil {
+			d.markRetry(item, holdErr)
+			return Result{}, holdErr
+		}
+		return d.deferDelegatedReply(
+			item,
+			candidate.Decision,
+			"candidate_resolution_failed",
+			d.replyResolutionRetry,
+		)
+	}
+	if resolution.Confidence < d.replyConfidenceMin ||
+		resolution.Result == replymatch.ResultAmbiguous {
+		delay := d.replyResolutionRetry
+		if resolution.RetryAfter > delay {
+			delay = resolution.RetryAfter
+		}
+		if err := candidates.HoldWorkReplyCandidate(
+			item.ID,
+			item.LeaseBy,
+			"candidate_context_ambiguous",
+		); err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+		return d.deferDelegatedReply(
+			item,
+			candidate.Decision,
+			"candidate_context_ambiguous",
+			delay,
+		)
+	}
+	switch resolution.Result {
+	case replymatch.ResultUnanswered:
+		return d.finishCandidateDecision(ctx, item, candidate.Decision, candidates)
+	case replymatch.ResultAnswered, replymatch.ResultNoReplyNeeded, replymatch.ResultWithdrawn:
+		if err := candidates.CancelWorkReplyCandidate(
+			item.ID,
+			item.LeaseBy,
+			"candidate no longer needs a sender-facing reply: "+string(resolution.Result),
+		); err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+		decision := candidate.Decision
+		decision.Kind = domain.DecisionIgnore
+		decision.ReplyText = ""
+		decision.OwnerAction = ""
+		decision.Reason = "held_candidate_" + string(resolution.Result)
+		return d.finishDecision(ctx, item, decision)
+	default:
+		if err := candidates.HoldWorkReplyCandidate(
+			item.ID,
+			item.LeaseBy,
+			"candidate_context_invalid",
+		); err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+		return d.deferDelegatedReply(
+			item,
+			candidate.Decision,
+			"candidate_context_invalid",
+			d.replyResolutionRetry,
+		)
+	}
 }
 
 func (d *Daemon) deferDelegatedReply(
@@ -822,7 +1033,7 @@ func (d *Daemon) startLeaseHeartbeat(
 }
 
 func (d *Daemon) finishDecision(ctx context.Context, item domain.WorkItem, decision domain.Decision) (Result, error) {
-	return d.finishDecisionWithApprovalState(ctx, item, decision, false)
+	return d.finishDecisionWithState(ctx, item, decision, false, nil)
 }
 
 func (d *Daemon) finishApprovedDecision(
@@ -830,14 +1041,24 @@ func (d *Daemon) finishApprovedDecision(
 	item domain.WorkItem,
 	decision domain.Decision,
 ) (Result, error) {
-	return d.finishDecisionWithApprovalState(ctx, item, decision, true)
+	return d.finishDecisionWithState(ctx, item, decision, true, nil)
 }
 
-func (d *Daemon) finishDecisionWithApprovalState(
+func (d *Daemon) finishCandidateDecision(
+	ctx context.Context,
+	item domain.WorkItem,
+	decision domain.Decision,
+	candidates replyCandidateStore,
+) (Result, error) {
+	return d.finishDecisionWithState(ctx, item, decision, false, candidates)
+}
+
+func (d *Daemon) finishDecisionWithState(
 	ctx context.Context,
 	item domain.WorkItem,
 	decision domain.Decision,
 	approvalGranted bool,
+	candidates replyCandidateStore,
 ) (Result, error) {
 	if err := d.ensureLease(ctx, item); err != nil {
 		d.markRetry(item, err)
@@ -922,9 +1143,11 @@ func (d *Daemon) finishDecisionWithApprovalState(
 		d.notifier != nil &&
 		!ownerNotified {
 		if notifications, ok := d.queue.(postReplyNotificationStore); ok {
-			return d.finishPostReplyNotification(ctx, item, decision, notifications)
-		}
-		if err := d.notifier.HandleNotification(ctx, item, decision, ""); err != nil {
+			if err := d.ensureOwnerNotification(ctx, item, decision, notifications); err != nil {
+				d.markRetry(item, err)
+				return Result{}, err
+			}
+		} else if err := d.notifier.HandleNotification(ctx, item, decision, ""); err != nil {
 			d.markRetry(item, err)
 			return Result{}, err
 		}
@@ -943,7 +1166,31 @@ func (d *Daemon) finishDecisionWithApprovalState(
 			return Result{}, err
 		}
 	}
-	if err := d.complete(item, decision); err != nil {
+	if candidates != nil {
+		if decision.Kind != domain.DecisionReply {
+			if err := candidates.CancelWorkReplyCandidate(
+				item.ID,
+				item.LeaseBy,
+				"reply action did not complete",
+			); err != nil {
+				return Result{}, err
+			}
+			if err := d.complete(item, decision); err != nil {
+				return Result{}, err
+			}
+		} else if completer, ok := d.queue.(replyCandidateCompleter); ok {
+			if err := completer.CompleteReplyCandidateClaim(item.ID, item.LeaseBy, decision); err != nil {
+				return Result{}, err
+			}
+		} else {
+			if err := candidates.ConsumeWorkReplyCandidate(item.ID, item.LeaseBy); err != nil {
+				return Result{}, err
+			}
+			if err := d.complete(item, decision); err != nil {
+				return Result{}, err
+			}
+		}
+	} else if err := d.complete(item, decision); err != nil {
 		return Result{}, err
 	}
 	return Result{Processed: true, Decision: decision}, nil
@@ -1038,16 +1285,7 @@ func (d *Daemon) complete(item domain.WorkItem, decision domain.Decision) error 
 func (d *Daemon) markRetry(item domain.WorkItem, runErr error) {
 	if problem, ok := errs.ProblemOf(runErr); ok &&
 		problem.Subtype == errs.SubtypeModelNonConvergence {
-		if item.LeaseBy != "" {
-			if q, ok := d.queue.(fencedDeadLetterMarker); ok {
-				_ = q.MarkDeadLetterClaim(item.ID, item.LeaseBy, runErr.Error())
-				d.notifyTerminalFailure(item, runErr)
-				return
-			}
-		}
-		if q, ok := d.queue.(deadLetterMarker); ok {
-			_ = q.MarkDeadLetter(item.ID, runErr.Error())
-			d.notifyTerminalFailure(item, runErr)
+		if d.markPermanentFailure(item, runErr) {
 			return
 		}
 	}
@@ -1073,6 +1311,26 @@ func (d *Daemon) markRetry(item domain.WorkItem, runErr error) {
 		_ = q.MarkRetry(item.ID, runErr.Error())
 		d.notifyTerminalFailure(item, runErr)
 	}
+}
+
+func (d *Daemon) markPermanentFailure(item domain.WorkItem, runErr error) bool {
+	if item.LeaseBy != "" {
+		if q, ok := d.queue.(fencedDeadLetterMarker); ok {
+			if err := q.MarkDeadLetterClaim(item.ID, item.LeaseBy, runErr.Error()); err != nil {
+				return false
+			}
+			d.notifyTerminalFailure(item, runErr)
+			return true
+		}
+	}
+	if q, ok := d.queue.(deadLetterMarker); ok {
+		if err := q.MarkDeadLetter(item.ID, runErr.Error()); err != nil {
+			return false
+		}
+		d.notifyTerminalFailure(item, runErr)
+		return true
+	}
+	return false
 }
 
 func (d *Daemon) notifyTerminalFailure(item domain.WorkItem, runErr error) {

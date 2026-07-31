@@ -23,12 +23,13 @@ import (
 
 // Store is a SQLite-backed durable queue.
 type Store struct {
-	db              *sql.DB
-	maxRetries      int
-	duplicateWindow time.Duration
-	maxActiveGoals  int
-	session         domain.OnlineSession
-	ownsSession     bool
+	db                   *sql.DB
+	maxRetries           int
+	ownerReplyMaxRetries int
+	duplicateWindow      time.Duration
+	maxActiveGoals       int
+	session              domain.OnlineSession
+	ownsSession          bool
 }
 
 // Open opens the state database for one daemon runtime, creates a new online
@@ -54,7 +55,13 @@ func open(path string, createSession bool) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	store := &Store{db: db, maxRetries: 20, duplicateWindow: 2 * time.Minute, maxActiveGoals: 3}
+	store := &Store{
+		db:                   db,
+		maxRetries:           20,
+		ownerReplyMaxRetries: 3,
+		duplicateWindow:      2 * time.Minute,
+		maxActiveGoals:       3,
+	}
 	if err := store.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -84,6 +91,14 @@ func open(path string, createSession bool) (*Store, error) {
 func (s *Store) ConfigureRecovery(maxRetries int) {
 	if maxRetries > 0 {
 		s.maxRetries = maxRetries
+	}
+}
+
+// ConfigureOwnerReplyRecovery sets the semantic context-only retry ceiling
+// independently from transient provider retries.
+func (s *Store) ConfigureOwnerReplyRecovery(maxRetries int) {
+	if maxRetries > 0 {
+		s.ownerReplyMaxRetries = maxRetries
 	}
 }
 
@@ -463,6 +478,27 @@ func (s *Store) migrate() error {
 			`CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_feedback_message
 			 ON memory_feedback(memory_entry_id, source_message_id)
 			 WHERE source_message_id IS NOT NULL AND source_message_id <> ''`,
+		}},
+		{version: 16, statements: []string{
+			`ALTER TABLE work_items
+			 ADD COLUMN owner_reply_retry_count INTEGER NOT NULL DEFAULT 0`,
+			`UPDATE work_items
+			 SET owner_reply_retry_count = retry_count,
+			     retry_count = 0
+			 WHERE status = 'waiting_user' AND retry_count > 0`,
+			`CREATE TABLE IF NOT EXISTS work_reply_candidates (
+				work_item_id INTEGER PRIMARY KEY REFERENCES work_items(id),
+				decision_json TEXT NOT NULL,
+				digest TEXT NOT NULL,
+				status TEXT NOT NULL CHECK (
+					status IN ('pending', 'held', 'consumed', 'cancelled')
+				),
+				hold_reason TEXT NOT NULL DEFAULT '',
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_work_reply_candidates_status
+			 ON work_reply_candidates(status, updated_at)`,
 		}},
 	}
 	for _, migration := range migrations {
@@ -988,10 +1024,19 @@ func (s *Store) RequeueAbandonedRuns(maxAge time.Duration) (int64, error) {
 // model or agent configuration upgrade.
 func (s *Store) RequeueChangedRuntimeFailures(modelFingerprint, configFingerprint string) (int64, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	result, err := s.db.Exec(
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return 0, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin runtime upgrade requeue",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	result, err := tx.Exec(
 		`UPDATE work_items
 		 SET status = ?, decision_json = NULL, lease_by = NULL, lease_time = NULL,
-		     retry_count = 0, next_attempt_at = NULL, updated_at = ?
+		     retry_count = 0, owner_reply_retry_count = 0,
+		     next_attempt_at = NULL, updated_at = ?
 		 WHERE status IN (?, ?)
 		   AND EXISTS (
 			SELECT 1 FROM agent_runs r
@@ -1014,12 +1059,38 @@ func (s *Store) RequeueChangedRuntimeFailures(modelFingerprint, configFingerprin
 		return 0, errs.NewInternalError(errs.SubtypeStorage, "read runtime upgrade requeue result").WithCause(err)
 	}
 	if changed > 0 {
-		if _, err := s.db.Exec(
+		if _, err := tx.Exec(
+			`UPDATE work_reply_candidates
+			 SET status = ?, hold_reason = ?, updated_at = ?
+			 WHERE status IN (?, ?)
+			   AND work_item_id IN (
+				SELECT id FROM work_items WHERE status = ? AND updated_at = ?
+			   )`,
+			domain.ReplyCandidateCancelled,
+			"runtime contract changed; candidate requires regeneration",
+			now,
+			domain.ReplyCandidatePending,
+			domain.ReplyCandidateHeld,
+			domain.StatusReceived,
+			now,
+		); err != nil {
+			return 0, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"cancel stale reply candidates after runtime upgrade",
+			).WithCause(err)
+		}
+		if _, err := tx.Exec(
 			`DELETE FROM dead_letters WHERE work_item_id IN (
 				SELECT id FROM work_items WHERE status = ? AND updated_at = ?
 			)`, domain.StatusReceived, now); err != nil {
 			return 0, errs.NewInternalError(errs.SubtypeStorage, "clear upgraded dead letters").WithCause(err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit runtime upgrade requeue",
+		).WithCause(err)
 	}
 	return changed, nil
 }
@@ -1097,7 +1168,8 @@ func (s *Store) RequeueChangedRuntimeDirectMentions(ownerOpenID, modelFingerprin
 	for _, id := range ids {
 		result, err := tx.Exec(
 			`UPDATE work_items SET status = ?, decision_json = NULL, lease_by = NULL,
-			        lease_time = NULL, retry_count = 0, next_attempt_at = NULL, updated_at = ?
+			        lease_time = NULL, retry_count = 0, owner_reply_retry_count = 0,
+			        next_attempt_at = NULL, updated_at = ?
 			 WHERE id = ? AND status IN (?, ?)`,
 			domain.StatusReceived, now, id, domain.StatusIgnored, domain.StatusCompleted)
 		if err != nil {
@@ -1216,7 +1288,8 @@ func (s *Store) RequeueLowRiskDirectMentionApprovals(ownerOpenID string) (int64,
 		}
 		result, err = tx.Exec(
 			`UPDATE work_items SET status = ?, decision_json = NULL, lease_by = NULL,
-			        lease_time = NULL, retry_count = 0, next_attempt_at = NULL, updated_at = ?
+			        lease_time = NULL, retry_count = 0, owner_reply_retry_count = 0,
+			        next_attempt_at = NULL, updated_at = ?
 			 WHERE id = ?`,
 			domain.StatusReceived, now, id)
 		if err != nil {
@@ -1289,7 +1362,8 @@ func (s *Store) RequeueLegacyCompletedMentions(ownerOpenID string) (int64, error
 	for _, id := range ids {
 		result, err := tx.Exec(
 			`UPDATE work_items SET status = ?, decision_json = NULL, lease_by = NULL,
-			        lease_time = NULL, retry_count = 0, next_attempt_at = NULL, updated_at = ?
+			        lease_time = NULL, retry_count = 0, owner_reply_retry_count = 0,
+			        next_attempt_at = NULL, updated_at = ?
 			 WHERE id = ? AND status = ?`,
 			domain.StatusReceived, now, id, domain.StatusCompleted)
 		if err != nil {
@@ -2232,6 +2306,199 @@ func (s *Store) ReadyApprovedReply(workItemID int64) (domain.Decision, bool, err
 		ReplyText:   request.Text,
 		OwnerAction: request.OwnerAction,
 	}, true, nil
+}
+
+// SaveWorkReplyCandidate durably preserves one already validated reply before
+// the final owner-handled semantic check.
+func (s *Store) SaveWorkReplyCandidate(
+	workItemID int64,
+	leaseToken string,
+	decision domain.Decision,
+) error {
+	if workItemID <= 0 {
+		return errs.NewValidationError(errs.SubtypeInvalidArgument, "reply candidate requires work_item_id")
+	}
+	if strings.TrimSpace(leaseToken) == "" {
+		return errs.NewValidationError(errs.SubtypeInvalidArgument, "reply candidate requires lease_token")
+	}
+	if decision.Kind != domain.DecisionReply || strings.TrimSpace(decision.ReplyText) == "" {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"reply candidate requires an exact validated reply decision",
+		)
+	}
+	data, err := json.Marshal(decision)
+	if err != nil {
+		return errs.NewInternalError(errs.SubtypeStorage, "encode work reply candidate").WithCause(err)
+	}
+	sum := sha256.Sum256(data)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.Exec(
+		`INSERT INTO work_reply_candidates(
+			work_item_id, decision_json, digest, status, hold_reason, created_at, updated_at
+		)
+		SELECT id, ?, ?, ?, '', ?, ?
+		FROM work_items
+		WHERE id = ? AND status = ? AND lease_by = ?
+		ON CONFLICT(work_item_id) DO UPDATE SET
+			decision_json = excluded.decision_json,
+			digest = excluded.digest,
+			status = excluded.status,
+			hold_reason = '',
+			updated_at = excluded.updated_at`,
+		string(data),
+		fmt.Sprintf("sha256:%x", sum[:]),
+		domain.ReplyCandidatePending,
+		now,
+		now,
+		workItemID,
+		domain.StatusProcessing,
+		leaseToken,
+	)
+	if err != nil {
+		return errs.NewInternalError(errs.SubtypeStorage, "save work reply candidate").WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return errs.NewInternalError(errs.SubtypeStorage, "read reply candidate save result").WithCause(err)
+	}
+	if affected != 1 {
+		return errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"reply candidate lease is no longer current",
+		)
+	}
+	return nil
+}
+
+// ReadyWorkReplyCandidate returns one pending or held unsent reply.
+func (s *Store) ReadyWorkReplyCandidate(workItemID int64) (domain.WorkReplyCandidate, bool, error) {
+	var candidate domain.WorkReplyCandidate
+	var decisionJSON, status, createdAt, updatedAt string
+	err := s.db.QueryRow(
+		`SELECT work_item_id, decision_json, digest, status, hold_reason, created_at, updated_at
+		 FROM work_reply_candidates
+		 WHERE work_item_id = ? AND status IN (?, ?)`,
+		workItemID,
+		domain.ReplyCandidatePending,
+		domain.ReplyCandidateHeld,
+	).Scan(
+		&candidate.WorkItemID,
+		&decisionJSON,
+		&candidate.Digest,
+		&status,
+		&candidate.HoldReason,
+		&createdAt,
+		&updatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.WorkReplyCandidate{}, false, nil
+	}
+	if err != nil {
+		return domain.WorkReplyCandidate{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read work reply candidate",
+		).WithCause(err)
+	}
+	sum := sha256.Sum256([]byte(decisionJSON))
+	if expected := fmt.Sprintf("sha256:%x", sum[:]); candidate.Digest != expected {
+		return domain.WorkReplyCandidate{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"work reply candidate digest mismatch",
+		)
+	}
+	if err := json.Unmarshal([]byte(decisionJSON), &candidate.Decision); err != nil {
+		return domain.WorkReplyCandidate{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"decode work reply candidate",
+		).WithCause(err)
+	}
+	candidate.Status = domain.ReplyCandidateStatus(status)
+	candidate.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	candidate.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	return candidate, true, nil
+}
+
+// HoldWorkReplyCandidate marks an unsent reply as waiting for semantic context.
+func (s *Store) HoldWorkReplyCandidate(workItemID int64, leaseToken, reason string) error {
+	return s.transitionWorkReplyCandidate(
+		workItemID,
+		leaseToken,
+		domain.ReplyCandidateHeld,
+		strings.TrimSpace(reason),
+		[]domain.ReplyCandidateStatus{domain.ReplyCandidatePending, domain.ReplyCandidateHeld},
+	)
+}
+
+// ConsumeWorkReplyCandidate closes a candidate after its idempotent reply path
+// has completed.
+func (s *Store) ConsumeWorkReplyCandidate(workItemID int64, leaseToken string) error {
+	return s.transitionWorkReplyCandidate(
+		workItemID,
+		leaseToken,
+		domain.ReplyCandidateConsumed,
+		"",
+		[]domain.ReplyCandidateStatus{domain.ReplyCandidatePending, domain.ReplyCandidateHeld},
+	)
+}
+
+// CancelWorkReplyCandidate closes a candidate that is no longer safe or needed.
+func (s *Store) CancelWorkReplyCandidate(workItemID int64, leaseToken, reason string) error {
+	return s.transitionWorkReplyCandidate(
+		workItemID,
+		leaseToken,
+		domain.ReplyCandidateCancelled,
+		strings.TrimSpace(reason),
+		[]domain.ReplyCandidateStatus{domain.ReplyCandidatePending, domain.ReplyCandidateHeld},
+	)
+}
+
+func (s *Store) transitionWorkReplyCandidate(
+	workItemID int64,
+	leaseToken string,
+	status domain.ReplyCandidateStatus,
+	reason string,
+	from []domain.ReplyCandidateStatus,
+) error {
+	if len(from) == 0 {
+		return errs.NewValidationError(errs.SubtypeInvalidArgument, "reply candidate transition requires source status")
+	}
+	if strings.TrimSpace(leaseToken) == "" {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"reply candidate transition requires lease_token",
+		).WithParam("lease_token")
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(from)), ",")
+	args := []any{status, reason, time.Now().UTC().Format(time.RFC3339Nano), workItemID}
+	for _, value := range from {
+		args = append(args, value)
+	}
+	args = append(args, workItemID, domain.StatusProcessing, leaseToken)
+	result, err := s.db.Exec(
+		`UPDATE work_reply_candidates
+		 SET status = ?, hold_reason = ?, updated_at = ?
+		 WHERE work_item_id = ? AND status IN (`+placeholders+`)
+		   AND EXISTS (
+		       SELECT 1 FROM work_items
+		       WHERE id = ? AND status = ? AND lease_by = ?
+		   )`,
+		args...,
+	)
+	if err != nil {
+		return errs.NewInternalError(errs.SubtypeStorage, "transition work reply candidate").WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return errs.NewInternalError(errs.SubtypeStorage, "read reply candidate transition result").WithCause(err)
+	}
+	if affected != 1 {
+		return errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"work reply candidate is no longer active",
+		)
+	}
+	return nil
 }
 
 func shellActionKey(dedupKey, command, cwd string) string {
@@ -3741,16 +4008,32 @@ func validInvestigationTransition(
 // Complete marks a work item completed, ignored, or cancelled according to its
 // decision and persists the decision snapshot.
 func (s *Store) Complete(id int64, decision domain.Decision) error {
-	return s.completeClaim(id, "", decision)
+	return s.completeClaim(id, "", decision, false)
 }
 
 // CompleteClaim atomically completes work and its CodingGoal only if the exact
 // lease token still owns the item.
 func (s *Store) CompleteClaim(id int64, leaseToken string, decision domain.Decision) error {
-	return s.completeClaim(id, leaseToken, decision)
+	return s.completeClaim(id, leaseToken, decision, false)
 }
 
-func (s *Store) completeClaim(id int64, leaseToken string, decision domain.Decision) error {
+// CompleteReplyCandidateClaim atomically completes the exact leased work and
+// consumes its validated reply candidate after the external reply path has
+// returned a durable completed result.
+func (s *Store) CompleteReplyCandidateClaim(
+	id int64,
+	leaseToken string,
+	decision domain.Decision,
+) error {
+	return s.completeClaim(id, leaseToken, decision, true)
+}
+
+func (s *Store) completeClaim(
+	id int64,
+	leaseToken string,
+	decision domain.Decision,
+	consumeCandidate bool,
+) error {
 	status := domain.StatusCompleted
 	switch decision.Kind {
 	case domain.DecisionIgnore:
@@ -3795,6 +4078,38 @@ func (s *Store) completeClaim(id int64, leaseToken string, decision domain.Decis
 	}
 	if affected == 0 {
 		return errs.NewValidationError(errs.SubtypeFailedPrecondition, "work item %d was not found", id)
+	}
+	if consumeCandidate {
+		candidateResult, err := tx.ExecContext(
+			context.Background(),
+			`UPDATE work_reply_candidates
+			 SET status = ?, hold_reason = '', updated_at = ?
+			 WHERE work_item_id = ? AND status IN (?, ?)`,
+			domain.ReplyCandidateConsumed,
+			time.Now().UTC().Format(time.RFC3339Nano),
+			id,
+			domain.ReplyCandidatePending,
+			domain.ReplyCandidateHeld,
+		)
+		if err != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"consume reply candidate while completing work",
+			).WithCause(err)
+		}
+		candidateAffected, err := candidateResult.RowsAffected()
+		if err != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"read reply candidate completion result",
+			).WithCause(err)
+		}
+		if candidateAffected != 1 {
+			return errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"work reply candidate is no longer active",
+			)
+		}
 	}
 	goalStatus := domain.CodingGoalCompleted
 	switch status {
@@ -3997,15 +4312,15 @@ func (s *Store) DeferWaitingUserClaim(
 		).WithCause(err)
 	}
 	defer tx.Rollback() //nolint:errcheck
-	var retryCount int
+	var ownerReplyRetryCount int
 	if err := tx.QueryRow(
-		`SELECT retry_count
+		`SELECT owner_reply_retry_count
 		 FROM work_items
 		 WHERE id = ? AND status = ? AND lease_by = ?`,
 		id,
 		domain.StatusProcessing,
 		leaseToken,
-	).Scan(&retryCount); err != nil {
+	).Scan(&ownerReplyRetryCount); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return errs.NewValidationError(
 				errs.SubtypeFailedPrecondition,
@@ -4017,17 +4332,17 @@ func (s *Store) DeferWaitingUserClaim(
 			"read delegated reply retry count",
 		).WithCause(err)
 	}
-	retryCount++
+	ownerReplyRetryCount++
 	nowRaw := now.Format(time.RFC3339Nano)
-	if s.maxRetries > 0 && retryCount >= s.maxRetries {
+	if s.ownerReplyMaxRetries > 0 && ownerReplyRetryCount >= s.ownerReplyMaxRetries {
 		result, err := tx.Exec(
 			`UPDATE work_items
 			 SET status = ?, decision_json = ?, lease_by = NULL, lease_time = NULL,
-			     retry_count = ?, next_attempt_at = NULL, updated_at = ?
+			     owner_reply_retry_count = ?, next_attempt_at = NULL, updated_at = ?
 			 WHERE id = ? AND status = ? AND lease_by = ?`,
 			domain.StatusDeadLetter,
 			string(decisionJSON),
-			retryCount,
+			ownerReplyRetryCount,
 			nowRaw,
 			id,
 			domain.StatusProcessing,
@@ -4046,8 +4361,8 @@ func (s *Store) DeferWaitingUserClaim(
 			)
 		}
 		metadata, _ := json.Marshal(map[string]any{
-			"retry_count": retryCount,
-			"source":      "semantic_waiting_user",
+			"owner_reply_retry_count": ownerReplyRetryCount,
+			"source":                  "semantic_waiting_user",
 		})
 		if _, err := tx.Exec(
 			`INSERT INTO dead_letters(work_item_id, reason, metadata_json, created_at)
@@ -4094,11 +4409,11 @@ func (s *Store) DeferWaitingUserClaim(
 	result, err := tx.Exec(
 		`UPDATE work_items
 		 SET status = ?, decision_json = ?, lease_by = NULL, lease_time = NULL,
-		     retry_count = ?, next_attempt_at = ?, updated_at = ?
+		     owner_reply_retry_count = ?, next_attempt_at = ?, updated_at = ?
 		 WHERE id = ? AND status = ? AND lease_by = ?`,
 		domain.StatusWaitingUser,
 		string(decisionJSON),
-		retryCount,
+		ownerReplyRetryCount,
 		now.Add(delay).Format(time.RFC3339Nano),
 		nowRaw,
 		id,

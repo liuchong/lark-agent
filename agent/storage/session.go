@@ -1730,6 +1730,13 @@ func (s *Store) InspectWork(
 	if found {
 		inspection.Investigation = &investigation
 	}
+	candidate, found, err := s.ReadyWorkReplyCandidate(item.ID)
+	if err != nil {
+		return inspection, err
+	}
+	if found {
+		inspection.ReplyCandidate = &candidate
+	}
 	inspection.State.Observed = inspection.Receipt != nil || inspection.WorkItem != nil
 	inspection.State.Admitted = inspection.WorkItem != nil
 	inspection.State.OfflineBacklog = inspection.Receipt != nil &&
@@ -1882,11 +1889,28 @@ func (s *Store) ResumeWork(
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE work_items SET status = ?, session_id = ?, decision_json = NULL,
 		        lease_by = NULL, lease_time = NULL, retry_count = 0,
+		        owner_reply_retry_count = 0,
 		        next_attempt_at = NULL, updated_at = ? WHERE id = ?`,
 		domain.StatusReceived, s.session.ID, nowRaw, item.ID); err != nil {
 		return domain.WorkInspection{}, errs.NewInternalError(
 			errs.SubtypeStorage,
 			"resume interrupted work",
+		).WithCause(err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE work_reply_candidates
+		 SET status = ?, hold_reason = ?, updated_at = ?
+		 WHERE work_item_id = ? AND status IN (?, ?)`,
+		domain.ReplyCandidateCancelled,
+		"explicit resume starts a new investigation",
+		nowRaw,
+		item.ID,
+		domain.ReplyCandidatePending,
+		domain.ReplyCandidateHeld,
+	); err != nil {
+		return domain.WorkInspection{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"cancel reply candidate before explicit resume",
 		).WithCause(err)
 	}
 	if _, err := tx.ExecContext(ctx,

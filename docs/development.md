@@ -31,10 +31,29 @@ Go SDK，并把 SDK HTTP 响应或 WebSocket 事件转为有类型数据。
 make build
 make unit-test
 make integration-test
+make harness-eval
 make verify
 bash -n scripts/macos/install-lark-agent.sh
 swiftc macos/LarkAgentStatus/main.swift -framework AppKit -o /tmp/LarkAgentStatus
 ```
+
+## Prompt 与收敛评测
+
+模型指令分为稳定的身份/权限核心、按工作类型生成的任务流程，以及每轮由 Go 重新
+生成的运行状态。运行状态包含剩余预算、已完成检查、未知项和最后失败门；上下文压缩
+后也会重新注入。提示词只解释当前处境，Workspace、权限、证据、预算和发送边界仍由
+Go 拒绝路径强制执行。
+
+`make harness-eval` 使用脱敏的脚本模型和固定工具回执，逐项显示并检查：不依赖固定
+措辞的部分成果、无需伪造代码读取的澄清、相同结果的重复调用熔断，以及无依据代码
+断言被拒绝后安全收敛。场景目录检查终态类型以及声明的模型/工具调用上限；各可执行
+用例断言对应行为所需的终态和调用边界。它不访问网络、不读取模型密钥，也不替代
+`make verify`。候选持久化、语义复查、重复发送和 Owner 终止通知由同一集成测试包中
+的其他测试覆盖。
+
+评测 fixture 只能使用合成消息号、会话号、路径和源码，不得保存真实飞书消息、凭据
+或私有数据库内容。当前门禁固定使用脚本模型，尚不提供真实模型探针；更换真实模型
+不属于默认离线验证范围。
 
 完整交付还必须执行：
 

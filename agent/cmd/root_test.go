@@ -1377,6 +1377,7 @@ func TestTerminalFailureRequirementSendsPrivateBotCommandsOnce(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	store.ConfigureRecovery(1)
+	store.ConfigureOwnerReplyRecovery(1)
 	item := domain.NewWorkItem(domain.NormalizedEvent{
 		Source:    domain.SourcePoll,
 		EventID:   "poll:om_terminal_private_commands",
@@ -1398,6 +1399,24 @@ func TestTerminalFailureRequirementSendsPrivateBotCommandsOnce(t *testing.T) {
 	claimed, ok, err := store.ClaimNext("terminal-command-test")
 	if err != nil || !ok {
 		t.Fatalf("claimed=%+v ok=%v err=%v", claimed, ok, err)
+	}
+	run, err := store.StartAgentRun(
+		context.Background(),
+		claimed.Event,
+		"weak-model",
+		"bounded-convergence",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendAgentStep(context.Background(), domain.AgentStep{
+		RunID:      run.ID,
+		Sequence:   1,
+		Kind:       "tool",
+		ToolName:   "read_workspace",
+		OutputJSON: `{"source":"verified-receipt"}`,
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if err := store.DeferWaitingUserClaim(
 		claimed.ID,
@@ -1426,6 +1445,8 @@ func TestTerminalFailureRequirementSendsPrivateBotCommandsOnce(t *testing.T) {
 	for _, want := range []string{
 		"/task " + strconv.FormatInt(claimed.ID, 10),
 		"/task resume " + strconv.FormatInt(claimed.ID, 10) + " confirm",
+		"已核对：read_workspace",
+		"未形成可安全发送的结论",
 	} {
 		if !strings.Contains(messenger.notification, want) {
 			t.Fatalf("terminal notification missing %q: %s", want, messenger.notification)
@@ -1462,6 +1483,7 @@ func TestTerminalFailureRequirementDoesNotSendAfterExplicitResume(t *testing.T) 
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	store.ConfigureRecovery(1)
+	store.ConfigureOwnerReplyRecovery(1)
 	item := domain.NewWorkItem(domain.NormalizedEvent{
 		Source:    domain.SourcePoll,
 		EventID:   "poll:om_resumed_before_terminal_notice",
@@ -1544,6 +1566,7 @@ func TestTerminalFailureRequirementRetriesExactFailedSend(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	store.ConfigureRecovery(1)
+	store.ConfigureOwnerReplyRecovery(1)
 	item := domain.NewWorkItem(domain.NormalizedEvent{
 		Source:    domain.SourcePoll,
 		EventID:   "poll:om_retry_terminal_notice",

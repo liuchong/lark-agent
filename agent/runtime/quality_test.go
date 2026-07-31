@@ -81,6 +81,41 @@ func TestDelegatedReplyQualityAcceptsConciseCompletedResearch(t *testing.T) {
 	}
 }
 
+func TestDelegatedReplyQualityUsesStructuredProgressInsteadOfFixedWording(t *testing.T) {
+	err := validateResponseQuality(delegatedBundle("请先调研图片审核接入点并同步初步结论"), domain.Decision{
+		Kind:         domain.DecisionReply,
+		Risk:         domain.RiskLow,
+		ReplyOutcome: domain.ReplyOutcomePartial,
+		ReplyText:    "上传入口已经接入缩略图审核；文件消息的生产透传没有足够证据。",
+		Progress: domain.DecisionProgress{
+			CompletedChecks: []string{"读取上传入口和消息关联实现"},
+			InitialFinding:  "缩略图路径已有审核调用",
+			Unknowns:        []string{"文件消息是否透传 SampleRule"},
+			NextStep:        "提供文件消息生产入口路径",
+		},
+		Sources: []domain.SourceRef{{
+			RelativePath: "service/message/upload.go",
+			Digest:       "sha256:prod",
+			Kind:         "workspace_file",
+		}},
+	}, responseEvidence{SuccessfulReads: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDelegatedReplyQualityRejectsEmptyStructuredProgress(t *testing.T) {
+	err := validateResponseQuality(delegatedBundle("请先调研图片审核接入点并同步初步结论"), domain.Decision{
+		Kind:         domain.DecisionReply,
+		Risk:         domain.RiskLow,
+		ReplyOutcome: domain.ReplyOutcomePartial,
+		ReplyText:    "目前还不清楚。",
+	}, responseEvidence{SuccessfulReads: 1})
+	if err == nil || !strings.Contains(err.Error(), "structured progress") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestDelegatedReplyQualityRejectsUnauthorizedFutureCommitment(t *testing.T) {
 	err := validateResponseQuality(delegatedBundle("请确认审核时机"), domain.Decision{
 		Kind:      domain.DecisionReply,

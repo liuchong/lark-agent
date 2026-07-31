@@ -57,8 +57,9 @@ lark-agent config show
   `--chat-query` 发现的群，并要求启动参数提供非空群关键词。
 - `policy.private_reply_scope`：真人私聊代回复范围，默认 `all_private`；设为
   `disabled` 时关闭。
-- `policy.owner_wait`、`owner_reply_confidence_min`、`owner_reply_retry`：
-  本人优先回复窗口、语义判断最低置信度和不确定结果的重试间隔。
+- `policy.owner_wait`、`owner_reply_confidence_min`、`owner_reply_retry`、
+  `owner_reply_max_retries`：本人优先回复窗口、语义判断最低置信度、不确定结果的
+  重试间隔和纯语义复查上限。复查上限默认 `3`，不会重新调用主回答模型。
 - `policy.reply_confidence_min`：低风险代回复自动发送的最低可信度，默认 `0.70`。
   中高风险、承诺、删除修改和不确定外部动作不因高可信度绕过审批。
 - `policy.investigation_progress`：`enabled` 或 `disabled`，默认 `enabled`。开启后，
@@ -85,7 +86,9 @@ lark-agent config show
 一旦工具额度、无进展或证据充分条件要求提交结论，后续只允许
 `submit_decision`，最多给模型 3 次强制收尾机会；仍调用旧工具会立即结束该次运行，
 并把该工作连同原因直接放入死信，不会继续消耗剩余通用轮次或自动重复同一调查。
-网络、限流等明确可重试错误仍按原有有界退避处理。
+相同工具、规范化参数和结果连续出现时，运行时会先要求改变策略，再限制广搜，最后
+只允许提交完整结论、部分结论或澄清请求。网络、限流等明确可重试错误仍使用
+`agent.max_retries` 和原有有界退避；确定性输出错误不会借此重复整个调查。
 
 配置不保存官方 Lark 凭据，也没有模型密钥字段。Lark app secret 放在 macOS
 Keychain；用户 access token 和 refresh token 可选，只用于用户身份轮询和代回复。
@@ -169,6 +172,7 @@ policy:
   owner_wait: 3m
   owner_reply_confidence_min: 0.85
   owner_reply_retry: 30s
+  owner_reply_max_retries: 3
   reply_confidence_min: 0.70
 ```
 
@@ -185,6 +189,10 @@ policy:
   到期后才读取目标前后有界的同一会话并逐条做语义判断。
 - `policy.owner_reply_confidence_min` 是“本人已处理/无需回复/尚未回答”的最低可信度；
   `policy.owner_reply_retry` 是判断不清、上下文不完整或模型异常后的静默重试间隔。
+- `policy.owner_reply_max_retries` 是上述只读语义复查的上限，默认 `3`。主模型已经
+  产出的安全草稿会持久保全，复查期间不会重新调查；触顶后只私聊 Owner，并明确草稿
+  尚未发送给原提问者。该次数由 SQLite 独立记录，不会与 `agent.max_retries` 的网络、
+  限流和模型供应商瞬时失败次数互相占用。
 - `policy.reply_confidence_min` 是主模型完成只读核对后自动代回复的最低可信度。
   达到 `0.70` 的低风险答复会先私聊通知 Owner，再直接发送，不会等待 Owner 在线。
 

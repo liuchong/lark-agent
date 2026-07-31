@@ -126,6 +126,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	bundle = filterBundleTools(bundle, visibleToolInfos, invocationScope)
 	messages := []*schema.Message{
 		schema.SystemMessage(l.SystemPrompt),
+		schema.SystemMessage(agentcontext.AgentTaskProcessPrompt(bundle)),
 		initialUserMessage(bundle),
 	}
 	if requestedWorkspaceScope != "" {
@@ -158,7 +159,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		recordObservedSource(observedSources, source)
 	}
 	totalToolBytes := 0
-	repeatedCalls := map[string]int{}
+	resultFingerprints := map[string]int{}
 	sourceLessWorkspaceSearches := 0
 	toolBudgetConvergencePrompted := false
 	codingEvidenceConvergencePrompted := false
@@ -177,6 +178,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	structuralRecoveryReadAttempted := false
 	var structuralRecoveryCandidates []string
 	evidence := responseEvidence{}
+	terminalRepair := terminalRepairContext{}
 	for turn := 0; turn < l.MaxTurns; turn++ {
 		if err := ctx.Err(); err != nil {
 			return domain.Decision{}, trajectory, err
@@ -216,7 +218,10 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			TargetLanguage:   resolvedBundleLanguage(bundle),
 		}
 		progressMessageIndex := len(requestMessages)
-		requestMessages = append(requestMessages, schema.SystemMessage(modelRunProgressPrompt(budget)))
+		requestMessages = append(
+			requestMessages,
+			schema.SystemMessage(modelRunProgressPrompt(budget, terminalRepair)),
+		)
 		structuralEvidenceCompletion := false
 		structuralEvidenceSearchRecovery := false
 		structuralEvidenceReadRecovery := false
@@ -286,7 +291,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			terminalOnlyAttempts++
 			turnToolInfos = submitDecisionOnly(visibleToolInfos)
 			requestMessages = append(requestMessages, schema.SystemMessage(
-				terminalOnlyPrompt(terminalOnlyAttempts, terminalAttemptLimit),
+				terminalOnlyPrompt(terminalOnlyAttempts, terminalAttemptLimit, terminalRepair),
 			))
 		} else if structuralEvidenceSearchRecovery {
 			turnToolInfos = namedToolOnly(visibleToolInfos, "search_workspace")
@@ -308,7 +313,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		}
 		for range 4 {
 			budget.ContextBytes = messageBytes(requestMessages)
-			progress := modelRunProgressPrompt(budget)
+			progress := modelRunProgressPrompt(budget, terminalRepair)
 			if requestMessages[progressMessageIndex].Content == progress {
 				break
 			}
@@ -364,21 +369,12 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			if strings.TrimSpace(call.ID) == "" || strings.TrimSpace(call.Function.Name) == "" {
 				return domain.Decision{}, trajectory, errs.NewInternalError(errs.SubtypeInvalidResponse, "model tool call is missing id or name")
 			}
-			callSignature := call.Function.Name + "\x00" + call.Function.Arguments
-			repeatedCalls[callSignature]++
-			if repeatedCalls[callSignature] > l.MaxNoProgress {
-				forceDecision = true
-			} else if repeatedCalls[callSignature] > l.MaxRepeatedCalls {
-				return domain.Decision{}, trajectory, errs.NewInternalError(
-					errs.SubtypeInvalidResponse,
-					"agent repeated the same tool call without progress: %s",
-					call.Function.Name,
-				)
-			}
+			callSignature := call.Function.Name + "\x00" + normalizeToolArguments(call.Function.Arguments)
 			toolCtx := agenttools.WithWorkItemDedup(ctx, domain.DedupKey(bundle.Event))
 			toolCtx = agenttools.WithInvocationScope(toolCtx, invocationScope)
 			var execution agenttools.Execution
 			var toolErr error
+			var submittedProgress domain.DecisionProgress
 			executionArguments := call.Function.Arguments
 			if (structuralEvidenceCompletion || structuralEvidenceReadRecovery) &&
 				call.Function.Name == "read_workspace" {
@@ -540,6 +536,9 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					toolCalls++
 				}
 			}
+			if execution.Decision != nil {
+				submittedProgress = execution.Decision.Progress
+			}
 			if toolErr == nil && execution.Decision != nil {
 				normalized := normalizeDecisionLanguage(bundle, *execution.Decision)
 				normalized = canonicalizeDecisionSources(normalized, allowedSources, observedSources)
@@ -569,6 +568,13 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				execution.Decision = nil
 			}
 			if toolErr == nil && execution.Decision != nil {
+				if execution.Decision.Kind == domain.DecisionReply ||
+					execution.Decision.Kind == domain.DecisionRequestApproval {
+					execution.Decision.Progress.CompletedChecks = append(
+						[]string(nil),
+						terminalRepair.CompletedChecks...,
+					)
+				}
 				normalized := normalizeCodingDecisionWithSearchEvidence(
 					bundle,
 					*execution.Decision,
@@ -639,6 +645,12 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					evidenceDigest(call.Function.Name, content),
 					nonEmpty,
 				)
+				if nonEmpty {
+					terminalRepair.CompletedChecks = appendUniqueString(
+						terminalRepair.CompletedChecks,
+						call.Function.Name,
+					)
+				}
 			}
 			if toolErr == nil &&
 				execution.Decision == nil &&
@@ -654,6 +666,46 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				)
 			}
 			content := toolResultContent(execution, toolErr)
+			if toolErr != nil {
+				terminalRepair.LastFailure = toolErr.Error()
+				if len(submittedProgress.Unknowns) > 0 {
+					terminalRepair.Unknowns = append(
+						[]string(nil),
+						submittedProgress.Unknowns...,
+					)
+				}
+			}
+			fingerprint := toolResultFingerprint(
+				call.Function.Name,
+				executionArguments,
+				toolFingerprintSummary(execution, toolErr),
+				toolErr,
+			)
+			resultFingerprints[fingerprint]++
+			repeatCount := resultFingerprints[fingerprint]
+			if repeatCount == 2 {
+				postToolPrompts = append(
+					postToolPrompts,
+					"Recovery disposition retry_with_changed_input: this exact tool, normalized input, and result repeated without new evidence. Change the arguments or evidence source; do not mechanically repeat it.",
+				)
+			}
+			repeatLimit := l.MaxRepeatedCalls
+			if l.MaxNoProgress > 0 &&
+				(repeatLimit <= 0 || l.MaxNoProgress < repeatLimit) {
+				repeatLimit = l.MaxNoProgress
+			}
+			if repeatCount >= repeatLimit {
+				forceDecision = true
+				terminalRepair.LastFailure = fmt.Sprintf(
+					"converge_partial: repeated tool-result fingerprint for %s occurred %d times without changed conditions",
+					call.Function.Name,
+					repeatCount,
+				)
+				postToolPrompts = append(
+					postToolPrompts,
+					"Recovery disposition converge_partial: repeated conditions did not change. Broad investigation is closed; preserve supported facts, state exact unknowns, and submit a typed terminal outcome.",
+				)
+			}
 			observation := callSignature + "\x00" + content
 			if toolErr == nil && observation != lastObservation {
 				turnMadeProgress = true
@@ -827,7 +879,7 @@ func (b runBudget) RemainingToolCalls() int {
 	return remaining
 }
 
-func modelRunProgressPrompt(budget runBudget) string {
+func modelRunProgressPrompt(budget runBudget, repair ...terminalRepairContext) string {
 	remainingBytes := budget.MaxContextBytes - budget.ContextBytes
 	if remainingBytes < 0 {
 		remainingBytes = 0
@@ -842,13 +894,35 @@ func modelRunProgressPrompt(budget runBudget) string {
 		(budget.MaxToolCalls > 0 && budget.ToolCalls*5 >= budget.MaxToolCalls*4) {
 		urgency = "urgent"
 	}
+	dynamicState := "Dynamic run state: no completed checks or failed terminal gate recorded yet."
+	if len(repair) > 0 {
+		current := repair[0]
+		completed := strings.Join(nonEmptyTrimmedStrings(current.CompletedChecks), ", ")
+		if completed == "" {
+			completed = "none"
+		}
+		unknowns := strings.Join(nonEmptyTrimmedStrings(current.Unknowns), ", ")
+		if unknowns == "" {
+			unknowns = "none"
+		}
+		lastFailure := strings.TrimSpace(current.LastFailure)
+		if lastFailure == "" {
+			lastFailure = "none"
+		}
+		dynamicState = fmt.Sprintf(
+			"Dynamic run state: completed_checks=%s; unknowns=%s; last_failed_gate=%s; allowed_terminal_outcomes=complete,partial,clarification.",
+			completed,
+			unknowns,
+			lastFailure,
+		)
+	}
 	return fmt.Sprintf(
 		"%s Tool-call budget: %d of %d investigation calls used, %d remaining. "+
 			"Context budget: %d of %d bytes used (%d%%), %d bytes remaining. "+
 			"Automatic compaction: %t; replaced old messages: %d. Urgency: %s. "+
 			"Required outward language: %s; use that language for all explanatory prose. "+
 			"When urgency is urgent, stop broad investigation, preserve explicit unknowns, "+
-			"and converge on submit_decision.",
+			"and converge on submit_decision. %s",
 		modelTurnProgressPrompt(budget.CurrentTurn, budget.MaxTurns),
 		budget.ToolCalls,
 		budget.MaxToolCalls,
@@ -861,6 +935,7 @@ func modelRunProgressPrompt(budget runBudget) string {
 		budget.ReplacedMessages,
 		urgency,
 		budget.TargetLanguage,
+		dynamicState,
 	)
 }
 
@@ -921,11 +996,43 @@ func claimsRuntimeEvidenceWasLost(decision domain.Decision) bool {
 	return false
 }
 
-func terminalOnlyPrompt(attempt, maxAttempts int) string {
+type terminalRepairContext struct {
+	LastFailure     string
+	CompletedChecks []string
+	Unknowns        []string
+}
+
+func terminalOnlyPrompt(attempt, maxAttempts int, repair ...terminalRepairContext) string {
+	contextText := "Last rejection: none recorded. Reusable completed checks: none recorded. Explicit unknowns: derive only from current evidence."
+	if len(repair) > 0 {
+		current := repair[0]
+		lastFailure := strings.TrimSpace(current.LastFailure)
+		if lastFailure == "" {
+			lastFailure = "none recorded"
+		}
+		completed := strings.Join(nonEmptyTrimmedStrings(current.CompletedChecks), "; ")
+		if completed == "" {
+			completed = "none recorded"
+		}
+		unknowns := strings.Join(nonEmptyTrimmedStrings(current.Unknowns), "; ")
+		if unknowns == "" {
+			unknowns = "derive only from current evidence"
+		}
+		contextText = fmt.Sprintf(
+			"Last rejection: %s. Reusable completed checks: %s. Explicit unknowns: %s.",
+			lastFailure,
+			completed,
+			unknowns,
+		)
+	}
 	return fmt.Sprintf(
 		"Only submit_decision is available now. Previous investigation tools are no longer available. "+
+			"%s "+
 			"Call submit_decision in this turn using verified facts and explicit unknowns. "+
+			"Choose reply_outcome=complete when every requested fact is supported, partial when safe findings remain useful but named facts are unknown, or clarification when exact missing input prevents investigation. "+
+			"Do not repeat the rejected action or claim. "+
 			"This is terminal-only attempt %d of %d.",
+		contextText,
 		attempt,
 		maxAttempts,
 	)
@@ -1371,6 +1478,28 @@ func SubmitDecisionDefinition() agenttools.Definition {
 					Enum: []string{"verified", "insufficient"},
 					Desc: "Required for coding replies. Use verified only after an authoritative current-run read_workspace production read; use insufficient when a definite code claim cannot be supported. Insufficient free-form reply_text is replaced by a canonical evidence-limited response.",
 				},
+				"reply_outcome": {
+					Type:     schema.String,
+					Required: true,
+					Enum:     []string{"complete", "partial", "clarification"},
+					Desc:     "Required for reply decisions. complete answers every requested fact at the required evidence level; partial preserves supported findings and names exact unknowns; clarification asks for exact missing input or an ambiguous referent. This does not weaken evidence_status.",
+				},
+				"progress": {
+					Type: schema.Object,
+					Desc: "Structured bounded progress. Required for partial and clarification, and recommended for investigated complete replies. Every claimed completed check must have a current-run receipt.",
+					SubParams: map[string]*schema.ParameterInfo{
+						"completed_checks": {
+							Type:     schema.Array,
+							ElemInfo: &schema.ParameterInfo{Type: schema.String},
+						},
+						"initial_finding": {Type: schema.String},
+						"unknowns": {
+							Type:     schema.Array,
+							ElemInfo: &schema.ParameterInfo{Type: schema.String},
+						},
+						"next_step": {Type: schema.String},
+					},
+				},
 				"reply_text": {
 					Type: schema.String,
 					Desc: "Exact sender-facing text. Required for reply and request_approval. For delegated work, state completed read-only work, a concise initial finding or explicit unknown, and concrete information passed to the owner; do not merely acknowledge, restate, or promise future coordination. For verified coding replies, keep the structure as 结论、依据、未知/下一步 and cite authoritative production source_refs. Every repository-relative path in the reply must be cited, and every lower-camel-case code identifier must occur in the cited authoritative reads. An opaque String, bytes, raw JSON, or generic container declaration does not prove its concrete serialized shape; cite a current example, fixture, protocol, or serialization implementation before claiming that shape. For insufficient coding replies, the runtime emits canonical evidence-limited text. Lark mention placeholders like @_user_1 are internal keys from the mentions mapping: do not invent them, and do not use shell to send messages. The runtime renders known mention placeholders into Lark-native mentions and adds the robot marker only when replying as the owner on the owner's behalf.",
@@ -1693,6 +1822,21 @@ func verifyCodingDecision(
 	if decision.Risk == domain.RiskHigh || decision.Risk == domain.RiskForbidden {
 		return errs.NewInternalError(errs.SubtypeInvalidResponse, "coding reply with high or forbidden risk requires approval")
 	}
+	if decision.ReplyOutcome == domain.ReplyOutcomeClarification {
+		if decision.EvidenceStatus != domain.EvidenceInsufficient {
+			return errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"coding clarification must use evidence_status=insufficient because it makes no verified code claim",
+			)
+		}
+		if len(decision.Progress.Unknowns) == 0 || strings.TrimSpace(decision.Progress.NextStep) == "" {
+			return errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"coding clarification requires exact unknowns and next_step",
+			)
+		}
+		return nil
+	}
 	if decision.EvidenceStatus == domain.EvidenceInsufficient {
 		if codingEvidenceReads == 0 {
 			return errs.NewInternalError(
@@ -1744,6 +1888,24 @@ const canonicalInsufficientCodingReply = "结论：当前证据不足，不能�
 	"依据：已完成有界的工作区代码定位，但没有取得足以支撑确定结论的生产源码证据。\n" +
 	"未知/下一步：相关符号是否存在及实际行为仍未核实，我不会据此推测。"
 
+func canonicalCodingClarification(
+	bundle agentcontext.Bundle,
+	progress domain.DecisionProgress,
+) string {
+	if resolvedBundleLanguage(bundle) == agentlocale.LanguageEnglish {
+		return fmt.Sprintf(
+			"Conclusion: the input required to verify the code fact is missing, so no code claim can be made.\nStill unknown: %s.\nNext step: %s.",
+			strings.Join(progress.Unknowns, "; "),
+			progress.NextStep,
+		)
+	}
+	return fmt.Sprintf(
+		"结论：当前缺少核对代码事实所需的输入，不能据此作出代码断言。\n仍未知：%s。\n下一步：%s。",
+		strings.Join(progress.Unknowns, "；"),
+		progress.NextStep,
+	)
+}
+
 func normalizeCodingDecision(bundle agentcontext.Bundle, decision domain.Decision) domain.Decision {
 	return normalizeCodingDecisionWithSearchEvidence(
 		bundle,
@@ -1760,6 +1922,10 @@ func normalizeCodingDecisionWithSearchEvidence(
 	if isCodingBundle(bundle) &&
 		decision.Kind == domain.DecisionReply &&
 		decision.EvidenceStatus == domain.EvidenceInsufficient {
+		if decision.ReplyOutcome == domain.ReplyOutcomeClarification {
+			decision.ReplyText = canonicalCodingClarification(bundle, decision.Progress)
+			return decision
+		}
 		if searches.canRenderNegativeResult() {
 			decision.ReplyText = searches.renderNegativeResult(bundle)
 		} else {
@@ -1823,6 +1989,52 @@ func nonEmptyStrings(values []string) []string {
 		}
 	}
 	return out
+}
+
+func appendUniqueString(values []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func normalizeToolArguments(raw string) string {
+	var value any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return strings.TrimSpace(raw)
+	}
+	normalized, err := json.Marshal(value)
+	if err != nil {
+		return strings.TrimSpace(raw)
+	}
+	return string(normalized)
+}
+
+func toolResultFingerprint(toolName, arguments, content string, toolErr error) string {
+	category := "success"
+	if toolErr != nil {
+		category = "error"
+		if problem, ok := errs.ProblemOf(toolErr); ok {
+			category = string(problem.Subtype)
+		}
+	}
+	return evidenceDigest(
+		strings.TrimSpace(toolName)+"\x00"+normalizeToolArguments(arguments)+"\x00"+category,
+		content,
+	)
+}
+
+func toolFingerprintSummary(execution agenttools.Execution, toolErr error) string {
+	if toolErr != nil {
+		return toolErr.Error()
+	}
+	return strings.TrimSpace(execution.Content)
 }
 
 func sourceKey(source domain.SourceRef) string {

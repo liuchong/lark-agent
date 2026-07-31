@@ -130,6 +130,54 @@ func TestVerifyCodingDecisionRejectsInsufficientWithoutCodeInvestigation(t *test
 	}
 }
 
+func TestVerifyCodingDecisionAllowsClarificationWithoutCodeInvestigation(t *testing.T) {
+	err := verifyCodingDecision(agentcontext.Bundle{
+		TaskClass: domain.TaskClassCoding,
+		WorkKind:  domain.WorkKindCodingQuestion,
+		Event: domain.NormalizedEvent{
+			Content: "看一下这个报错",
+		},
+	}, domain.Decision{
+		Kind:           domain.DecisionReply,
+		Risk:           domain.RiskLow,
+		EvidenceStatus: domain.EvidenceInsufficient,
+		ReplyOutcome:   domain.ReplyOutcomeClarification,
+		ReplyText:      "请补充报错内容或对应代码路径，当前消息没有可核对的对象。",
+		Progress: domain.DecisionProgress{
+			Unknowns: []string{"报错内容和代码路径"},
+			NextStep: "补充报错文本或工作区相对路径",
+		},
+	}, map[string]bool{}, map[string]bool{}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestVerifyCodingDecisionKeepsVerifiedClaimsStrictForPartialOutcome(t *testing.T) {
+	err := verifyCodingDecision(agentcontext.Bundle{
+		TaskClass: domain.TaskClassCoding,
+		WorkKind:  domain.WorkKindCodingQuestion,
+		Event: domain.NormalizedEvent{
+			Content: "这个接口返回什么，是否有缓存？",
+		},
+	}, domain.Decision{
+		Kind:           domain.DecisionReply,
+		Risk:           domain.RiskLow,
+		EvidenceStatus: domain.EvidenceVerified,
+		ReplyOutcome:   domain.ReplyOutcomePartial,
+		ReplyText:      "接口返回 JSON；缓存行为仍未知。",
+		Progress: domain.DecisionProgress{
+			CompletedChecks: []string{"读取接口实现"},
+			InitialFinding:  "接口返回 JSON",
+			Unknowns:        []string{"缓存行为"},
+			NextStep:        "读取缓存适配器",
+		},
+	}, map[string]bool{}, map[string]bool{}, 1)
+	if err == nil || !strings.Contains(err.Error(), "no cited code evidence") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestVerifyGroundedCodingReplyRejectsUncitedRepositoryPath(t *testing.T) {
 	source := domain.SourceRef{
 		RelativePath: "sample-project/sample-module/sample-client/SampleRequest.java",

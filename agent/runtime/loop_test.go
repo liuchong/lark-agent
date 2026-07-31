@@ -1552,6 +1552,26 @@ func TestAgentLoopTerminalOnlyPromptAllowsOneCorrection(t *testing.T) {
 	}
 }
 
+func TestTerminalOnlyPromptCarriesFailureAndSafeDowngradeChoices(t *testing.T) {
+	got := terminalOnlyPrompt(2, 3, terminalRepairContext{
+		LastFailure:     "quality_gate: reply omitted the remaining unknown",
+		CompletedChecks: []string{"read_workspace service/message.go"},
+		Unknowns:        []string{"production rollout state"},
+	})
+	for _, want := range []string{
+		"quality_gate",
+		"read_workspace service/message.go",
+		"production rollout state",
+		"complete",
+		"partial",
+		"clarification",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("terminal prompt missing %q: %s", want, got)
+		}
+	}
+}
+
 func TestAgentLoopStopsAfterThreeIgnoredTerminalOnlyAttempts(t *testing.T) {
 	model := &scriptedModel{responses: []*schema.Message{
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("read_1", "read_workspace", `{"path":"account.go"}`)}),

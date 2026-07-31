@@ -1,0 +1,26 @@
+[
+  {
+    "name": "useful_partial_without_fixed_phrasing",
+    "expected_outcome": "partial",
+    "max_model_calls": 2,
+    "max_tool_calls": 1
+  },
+  {
+    "name": "clarification_without_fake_code_read",
+    "expected_outcome": "clarification",
+    "max_model_calls": 1,
+    "max_tool_calls": 0
+  },
+  {
+    "name": "repeated_tool_result_converges",
+    "expected_outcome": "partial",
+    "max_model_calls": 5,
+    "max_tool_calls": 3
+  },
+  {
+    "name": "unsupported_grounding_never_escapes",
+    "expected_outcome": "partial",
+    "max_model_calls": 3,
+    "max_tool_calls": 1
+  }
+]

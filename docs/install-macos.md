@@ -81,6 +81,7 @@ policy:
   owner_wait: 3m
   owner_reply_confidence_min: 0.85
   owner_reply_retry: 30s
+  owner_reply_max_retries: 3
   reply_confidence_min: 0.70
 ```
 

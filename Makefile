@@ -1,4 +1,4 @@
-.PHONY: build test unit-test integration-test install-test lint license-check verify
+.PHONY: build test unit-test integration-test harness-eval install-test lint license-check verify
 
 build:
 	go build ./cmd/lark-agent
@@ -8,6 +8,9 @@ unit-test:
 
 integration-test:
 	go test -race ./integration_test/lark_agent/...
+
+harness-eval:
+	go test -race -v ./integration_test/lark_agent -run 'TestHarnessEval'
 
 test:
 	go test -race ./...

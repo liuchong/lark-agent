@@ -151,6 +151,23 @@ func validateResponseQuality(bundle agentcontext.Bundle, decision domain.Decisio
 	if decision.Kind == domain.DecisionReply && containsFutureCommitment(decision.ReplyText) {
 		return qualityError("delegated automatic reply contains an unapproved future commitment")
 	}
+	if decision.Kind == domain.DecisionReply &&
+		decision.ReplyOutcome == domain.ReplyOutcomeClarification {
+		if len(decision.Progress.Unknowns) == 0 || strings.TrimSpace(decision.Progress.NextStep) == "" {
+			return qualityError("clarification reply requires structured progress with exact unknowns and next_step")
+		}
+		if isAcknowledgementOnly(decision.ReplyText) {
+			return qualityError("clarification reply is acknowledgement-only; ask for the exact missing input")
+		}
+		requestText := strings.TrimSpace(bundle.TaskSummary)
+		if requestText == "" {
+			requestText = bundle.Event.Content
+		}
+		if highRestatementSimilarity(requestText, decision.ReplyText) {
+			return qualityError("clarification reply mostly restates the request without asking for exact missing input")
+		}
+		return nil
+	}
 	if !bundleRequiresRelevantWork(bundle) {
 		return nil
 	}
@@ -163,20 +180,35 @@ func validateResponseQuality(bundle agentcontext.Bundle, decision domain.Decisio
 	if decision.Kind != domain.DecisionReply {
 		return nil
 	}
-	if isAcknowledgementOnly(decision.ReplyText) {
+	structuredProgress := hasUsefulStructuredProgress(decision.Progress)
+	if decision.ReplyOutcome == domain.ReplyOutcomePartial && !structuredProgress {
+		return qualityError("partial reply requires structured progress with completed checks, a finding or unknown, and next_step")
+	}
+	if isAcknowledgementOnly(decision.ReplyText) && !structuredProgress {
 		return qualityError("delegated reply is acknowledgement-only; state completed work and an initial finding or explicit unknown")
 	}
 	requestText := strings.TrimSpace(bundle.TaskSummary)
 	if requestText == "" {
 		requestText = bundle.Event.Content
 	}
-	if highRestatementSimilarity(requestText, decision.ReplyText) && !containsCompletedWorkSignal(decision.ReplyText) {
+	if highRestatementSimilarity(requestText, decision.ReplyText) &&
+		!structuredProgress &&
+		!containsCompletedWorkSignal(decision.ReplyText) {
 		return qualityError("delegated reply mostly restates the request without completed relevant work")
+	}
+	if structuredProgress {
+		return nil
 	}
 	if !containsCompletedWorkSignal(decision.ReplyText) {
 		return qualityError("delegated reply must state completed relevant work and an initial finding or explicit unknown")
 	}
 	return nil
+}
+
+func hasUsefulStructuredProgress(progress domain.DecisionProgress) bool {
+	return len(progress.CompletedChecks) > 0 &&
+		(strings.TrimSpace(progress.InitialFinding) != "" || len(progress.Unknowns) > 0) &&
+		strings.TrimSpace(progress.NextStep) != ""
 }
 
 func bundleRequiresRelevantWork(bundle agentcontext.Bundle) bool {

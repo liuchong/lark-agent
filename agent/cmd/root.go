@@ -1432,6 +1432,7 @@ func buildLiveOptions(
 		return nil, nil, nil, info, nil
 	}
 	store.ConfigureRecovery(cfg.Agent.MaxRetries)
+	store.ConfigureOwnerReplyRecovery(cfg.Policy.OwnerReplyMaxRetries)
 	credentials, err := serviceim.LoadCredentials(ctx, credentialRefs(cfg))
 	if err != nil {
 		return nil, nil, nil, info, err
@@ -1720,6 +1721,7 @@ func runtimePolicySnapshot(cfg config.Config) agentcontext.RuntimePolicySnapshot
 		OwnerWait:               cfg.Policy.OwnerWait.String(),
 		OwnerReplyConfidenceMin: cfg.Policy.OwnerReplyConfidenceMin,
 		OwnerReplyRetry:         cfg.Policy.OwnerReplyRetry.String(),
+		OwnerReplyMaxRetries:    cfg.Policy.OwnerReplyMaxRetries,
 		ReplyConfidenceMin:      cfg.Policy.ReplyConfidenceMin,
 		InvestigationProgress:   cfg.Policy.InvestigationProgress,
 	}
@@ -2228,7 +2230,7 @@ func (h liveTerminalFailureHandler) HandleTerminalFailure(
 		h.store,
 		h.messenger,
 		current.ID,
-		h.terminalFailureText(current, runErr),
+		h.terminalFailureText(ctx, current, runErr),
 	)
 }
 
@@ -2243,11 +2245,12 @@ func (h liveTerminalFailureHandler) handleTerminalFailureRequirement(
 		h.store,
 		h.messenger,
 		requirement,
-		h.terminalFailureText(item, runErr),
+		h.terminalFailureText(ctx, item, runErr),
 	)
 }
 
 func (h liveTerminalFailureHandler) terminalFailureText(
+	ctx context.Context,
 	item domain.WorkItem,
 	runErr error,
 ) string {
@@ -2265,29 +2268,127 @@ func (h liveTerminalFailureHandler) terminalFailureText(
 		}
 	}
 	reason := agentlocale.LocalizedReason(language, runErr.Error())
+	candidateText := h.unsentCandidateText(ctx, item.ID, language)
 	var text string
 	if language == agentlocale.LanguageEnglish {
 		text = fmt.Sprintf(
-			"%s, work #%d for message %s has stopped after bounded retries: %s. Completed evidence and failure history were preserved. In the intelligent-assistant private chat, send `/task %d` to inspect it; after reviewing side effects, send `/task resume %d confirm` only if it should run again.",
+			"%s, work #%d for message %s has stopped after bounded retries: %s. Completed evidence and failure history were preserved.%s In the intelligent-assistant private chat, send `/task %d` to inspect it; after reviewing side effects, send `/task resume %d confirm` only if it should run again.",
 			name,
 			item.ID,
 			item.Event.MessageID,
 			reason,
+			candidateText,
 			item.ID,
 			item.ID,
 		)
 	} else {
 		text = fmt.Sprintf(
-			"%s，工作 #%d（消息 %s）在有界重试后已停止：%s。已完成的证据和失败记录均已保留。请在智能助手私聊发送 `/task %d` 查看；核对外部动作后，确需重做时再发送 `/task resume %d confirm`。",
+			"%s，工作 #%d（消息 %s）在有界重试后已停止：%s。已完成的证据和失败记录均已保留。%s请在智能助手私聊发送 `/task %d` 查看；核对外部动作后，确需重做时再发送 `/task resume %d confirm`。",
 			name,
 			item.ID,
 			item.Event.MessageID,
 			reason,
+			candidateText,
 			item.ID,
 			item.ID,
 		)
 	}
 	return text
+}
+
+func (h liveTerminalFailureHandler) unsentCandidateText(
+	ctx context.Context,
+	workItemID int64,
+	language agentlocale.Language,
+) string {
+	candidate, found, err := h.store.ReadyWorkReplyCandidate(workItemID)
+	if err != nil {
+		return ""
+	}
+	if !found {
+		return h.durableRunProgressText(ctx, workItemID, language)
+	}
+	checks := strings.Join(candidate.Decision.Progress.CompletedChecks, "；")
+	unknowns := strings.Join(candidate.Decision.Progress.Unknowns, "；")
+	nextStep := strings.TrimSpace(candidate.Decision.Progress.NextStep)
+	draft := boundedOwnerSummary(candidate.Decision.ReplyText, 1200)
+	if language == agentlocale.LanguageEnglish {
+		return fmt.Sprintf(
+			" The original sender has not been answered. Unsent validated draft: %s. Completed checks: %s. Unknowns: %s. Next step: %s.",
+			draft,
+			emptySummaryValue(checks),
+			emptySummaryValue(unknowns),
+			emptySummaryValue(nextStep),
+		)
+	}
+	return fmt.Sprintf(
+		"尚未回复原提问者。未发送且已通过校验的草稿：%s。已核对：%s。未知：%s。下一步：%s。",
+		draft,
+		emptySummaryValue(checks),
+		emptySummaryValue(unknowns),
+		emptySummaryValue(nextStep),
+	)
+}
+
+func (h liveTerminalFailureHandler) durableRunProgressText(
+	ctx context.Context,
+	workItemID int64,
+	language agentlocale.Language,
+) string {
+	inspection, err := h.store.InspectWork(ctx, domain.WorkInspectionQuery{
+		WorkItemID: workItemID,
+	})
+	if err != nil || inspection.LatestRun == nil {
+		return ""
+	}
+	steps, err := h.store.ListAgentSteps(inspection.LatestRun.ID)
+	if err != nil {
+		return ""
+	}
+	checks := make([]string, 0, len(steps))
+	seen := make(map[string]bool)
+	for _, step := range steps {
+		name := strings.TrimSpace(step.ToolName)
+		if step.Kind != "tool" ||
+			strings.TrimSpace(step.Error) != "" ||
+			name == "" ||
+			name == "submit_decision" ||
+			name == "submit_investigation_plan" ||
+			seen[name] {
+			continue
+		}
+		seen[name] = true
+		checks = append(checks, name)
+	}
+	if len(checks) == 0 {
+		return ""
+	}
+	if language == agentlocale.LanguageEnglish {
+		return fmt.Sprintf(
+			" The original sender has not been answered. No sender-facing conclusion passed the safety and evidence gates. Completed checks: %s. Remaining unknown: a reliable answer to the original request.",
+			strings.Join(checks, ", "),
+		)
+	}
+	return fmt.Sprintf(
+		"尚未回复原提问者，未形成可安全发送的结论。已核对：%s。未知：原消息所需的可靠结论。",
+		strings.Join(checks, "；"),
+	)
+}
+
+func boundedOwnerSummary(value string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if maxRunes <= 0 || len(runes) <= maxRunes {
+		return value
+	}
+	return string(runes[:maxRunes]) + "…"
+}
+
+func emptySummaryValue(value string) string {
+	if value = strings.TrimSpace(value); value != "" {
+		return value
+	}
+	return "—"
 }
 
 func (n liveOwnerNotifier) HandleNotification(
@@ -3129,7 +3230,8 @@ func newQueueInspectCommand(out io.Writer, statePath *string) *cobra.Command {
 		Use:   "inspect",
 		Short: "Inspect one exact message or durable work item",
 		Long: "Inspect the intake receipt, latest durable stage, action, and " +
-			"interruption state for one exact message. Inspection never replays work.",
+			"interruption state for one exact message. A held validated reply candidate " +
+			"is included and remains explicitly unsent. Inspection never replays work.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := storage.OpenInspection(resolveStatePath(*statePath))
 			if err != nil {
@@ -3162,6 +3264,7 @@ func newQueueResumeCommand(out io.Writer, statePath *string) *cobra.Command {
 			"Safe cross-restart work is already re-evaluated automatically. " +
 			"Result-uncertain external actions are never replayed automatically. " +
 			"Completed, ignored, cancelled, or dead-letter work additionally requires --force-terminal. " +
+			"Explicit resume cancels any held reply candidate and starts a new investigation; it never sends the old draft. " +
 			"结果不确定的外部动作不会自动重放；仅在核对外部结果后，才可显式恢复终态工作。",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := storage.OpenInspection(resolveStatePath(*statePath))

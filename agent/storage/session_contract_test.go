@@ -198,6 +198,7 @@ func TestWaitingUserDeferralReachesRetryCeilingAtomically(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	store.ConfigureRecovery(1)
+	store.ConfigureOwnerReplyRecovery(1)
 
 	item := domain.NewWorkItem(domain.NormalizedEvent{
 		Source:    domain.SourcePoll,
@@ -235,8 +236,16 @@ func TestWaitingUserDeferralReachesRetryCeilingAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var semanticRetries int
+	if err := store.db.QueryRow(
+		`SELECT owner_reply_retry_count FROM work_items WHERE id = ?`,
+		current.ID,
+	).Scan(&semanticRetries); err != nil {
+		t.Fatal(err)
+	}
 	if current.Status != domain.StatusDeadLetter ||
-		current.RetryCount != 1 ||
+		current.RetryCount != 0 ||
+		semanticRetries != 1 ||
 		!current.NextAttemptAt.IsZero() ||
 		current.LeaseBy != "" {
 		t.Fatalf("current=%+v", current)
@@ -272,6 +281,7 @@ func TestTerminalResolutionRequirementIsCancelledByExplicitResume(t *testing.T) 
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	store.ConfigureRecovery(1)
+	store.ConfigureOwnerReplyRecovery(1)
 
 	item := terminalizeWaitingUserWork(t, store, "om_cancel_stale_terminal_notice")
 	required, err := store.ListRequiredOwnerResolutionNotifications(context.Background())
@@ -311,6 +321,7 @@ func TestLaterTerminalGenerationHasIndependentOwnerResolution(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	store.ConfigureRecovery(1)
+	store.ConfigureOwnerReplyRecovery(1)
 
 	firstItem := terminalizeWaitingUserWork(t, store, "om_terminal_generation")
 	firstRequired, err := store.ListRequiredOwnerResolutionNotifications(context.Background())
@@ -401,6 +412,7 @@ func TestExplicitResumeRejectsExecutingTerminalNotification(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	store.ConfigureRecovery(1)
+	store.ConfigureOwnerReplyRecovery(1)
 
 	item := terminalizeWaitingUserWork(t, store, "om_executing_terminal_notice")
 	required, err := store.ListRequiredOwnerResolutionNotifications(context.Background())
@@ -441,6 +453,7 @@ func TestExplicitResumeCancelsKnownFailedTerminalNotification(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	store.ConfigureRecovery(1)
+	store.ConfigureOwnerReplyRecovery(1)
 
 	item := terminalizeWaitingUserWork(t, store, "om_failed_terminal_notice")
 	required, err := store.ListRequiredOwnerResolutionNotifications(context.Background())

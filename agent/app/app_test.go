@@ -32,6 +32,11 @@ type fakeQueue struct {
 	deferFor   time.Duration
 	deadLetter bool
 	deadReason string
+	candidate  *domain.WorkReplyCandidate
+	saved      *domain.Decision
+	held       bool
+	consumed   bool
+	cancelled  bool
 }
 
 func (f *fakeQueue) UpdateWorkItemSchedulingClaim(
@@ -65,6 +70,44 @@ func (f *fakeQueue) ReadyApprovedReply(int64) (domain.Decision, bool, error) {
 		return domain.Decision{}, false, nil
 	}
 	return *f.approved, true, nil
+}
+
+func (f *fakeQueue) ReadyWorkReplyCandidate(int64) (domain.WorkReplyCandidate, bool, error) {
+	if f.candidate == nil {
+		return domain.WorkReplyCandidate{}, false, nil
+	}
+	return *f.candidate, true, nil
+}
+
+func (f *fakeQueue) SaveWorkReplyCandidate(_ int64, _ string, decision domain.Decision) error {
+	f.saved = &decision
+	f.candidate = &domain.WorkReplyCandidate{
+		WorkItemID: f.item.ID,
+		Status:     domain.ReplyCandidatePending,
+		Decision:   decision,
+	}
+	return nil
+}
+
+func (f *fakeQueue) HoldWorkReplyCandidate(_ int64, _ string, reason string) error {
+	f.held = true
+	if f.candidate != nil {
+		f.candidate.Status = domain.ReplyCandidateHeld
+		f.candidate.HoldReason = reason
+	}
+	return nil
+}
+
+func (f *fakeQueue) ConsumeWorkReplyCandidate(int64, string) error {
+	f.consumed = true
+	f.candidate = nil
+	return nil
+}
+
+func (f *fakeQueue) CancelWorkReplyCandidate(_ int64, _, _ string) error {
+	f.cancelled = true
+	f.candidate = nil
+	return nil
 }
 
 func (f *fakeQueue) ClaimNext(string) (domain.WorkItem, bool, error) {
@@ -406,6 +449,135 @@ func TestDaemonAmbiguousOwnerReplyDefersWithoutMainModel(t *testing.T) {
 	if !result.Processed || resolver.calls != 1 || decider.called ||
 		!q.deferred || q.deferFor != 45*time.Second || q.done {
 		t.Fatalf("result=%+v queue=%+v resolver=%+v decider=%+v", result, q, resolver, decider)
+	}
+}
+
+func TestDaemonResolvesHeldCandidateWithoutCallingMainModel(t *testing.T) {
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_held_candidate",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})
+	item.ID = 901
+	decision := domain.Decision{
+		Kind:         domain.DecisionReply,
+		Relevance:    domain.RelevanceDirectMention,
+		Risk:         domain.RiskLow,
+		ReplyOutcome: domain.ReplyOutcomePartial,
+		ReplyText:    "已核对入口；生产配置仍未知。",
+	}
+	q := &fakeQueue{
+		ok:   true,
+		item: item,
+		candidate: &domain.WorkReplyCandidate{
+			WorkItemID: item.ID,
+			Status:     domain.ReplyCandidateHeld,
+			Decision:   decision,
+		},
+	}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: item.Event.MessageID,
+		Result:          replymatch.ResultUnanswered,
+		Confidence:      0.99,
+		Reason:          "still unanswered",
+	}}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithReplyHandler(replier),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decider.called || resolver.calls != 1 || !replier.called ||
+		!q.consumed || !q.done || result.Decision.ReplyText != decision.ReplyText {
+		t.Fatalf("result=%+v queue=%+v resolver=%+v decider=%+v replier=%+v",
+			result, q, resolver, decider, replier)
+	}
+}
+
+func TestHeldCandidateReappliesCurrentRoutingPolicyBeforeSend(t *testing.T) {
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_held_candidate_paused",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})
+	item.ID = 902
+	q := &fakeQueue{
+		ok:   true,
+		item: item,
+		candidate: &domain.WorkReplyCandidate{
+			WorkItemID: item.ID,
+			Status:     domain.ReplyCandidateHeld,
+			Decision: domain.Decision{
+				Kind:         domain.DecisionReply,
+				Relevance:    domain.RelevanceDirectMention,
+				ReplyOutcome: domain.ReplyOutcomePartial,
+				ReplyText:    "stale validated candidate",
+			},
+		},
+	}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{
+			OwnerOpenID: "ou_owner",
+			Mode:        domain.ModePaused,
+		}),
+		WithReplyHandler(replier),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replier.called || !q.cancelled || !q.done ||
+		result.Decision.Kind != domain.DecisionIgnore ||
+		result.Decision.Reason != "agent_paused" {
+		t.Fatalf("result=%+v queue=%+v replier=%+v", result, q, replier)
+	}
+}
+
+func TestHeldCandidateWithoutResolverDeadLettersInsteadOfRetrying(t *testing.T) {
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_candidate_without_resolver",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})
+	item.ID = 44
+	decision := domain.Decision{
+		Kind:      domain.DecisionReply,
+		ReplyText: "validated candidate",
+	}
+	q := &fakeQueue{
+		ok:   true,
+		item: item,
+		candidate: &domain.WorkReplyCandidate{
+			WorkItemID: item.ID,
+			Status:     domain.ReplyCandidateHeld,
+			Decision:   decision,
+		},
+	}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithReplyHandler(&fakeReplyHandler{}),
+	)
+	if _, err := daemon.RunOnce(context.Background()); err == nil {
+		t.Fatal("missing candidate resolver unexpectedly succeeded")
+	}
+	if !q.deadLetter || q.retried {
+		t.Fatalf("queue=%+v", q)
 	}
 }
 
@@ -789,6 +961,18 @@ func (h *fakeReplyHandler) Handle(_ context.Context, _ domain.WorkItem, decision
 
 func (h *fakeReplyHandler) RequiresApproval(domain.Decision) bool {
 	return h.approvalExpected || h.status == domain.ActionAwaitingApproval
+}
+
+type blockedPreflightCompletedReplyHandler struct {
+	fakeReplyHandler
+}
+
+func (h *blockedPreflightCompletedReplyHandler) Preflight(
+	context.Context,
+	domain.WorkItem,
+	domain.Decision,
+) (domain.Action, error) {
+	return domain.Action{Status: domain.ActionBlocked}, nil
 }
 
 type fakeOwnerActivity struct {
@@ -1511,6 +1695,48 @@ func TestDaemonCompletesWorkForCompletedPostReplyNotification(t *testing.T) {
 	}
 	if replier.called || notifier.called || !result.Processed || q.completed == false {
 		t.Fatalf("result=%+v replier=%+v notifier=%+v queue=%+v", result, replier, notifier, q)
+	}
+}
+
+func TestCandidateIsConsumedAfterPostReplyNotificationCompletes(t *testing.T) {
+	decision := domain.Decision{
+		Kind:        domain.DecisionReply,
+		Relevance:   domain.RelevanceDirectMention,
+		ReplyText:   "validated candidate",
+		OwnerAction: "owner follow-up",
+	}
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_candidate_post_notice",
+	})
+	item.ID = 42
+	q := &fakePostReplyQueue{
+		fakeQueue: &fakeQueue{
+			item: item,
+			candidate: &domain.WorkReplyCandidate{
+				WorkItemID: item.ID,
+				Status:     domain.ReplyCandidatePending,
+				Decision:   decision,
+			},
+		},
+		actionID:  93,
+		key:       "owner-notification:candidate",
+		completed: true,
+	}
+	daemon := NewDaemon(q, router.New(router.Config{Mode: domain.ModeAuto}),
+		WithReplyHandler(&blockedPreflightCompletedReplyHandler{}),
+		WithNotificationHandler(&fakeNotifier{}),
+	)
+	result, err := daemon.finishCandidateDecision(
+		context.Background(),
+		item,
+		decision,
+		q,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || !q.consumed || !q.done || q.candidate != nil {
+		t.Fatalf("result=%+v queue=%+v", result, q)
 	}
 }
 

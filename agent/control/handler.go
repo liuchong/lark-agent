@@ -318,6 +318,7 @@ func (h *Handler) taskText(ctx context.Context, workItemID int64) (string, error
 			state.en,
 		)
 		text += investigationTaskText(task.Investigation, true, true)
+		text += replyCandidateTaskText(inspection.ReplyCandidate, true)
 		if state.fact != "" {
 			text += "\nLatest durable fact: " + sanitizeText(state.fact, 240, true)
 		}
@@ -335,6 +336,7 @@ func (h *Handler) taskText(ctx context.Context, workItemID int64) (string, error
 		state.zh,
 	)
 	text += investigationTaskText(task.Investigation, false, true)
+	text += replyCandidateTaskText(inspection.ReplyCandidate, false)
 	if state.fact != "" {
 		text += "\n最新可靠事实：" + sanitizeText(state.fact, 240, false)
 	}
@@ -344,6 +346,34 @@ func (h *Handler) taskText(ctx context.Context, workItemID int64) (string, error
 		text += "\n当前没有需要人工执行的操作。"
 	}
 	return text, nil
+}
+
+func replyCandidateTaskText(candidate *domain.WorkReplyCandidate, english bool) string {
+	if candidate == nil {
+		return ""
+	}
+	draft := sanitizeText(candidate.Decision.ReplyText, 600, english)
+	checks := sanitizeText(strings.Join(candidate.Decision.Progress.CompletedChecks, "; "), 300, english)
+	unknowns := sanitizeText(strings.Join(candidate.Decision.Progress.Unknowns, "; "), 300, english)
+	nextStep := sanitizeText(candidate.Decision.Progress.NextStep, 240, english)
+	if english {
+		return fmt.Sprintf(
+			"\nUnsent reply candidate: %s (the original sender has not been answered)\nDraft: %s\nCompleted checks: %s\nUnknowns: %s\nNext step: %s",
+			candidate.Status,
+			draft,
+			checks,
+			unknowns,
+			nextStep,
+		)
+	}
+	return fmt.Sprintf(
+		"\n未发送回复候选：%s（尚未回复原提问者）\n草稿：%s\n已核对：%s\n未知：%s\n下一步：%s",
+		candidate.Status,
+		draft,
+		checks,
+		unknowns,
+		nextStep,
+	)
 }
 
 func (h *Handler) approvalsText(ctx context.Context, pageNumber int) (string, error) {
@@ -578,6 +608,8 @@ func detailedHelp(english bool, topic string) string {
 				"`/task cancel <work-id> <reason>`",
 				"`/task acknowledge <work-id> <note>`",
 				"`/task reconcile <work-id> completed|not-completed|unknown <reason>`",
+				"`/task <work-id>` shows a held unsent reply candidate and its completed checks when one exists.",
+				"`/task resume <work-id> confirm` cancels that candidate and starts a new investigation.",
 				"Uncertain external actions must be reconciled and are never replayed automatically.",
 			}, "\n")
 		}
@@ -590,7 +622,8 @@ func detailedHelp(english bool, topic string) string {
 			"`/task cancel <工作号> <原因>`",
 			"`/task acknowledge <工作号> <说明>`",
 			"`/task reconcile <工作号> completed|not-completed|unknown <核对说明>`",
-			"`/tasks` 和 `/task <工作号>` 会显示调查主题、调查状态、上下文证据和最近错误。",
+			"`/tasks` 和 `/task <工作号>` 会显示调查主题、调查状态、上下文证据、最近错误，以及已保全但尚未发给原提问者的回复候选。",
+			"`/task resume <工作号> confirm` 会取消旧候选并重新调查，不会直接发送旧草稿。",
 			"正在自动调查时可再次发送 `/task <工作号>` 刷新；中断、失败或结果不确定时按详情给出的精确命令处理。",
 			"外部结果不确定时必须先核对，智能助手不会自动重放。",
 		}, "\n")

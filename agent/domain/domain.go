@@ -593,6 +593,25 @@ const (
 	EvidenceInsufficient EvidenceStatus = "insufficient"
 )
 
+// ReplyOutcome records whether a sender-facing decision is complete, bounded
+// but partial, or requires exact missing input.
+type ReplyOutcome string
+
+const (
+	ReplyOutcomeComplete      ReplyOutcome = "complete"
+	ReplyOutcomePartial       ReplyOutcome = "partial"
+	ReplyOutcomeClarification ReplyOutcome = "clarification"
+)
+
+// DecisionProgress preserves useful bounded work independently from reply
+// wording so quality checks do not depend on fixed phrases.
+type DecisionProgress struct {
+	CompletedChecks []string `json:"completed_checks,omitempty" yaml:"completed_checks,omitempty"`
+	InitialFinding  string   `json:"initial_finding,omitempty" yaml:"initial_finding,omitempty"`
+	Unknowns        []string `json:"unknowns,omitempty" yaml:"unknowns,omitempty"`
+	NextStep        string   `json:"next_step,omitempty" yaml:"next_step,omitempty"`
+}
+
 // Decision is an auditable routing or agent decision.
 type Decision struct {
 	Kind           DecisionKind         `json:"kind" yaml:"kind"`
@@ -603,12 +622,37 @@ type Decision struct {
 	Confidence     float64              `json:"confidence" yaml:"confidence"`
 	Risk           Risk                 `json:"risk" yaml:"risk"`
 	EvidenceStatus EvidenceStatus       `json:"evidence_status,omitempty" yaml:"evidence_status,omitempty"`
+	ReplyOutcome   ReplyOutcome         `json:"reply_outcome,omitempty" yaml:"reply_outcome,omitempty"`
+	Progress       DecisionProgress     `json:"progress,omitempty" yaml:"progress,omitempty"`
 	Reason         string               `json:"reason" yaml:"reason"`
 	ReplyText      string               `json:"reply_text,omitempty" yaml:"reply_text,omitempty"`
 	OwnerAction    string               `json:"owner_action,omitempty" yaml:"owner_action,omitempty"`
 	Language       string               `json:"language,omitempty" yaml:"language,omitempty"`
 	Sources        []SourceRef          `json:"sources,omitempty" yaml:"sources,omitempty"`
 	ControlCommand *OwnerControlCommand `json:"control_command,omitempty" yaml:"control_command,omitempty"`
+}
+
+// ReplyCandidateStatus is the durable lifecycle of one validated but not yet
+// necessarily sent reply.
+type ReplyCandidateStatus string
+
+const (
+	ReplyCandidatePending   ReplyCandidateStatus = "pending"
+	ReplyCandidateHeld      ReplyCandidateStatus = "held"
+	ReplyCandidateConsumed  ReplyCandidateStatus = "consumed"
+	ReplyCandidateCancelled ReplyCandidateStatus = "cancelled"
+)
+
+// WorkReplyCandidate preserves an already validated decision across a final
+// owner-handled semantic recheck.
+type WorkReplyCandidate struct {
+	WorkItemID int64                `json:"work_item_id" yaml:"work_item_id"`
+	Digest     string               `json:"digest" yaml:"digest"`
+	Status     ReplyCandidateStatus `json:"status" yaml:"status"`
+	HoldReason string               `json:"hold_reason,omitempty" yaml:"hold_reason,omitempty"`
+	Decision   Decision             `json:"decision" yaml:"decision"`
+	CreatedAt  time.Time            `json:"created_at" yaml:"created_at"`
+	UpdatedAt  time.Time            `json:"updated_at" yaml:"updated_at"`
 }
 
 // SourceRef identifies a source that may be shown to the model or owner.
@@ -781,6 +825,7 @@ type WorkInspection struct {
 	LatestAction       *ActionAttempt          `json:"latest_action,omitempty" yaml:"latest_action,omitempty"`
 	LatestInterruption *WorkInterruption       `json:"latest_interruption,omitempty" yaml:"latest_interruption,omitempty"`
 	Investigation      *DelegatedInvestigation `json:"investigation,omitempty" yaml:"investigation,omitempty"`
+	ReplyCandidate     *WorkReplyCandidate     `json:"reply_candidate,omitempty" yaml:"reply_candidate,omitempty"`
 	State              WorkInspectionState     `json:"state" yaml:"state"`
 }
 
