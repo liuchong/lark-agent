@@ -511,7 +511,12 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 			if resolution.RetryAfter > delay {
 				delay = resolution.RetryAfter
 			}
-			return d.deferDelegatedReply(item, decision, "owner_reply_ambiguous", delay)
+			return d.deferDelegatedReply(
+				item,
+				decision,
+				delegatedReplyAmbiguousReason("owner_reply_ambiguous", resolution),
+				delay,
+			)
 		}
 		switch resolution.Result {
 		case replymatch.ResultAnswered:
@@ -772,11 +777,15 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 		}
 		if latest.Confidence < d.replyConfidenceMin ||
 			latest.Result == replymatch.ResultAmbiguous {
+			reason := delegatedReplyAmbiguousReason(
+				"investigation_final_context_ambiguous",
+				latest,
+			)
 			if candidateSaved {
 				if err := candidates.HoldWorkReplyCandidate(
 					item.ID,
 					item.LeaseBy,
-					"investigation_final_context_ambiguous",
+					reason,
 				); err != nil {
 					d.markRetry(item, err)
 					return Result{}, err
@@ -785,7 +794,7 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 			return d.deferDelegatedReply(
 				item,
 				decision,
-				"investigation_final_context_ambiguous",
+				reason,
 				d.replyResolutionRetry,
 			)
 		}
@@ -906,10 +915,11 @@ func (d *Daemon) resolveHeldReplyCandidate(
 		if resolution.RetryAfter > delay {
 			delay = resolution.RetryAfter
 		}
+		reason := delegatedReplyAmbiguousReason("candidate_context_ambiguous", resolution)
 		if err := candidates.HoldWorkReplyCandidate(
 			item.ID,
 			item.LeaseBy,
-			"candidate_context_ambiguous",
+			reason,
 		); err != nil {
 			d.markRetry(item, err)
 			return Result{}, err
@@ -917,7 +927,7 @@ func (d *Daemon) resolveHeldReplyCandidate(
 		return d.deferDelegatedReply(
 			item,
 			candidate.Decision,
-			"candidate_context_ambiguous",
+			reason,
 			delay,
 		)
 	}
@@ -998,6 +1008,16 @@ func (d *Daemon) deferDelegatedReply(
 			Reason:    reason,
 		},
 	}, nil
+}
+
+func delegatedReplyAmbiguousReason(
+	fallback string,
+	resolution replymatch.Resolution,
+) string {
+	if strings.Contains(strings.ToLower(resolution.Reason), "owner reaction read failed") {
+		return "owner_reaction_read_failed"
+	}
+	return fallback
 }
 
 func isDelegatedReply(relevance domain.Relevance) bool {

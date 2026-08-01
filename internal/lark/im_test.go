@@ -307,6 +307,109 @@ func TestDeleteTypingReactionUsesBotIdentity(t *testing.T) {
 	}
 }
 
+func TestListMessageReactionsUsesUserIdentityAndOpenIDPagination(t *testing.T) {
+	caller := &routingCaller{
+		call: func(req APIRequest) (interface{}, error) {
+			switch req.Params["page_token"] {
+			case nil:
+				return map[string]any{"data": map[string]any{
+					"has_more":   true,
+					"page_token": "next-page",
+					"items": []any{map[string]any{
+						"reaction_id": "r_other",
+						"operator": map[string]any{
+							"operator_type": "user",
+							"operator_id":   map[string]any{"open_id": "ou_other"},
+						},
+						"reaction_type": map[string]any{"emoji_type": "Get"},
+					}},
+				}}, nil
+			case "next-page":
+				return map[string]any{"data": map[string]any{
+					"items": []any{map[string]any{
+						"reaction_id": "r_owner",
+						"operator": map[string]any{
+							"operator_type": "user",
+							"operator_id":   map[string]any{"open_id": "ou_owner"},
+						},
+						"reaction_type": map[string]any{"emoji_type": "Get"},
+					}},
+				}}, nil
+			default:
+				t.Fatalf("unexpected page token: %+v", req.Params)
+				return nil, nil
+			}
+		},
+	}
+	svc := NewService(caller, "ou_owner")
+	result, err := svc.FindOwnerAckReaction(context.Background(), OwnerAckReactionRequest{
+		MessageID:   "om_private",
+		OwnerOpenID: "ou_owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Found ||
+		result.Reaction.ReactionID != "r_owner" ||
+		result.Reaction.EmojiType != "Get" ||
+		result.Reaction.OperatorOpenID != "ou_owner" {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(caller.requests) != 2 {
+		t.Fatalf("requests=%d", len(caller.requests))
+	}
+	for _, req := range caller.requests {
+		if req.As != IdentityUser ||
+			req.Method != http.MethodGet ||
+			req.Path != "/open-apis/im/v1/messages/om_private/reactions" ||
+			req.Params["user_id_type"] != "open_id" {
+			t.Fatalf("request=%+v", req)
+		}
+	}
+}
+
+func TestFindOwnerAckReactionIgnoresOtherUsersBotsAndUnsupportedEmoji(t *testing.T) {
+	caller := &fakeCaller{response: map[string]any{"data": map[string]any{
+		"items": []any{
+			map[string]any{
+				"reaction_id": "r_other",
+				"operator": map[string]any{
+					"operator_type": "user",
+					"operator_id":   map[string]any{"open_id": "ou_other"},
+				},
+				"reaction_type": map[string]any{"emoji_type": "Get"},
+			},
+			map[string]any{
+				"reaction_id": "r_bot",
+				"operator": map[string]any{
+					"operator_type": "bot",
+					"operator_id":   map[string]any{"open_id": "ou_owner"},
+				},
+				"reaction_type": map[string]any{"emoji_type": "Get"},
+			},
+			map[string]any{
+				"reaction_id": "r_owner_typing",
+				"operator": map[string]any{
+					"operator_type": "user",
+					"operator_id":   map[string]any{"open_id": "ou_owner"},
+				},
+				"reaction_type": map[string]any{"emoji_type": "Typing"},
+			},
+		},
+	}}}
+	svc := NewService(caller, "ou_owner")
+	result, err := svc.FindOwnerAckReaction(context.Background(), OwnerAckReactionRequest{
+		MessageID:   "om_private",
+		OwnerOpenID: "ou_owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Found {
+		t.Fatalf("unsupported reaction counted: %+v", result)
+	}
+}
+
 func TestNotifyOwnerUsesBotIdentity(t *testing.T) {
 	caller := &fakeCaller{}
 	svc := NewService(caller, "ou_owner")

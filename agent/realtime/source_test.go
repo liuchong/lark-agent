@@ -134,7 +134,8 @@ func TestRealtimePreflightAcceptsPublishedEventWithBothScopes(t *testing.T) {
 	    "event_infos":[{"event_type":"im.message.receive_v1"}],
 	    "scopes":[
 	      {"scope":"im:message.p2p_msg:readonly","token_types":["tenant"]},
-	      {"scope":"im:message.group_at_msg:readonly","token_types":["tenant"]}
+	      {"scope":"im:message.group_at_msg:readonly","token_types":["tenant"]},
+	      {"scope":"im:message.reactions:read","token_types":["tenant"]}
 	    ]
 	  }]}
 	}`}

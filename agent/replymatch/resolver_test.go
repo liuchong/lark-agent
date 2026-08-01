@@ -102,6 +102,32 @@ func TestResolverRejectsInventedOrNonOwnerMatchedMessageID(t *testing.T) {
 	}
 }
 
+func TestResolverRejectsModelFabricatedOwnerAckReaction(t *testing.T) {
+	base := time.Date(2026, 7, 31, 5, 0, 0, 0, time.UTC)
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_target",
+		"result":"answered",
+		"owner_ack_reaction":{
+			"reaction_id":"r_fabricated",
+			"emoji_type":"Get",
+			"operator_type":"user",
+			"operator_open_id":"ou_owner"
+		},
+		"confidence":1,
+		"reason":"Owner reacted with Get."
+	}`}
+	_, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_target", ChatID: "oc_private", ChatType: "p2p",
+			SenderID: "ou_teammate", Content: "要回复的问题", CreatedAt: base,
+		}),
+		ContextCutoff: base.Add(3 * time.Minute),
+	})
+	if err == nil {
+		t.Fatal("model-fabricated owner ack reaction was accepted")
+	}
+}
+
 func TestResolverFailsClosedWhenContextIsIncomplete(t *testing.T) {
 	model := &scriptedModel{reply: `{"result":"unanswered","confidence":1}`}
 	resolution, err := New(model, "ou_owner").Resolve(context.Background(), Request{
@@ -160,6 +186,115 @@ func TestResolverAcceptsNoReplyNeededForAnswerToOwnerLedPrivateDiscussion(t *tes
 		resolution.MatchedOwnerMessageIDs[0] != "om_owner_continues" {
 		t.Fatalf("resolution=%+v", resolution)
 	}
+}
+
+func TestResolverNormalizesPrivateAnswerWithoutTargetObligationToNoReplyNeeded(t *testing.T) {
+	base := time.Date(2026, 7, 31, 4, 22, 52, 0, time.UTC)
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_private_answer",
+		"result":"unanswered",
+		"confidence":0.92,
+		"reason":"The prior owner question mentioned a missing group member limit, but the target only reports that it was discussed without detailed design.",
+		"target_intent":"answer",
+		"task_summary":"investigate why the group member limit cannot be found",
+		"task_class":"coding",
+		"classification_confidence":0.90,
+		"requires_progress":true
+	}`}
+	resolution, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_private_answer", ChatID: "oc_private", ChatType: "p2p",
+			SenderID: "ou_teammate", SenderType: "user",
+			Content:   "当时说要做但没设计详细交互，后面也没看到继续推进",
+			CreatedAt: base.Add(2 * time.Minute),
+		}),
+		Messages: []domain.NormalizedEvent{
+			{
+				MessageID: "om_owner_question", ChatID: "oc_private", ChatType: "p2p",
+				SenderID:  "ou_owner",
+				Content:   "那个群成员数量限制为什么找不到？",
+				CreatedAt: base,
+			},
+			{
+				MessageID: "om_private_answer", ChatID: "oc_private", ChatType: "p2p",
+				SenderID: "ou_teammate", SenderType: "user",
+				Content:   "当时说要做但没设计详细交互，后面也没看到继续推进",
+				CreatedAt: base.Add(2 * time.Minute),
+			},
+		},
+		ContextCutoff: base.Add(3 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Result != ResultNoReplyNeeded ||
+		resolution.TargetIntent != "answer" ||
+		resolution.ResponseObligationQuote != "" ||
+		resolution.RequiresProgress ||
+		resolution.TaskSummary != "" {
+		t.Fatalf("resolution=%+v", resolution)
+	}
+}
+
+func TestResolverRequiresExactPrivateTargetObligationForUnanswered(t *testing.T) {
+	base := time.Date(2026, 7, 31, 4, 22, 52, 0, time.UTC)
+	t.Run("explicit request quote is accepted", func(t *testing.T) {
+		model := &scriptedModel{reply: `{
+			"target_message_id":"om_private_request",
+			"result":"unanswered",
+			"confidence":0.94,
+			"reason":"The target asks the owner to investigate code.",
+			"target_intent":"request",
+			"response_obligation_quote":"你帮我查一下代码",
+			"task_summary":"查代码确认群成员数量限制入口",
+			"task_class":"coding",
+			"classification_confidence":0.91,
+			"requires_progress":true
+		}`}
+		resolution, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+			Target: domain.NewWorkItem(domain.NormalizedEvent{
+				MessageID: "om_private_request", ChatID: "oc_private", ChatType: "p2p",
+				SenderID: "ou_teammate", SenderType: "user",
+				Content:   "当时说要做但没设计详细交互，你帮我查一下代码",
+				CreatedAt: base.Add(2 * time.Minute),
+			}),
+			ContextCutoff: base.Add(3 * time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resolution.Result != ResultUnanswered ||
+			resolution.ResponseObligationQuote != "你帮我查一下代码" {
+			t.Fatalf("resolution=%+v", resolution)
+		}
+	})
+
+	t.Run("invented quote is rejected", func(t *testing.T) {
+		model := &scriptedModel{reply: `{
+			"target_message_id":"om_private_answer",
+			"result":"unanswered",
+			"confidence":0.94,
+			"reason":"The target asks for code investigation.",
+			"target_intent":"request",
+			"response_obligation_quote":"你帮我查一下代码",
+			"task_summary":"查代码确认群成员数量限制入口",
+			"task_class":"coding",
+			"classification_confidence":0.91,
+			"requires_progress":true
+		}`}
+		_, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+			Target: domain.NewWorkItem(domain.NormalizedEvent{
+				MessageID: "om_private_answer", ChatID: "oc_private", ChatType: "p2p",
+				SenderID: "ou_teammate", SenderType: "user",
+				Content:   "当时说要做但没设计详细交互，后面也没看到继续推进",
+				CreatedAt: base.Add(2 * time.Minute),
+			}),
+			ContextCutoff: base.Add(3 * time.Minute),
+		})
+		if err == nil {
+			t.Fatal("invented private target obligation quote was accepted")
+		}
+	})
 }
 
 func TestResolverRejectsNoReplyNeededForExplicitGroupOwnerMention(t *testing.T) {

@@ -500,6 +500,14 @@ func (s *Store) migrate() error {
 			`CREATE INDEX IF NOT EXISTS idx_work_reply_candidates_status
 			 ON work_reply_candidates(status, updated_at)`,
 		}},
+		{version: 17, statements: []string{
+			`ALTER TABLE owner_reply_resolutions
+			 ADD COLUMN target_intent TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE owner_reply_resolutions
+			 ADD COLUMN response_obligation_quote TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE owner_reply_resolutions
+			 ADD COLUMN owner_ack_reaction_json TEXT NOT NULL DEFAULT ''`,
+		}},
 	}
 	for _, migration := range migrations {
 		if version >= migration.version {
@@ -3453,6 +3461,17 @@ func (s *Store) RecordOwnerReplyResolution(
 			"encode matched owner messages",
 		).WithCause(err)
 	}
+	ownerAckReactionJSON := ""
+	if resolution.OwnerAckReaction != nil {
+		encoded, err := json.Marshal(resolution.OwnerAckReaction)
+		if err != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"encode owner ack reaction",
+			).WithCause(err)
+		}
+		ownerAckReactionJSON = string(encoded)
+	}
 	if resolution.ContextCutoff.IsZero() {
 		return errs.NewValidationError(
 			errs.SubtypeInvalidArgument,
@@ -3464,15 +3483,19 @@ func (s *Store) RecordOwnerReplyResolution(
 		`INSERT INTO owner_reply_resolutions(
 			work_item_id, target_message_id, result,
 			matched_owner_message_ids_json, confidence, reason,
+			target_intent, response_obligation_quote, owner_ack_reaction_json,
 			task_summary, task_class, classification_confidence,
 			requires_progress, context_cutoff, evaluated_at
-		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		workItemID,
 		resolution.TargetMessageID,
 		resolution.Result,
 		string(matchedJSON),
 		resolution.Confidence,
 		resolution.Reason,
+		resolution.TargetIntent,
+		resolution.ResponseObligationQuote,
+		ownerAckReactionJSON,
 		resolution.TaskSummary,
 		resolution.TaskClass,
 		resolution.ClassificationConfidence,
@@ -3496,7 +3519,8 @@ func (s *Store) ListOwnerReplyResolutions(
 	rows, err := s.db.QueryContext(
 		context.Background(),
 		`SELECT target_message_id, result, matched_owner_message_ids_json,
-		        confidence, reason, task_summary, task_class,
+		        confidence, reason, target_intent, response_obligation_quote,
+		        owner_ack_reaction_json, task_summary, task_class,
 		        classification_confidence, requires_progress, context_cutoff
 		 FROM owner_reply_resolutions
 		 WHERE work_item_id = ?
@@ -3515,13 +3539,16 @@ func (s *Store) ListOwnerReplyResolutions(
 	var out []replymatch.Resolution
 	for rows.Next() {
 		var resolution replymatch.Resolution
-		var resultRaw, matchedRaw, taskClassRaw, cutoffRaw string
+		var resultRaw, matchedRaw, ownerAckReactionRaw, taskClassRaw, cutoffRaw string
 		if err := rows.Scan(
 			&resolution.TargetMessageID,
 			&resultRaw,
 			&matchedRaw,
 			&resolution.Confidence,
 			&resolution.Reason,
+			&resolution.TargetIntent,
+			&resolution.ResponseObligationQuote,
+			&ownerAckReactionRaw,
 			&resolution.TaskSummary,
 			&taskClassRaw,
 			&resolution.ClassificationConfidence,
@@ -3543,6 +3570,19 @@ func (s *Store) ListOwnerReplyResolutions(
 				errs.SubtypeStorage,
 				"decode matched owner messages",
 			).WithCause(err)
+		}
+		if strings.TrimSpace(ownerAckReactionRaw) != "" {
+			var reaction replymatch.OwnerAckReaction
+			if err := json.Unmarshal(
+				[]byte(ownerAckReactionRaw),
+				&reaction,
+			); err != nil {
+				return nil, errs.NewInternalError(
+					errs.SubtypeStorage,
+					"decode owner ack reaction",
+				).WithCause(err)
+			}
+			resolution.OwnerAckReaction = &reaction
 		}
 		resolution.ContextCutoff, _ = time.Parse(time.RFC3339Nano, cutoffRaw)
 		out = append(out, resolution)

@@ -172,6 +172,26 @@ type Message struct {
 	UpdateTime        string
 }
 
+// MessageReaction is the typed subset of Lark reaction data used by the agent.
+type MessageReaction struct {
+	ReactionID     string
+	EmojiType      string
+	OperatorType   string
+	OperatorOpenID string
+}
+
+type OwnerAckReactionRequest struct {
+	MessageID   string
+	OwnerOpenID string
+	PageSize    int
+	MaxPages    int
+}
+
+type OwnerAckReactionResult struct {
+	Found    bool
+	Reaction MessageReaction
+}
+
 // MessageAttachment is a typed reference to message evidence that can be
 // fetched through the Lark resource API when the model needs it.
 type MessageAttachment struct {
@@ -1236,6 +1256,87 @@ func (s *Service) DeleteReactionAsBot(ctx context.Context, messageID, reactionID
 	return err
 }
 
+// FindOwnerAckReaction reads reactions on one exact message as the user and
+// returns only configured-owner acknowledgement reactions.
+func (s *Service) FindOwnerAckReaction(
+	ctx context.Context,
+	req OwnerAckReactionRequest,
+) (OwnerAckReactionResult, error) {
+	if s.caller == nil {
+		return OwnerAckReactionResult{}, errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"IM API caller is not configured",
+		)
+	}
+	messageID := strings.TrimSpace(req.MessageID)
+	if messageID == "" {
+		return OwnerAckReactionResult{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"message_id is required",
+		).WithParam("message_id")
+	}
+	ownerOpenID := strings.TrimSpace(req.OwnerOpenID)
+	if ownerOpenID == "" {
+		ownerOpenID = s.ownerOpenID
+	}
+	if ownerOpenID == "" {
+		return OwnerAckReactionResult{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"owner_open_id is required",
+		).WithParam("owner_open_id")
+	}
+	pageSize := clamp(req.PageSize, 1, 50, 50)
+	maxPages := req.MaxPages
+	if maxPages <= 0 || maxPages > 5 {
+		maxPages = 5
+	}
+	pageToken := ""
+	for page := 0; page < maxPages; page++ {
+		params := map[string]any{
+			"page_size":    pageSize,
+			"user_id_type": "open_id",
+		}
+		if pageToken != "" {
+			params["page_token"] = pageToken
+		}
+		result, err := s.caller.CallAPI(ctx, APIRequest{
+			Method: http.MethodGet,
+			Path: fmt.Sprintf(
+				"/open-apis/im/v1/messages/%s/reactions",
+				url.PathEscape(messageID),
+			),
+			Params: params,
+			As:     IdentityUser,
+		})
+		if err != nil {
+			return OwnerAckReactionResult{}, err
+		}
+		data := responseData(result)
+		for _, raw := range arrayValue(data["items"]) {
+			reaction := parseMessageReaction(raw)
+			if reaction.OperatorType == "user" &&
+				reaction.OperatorOpenID == ownerOpenID &&
+				isAckEmoji(reaction.EmojiType) {
+				return OwnerAckReactionResult{Found: true, Reaction: reaction}, nil
+			}
+		}
+		if !boolValue(data["has_more"]) {
+			return OwnerAckReactionResult{}, nil
+		}
+		pageToken = stringValue(data["page_token"])
+		if pageToken == "" {
+			return OwnerAckReactionResult{}, errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"reaction list response is missing page_token",
+			)
+		}
+	}
+	return OwnerAckReactionResult{}, errs.NewInternalError(
+		errs.SubtypeInvalidResponse,
+		"reaction list exceeded bounded page limit",
+	)
+}
+
 // NotifyOwner sends a bot message to the owner.
 func (s *Service) NotifyOwner(ctx context.Context, req tools.NotifyRequest) error {
 	if s.caller == nil {
@@ -1292,6 +1393,29 @@ func parseReplyResult(result interface{}) tools.ReplyResult {
 		out.ChatID = v
 	}
 	return out
+}
+
+func parseMessageReaction(raw any) MessageReaction {
+	item := mapValue(raw)
+	reaction := MessageReaction{
+		ReactionID: stringValue(item["reaction_id"]),
+	}
+	reactionType := mapValue(item["reaction_type"])
+	reaction.EmojiType = stringValue(reactionType["emoji_type"])
+	operator := mapValue(item["operator"])
+	reaction.OperatorType = stringValue(operator["operator_type"])
+	operatorID := mapValue(operator["operator_id"])
+	reaction.OperatorOpenID = stringValue(operatorID["open_id"])
+	return reaction
+}
+
+func isAckEmoji(emojiType string) bool {
+	switch strings.TrimSpace(emojiType) {
+	case "Get", "OK", "DONE", "THUMBSUP", "CheckMark", "Yes", "LGTM":
+		return true
+	default:
+		return false
+	}
 }
 
 func parseMessage(raw any) Message {

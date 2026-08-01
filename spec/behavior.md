@@ -179,9 +179,12 @@ policy. An inbound human P2P message to the owner is a `private_message`
 candidate and uses that same delegated-reply identity and policy only when the
 semantic gate finds an outstanding conversational need for an owner response.
 A private answer to an owner-initiated question, acknowledgement, reaction, or
-ordinary continuation with no new request may be `no_reply_needed`. A private
-`owner_request` answers the configured owner's own assistant prompt using bot
-identity.
+ordinary continuation with no new request may be `no_reply_needed`. For ordinary
+private messages, `unanswered` must be grounded in a new question, request,
+invitation, or coordination need present in the target text itself; context may
+explain that obligation, but must not invent it from the owner's earlier
+question. A private `owner_request` answers the configured owner's own
+assistant prompt using bot identity.
 Non-owner private messages addressed to the assistant and non-owner native
 assistant mentions are ignored before model work. A direct owner mention is
 addressed to this personal-assistant
@@ -212,11 +215,27 @@ response at all. A high-confidence semantic answer cancels only the matched
 target; a high-confidence `no_reply_needed` result cancels a private answer,
 acknowledgement, reaction, or owner-led conversational continuation without
 inventing another response. A high-confidence unanswered result admits only
-that target to the delegated agent loop. Explicit group `@Owner` messages
-cannot use `no_reply_needed`; they remain addressed owner work unless owner
-content handled them. Ambiguous, malformed, low-confidence, truncated, or
-unavailable resolution fails closed and retries after the configured semantic
-retry delay.
+that target to the delegated agent loop after it records a target intent and an
+exact response-obligation quote from the target message. If an ordinary private
+target is classified as an answer, acknowledgement, or continuation and does not
+contain such a quote, the runtime normalizes it to `no_reply_needed` instead of
+starting an investigation. Explicit group `@Owner` messages cannot use
+`no_reply_needed`; they remain addressed owner work unless owner content
+handled them. Ambiguous, malformed, low-confidence, truncated, or unavailable
+resolution fails closed and retries after the configured semantic retry delay.
+
+Immediately before semantic classification, before finishing durable
+investigation, and before sending a held candidate, the resolver reads reactions
+on the exact target with user identity. A reaction by the configured owner whose
+emoji type is one of `Get`, `OK`, `DONE`, `THUMBSUP`, `CheckMark`, `Yes`, or
+`LGTM` is deterministic evidence that the owner handled the target. The result
+is `answered` with confidence `1`, no sender-facing reply is sent, and the
+reaction evidence is recorded in the semantic audit row. Reactions by other
+users, bot reactions such as `Typing`, unsupported emoji types, reactions on
+other messages, or reactions that were later deleted do not count. If reaction
+reading fails, is unauthorized, or cannot finish within its page bound, the
+resolver fails closed and retries; absence of readable reaction data is never
+permission to guess that the owner did not handle the target.
 
 The semantic resolver and the main delegated Agent consume one logically
 identical context snapshot. The snapshot includes at most twenty same-chat
@@ -1479,6 +1498,20 @@ The multi-step loop is accepted by these executable BDD scenarios:
   the same conversation, when semantic delegated-reply resolution runs, then
   it returns high-confidence `no_reply_needed` and neither the main reply model
   nor a sender-facing reply runs.
+- Given the owner privately asks why a remembered group-member-count limit
+  cannot be found and another human replies that it was only discussed without
+  detailed interaction or design, when semantic delegated-reply resolution
+  runs, then the target is treated as an answer to the owner's question rather
+  than a new coding task, returns `no_reply_needed`, and does not start
+  investigation.
+- Given the same private answer adds a new explicit request such as `你帮我查一下代码`,
+  when semantic delegated-reply resolution runs, then that exact request quote
+  may satisfy the unanswered obligation check and enter the delegated workflow.
+- Given the configured owner adds `Get`, `OK`, `DONE`, `THUMBSUP`,
+  `CheckMark`, `Yes`, or `LGTM` to a delegated target, when semantic resolution
+  or the final owner-handled check runs, then the target is treated as already
+  handled; unsupported, bot-authored, or other-user reactions do not suppress
+  the workflow.
 - Given an ordinary private message contains a new question, request,
   invitation, or coordination need that the owner has not handled, when the
   semantic deadline is evaluated, then it remains `unanswered` and may enter

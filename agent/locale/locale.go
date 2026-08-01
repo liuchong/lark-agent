@@ -206,6 +206,12 @@ func (p DelegatedPresenter) Present(item domain.WorkItem, decision domain.Decisi
 func LocalizedReason(language Language, reason string) string {
 	lower := strings.ToLower(reason)
 	switch {
+	case strings.Contains(lower, "owner_reaction_read_failed") ||
+		strings.Contains(lower, "owner reaction read failed"):
+		if language == LanguageEnglish {
+			return "Owner acknowledgement reactions could not be read."
+		}
+		return "无法读取负责人确认表情"
 	case strings.Contains(lower, "context") || strings.Contains(reason, "上下文"):
 		if language == LanguageEnglish {
 			return "The referenced conversation context is incomplete."

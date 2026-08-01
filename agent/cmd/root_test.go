@@ -61,8 +61,10 @@ func TestRuntimePolicySnapshotUsesValidatedActiveConfiguration(t *testing.T) {
 }
 
 type fakeSemanticContextReader struct {
-	result serviceim.SemanticReplyContext
-	err    error
+	result    serviceim.SemanticReplyContext
+	err       error
+	ackResult serviceim.OwnerAckReactionResult
+	ackErr    error
 }
 
 type runtimePolicyCaptureDecider struct {
@@ -110,6 +112,13 @@ func (r fakeSemanticContextReader) GetSemanticReplyContext(
 	serviceim.SemanticReplyContextRequest,
 ) (serviceim.SemanticReplyContext, error) {
 	return r.result, r.err
+}
+
+func (r fakeSemanticContextReader) FindOwnerAckReaction(
+	context.Context,
+	serviceim.OwnerAckReactionRequest,
+) (serviceim.OwnerAckReactionResult, error) {
+	return r.ackResult, r.ackErr
 }
 
 type capturingSemanticContextReader struct {
@@ -299,6 +308,57 @@ func TestLiveDelegatedReplyResolverUsesLatestLarkContextAndAllPendingTargets(t *
 			result,
 			matcher,
 			matcher.request,
+			store.recorded,
+		)
+	}
+}
+
+func TestLiveDelegatedReplyResolverSuppressesExactOwnerAckReaction(t *testing.T) {
+	base := time.Date(2026, 7, 31, 4, 22, 52, 0, time.UTC)
+	target := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_private_answer", ChatID: "oc_private", ChatType: "p2p",
+		SenderID: "ou_teammate", SenderType: "user",
+		Content:   "当时说要做但没设计详细交互，后面也没看到继续推进",
+		CreatedAt: base,
+	})
+	target.ID = 5517
+	store := &fakeSemanticReplyStore{pending: []domain.WorkItem{target}}
+	matcher := &fakeSemanticMatcher{}
+	resolver := liveDelegatedReplyResolver{
+		contexts: fakeSemanticContextReader{
+			ackResult: serviceim.OwnerAckReactionResult{
+				Found: true,
+				Reaction: serviceim.MessageReaction{
+					ReactionID:     "r_get",
+					EmojiType:      "Get",
+					OperatorType:   "user",
+					OperatorOpenID: "ou_owner",
+				},
+			},
+			result: serviceim.SemanticReplyContext{
+				Incomplete:    true,
+				ContextCutoff: base.Add(3 * time.Minute),
+			},
+		},
+		store:       store,
+		matcher:     matcher,
+		ownerOpenID: "ou_owner",
+	}
+
+	result, err := resolver.Resolve(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Result != replymatch.ResultAnswered ||
+		result.OwnerAckReaction == nil ||
+		result.OwnerAckReaction.EmojiType != "Get" ||
+		matcher.calls != 0 ||
+		len(store.recorded) != 1 ||
+		store.recorded[0].OwnerAckReaction == nil {
+		t.Fatalf(
+			"result=%+v matcher_calls=%d recorded=%+v",
+			result,
+			matcher.calls,
 			store.recorded,
 		)
 	}

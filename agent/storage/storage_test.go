@@ -110,12 +110,20 @@ func TestPendingDelegatedWorkAndSemanticResolutionAudit(t *testing.T) {
 
 	cutoff := time.Date(2026, 7, 29, 3, 0, 0, 0, time.UTC)
 	resolution := replymatch.Resolution{
-		TargetMessageID:        "om_a",
-		Result:                 replymatch.ResultAnswered,
-		MatchedOwnerMessageIDs: []string{"om_owner"},
-		Confidence:             0.97,
-		Reason:                 "owner supplied the requested date",
-		ContextCutoff:          cutoff,
+		TargetMessageID:         "om_a",
+		Result:                  replymatch.ResultAnswered,
+		MatchedOwnerMessageIDs:  []string{"om_owner"},
+		Confidence:              0.97,
+		Reason:                  "owner supplied the requested date",
+		TargetIntent:            "request",
+		ResponseObligationQuote: "发布日期？",
+		OwnerAckReaction: &replymatch.OwnerAckReaction{
+			ReactionID:     "r_get",
+			EmojiType:      "Get",
+			OperatorType:   "user",
+			OperatorOpenID: "ou_owner",
+		},
+		ContextCutoff: cutoff,
 	}
 	if err := store.RecordOwnerReplyResolution(pending[0].ID, resolution); err != nil {
 		t.Fatal(err)
@@ -128,6 +136,10 @@ func TestPendingDelegatedWorkAndSemanticResolutionAudit(t *testing.T) {
 		audits[0].Result != replymatch.ResultAnswered ||
 		len(audits[0].MatchedOwnerMessageIDs) != 1 ||
 		audits[0].MatchedOwnerMessageIDs[0] != "om_owner" ||
+		audits[0].TargetIntent != "request" ||
+		audits[0].ResponseObligationQuote != "发布日期？" ||
+		audits[0].OwnerAckReaction == nil ||
+		audits[0].OwnerAckReaction.EmojiType != "Get" ||
 		!audits[0].ContextCutoff.Equal(cutoff) {
 		t.Fatalf("audits=%+v", audits)
 	}
@@ -1313,6 +1325,17 @@ func TestWorkReplyCandidateMigrationIsSchemaVersion16(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	for _, column := range []string{
+		"target_intent",
+		"response_obligation_quote",
+		"owner_ack_reaction_json",
+	} {
+		if _, err := store.db.Exec(
+			`ALTER TABLE owner_reply_resolutions DROP COLUMN ` + column,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := store.db.Exec(
 		`UPDATE work_items SET status = ?, retry_count = 2 WHERE id = ?`,
 		domain.StatusWaitingUser,
@@ -1364,6 +1387,76 @@ func TestWorkReplyCandidateMigrationIsSchemaVersion16(t *testing.T) {
 			providerRetries,
 			semanticRetries,
 		)
+	}
+}
+
+func TestOwnerReplyResolutionAuditMigrationIsSchemaVersion17(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_v16_resolution",
+		ChatID:    "oc_private",
+		ChatType:  "p2p",
+		Content:   "legacy private answer",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	cutoff := time.Date(2026, 7, 31, 4, 0, 0, 0, time.UTC)
+	if err := store.RecordOwnerReplyResolution(item.ID, replymatch.Resolution{
+		TargetMessageID: item.Event.MessageID,
+		Result:          replymatch.ResultAmbiguous,
+		Confidence:      0,
+		Reason:          "legacy ambiguous resolution",
+		ContextCutoff:   cutoff,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, column := range []string{
+		"target_intent",
+		"response_obligation_quote",
+		"owner_ack_reaction_json",
+	} {
+		if _, err := store.db.Exec(
+			`ALTER TABLE owner_reply_resolutions DROP COLUMN ` + column,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.db.Exec(`UPDATE schema_version SET version = 16`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	var version int
+	if err := store.db.QueryRow(`SELECT version FROM schema_version LIMIT 1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version < 17 {
+		t.Fatalf("schema version=%d, want at least 17", version)
+	}
+	audits, err := store.ListOwnerReplyResolutions(item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) != 1 ||
+		audits[0].TargetIntent != "" ||
+		audits[0].ResponseObligationQuote != "" ||
+		audits[0].OwnerAckReaction != nil {
+		t.Fatalf("audits=%+v", audits)
 	}
 }
 

@@ -236,6 +236,8 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 			"result":"unanswered",
 			"confidence":0.97,
 			"reason":"no owner-authored message answered this private request",
+			"target_intent":"request",
+			"response_obligation_quote":"发布包现在可以用了么？",
 			"task_summary":"确认发布包当前是否可用",
 			"task_class":"simple",
 			"classification_confidence":0.97,
@@ -346,6 +348,75 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 				"result=%+v semantic=%d builder=%d decider=%d replier=%d",
 				result,
 				semanticModel.calls,
+				builder.calls,
+				decider.calls,
+				replier.calls,
+			)
+		}
+	})
+
+	t.Run("private answer without target obligation cannot become investigation", func(t *testing.T) {
+		store := openSemanticIntegrationStore(t)
+		base := store.CurrentSession().StartedAt.Add(time.Second)
+		item := enqueueDueDelegatedItem(t, store, domain.NormalizedEvent{
+			Source:     domain.SourcePoll,
+			EventID:    "poll:om_5517_shape",
+			MessageID:  "om_5517_shape",
+			ChatID:     "oc_private",
+			ChatType:   "p2p",
+			SenderID:   "ou_teammate",
+			SenderType: "user",
+			Content:    "当时说要做但没设计详细交互，后面也没看到继续推进",
+			CreatedAt:  base.Add(2 * time.Minute),
+		})
+		semanticModel := &semanticIntegrationModel{response: `{
+			"target_message_id":"om_5517_shape",
+			"result":"unanswered",
+			"confidence":0.92,
+			"reason":"the owner has not handled the remembered group member limit",
+			"target_intent":"answer",
+			"task_summary":"investigate why the group member limit cannot be found",
+			"task_class":"coding",
+			"classification_confidence":0.90,
+			"requires_progress":true
+		}`}
+		builder := &semanticIntegrationBuilder{}
+		decider := &semanticIntegrationDecider{}
+		replier := &semanticIntegrationReplyHandler{}
+		daemon := app.NewDaemon(
+			store,
+			router.New(router.Config{
+				OwnerOpenID:       "ou_owner",
+				Mode:              domain.ModeAuto,
+				PrivateReplyScope: domain.PrivateReplyScopeAll,
+			}),
+			app.WithContextBuilder(builder),
+			app.WithDecider(decider),
+			app.WithReplyHandler(replier),
+			app.WithDelegatedReplyResolver(semanticIntegrationResolver{
+				store:   store,
+				matcher: replymatch.New(semanticModel, "ou_owner"),
+				messages: []domain.NormalizedEvent{
+					{
+						MessageID: "om_owner_question", ChatID: "oc_private",
+						ChatType: "p2p", SenderID: "ou_owner",
+						Content:   "那个群成员数量限制为什么找不到？",
+						CreatedAt: base,
+					},
+					item.Event,
+				},
+			}, 0.85, 30*time.Second),
+		)
+
+		result, err := daemon.RunOnce(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Decision.Reason != "delegated_reply_not_needed" ||
+			builder.calls != 0 || decider.calls != 0 || replier.calls != 0 {
+			t.Fatalf(
+				"result=%+v builder=%d decider=%d replier=%d",
+				result,
 				builder.calls,
 				decider.calls,
 				replier.calls,

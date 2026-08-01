@@ -10,9 +10,10 @@ import (
 )
 
 const (
-	messageEventType = "im.message.receive_v1"
-	p2pReadScope     = "im:message.p2p_msg:readonly"
-	groupAtReadScope = "im:message.group_at_msg:readonly"
+	messageEventType  = "im.message.receive_v1"
+	p2pReadScope      = "im:message.p2p_msg:readonly"
+	groupAtReadScope  = "im:message.group_at_msg:readonly"
+	reactionReadScope = "im:message.reactions:read"
 )
 
 type PublishedApp struct {
@@ -76,7 +77,11 @@ func CheckPublishedApp(ctx context.Context, caller Caller, appID string) (Publis
 				messageEventType,
 			)
 		}
-		for _, required := range []string{p2pReadScope, groupAtReadScope} {
+		for _, required := range []string{
+			p2pReadScope,
+			groupAtReadScope,
+			reactionReadScope,
+		} {
 			if !contains(version.TenantScopes, required) {
 				return PublishedApp{}, errs.NewPermissionError(
 					errs.SubtypeMissingScope,

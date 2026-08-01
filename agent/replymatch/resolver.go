@@ -40,6 +40,9 @@ type Resolution struct {
 	MatchedOwnerMessageIDs   []string                 `json:"matched_owner_message_ids,omitempty"`
 	Confidence               float64                  `json:"confidence"`
 	Reason                   string                   `json:"reason"`
+	TargetIntent             string                   `json:"target_intent,omitempty"`
+	ResponseObligationQuote  string                   `json:"response_obligation_quote,omitempty"`
+	OwnerAckReaction         *OwnerAckReaction        `json:"owner_ack_reaction,omitempty"`
 	TaskSummary              string                   `json:"task_summary,omitempty"`
 	TaskClass                domain.TaskClass         `json:"task_class,omitempty"`
 	ClassificationConfidence float64                  `json:"classification_confidence,omitempty"`
@@ -48,6 +51,15 @@ type Resolution struct {
 	RetryAfter               time.Duration            `json:"-"`
 	ContextDigest            string                   `json:"-"`
 	ContextMessages          []domain.NormalizedEvent `json:"-"`
+}
+
+// OwnerAckReaction is deterministic evidence captured by Go from the exact
+// target message; the semantic model must not fabricate it.
+type OwnerAckReaction struct {
+	ReactionID     string `json:"reaction_id"`
+	EmojiType      string `json:"emoji_type"`
+	OperatorType   string `json:"operator_type"`
+	OperatorOpenID string `json:"operator_open_id"`
 }
 
 type Model interface {
@@ -133,7 +145,9 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (Resolution, error)
 			"parse semantic owner-reply JSON",
 		).WithCause(err)
 	}
+	resolution.OwnerAckReaction = nil
 	resolution.ContextCutoff = req.ContextCutoff
+	resolution = normalizePrivateDirection(req, r.ownerOpenID, resolution)
 	if err := validateResolution(req, r.ownerOpenID, resolution); err != nil {
 		return Resolution{}, err
 	}
@@ -156,7 +170,8 @@ func resolutionPrompt(req Request, ownerOpenID string) (string, error) {
 			"Adjacency, a quote, or unrelated owner discussion is not sufficient by itself.",
 			"Use answered when later owner content substantively handles the target.",
 			"Use no_reply_needed only for an ordinary private message without an explicit owner mention when it is an answer to an owner-initiated question, an acknowledgement, reaction, or conversational continuation that adds no new question, request, invitation, or coordination need.",
-			"Use unanswered only when the target reasonably calls for a response and the owner has not handled it.",
+			"Use unanswered only when the target itself contains a new question, request, invitation, or coordination need and the owner has not handled it.",
+			"For private unanswered results, set target_intent and copy an exact response_obligation_quote from the target message text; do not quote the owner's earlier message or infer a coding task from context alone.",
 			"Use ambiguous when conversation direction or response need cannot be established safely.",
 			"matched_owner_message_ids may contain only supplied owner-authored messages newer than the target.",
 		},
@@ -178,7 +193,7 @@ func resolutionPrompt(req Request, ownerOpenID string) (string, error) {
 			"encode semantic owner-reply prompt",
 		).WithCause(err)
 	}
-	return "Return JSON with target_message_id, result, matched_owner_message_ids, confidence, reason, task_summary, task_class, classification_confidence, and requires_progress. " +
+	return "Return JSON with target_message_id, result, matched_owner_message_ids, confidence, reason, target_intent, response_obligation_quote, task_summary, task_class, classification_confidence, and requires_progress. " +
 		"For unanswered results, task_summary must identify the concrete subject from the full bounded conversation; task_class must be simple, investigation, or coding. " +
 		"Use coding for source, configuration, deployment, API, or error-code investigation even when the target's final sentence is ambiguous. " +
 		"requires_progress is true only when durable investigation is needed.\n" +
@@ -209,6 +224,18 @@ func validateResolution(req Request, ownerOpenID string, resolution Resolution) 
 		return invalidResolution("semantic result requires a reason")
 	}
 	if resolution.Result == ResultUnanswered {
+		if ordinaryPrivateTarget(target, ownerOpenID) {
+			if strings.TrimSpace(resolution.TargetIntent) == "" {
+				return invalidResolution("private unanswered semantic result requires target_intent")
+			}
+			quote := strings.TrimSpace(resolution.ResponseObligationQuote)
+			if quote == "" {
+				return invalidResolution("private unanswered semantic result requires response_obligation_quote")
+			}
+			if !strings.Contains(target.Content, quote) {
+				return invalidResolution("private response_obligation_quote must be copied from the target message")
+			}
+		}
 		if strings.TrimSpace(resolution.TaskSummary) == "" {
 			return invalidResolution("unanswered semantic result requires task_summary")
 		}
@@ -252,8 +279,10 @@ func validateResolution(req Request, ownerOpenID string, resolution Resolution) 
 		}
 		seen[messageID] = true
 	}
-	if resolution.Result == ResultAnswered && len(resolution.MatchedOwnerMessageIDs) == 0 {
-		return invalidResolution("answered result requires a matched owner message")
+	if resolution.Result == ResultAnswered &&
+		len(resolution.MatchedOwnerMessageIDs) == 0 &&
+		resolution.OwnerAckReaction == nil {
+		return invalidResolution("answered result requires a matched owner message or owner ack reaction")
 	}
 	if resolution.Result == ResultUnanswered && len(resolution.MatchedOwnerMessageIDs) != 0 {
 		return invalidResolution("unanswered result cannot contain matched owner messages")
@@ -265,6 +294,37 @@ func validateResolution(req Request, ownerOpenID string, resolution Resolution) 
 		)
 	}
 	return nil
+}
+
+func normalizePrivateDirection(req Request, ownerOpenID string, resolution Resolution) Resolution {
+	target := req.Target.Event
+	if resolution.Result != ResultUnanswered ||
+		!ordinaryPrivateTarget(target, ownerOpenID) ||
+		strings.TrimSpace(resolution.ResponseObligationQuote) != "" ||
+		!privateNoReplyIntent(resolution.TargetIntent) {
+		return resolution
+	}
+	resolution.Result = ResultNoReplyNeeded
+	if resolution.Confidence < 0.85 {
+		resolution.Confidence = 0.85
+	}
+	if strings.TrimSpace(resolution.Reason) == "" {
+		resolution.Reason = "private target is a response without a new target obligation"
+	}
+	resolution.TaskSummary = ""
+	resolution.TaskClass = ""
+	resolution.ClassificationConfidence = 0
+	resolution.RequiresProgress = false
+	return resolution
+}
+
+func privateNoReplyIntent(intent string) bool {
+	switch strings.ToLower(strings.TrimSpace(intent)) {
+	case "answer", "ack", "acknowledgement", "acknowledgment", "reaction", "continuation", "reply":
+		return true
+	default:
+		return false
+	}
 }
 
 func ordinaryPrivateTarget(target domain.NormalizedEvent, ownerOpenID string) bool {

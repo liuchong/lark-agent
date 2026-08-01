@@ -11,8 +11,8 @@
 - 状态栏：`~/Applications/Lark Agent.app`
 
 Agent 通过官方公开 Go SDK 访问 Lark。配置只保存 app id 和 Keychain 引用；app secret
-必须在 macOS Keychain 中。用户 token 可选，只用于用户身份轮询和代回复。凭据不写入
-plist、脚本参数或仓库文件。
+必须在 macOS Keychain 中。用户 token 可选，只用于用户身份轮询、读取消息确认表情和
+代回复。凭据不写入 plist、脚本参数或仓库文件。
 
 可选的 GitHub 证据桥使用独立的只读 GitHub token Keychain 引用。启用
 `github.enabled` 时，还必须配置精确的 `github.allowed_repositories`，并在安装前
@@ -89,6 +89,11 @@ policy:
 后触发智能代回复。用户身份可见的真人私聊由 `private_reply_scope` 单独控制。
 `all_private` 表示所有对方发来的真人私聊都进入语义判断，不表示每条消息都要回复；
 对方只是在回答 Owner 主动发起的话题、确认或继续闲聊且没有新增请求时会静默结束。
+私聊被判定为未处理请求时，目标消息本身必须包含新的问题、请求、邀请或协调义务；
+只从 Owner 先前问题里推断出来的任务不会进入调查。Owner 在目标消息上添加
+`Get`、`OK`、`DONE`、`THUMBSUP`、`CheckMark`、`Yes` 或 `LGTM` 这类确认表情，也会
+被视为已经回复。读取确认表情需要发布态应用具备 `im:message.reactions:read` scope，
+并且本机 user token 已按当前应用重新授权。
 Owner 发给其他真人的普通私聊消息不会进入代回复队列。
 非 Owner 私聊机器人或直接 `@机器人` 始终静默；这些范围配置不会互相代替。
 

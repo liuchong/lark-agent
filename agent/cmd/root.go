@@ -1614,6 +1614,7 @@ func buildLiveOptions(
 				contexts:             imSvc,
 				store:                store,
 				matcher:              replymatch.New(modelAdapter, cfg.Owner.OpenID),
+				ownerOpenID:          cfg.Owner.OpenID,
 				ownerWait:            cfg.Policy.OwnerWait,
 				visionEnabled:        strings.TrimSpace(cfg.Agent.VisionModel) != "",
 				maxContextImages:     cfg.Agent.MaxContextImages,
@@ -1986,6 +1987,13 @@ type semanticReplyContextReader interface {
 	) (serviceim.SemanticReplyContext, error)
 }
 
+type ownerAckReactionReader interface {
+	FindOwnerAckReaction(
+		context.Context,
+		serviceim.OwnerAckReactionRequest,
+	) (serviceim.OwnerAckReactionResult, error)
+}
+
 type semanticContextImageHydrator interface {
 	HydrateContextImages(
 		context.Context,
@@ -2020,6 +2028,7 @@ type liveDelegatedReplyResolver struct {
 	store                semanticReplyStore
 	matcher              semanticReplyMatcher
 	maxMessages          int
+	ownerOpenID          string
 	ownerWait            time.Duration
 	visionEnabled        bool
 	maxContextImages     int
@@ -2046,6 +2055,46 @@ func (r liveDelegatedReplyResolver) Resolve(
 		}
 		if since.IsZero() || candidate.Event.CreatedAt.Before(since) {
 			since = candidate.Event.CreatedAt
+		}
+	}
+	if reader, ok := r.contexts.(ownerAckReactionReader); ok {
+		reactionResult, reactionErr := reader.FindOwnerAckReaction(
+			ctx,
+			serviceim.OwnerAckReactionRequest{
+				MessageID:   item.Event.MessageID,
+				OwnerOpenID: r.ownerOpenID,
+			},
+		)
+		if reactionErr != nil {
+			resolution := replymatch.Resolution{
+				TargetMessageID: item.Event.MessageID,
+				Result:          replymatch.ResultAmbiguous,
+				Reason:          "owner reaction read failed",
+				ContextCutoff:   time.Now().UTC(),
+			}
+			if err := r.store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
+				return replymatch.Resolution{}, err
+			}
+			return resolution, nil
+		}
+		if reactionResult.Found {
+			resolution := replymatch.Resolution{
+				TargetMessageID: item.Event.MessageID,
+				Result:          replymatch.ResultAnswered,
+				Confidence:      1,
+				Reason:          "owner acknowledged the exact target with an allowed reaction",
+				OwnerAckReaction: &replymatch.OwnerAckReaction{
+					ReactionID:     reactionResult.Reaction.ReactionID,
+					EmojiType:      reactionResult.Reaction.EmojiType,
+					OperatorType:   reactionResult.Reaction.OperatorType,
+					OperatorOpenID: reactionResult.Reaction.OperatorOpenID,
+				},
+				ContextCutoff: time.Now().UTC(),
+			}
+			if err := r.store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
+				return replymatch.Resolution{}, err
+			}
+			return resolution, nil
 		}
 	}
 	if !since.IsZero() {

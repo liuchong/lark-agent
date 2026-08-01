@@ -60,3 +60,10 @@ func TestRenderDelegatedReplyRequiresOwnerName(t *testing.T) {
 		t.Fatal("missing owner name must fail")
 	}
 }
+
+func TestLocalizedReasonDistinguishesReactionReadFailure(t *testing.T) {
+	got := LocalizedReason(LanguageChinese, "owner_reaction_read_failed")
+	if got != "无法读取负责人确认表情" {
+		t.Fatalf("reason=%q", got)
+	}
+}
