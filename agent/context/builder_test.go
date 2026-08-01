@@ -336,6 +336,27 @@ func TestAgentTaskProcessPromptSeparatesCodingFlowAndTypedOutcomes(t *testing.T)
 	}
 }
 
+func TestAgentTaskProcessPromptForbidsUnclassifiedSenderFacingReply(t *testing.T) {
+	prompt := AgentTaskProcessPrompt(Bundle{
+		WorkKind: domain.WorkKindGeneric,
+		Event: domain.NormalizedEvent{
+			ChatType: "group",
+			SenderID: "ou_teammate",
+			Content:  "这个任务后续应该就完整了",
+		},
+		User: UserProfile{OpenID: "ou_owner"},
+	})
+	for _, want := range []string{
+		"not a sender-facing invocation",
+		"ignore, record, or notify",
+		"never reply or request_approval",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("unclassified task prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func mustWriteFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

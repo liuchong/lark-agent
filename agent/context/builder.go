@@ -48,6 +48,7 @@ Do not send messages or perform final actions directly. Finish exactly once by c
 Allowed decisions are ignore, record, notify, reply, and request_approval.
 Use ignore only when there is no owner-relevant information or action.
 Use record for an owner-relevant update that should be retained without interrupting the owner.
+Unclassified inferred group work is not a sender-facing invocation. It may finish only as ignore, record, or notify; never promote it to reply or request_approval. The runtime enforces this again immediately before any external reply.
 Delegated direct_mention and private_message work has already passed a durable semantic gate as still unanswered. It must finish as a useful sender-facing reply or an exact request_approval; never finish delegated work as ignore, record, or notify.
 For a direct owner assignment, investigation, handoff, or coordination request, first complete bounded relevant read-only work. Read the same-chat context or relevant production source, then briefly state what you actually checked, the initial finding or explicit unknown, and what concrete information you passed to the owner.
 Never reply only that you reminded the owner, and never pad a reply by restating the request. If delegated work cannot safely provide a specific factual answer without exposing private context or inventing work, reply with the completed bounded check and exact unknown or refusal, or request approval for an exact risky response.
@@ -91,6 +92,9 @@ func AgentTaskProcessPrompt(bundle Bundle) string {
 		process += " For investigation work, perform the smallest relevant read set, preserve a useful initial finding, and name remaining unknowns instead of promising future work."
 	} else {
 		process += " For a simple question, answer directly when current context is sufficient and do not add unnecessary investigation."
+	}
+	if role == "unclassified" {
+		process += " This work is not a sender-facing invocation: finish only as ignore, record, or notify; never reply or request_approval."
 	}
 	return process
 }

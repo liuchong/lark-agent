@@ -17,6 +17,12 @@
   do not turn them into a general queue retry that repeats the investigation.
 - Prompt guidance is explanatory. Every tool, path, permission, budget,
   evidence, and send restriction needs a matching Go rejection path.
+- Sender-facing authority must be recomputed from the original event and the
+  current deterministic router immediately before every reply or approval.
+  Model output, candidate metadata, and persisted approval relevance are not
+  authority. If routing no longer permits a send, cancel the candidate and
+  lease-fence any ready approval into a blocked audit state before completing
+  the work as ignore, record, or notify.
 - Failure fingerprints must exclude volatile receipt metadata. Bind the tool,
   normalized arguments, stable error class, and bounded result content so
   unchanged conditions are detected reliably.

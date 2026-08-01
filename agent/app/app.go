@@ -73,6 +73,15 @@ type approvedReplySource interface {
 	ReadyApprovedReply(workItemID int64) (domain.Decision, bool, error)
 }
 
+type approvedReplyBlocker interface {
+	BlockReadyReplyApprovalClaim(
+		context.Context,
+		int64,
+		string,
+		string,
+	) error
+}
+
 type replyCandidateStore interface {
 	ReadyWorkReplyCandidate(workItemID int64) (domain.WorkReplyCandidate, bool, error)
 	SaveWorkReplyCandidate(workItemID int64, leaseToken string, decision domain.Decision) error
@@ -1064,6 +1073,40 @@ func (d *Daemon) finishDecisionWithState(
 		d.markRetry(item, err)
 		return Result{}, err
 	}
+	if isSenderFacingDecision(decision) {
+		currentRoute, err := d.router.Route(ctx, item)
+		if err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+		if !routeAllowsSenderFacingDecision(currentRoute) {
+			if approvalGranted {
+				blocker, ok := d.queue.(approvedReplyBlocker)
+				if !ok {
+					err := errs.NewInternalError(
+						errs.SubtypeFailedPrecondition,
+						"approved reply blocker is not configured",
+					)
+					d.markRetry(item, err)
+					return Result{}, err
+				}
+				if err := blocker.BlockReadyReplyApprovalClaim(
+					ctx,
+					item.ID,
+					item.LeaseBy,
+					currentRoute.Reason,
+				); err != nil {
+					d.markRetry(item, err)
+					return Result{}, err
+				}
+			}
+			currentRoute.Reason = appendReason(
+				currentRoute.Reason,
+				"sender_facing_reply_blocked_by_current_route",
+			)
+			decision = currentRoute
+		}
+	}
 	if (decision.Kind == domain.DecisionReply || decision.Kind == domain.DecisionRequestApproval) && d.replier == nil {
 		err := errs.NewInternalError(errs.SubtypeFailedPrecondition, "reply handler is not configured")
 		d.markRetry(item, err)
@@ -1168,10 +1211,17 @@ func (d *Daemon) finishDecisionWithState(
 	}
 	if candidates != nil {
 		if decision.Kind != domain.DecisionReply {
+			cancelReason := "reply action did not complete"
+			if strings.Contains(
+				decision.Reason,
+				"sender_facing_reply_blocked_by_current_route",
+			) {
+				cancelReason = "sender_facing_reply_blocked_by_current_route"
+			}
 			if err := candidates.CancelWorkReplyCandidate(
 				item.ID,
 				item.LeaseBy,
-				"reply action did not complete",
+				cancelReason,
 			); err != nil {
 				return Result{}, err
 			}
@@ -1194,6 +1244,27 @@ func (d *Daemon) finishDecisionWithState(
 		return Result{}, err
 	}
 	return Result{Processed: true, Decision: decision}, nil
+}
+
+func isSenderFacingDecision(decision domain.Decision) bool {
+	return decision.Kind == domain.DecisionReply ||
+		decision.Kind == domain.DecisionRequestApproval
+}
+
+func routeAllowsSenderFacingDecision(decision domain.Decision) bool {
+	if decision.Kind != domain.DecisionNotify &&
+		decision.Kind != domain.DecisionReply {
+		return false
+	}
+	switch decision.Relevance {
+	case domain.RelevanceAssistantRequest,
+		domain.RelevanceOwnerRequest,
+		domain.RelevanceDirectMention,
+		domain.RelevancePrivateMessage:
+		return true
+	default:
+		return false
+	}
 }
 
 func replyRequiresApproval(handler ReplyHandler, decision domain.Decision) bool {

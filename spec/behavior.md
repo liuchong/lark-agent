@@ -1113,7 +1113,12 @@ cancellation check, do not add the delegated `🤖` marker, and do not create a
 delegated owner notice. Non-owner messages can trigger a sender-facing
 response only by natively mentioning the configured human owner in a group
 allowed by `policy.reply_scope`; that path is the read-only delegated-owner
-workflow.
+workflow. A non-owner group message without that native Owner mention may still
+be classified as Owner-relevant background information and enter bounded model
+work, but its only legal terminal outcomes are `ignore`, `record`, or `notify`.
+The Go runtime re-runs deterministic routing immediately before every external
+reply or approval and blocks any model, resumed candidate, or legacy approval
+that attempts to promote such a message to `reply` or `request_approval`.
 
 The router attaches a work kind and priority to every accepted item. Assistant
 and owner requests that match a fast-path command are `fast_path` work. Requests
@@ -1436,6 +1441,13 @@ The multi-step loop is accepted by these executable BDD scenarios:
   `assistant.reply_scope`, when real-time or polling intake evaluates it, then
   the request is ignored before queueing, model work, working reactions, or any
   reply.
+- Given a non-owner group message contains relevance words such as `任务` and
+  may mention other people, but does not natively mention the configured owner,
+  when deterministic routing classifies it as inferred background work and the
+  model, a resumed candidate, or a legacy approval attempts `reply` or
+  `request_approval`, then the final Go send gate re-runs current routing,
+  preserves only a non-sender-facing `ignore`, `record`, or `notify` outcome,
+  and creates no group reply action.
 - Given `assistant.reply_scope` is `configured_groups` and the configured owner
   mentions the assistant outside the groups discovered by `--chat-query`, when
   real-time or polling intake evaluates it, then the request is ignored before

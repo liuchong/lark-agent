@@ -1133,6 +1133,68 @@ func TestReadyApprovedReplyReturnsPersistedExactDraft(t *testing.T) {
 	}
 }
 
+func TestBlockReadyReplyApprovalRequiresCurrentLease(t *testing.T) {
+	store := openStore(t)
+	if _, err := store.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_block_stale_approval",
+		Content:   "question",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("initial-worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	actionID, err := store.RequestReplyApproval(
+		context.Background(),
+		item.DedupKey,
+		"exact persisted draft",
+		"code evidence",
+		"confirm backend contract",
+		domain.RelevanceAssistantRequest,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DecideAction(actionID, true); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err = store.ClaimNext("approval-worker")
+	if err != nil || !ok {
+		t.Fatalf("reclaim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	if err := store.BlockReadyReplyApprovalClaim(
+		context.Background(),
+		item.ID,
+		"stale-lease",
+		"assistant_request_from_non_owner",
+	); err == nil {
+		t.Fatal("stale lease blocked a ready approval")
+	}
+	if err := store.BlockReadyReplyApprovalClaim(
+		context.Background(),
+		item.ID,
+		item.LeaseBy,
+		"assistant_request_from_non_owner",
+	); err != nil {
+		t.Fatal(err)
+	}
+	action, err := store.GetActionAttempt(actionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Status != domain.ActionBlocked ||
+		action.Error != "assistant_request_from_non_owner" {
+		t.Fatalf("action=%+v", action)
+	}
+	if decision, found, err := store.ReadyApprovedReply(item.ID); err != nil || found {
+		t.Fatalf("decision=%+v found=%v err=%v", decision, found, err)
+	}
+}
+
 func TestWorkReplyCandidatePersistsHeldDecisionAndConsumesOnce(t *testing.T) {
 	store := openStore(t)
 	event := domain.NormalizedEvent{MessageID: "om_candidate", Content: "question"}

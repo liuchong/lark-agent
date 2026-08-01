@@ -280,6 +280,12 @@ Owner 私聊 Assistant Bot 发送“在吗”或简单问候时走本地快速�
 `lark-agent doctor` 可在 `reply_scopes.assistant_mentions` 和
 `reply_scopes.owner_mentions` 分别确认实际值。用户身份可见的真人私聊由
 `reply_scopes.private_messages` 显示，生产安装应为 `all_private`。
+其他群消息即使因为包含“任务”“项目”等内容被判断为 Owner 相关背景，也只能忽略、
+记录或私聊通知 Owner，不能向群里回复。每次真正发送或发起审批前，Go 运行时都会
+重新执行当前路由；没有原生 `@Owner` 的群消息即使模型返回回复、存在旧候选草稿或
+已经批准的旧审批，也会被阻止。被阻止的已批准审批会以 `blocked` 状态留下审计记录，
+不会保持 `ready` 等待后续意外发送，也不会把被阻止的发送报告成成功；当前不会为这类
+策略拦截再发送一条私聊通知，可用 `/approval 动作号` 查看 `blocked` 原因。
 
 群 @Owner 和对方发来的真人私聊先进入 3 分钟持久等待，再按同一会话语义逐条判断
 Owner 是否已处理，以及该消息本身是否合理期待回复。真人私聊如果只是回答 Owner

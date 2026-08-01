@@ -66,6 +66,19 @@ type countingPartialDecider struct {
 	calls int
 }
 
+type countingDecisionDecider struct {
+	calls    int
+	decision domain.Decision
+}
+
+func (d *countingDecisionDecider) Decide(
+	context.Context,
+	agentcontext.Bundle,
+) (domain.Decision, error) {
+	d.calls++
+	return d.decision, nil
+}
+
 func (d *countingPartialDecider) Decide(
 	context.Context,
 	agentcontext.Bundle,
@@ -278,6 +291,104 @@ func TestModelNonConvergenceMovesLeasedWorkDirectlyToDeadLetter(t *testing.T) {
 	if terminal.calls != 1 || terminal.item.ID != items[0].ID ||
 		terminal.err == nil {
 		t.Fatalf("terminal failure capture=%+v", terminal)
+	}
+}
+
+func TestInferredGroupWorkCannotPromoteToSenderFacingReply(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_non_owner_without_owner_mention",
+		ChatID:    "oc_tendo_group",
+		ChatType:  "group",
+		SenderID:  "ou_teammate",
+		Content:   "等语音回复好了，Tendo 的任务应该就都有了",
+		Mentions:  []domain.Mention{{OpenID: "ou_someone_else"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	decider := &countingPartialDecider{}
+	replier := &completedReplyHandler{}
+	daemon := app.NewDaemon(
+		store,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		app.WithContextBuilder(convergenceContextBuilder{}),
+		app.WithDecider(decider),
+		app.WithReplyHandler(replier),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || result.Decision.Kind != domain.DecisionRecord {
+		t.Fatalf("result=%+v", result)
+	}
+	if decider.calls != 1 {
+		t.Fatalf("model calls=%d want=1", decider.calls)
+	}
+	if replier.calls != 0 {
+		t.Fatalf("sender-facing reply calls=%d want=0", replier.calls)
+	}
+	items, err := store.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Status != domain.StatusCompleted {
+		t.Fatalf("items=%+v", items)
+	}
+}
+
+func TestInferredGroupWorkCannotCreateSenderFacingApproval(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_non_owner_approval_without_owner_mention",
+		ChatID:    "oc_tendo_group",
+		ChatType:  "group",
+		SenderID:  "ou_teammate",
+		Content:   "等语音回复好了，Tendo 的任务应该就都有了",
+		Mentions:  []domain.Mention{{OpenID: "ou_someone_else"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	decider := &countingDecisionDecider{decision: domain.Decision{
+		Kind:         domain.DecisionRequestApproval,
+		Risk:         domain.RiskHigh,
+		ReplyOutcome: domain.ReplyOutcomeComplete,
+		ReplyText:    "需要审批的群回复",
+		OwnerAction:  "批准群回复",
+	}}
+	replier := &completedReplyHandler{}
+	daemon := app.NewDaemon(
+		store,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		app.WithContextBuilder(convergenceContextBuilder{}),
+		app.WithDecider(decider),
+		app.WithReplyHandler(replier),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || result.Decision.Kind != domain.DecisionRecord ||
+		decider.calls != 1 || replier.calls != 0 {
+		t.Fatalf("result=%+v modelCalls=%d replyCalls=%d",
+			result, decider.calls, replier.calls)
+	}
+	actions, err := store.ListActionAttempts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("sender-facing approval actions=%+v", actions)
 	}
 }
 

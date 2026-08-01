@@ -2308,6 +2308,63 @@ func (s *Store) ReadyApprovedReply(workItemID int64) (domain.Decision, bool, err
 	}, true, nil
 }
 
+// BlockReadyReplyApprovalClaim terminalizes one approved draft when current
+// deterministic routing no longer permits a sender-facing reply.
+func (s *Store) BlockReadyReplyApprovalClaim(
+	ctx context.Context,
+	workItemID int64,
+	leaseToken string,
+	reason string,
+) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(
+		ctx,
+		`UPDATE action_attempts
+		 SET status = ?, error = ?, updated_at = ?
+		 WHERE id = (
+			SELECT a.id
+			FROM action_attempts a
+			JOIN work_items w ON w.id = a.work_item_id
+			WHERE a.work_item_id = ?
+			  AND a.kind = 'reply'
+			  AND a.status = ?
+			  AND COALESCE(w.lease_by, '') = ?
+			ORDER BY a.id
+			LIMIT 1
+		 )`,
+		domain.ActionBlocked,
+		strings.TrimSpace(reason),
+		now,
+		workItemID,
+		domain.ActionReady,
+		leaseToken,
+	)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"block approved reply after routing change",
+		).WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read blocked approved reply result",
+		).WithCause(err)
+	}
+	if affected == 1 {
+		return nil
+	}
+	if err := s.ValidateLease(workItemID, leaseToken); err != nil {
+		return err
+	}
+	return errs.NewValidationError(
+		errs.SubtypeFailedPrecondition,
+		"work item %d has no ready approved reply to block",
+		workItemID,
+	)
+}
+
 // SaveWorkReplyCandidate durably preserves one already validated reply before
 // the final owner-handled semantic check.
 func (s *Store) SaveWorkReplyCandidate(
