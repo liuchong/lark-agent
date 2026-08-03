@@ -300,6 +300,243 @@ func TestAgentLoopRejectsPlainTextWithoutSubmit(t *testing.T) {
 	}
 }
 
+func TestAgentLoopUsesToollessFinalizerAfterTerminalOnlyRefusal(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{
+			"question":"示例状态变更通知需要同步 示例客户端回调和示例通知吗？",
+			"entry_points":["sdk","message"],
+			"symbols":["sample state change","callback"],
+			"tools":["search_workspace"],
+			"stop_conditions":["找到 示例客户端回调或示例通知实现"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("search", "search_workspace", `{"query":"sample state change callback"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("explore", "explore_workspace", `{"query":"sample state change"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("list", "list_workspace", `{"path":"."}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("read", "read_workspace", `{"path":"sample-module/callback.go"}`)}),
+	}}
+	finalizer := &scriptedModel{responses: []*schema.Message{{
+		Role: schema.Assistant,
+		Content: `{
+			"decision":"reply",
+			"relevance_confidence":0.94,
+			"reply_confidence":0.86,
+			"risk":"low",
+			"evidence_status":"insufficient",
+			"reply_outcome":"partial",
+			"progress":{
+				"completed_checks":["search_workspace"],
+				"initial_finding":"已尝试在工作区搜索示例状态变更通知和 示例客户端回调，但搜索结果没有提供可引用生产实现。",
+				"unknowns":["是否存在已上线的 示例客户端回调类型","是否需要同步示例通知"],
+				"next_step":"继续提供更精确的代码路径或由 Owner 核对 示例客户端回调入口"
+			},
+			"reply_text":"我已尝试搜索示例状态变更通知和 示例客户端回调，但没有得到可引用的生产实现证据。目前只能确认这一轮搜索未证明已上线或不需要同步；仍未知是否存在 示例客户端回调类型和示例通知同步，下一步需要更精确代码路径或由 Owner 核对入口。",
+			"owner_action":"核对示例状态变更通知对应的 示例客户端回调入口。",
+			"reason":"terminal finalizer summarized retained search evidence after the main model refused submit_decision"
+		}`,
+	}}}
+	searchCalls := 0
+	registry, err := agenttools.NewRegistry(
+		testTool("search_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			searchCalls++
+			return agenttools.Execution{Content: `{"results":[],"searched":"sample state change callback"}`}, nil
+		}),
+		testTool("explore_workspace", func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+			t.Fatal("terminal-only invalid tool was executed")
+			return agenttools.Execution{}, nil
+		}),
+		testTool("list_workspace", func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+			t.Fatal("terminal-only invalid tool was executed")
+			return agenttools.Execution{}, nil
+		}),
+		testTool("read_workspace", func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+			t.Fatal("terminal-only invalid tool was executed")
+			return agenttools.Execution{}, nil
+		}),
+		SubmitInvestigationPlanDefinition(),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, trajectory, err := (AgentLoop{
+		Model: model, TerminalFinalizer: finalizer, Tools: registry, MaxTurns: 8, MaxToolCalls: 1,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		User: agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_5680_like",
+			ChatID:    "oc_backend",
+			SenderID:  "ou_sender",
+			Content:   "@Owner 示例状态变更通知需要同步 示例客户端回调和示例通知吗？",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		},
+		TaskClass: domain.TaskClassCoding,
+		WorkKind:  domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatalf("err=%v trajectory=%+v", err, trajectory)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		decision.ReplyOutcome != domain.ReplyOutcomePartial ||
+		decision.EvidenceStatus != domain.EvidenceInsufficient ||
+		searchCalls != 1 {
+		t.Fatalf("decision=%+v searchCalls=%d", decision, searchCalls)
+	}
+	if finalizer.calls != 1 {
+		t.Fatalf("finalizer calls=%d", finalizer.calls)
+	}
+	if len(finalizer.toolNames) != 1 || len(finalizer.toolNames[0]) != 0 {
+		t.Fatalf("finalizer was given tools: %+v", finalizer.toolNames)
+	}
+	if !messagesContain(finalizer.inputs[0], "search_workspace") ||
+		!messagesContain(finalizer.inputs[0], "model did not submit a terminal decision") {
+		t.Fatalf("finalizer input missing retained evidence/failure: %+v", finalizer.inputs[0])
+	}
+}
+
+func TestAgentLoopFinalizerCanUseRetainedSourceRefs(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{
+			"question":"确认 示例客户端回调是否存在",
+			"entry_points":["sample-module/callback.go"],
+			"symbols":["SampleCallback"],
+			"tools":["read_workspace"],
+			"stop_conditions":["读到回调定义"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("read-source", "read_workspace", `{"path":"sample-module/callback.go"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("explore", "explore_workspace", `{"query":"SampleCallback"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("list", "list_workspace", `{"path":"."}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("read-again", "read_workspace", `{"path":"sample-module/callback.go"}`)}),
+	}}
+	finalizer := &scriptedModel{responses: []*schema.Message{{
+		Role: schema.Assistant,
+		Content: `{
+			"decision":"reply",
+			"relevance_confidence":0.97,
+			"reply_confidence":0.94,
+			"risk":"low",
+			"evidence_status":"verified",
+			"reply_outcome":"complete",
+			"reply_text":"结论：SampleCallback 已在 sample-module/callback.go 中定义。依据：sample-module/callback.go。未知/下一步：没有。",
+			"reason":"terminal finalizer used retained read_workspace source",
+			"source_refs":[{"relative_path":"sample-module/callback.go","digest":"sha256:callback","kind":"workspace_file"}]
+		}`,
+	}}}
+	registry, err := agenttools.NewRegistry(
+		testTool("read_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			return agenttools.Execution{
+				Content: "type SampleCallback struct{}",
+				Sources: []domain.SourceRef{{
+					RelativePath: "sample-module/callback.go",
+					Digest:       "sha256:callback",
+					Kind:         "workspace_file",
+				}},
+			}, nil
+		}),
+		testTool("explore_workspace", func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+			t.Fatal("terminal-only invalid tool was executed")
+			return agenttools.Execution{}, nil
+		}),
+		testTool("list_workspace", func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+			t.Fatal("terminal-only invalid tool was executed")
+			return agenttools.Execution{}, nil
+		}),
+		SubmitInvestigationPlanDefinition(),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, _, err := (AgentLoop{
+		Model: model, TerminalFinalizer: finalizer, Tools: registry, MaxTurns: 8, MaxToolCalls: 1,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		User: agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_source_backed",
+			ChatID:    "oc_backend",
+			SenderID:  "ou_sender",
+			Content:   "@Owner 示例客户端有状态变更回调吗？",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		},
+		TaskClass: domain.TaskClassCoding,
+		WorkKind:  domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.EvidenceStatus != domain.EvidenceVerified || len(decision.Sources) != 1 {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if !messagesContain(finalizer.inputs[0], `"relative_path":"sample-module/callback.go"`) ||
+		!messagesContain(finalizer.inputs[0], `{"path":"sample-module/callback.go"}`) {
+		t.Fatalf("finalizer input missing source refs or arguments: %+v", finalizer.inputs[0])
+	}
+}
+
+func TestAgentLoopRejectsFinalizerUnsupportedSource(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("plan", "submit_investigation_plan", `{
+			"question":"示例状态变更通知需要同步 示例客户端回调和示例通知吗？",
+			"entry_points":["sdk","message"],
+			"symbols":["sample state change","callback"],
+			"tools":["search_workspace"],
+			"stop_conditions":["找到 示例客户端回调或示例通知实现"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("search", "search_workspace", `{"query":"sample state change callback"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("explore", "explore_workspace", `{"query":"sample state change"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("list", "list_workspace", `{"path":"."}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("read", "read_workspace", `{"path":"sample-module/callback.go"}`)}),
+	}}
+	finalizer := &scriptedModel{responses: []*schema.Message{{
+		Role: schema.Assistant,
+		Content: `{
+			"decision":"reply",
+			"relevance_confidence":0.94,
+			"reply_confidence":0.86,
+			"risk":"low",
+			"evidence_status":"verified",
+			"reply_text":"结论：sample-module/callback.go 已上线示例状态变更回调。依据：sample-module/callback.go。未知/下一步：没有。",
+			"reason":"unsupported finalizer source",
+			"source_refs":[{"relative_path":"sample-module/callback.go","digest":"sha256:invented","kind":"workspace_file"}]
+		}`,
+	}}}
+	registry, err := agenttools.NewRegistry(
+		testTool("search_workspace", func(_ context.Context, _ json.RawMessage) (agenttools.Execution, error) {
+			return agenttools.Execution{Content: `{"results":[]}`}, nil
+		}),
+		testTool("explore_workspace", func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+			return agenttools.Execution{}, errors.New("must not execute")
+		}),
+		testTool("list_workspace", func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+			return agenttools.Execution{}, errors.New("must not execute")
+		}),
+		testTool("read_workspace", func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+			return agenttools.Execution{}, errors.New("must not execute")
+		}),
+		SubmitInvestigationPlanDefinition(),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = (AgentLoop{
+		Model: model, TerminalFinalizer: finalizer, Tools: registry, MaxTurns: 8, MaxToolCalls: 1,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		User: agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_5680_like",
+			ChatID:    "oc_backend",
+			SenderID:  "ou_sender",
+			Content:   "@Owner 示例状态变更通知需要同步 示例客户端回调和示例通知吗？",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		},
+		TaskClass: domain.TaskClassCoding,
+		WorkKind:  domain.WorkKindCodingQuestion,
+	})
+	if err == nil || !strings.Contains(err.Error(), "unavailable source") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestAgentLoopRejectsNotifyForDelegatedCodingQuestion(t *testing.T) {
 	model := &scriptedModel{responses: []*schema.Message{
 		schema.AssistantMessage("", []schema.ToolCall{toolCall("call_context", "get_lark_context", `{
@@ -2006,7 +2243,7 @@ func TestKindSpecificTurnBudgetsAreEnforced(t *testing.T) {
 	}
 	_, _, err = (AgentLoop{
 		Model: model, Tools: registry, MaxTurns: 150,
-		SimpleMaxTurns: 2, CodingMaxTurns: 20, GoalMaxTurns: 150,
+		SimpleMaxTurns: 2, CodingMaxTurns: 100, GoalMaxTurns: 150,
 	}).Decide(context.Background(), agentcontext.Bundle{
 		WorkKind: domain.WorkKindSimpleQuestion,
 		Event:    domain.NormalizedEvent{MessageID: "om_simple", Content: "hello"},
@@ -2014,8 +2251,8 @@ func TestKindSpecificTurnBudgetsAreEnforced(t *testing.T) {
 	if err == nil || model.calls != 2 {
 		t.Fatalf("calls=%d err=%v", model.calls, err)
 	}
-	loop := AgentLoop{MaxTurns: 150, SimpleMaxTurns: 2, CodingMaxTurns: 20, GoalMaxTurns: 150}
-	if got := loop.maxTurnsForWorkKind(domain.WorkKindCodingQuestion); got != 20 {
+	loop := AgentLoop{MaxTurns: 150, SimpleMaxTurns: 2, CodingMaxTurns: 100, GoalMaxTurns: 150}
+	if got := loop.maxTurnsForWorkKind(domain.WorkKindCodingQuestion); got != 100 {
 		t.Fatalf("coding max turns=%d", got)
 	}
 	if got := loop.maxTurnsForWorkKind(domain.WorkKindCodingGoal); got != 150 {

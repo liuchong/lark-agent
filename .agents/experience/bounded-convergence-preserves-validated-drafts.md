@@ -29,3 +29,8 @@
 - Owner-visible terminal summaries may include only validated candidates or
   deterministic receipt-derived progress. Rejected model prose remains audit
   history and must not be copied into a message.
+- When a model ignores submit-only terminal turns, run one separate no-tool
+  terminal finalizer over retained runtime tool receipts before dead-lettering.
+  Treat the result exactly like `submit_decision`: parse typed JSON, reject tool
+  calls and invented sources, then apply the same quality, evidence, grounding,
+  permission, approval, and send gates.

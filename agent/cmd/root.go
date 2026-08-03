@@ -1629,6 +1629,7 @@ func buildLiveOptions(
 		}
 		options = append(options, app.WithDecider(agentruntime.LoopDecisionAgent{Loop: agentruntime.AgentLoop{
 			Model:             loopModelAdapter,
+			TerminalFinalizer: loopModelAdapter,
 			Tools:             registry,
 			MaxTurns:          cfg.Agent.MaxTurns,
 			MaxToolBytes:      cfg.Agent.MaxToolOutput,

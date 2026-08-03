@@ -347,3 +347,91 @@ func TestHarnessEvalUnsupportedGroundingCannotEscapeAsVerified(t *testing.T) {
 		t.Fatalf("decision=%+v executions=%d modelCalls=%d", decision, executions, model.calls)
 	}
 }
+
+func TestHarnessEvalTerminalFinalizerPreservesPartialForNonConvergedCodingRun(t *testing.T) {
+	model := &responseQualityModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall("plan", "submit_investigation_plan", `{
+			"question":"示例状态变更通知是否需要同步 示例客户端回调和示例通知",
+			"entry_points":["sdk","message"],
+			"symbols":["sample state change","callback"],
+			"tools":["search_workspace"],
+			"stop_conditions":["找到生产实现或确认搜索无证据"]
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall("search", "search_workspace", `{"query":"sample state change callback"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall("explore", "explore_workspace", `{"query":"sample state change"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall("list", "list_workspace", `{"path":"."}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall("read", "read_workspace", `{"path":"sample-module/callback.go"}`)}),
+	}}
+	finalizer := &responseQualityModel{responses: []*schema.Message{{
+		Role: schema.Assistant,
+		Content: `{
+			"decision":"reply",
+			"relevance_confidence":0.96,
+			"reply_confidence":0.88,
+			"risk":"low",
+			"evidence_status":"insufficient",
+			"reply_outcome":"partial",
+			"progress":{
+				"completed_checks":["search_workspace"],
+				"initial_finding":"已搜索示例状态变更通知和 示例客户端回调关键词，但没有可引用生产实现。",
+				"unknowns":["是否已有 示例客户端回调类型","是否需要同步示例通知"],
+				"next_step":"提供更精确入口路径，或由 Owner 继续核对示例客户端和通知模块"
+			},
+			"reply_text":"我已搜索示例状态变更通知和 示例客户端回调关键词，但没有找到可引用的生产实现。因此目前无法确认是否已有 示例客户端回调类型或是否需要同步示例通知；下一步需要更精确入口路径，或由 Owner 继续核对示例客户端和通知模块。",
+			"owner_action":"核对示例客户端和通知模块入口。",
+			"reason":"terminal finalizer produced bounded partial result from retained search receipts"
+		}`,
+	}}}
+	searches := 0
+	registry, err := agenttools.NewRegistry(
+		agenttools.Definition{
+			Info:             &schema.ToolInfo{Name: "search_workspace"},
+			NonOwnerReadOnly: true,
+			Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+				searches++
+				return agenttools.Execution{Content: `{"results":[],"query":"sample state change callback"}`}, nil
+			},
+		},
+		agenttools.Definition{Info: &schema.ToolInfo{Name: "explore_workspace"}, NonOwnerReadOnly: true, Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+			t.Fatal("terminal-only tool should not execute")
+			return agenttools.Execution{}, nil
+		}},
+		agenttools.Definition{Info: &schema.ToolInfo{Name: "list_workspace"}, NonOwnerReadOnly: true, Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+			t.Fatal("terminal-only tool should not execute")
+			return agenttools.Execution{}, nil
+		}},
+		agenttools.Definition{Info: &schema.ToolInfo{Name: "read_workspace"}, NonOwnerReadOnly: true, Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+			t.Fatal("terminal-only tool should not execute")
+			return agenttools.Execution{}, nil
+		}},
+		agentruntime.SubmitInvestigationPlanDefinition(),
+		agentruntime.SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, _, err := (agentruntime.AgentLoop{
+		Model: model, TerminalFinalizer: finalizer, Tools: registry, MaxTurns: 8, MaxToolCalls: 1,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		User: agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_5680_eval",
+			ChatID:    "oc_backend",
+			SenderID:  "ou_sender",
+			Content:   "@Owner 示例状态变更通知需要同步 示例客户端回调和示例通知吗？",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		},
+		TaskClass: domain.TaskClassCoding,
+		WorkKind:  domain.WorkKindCodingQuestion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.ReplyOutcome != domain.ReplyOutcomePartial ||
+		decision.EvidenceStatus != domain.EvidenceInsufficient ||
+		searches != 1 ||
+		finalizer.calls != 1 ||
+		model.calls != 5 {
+		t.Fatalf("decision=%+v searches=%d modelCalls=%d finalizerCalls=%d", decision, searches, model.calls, finalizer.calls)
+	}
+}

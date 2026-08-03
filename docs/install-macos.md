@@ -117,14 +117,17 @@ agent:
   max_context_image_total_bytes: 2097152
 fast_path:
   simple_max_turns: 3
+  coding_max_turns: 100
 tool_policy:
   coding_max_tool_calls: 16
 policy:
   investigation_progress: enabled
 ```
 
-这不会放宽安全边界。非 Owner 请求仍是同群和 Workspace 只读，环境刺探与工作目录
-外访问仍被强制拒绝。
+这不会放宽安全边界。`coding_max_turns` 只是代码调查的模型轮次上限，不会同步放宽
+工具调用次数；模型仍被提示尽早收敛。已有安装如果保留旧 `config.yaml`，安装后需确认
+`fast_path.coding_max_turns: 100` 已写入本机配置。非 Owner 请求仍是同群和 Workspace
+只读，环境刺探与工作目录外访问仍被强制拒绝。
 
 ## GitHub Environment
 

@@ -20,6 +20,7 @@ import (
 // AgentLoop drives an explicit native tool-calling conversation.
 type AgentLoop struct {
 	Model             einomodel.BaseChatModel
+	TerminalFinalizer einomodel.BaseChatModel
 	Tools             *agenttools.Registry
 	MaxTurns          int
 	MaxToolBytes      int
@@ -179,6 +180,82 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	var structuralRecoveryCandidates []string
 	evidence := responseEvidence{}
 	terminalRepair := terminalRepairContext{}
+	runTerminalFinalizer := func(failure string) (domain.Decision, error) {
+		if l.TerminalFinalizer == nil {
+			return domain.Decision{}, errs.NewInternalError(
+				errs.SubtypeModelNonConvergence,
+				"%s; terminal finalizer is not configured",
+				failure,
+			)
+		}
+		finalizerMessages := terminalFinalizerMessages(bundle, trajectory, terminalRepair, failure)
+		assistant, generateErr := l.TerminalFinalizer.Generate(ctx, finalizerMessages)
+		if generateErr != nil {
+			return domain.Decision{}, generateErr
+		}
+		if assistant == nil {
+			return domain.Decision{}, errs.NewInternalError(errs.SubtypeInvalidResponse, "terminal finalizer returned no message")
+		}
+		sequence++
+		if err := l.recordModelStep(ctx, runID, sequence, assistant); err != nil {
+			return domain.Decision{}, err
+		}
+		trajectory = append(trajectory, assistant)
+		if len(assistant.ToolCalls) > 0 {
+			return domain.Decision{}, errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"terminal finalizer must not call tools",
+			)
+		}
+		finalized, err := ParseDecision(assistant.Content)
+		if err != nil {
+			return domain.Decision{}, err
+		}
+		normalized := normalizeDecisionLanguage(bundle, finalized)
+		normalized = canonicalizeDecisionSources(normalized, allowedSources, observedSources)
+		if err := validateTerminalDecision(bundle, normalized); err != nil {
+			return domain.Decision{}, err
+		}
+		if err := validateDecisionSources(normalized, allowedSources); err != nil {
+			return domain.Decision{}, err
+		}
+		if normalized.Kind == domain.DecisionReply ||
+			normalized.Kind == domain.DecisionRequestApproval {
+			normalized.Progress.CompletedChecks = append(
+				[]string(nil),
+				terminalRepair.CompletedChecks...,
+			)
+		}
+		normalized = normalizeCodingDecisionWithSearchEvidence(
+			bundle,
+			normalized,
+			codingSearches,
+		)
+		if err := validateResponseQuality(bundle, normalized, evidence); err != nil {
+			return domain.Decision{}, err
+		}
+		if err := verifyCodingDecision(
+			bundle,
+			normalized,
+			allowedSources,
+			authoritativeSources,
+			codingEvidenceReads,
+		); err != nil {
+			return domain.Decision{}, err
+		}
+		if err := verifyGroundedCodingReply(
+			codingStructuralQuestion(bundle),
+			normalized,
+			authoritativeContents,
+		); err != nil {
+			return domain.Decision{}, errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"%v. Terminal finalizer cannot repair unsupported reply wording with more tools; emit only grounded facts, explicit unknowns, and a next step",
+				err,
+			)
+		}
+		return normalized, nil
+	}
 	for turn := 0; turn < l.MaxTurns; turn++ {
 		if err := ctx.Err(); err != nil {
 			return domain.Decision{}, trajectory, err
@@ -282,11 +359,26 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 				terminalAttemptLimit++
 			}
 			if terminalOnlyAttempts >= terminalAttemptLimit {
-				return domain.Decision{}, trajectory, errs.NewInternalError(
-					errs.SubtypeModelNonConvergence,
+				failure := fmt.Sprintf(
 					"model did not submit a terminal decision after %d attempts",
 					terminalAttemptLimit,
 				)
+				decision, finalizerErr := runTerminalFinalizer(failure)
+				if finalizerErr != nil {
+					return domain.Decision{}, trajectory, errs.NewInternalError(
+						errs.SubtypeModelNonConvergence,
+						"%s; terminal finalizer failed: %v",
+						failure,
+						finalizerErr,
+					)
+				}
+				if l.Recorder != nil {
+					if err := l.Recorder.FinishAgentRun(ctx, runID, domain.AgentRunCompleted, ""); err != nil {
+						return domain.Decision{}, trajectory, err
+					}
+					runFinished = true
+				}
+				return decision, trajectory, nil
 			}
 			terminalOnlyAttempts++
 			turnToolInfos = submitDecisionOnly(visibleToolInfos)
@@ -826,7 +918,7 @@ func (l AgentLoop) maxTurnsForWorkKind(kind domain.WorkKind) int {
 
 func modelTurnBudgetPrompt(maxTurns int) string {
 	return fmt.Sprintf(
-		"The hard model-turn limit for this run is %d. Plan the investigation within this budget and call submit_decision before the limit is exhausted.",
+		"The hard model-turn limit for this run is %d. This is an upper bound, not a target. Plan the shortest reliable investigation, stop as soon as evidence is sufficient, and call submit_decision before the limit is exhausted.",
 		maxTurns,
 	)
 }
@@ -844,7 +936,7 @@ func modelTurnProgressPrompt(currentTurn, maxTurns int) string {
 		)
 	}
 	return fmt.Sprintf(
-		"Current model turn: %d of %d. Remaining model turns after this request: %d. Use the remaining budget deliberately and converge on submit_decision.",
+		"Current model turn: %d of %d. Remaining model turns after this request: %d. Use the remaining budget deliberately; prefer fewer turns and converge on submit_decision as soon as the available evidence supports a complete, partial, or clarification outcome.",
 		currentTurn,
 		maxTurns,
 		remaining,
@@ -921,6 +1013,7 @@ func modelRunProgressPrompt(budget runBudget, repair ...terminalRepairContext) s
 			"Context budget: %d of %d bytes used (%d%%), %d bytes remaining. "+
 			"Automatic compaction: %t; replaced old messages: %d. Urgency: %s. "+
 			"Required outward language: %s; use that language for all explanatory prose. "+
+			"Do not spend turns just because the ceiling is high; when a narrow answer is supported, submit it. "+
 			"When urgency is urgent, stop broad investigation, preserve explicit unknowns, "+
 			"and converge on submit_decision. %s",
 		modelTurnProgressPrompt(budget.CurrentTurn, budget.MaxTurns),
@@ -937,6 +1030,104 @@ func modelRunProgressPrompt(budget runBudget, repair ...terminalRepairContext) s
 		budget.TargetLanguage,
 		dynamicState,
 	)
+}
+
+func terminalFinalizerMessages(
+	bundle agentcontext.Bundle,
+	trajectory []*schema.Message,
+	repair terminalRepairContext,
+	failure string,
+) []*schema.Message {
+	type retainedCall struct {
+		Name      string
+		Arguments string
+	}
+	retainedCalls := make(map[string]retainedCall)
+	for _, message := range trajectory {
+		if message == nil || message.Role != schema.Assistant {
+			continue
+		}
+		for _, call := range message.ToolCalls {
+			retainedCalls[call.ID] = retainedCall{
+				Name:      call.Function.Name,
+				Arguments: call.Function.Arguments,
+			}
+		}
+	}
+	var evidenceLines []string
+	for _, message := range trajectory {
+		if message == nil || message.Role != schema.Tool {
+			continue
+		}
+		content := strings.TrimSpace(message.Content)
+		if content == "" {
+			continue
+		}
+		if len(content) > 4000 {
+			content = content[:4000] + "\n... [truncated]"
+		}
+		call := retainedCalls[message.ToolCallID]
+		toolName := strings.TrimSpace(message.ToolName)
+		if toolName == "" {
+			toolName = call.Name
+		}
+		arguments := strings.TrimSpace(call.Arguments)
+		if arguments == "" {
+			arguments = "{}"
+		}
+		sourceText := retainedToolSourceText(message.Content)
+		evidenceLines = append(evidenceLines, fmt.Sprintf(
+			"- tool_result id=%s name=%s arguments=%s source_refs=%s content=%s",
+			message.ToolCallID,
+			toolName,
+			arguments,
+			sourceText,
+			content,
+		))
+	}
+	if len(evidenceLines) == 0 {
+		evidenceLines = []string{"- none"}
+	}
+	completed := strings.Join(nonEmptyTrimmedStrings(repair.CompletedChecks), "; ")
+	if completed == "" {
+		completed = "none"
+	}
+	unknowns := strings.Join(nonEmptyTrimmedStrings(repair.Unknowns), "; ")
+	if unknowns == "" {
+		unknowns = "derive only from retained evidence"
+	}
+	lastFailure := strings.TrimSpace(repair.LastFailure)
+	if lastFailure == "" {
+		lastFailure = "none recorded"
+	}
+	return []*schema.Message{
+		schema.SystemMessage("You are the lark-agent terminal finalizer. You have no tools. Do not request, call, or imply any tool use. Produce exactly one JSON object with the same fields accepted by submit_decision. Use only retained runtime evidence below. If evidence is insufficient, return reply_outcome=partial or clarification with evidence_status=insufficient, completed_checks, unknowns, and next_step. Never invent source_refs, code paths, deployment state, or Lark context."),
+		schema.UserMessage(fmt.Sprintf(
+			"Original message: %s\nWork kind: %s\nTask class: %s\nTerminal failure: %s\nLast runtime gate failure: %s\nReusable completed checks: %s\nKnown unknowns: %s\nRetained successful tool receipts:\n%s",
+			bundle.Event.Content,
+			bundle.WorkKind,
+			bundle.TaskClass,
+			failure,
+			lastFailure,
+			completed,
+			unknowns,
+			strings.Join(evidenceLines, "\n"),
+		)),
+	}
+}
+
+func retainedToolSourceText(content string) string {
+	var payload struct {
+		Sources []domain.SourceRef `json:"sources"`
+	}
+	if err := json.Unmarshal([]byte(content), &payload); err != nil || len(payload.Sources) == 0 {
+		return "none"
+	}
+	data, err := json.Marshal(payload.Sources)
+	if err != nil {
+		return "none"
+	}
+	return string(data)
 }
 
 func consumesInvestigationToolBudget(toolName string) bool {

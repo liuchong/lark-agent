@@ -2231,9 +2231,17 @@ The multi-step loop is accepted by these executable BDD scenarios:
   decision, when the model calls an earlier investigation tool and then submits
   a valid decision, then the earlier call is rejected without execution and
   the decision completes; when the model ignores terminal-only instructions
-  for three attempts, then the run fails before the general turn limit, moves
-  directly to dead letter, does not fabricate a reply or action, and the Owner
-  summary lists only successful runtime-recorded tool checks.
+  for three attempts, then the runtime performs one no-tool terminal finalizer
+  request over the retained tool receipts. If that finalizer produces a valid
+  typed decision, the work completes with the same validation and send gates as
+  `submit_decision`; if it fails validation, the work moves to dead letter and
+  the Owner summary lists only successful runtime-recorded tool checks plus the
+  finalizer failure reason.
+- Given coding work is configured, when a coding question enters the model
+  loop, then its default model-turn ceiling is high enough for deeper
+  investigation while every prompt still reports current turn, maximum turns,
+  remaining turns, tool budget, and encourages the model to converge in fewer
+  turns whenever evidence is sufficient.
 - Given a coding run proves one requested fact but cannot prove another after
   bounded repair, when it submits `reply_outcome=partial`, then every definite
   claim remains grounded, the exact unknown and next step remain visible, and

@@ -22,5 +22,11 @@
     "expected_outcome": "partial",
     "max_model_calls": 3,
     "max_tool_calls": 1
+  },
+  {
+    "name": "terminal_finalizer_preserves_partial",
+    "expected_outcome": "partial",
+    "max_model_calls": 6,
+    "max_tool_calls": 1
   }
 ]

@@ -272,7 +272,7 @@ func Default() Config {
 			MaxContextImageBytes:      1 << 20,
 			MaxContextImageTotalBytes: 2 << 20,
 		},
-		FastPath: FastPathConfig{Enabled: true, SimpleMaxTurns: 3, CodingMaxTurns: 20},
+		FastPath: FastPathConfig{Enabled: true, SimpleMaxTurns: 3, CodingMaxTurns: 100},
 		Scheduler: SchedulerConfig{
 			DuplicateWindow:     2 * time.Minute,
 			PollIndexLookback:   2 * time.Minute,

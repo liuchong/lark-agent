@@ -78,7 +78,7 @@ func TestDefaultHarnessConfig(t *testing.T) {
 	if !cfg.FastPath.Enabled {
 		t.Fatalf("fast path disabled by default: %+v", cfg.FastPath)
 	}
-	if cfg.FastPath.SimpleMaxTurns != 3 || cfg.FastPath.CodingMaxTurns != 20 {
+	if cfg.FastPath.SimpleMaxTurns != 3 || cfg.FastPath.CodingMaxTurns != 100 {
 		t.Fatalf("fast path turn budgets=%+v", cfg.FastPath)
 	}
 	if cfg.Scheduler.FastPathLease <= 0 ||
