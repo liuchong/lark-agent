@@ -366,6 +366,10 @@ run 的 PR 头，不下载 artifacts，不执行外部贡献代码。
 应核对模型输入里的 `runtime_policy`：其中 `owner_reply_confidence_min` 是判断
 Owner 是否已经回复的语义门槛，`reply_confidence_min` 是低风险草稿直接发送门槛；
 Workspace 项目规则不能覆盖或替代这组当前配置事实。
+语义门槛按动作方向区分：`unanswered` 会启动代回复或调查，仍要求达到
+`owner_reply_confidence_min`；`answered`、`no_reply_needed`、`withdrawn` 不会替
+Owner 发送任何内容，且 `answered` 必须引用有效的 Owner 后续消息或 Owner reaction，
+因此达到较低的安全收口阈值即可完成，避免把已处理对话反复重试成死信。
 
 明确要求检查源码、生产入口、代码入口、API、处理函数或数据库依据的消息会进入
 `coding_question` 代码调查链路，而不是简单问答链路。单独提到 Workspace 或业务

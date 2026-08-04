@@ -505,6 +505,22 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 				d.replyResolutionRetry,
 			)
 		}
+		if semanticSuppressesDelegatedReply(resolution, d.replyConfidenceMin) {
+			switch resolution.Result {
+			case replymatch.ResultAnswered:
+				decision.Kind = domain.DecisionIgnore
+				decision.Reason = "owner_semantically_replied"
+				return d.finishDecision(ctx, item, decision)
+			case replymatch.ResultNoReplyNeeded:
+				decision.Kind = domain.DecisionIgnore
+				decision.Reason = "delegated_reply_not_needed"
+				return d.finishDecision(ctx, item, decision)
+			case replymatch.ResultWithdrawn:
+				decision.Kind = domain.DecisionIgnore
+				decision.Reason = "message_withdrawn"
+				return d.finishDecision(ctx, item, decision)
+			}
+		}
 		if resolution.Confidence < d.replyConfidenceMin ||
 			resolution.Result == replymatch.ResultAmbiguous {
 			delay := d.replyResolutionRetry
@@ -519,18 +535,6 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 			)
 		}
 		switch resolution.Result {
-		case replymatch.ResultAnswered:
-			decision.Kind = domain.DecisionIgnore
-			decision.Reason = "owner_semantically_replied"
-			return d.finishDecision(ctx, item, decision)
-		case replymatch.ResultNoReplyNeeded:
-			decision.Kind = domain.DecisionIgnore
-			decision.Reason = "delegated_reply_not_needed"
-			return d.finishDecision(ctx, item, decision)
-		case replymatch.ResultWithdrawn:
-			decision.Kind = domain.DecisionIgnore
-			decision.Reason = "message_withdrawn"
-			return d.finishDecision(ctx, item, decision)
 		case replymatch.ResultUnanswered:
 			if resolution.ClassificationConfidence < d.replyConfidenceMin {
 				return d.deferDelegatedReply(
@@ -775,93 +779,98 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 			d.markRetry(item, err)
 			return Result{}, err
 		}
-		if latest.Confidence < d.replyConfidenceMin ||
-			latest.Result == replymatch.ResultAmbiguous {
-			reason := delegatedReplyAmbiguousReason(
-				"investigation_final_context_ambiguous",
-				latest,
-			)
-			if candidateSaved {
-				if err := candidates.HoldWorkReplyCandidate(
-					item.ID,
-					item.LeaseBy,
+		if semanticSuppressesDelegatedReply(latest, d.replyConfidenceMin) {
+			switch latest.Result {
+			case replymatch.ResultAnswered:
+				if candidateSaved {
+					if err := candidates.CancelWorkReplyCandidate(
+						item.ID,
+						item.LeaseBy,
+						"owner answered",
+					); err != nil {
+						d.markRetry(item, err)
+						return Result{}, err
+					}
+				}
+				decision.Kind = domain.DecisionIgnore
+				decision.Reason = "owner_semantically_replied_during_investigation"
+				decision.ReplyText = ""
+				decision.OwnerAction = ""
+			case replymatch.ResultNoReplyNeeded:
+				if candidateSaved {
+					if err := candidates.CancelWorkReplyCandidate(
+						item.ID,
+						item.LeaseBy,
+						"reply no longer needed",
+					); err != nil {
+						d.markRetry(item, err)
+						return Result{}, err
+					}
+				}
+				decision.Kind = domain.DecisionIgnore
+				decision.Reason = "delegated_reply_no_longer_needed_during_investigation"
+				decision.ReplyText = ""
+				decision.OwnerAction = ""
+			case replymatch.ResultWithdrawn:
+				if candidateSaved {
+					if err := candidates.CancelWorkReplyCandidate(
+						item.ID,
+						item.LeaseBy,
+						"source message withdrawn",
+					); err != nil {
+						d.markRetry(item, err)
+						return Result{}, err
+					}
+				}
+				decision.Kind = domain.DecisionIgnore
+				decision.Reason = "message_withdrawn_during_investigation"
+				decision.ReplyText = ""
+				decision.OwnerAction = ""
+			}
+		} else {
+			if latest.Confidence < d.replyConfidenceMin ||
+				latest.Result == replymatch.ResultAmbiguous {
+				reason := delegatedReplyAmbiguousReason(
+					"investigation_final_context_ambiguous",
+					latest,
+				)
+				if candidateSaved {
+					if err := candidates.HoldWorkReplyCandidate(
+						item.ID,
+						item.LeaseBy,
+						reason,
+					); err != nil {
+						d.markRetry(item, err)
+						return Result{}, err
+					}
+				}
+				return d.deferDelegatedReply(
+					item,
+					decision,
 					reason,
-				); err != nil {
-					d.markRetry(item, err)
-					return Result{}, err
-				}
+					d.replyResolutionRetry,
+				)
 			}
-			return d.deferDelegatedReply(
-				item,
-				decision,
-				reason,
-				d.replyResolutionRetry,
-			)
-		}
-		switch latest.Result {
-		case replymatch.ResultAnswered:
-			if candidateSaved {
-				if err := candidates.CancelWorkReplyCandidate(
-					item.ID,
-					item.LeaseBy,
-					"owner answered",
-				); err != nil {
-					d.markRetry(item, err)
-					return Result{}, err
+			switch latest.Result {
+			case replymatch.ResultUnanswered:
+			default:
+				if candidateSaved {
+					if err := candidates.HoldWorkReplyCandidate(
+						item.ID,
+						item.LeaseBy,
+						"investigation_final_context_invalid",
+					); err != nil {
+						d.markRetry(item, err)
+						return Result{}, err
+					}
 				}
-			}
-			decision.Kind = domain.DecisionIgnore
-			decision.Reason = "owner_semantically_replied_during_investigation"
-			decision.ReplyText = ""
-			decision.OwnerAction = ""
-		case replymatch.ResultNoReplyNeeded:
-			if candidateSaved {
-				if err := candidates.CancelWorkReplyCandidate(
-					item.ID,
-					item.LeaseBy,
-					"reply no longer needed",
-				); err != nil {
-					d.markRetry(item, err)
-					return Result{}, err
-				}
-			}
-			decision.Kind = domain.DecisionIgnore
-			decision.Reason = "delegated_reply_no_longer_needed_during_investigation"
-			decision.ReplyText = ""
-			decision.OwnerAction = ""
-		case replymatch.ResultWithdrawn:
-			if candidateSaved {
-				if err := candidates.CancelWorkReplyCandidate(
-					item.ID,
-					item.LeaseBy,
-					"source message withdrawn",
-				); err != nil {
-					d.markRetry(item, err)
-					return Result{}, err
-				}
-			}
-			decision.Kind = domain.DecisionIgnore
-			decision.Reason = "message_withdrawn_during_investigation"
-			decision.ReplyText = ""
-			decision.OwnerAction = ""
-		case replymatch.ResultUnanswered:
-		default:
-			if candidateSaved {
-				if err := candidates.HoldWorkReplyCandidate(
-					item.ID,
-					item.LeaseBy,
+				return d.deferDelegatedReply(
+					item,
+					decision,
 					"investigation_final_context_invalid",
-				); err != nil {
-					d.markRetry(item, err)
-					return Result{}, err
-				}
+					d.replyResolutionRetry,
+				)
 			}
-			return d.deferDelegatedReply(
-				item,
-				decision,
-				"investigation_final_context_invalid",
-				d.replyResolutionRetry,
-			)
 		}
 	}
 	if item.InvestigationActive && d.investigationProgress != nil {
@@ -909,6 +918,22 @@ func (d *Daemon) resolveHeldReplyCandidate(
 			d.replyResolutionRetry,
 		)
 	}
+	if semanticSuppressesDelegatedReply(resolution, d.replyConfidenceMin) {
+		if err := candidates.CancelWorkReplyCandidate(
+			item.ID,
+			item.LeaseBy,
+			"candidate no longer needs a sender-facing reply: "+string(resolution.Result),
+		); err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+		decision := candidate.Decision
+		decision.Kind = domain.DecisionIgnore
+		decision.ReplyText = ""
+		decision.OwnerAction = ""
+		decision.Reason = "held_candidate_" + string(resolution.Result)
+		return d.finishDecision(ctx, item, decision)
+	}
 	if resolution.Confidence < d.replyConfidenceMin ||
 		resolution.Result == replymatch.ResultAmbiguous {
 		delay := d.replyResolutionRetry
@@ -934,21 +959,6 @@ func (d *Daemon) resolveHeldReplyCandidate(
 	switch resolution.Result {
 	case replymatch.ResultUnanswered:
 		return d.finishCandidateDecision(ctx, item, candidate.Decision, candidates)
-	case replymatch.ResultAnswered, replymatch.ResultNoReplyNeeded, replymatch.ResultWithdrawn:
-		if err := candidates.CancelWorkReplyCandidate(
-			item.ID,
-			item.LeaseBy,
-			"candidate no longer needs a sender-facing reply: "+string(resolution.Result),
-		); err != nil {
-			d.markRetry(item, err)
-			return Result{}, err
-		}
-		decision := candidate.Decision
-		decision.Kind = domain.DecisionIgnore
-		decision.ReplyText = ""
-		decision.OwnerAction = ""
-		decision.Reason = "held_candidate_" + string(resolution.Result)
-		return d.finishDecision(ctx, item, decision)
 	default:
 		if err := candidates.HoldWorkReplyCandidate(
 			item.ID,
@@ -1018,6 +1028,29 @@ func delegatedReplyAmbiguousReason(
 		return "owner_reaction_read_failed"
 	}
 	return fallback
+}
+
+func semanticSuppressesDelegatedReply(
+	resolution replymatch.Resolution,
+	configuredMin float64,
+) bool {
+	if resolution.Confidence < semanticSuppressionConfidenceMin(configuredMin) {
+		return false
+	}
+	switch resolution.Result {
+	case replymatch.ResultAnswered:
+		return len(resolution.MatchedOwnerMessageIDs) > 0 ||
+			resolution.OwnerAckReaction != nil
+	case replymatch.ResultNoReplyNeeded, replymatch.ResultWithdrawn:
+		return true
+	default:
+		return false
+	}
+}
+
+func semanticSuppressionConfidenceMin(configuredMin float64) float64 {
+	const defaultSuppressionFloor = 0.70
+	return defaultSuppressionFloor
 }
 
 func isDelegatedReply(relevance domain.Relevance) bool {

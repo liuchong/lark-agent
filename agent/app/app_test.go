@@ -466,6 +466,21 @@ func TestDaemonAmbiguousOwnerReplyDefersWithoutMainModel(t *testing.T) {
 	}
 }
 
+func TestSemanticSuppressionConfidenceFloorDoesNotFollowLowerConfig(t *testing.T) {
+	resolution := replymatch.Resolution{
+		Result:                 replymatch.ResultAnswered,
+		Confidence:             0.65,
+		MatchedOwnerMessageIDs: []string{"om_owner_answer"},
+	}
+	if semanticSuppressesDelegatedReply(resolution, 0.60) {
+		t.Fatal("semantic suppression accepted below the 0.70 safety floor")
+	}
+	resolution.Confidence = 0.70
+	if !semanticSuppressesDelegatedReply(resolution, 0.60) {
+		t.Fatal("semantic suppression rejected the 0.70 safety floor")
+	}
+}
+
 func TestDaemonResolvesHeldCandidateWithoutCallingMainModel(t *testing.T) {
 	item := domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID: "om_held_candidate",
@@ -513,6 +528,61 @@ func TestDaemonResolvesHeldCandidateWithoutCallingMainModel(t *testing.T) {
 	}
 	if decider.called || resolver.calls != 1 || !replier.called ||
 		!q.consumed || !q.done || result.Decision.ReplyText != decision.ReplyText {
+		t.Fatalf("result=%+v queue=%+v resolver=%+v decider=%+v replier=%+v",
+			result, q, resolver, decider, replier)
+	}
+}
+
+func TestDaemonCancelsHeldCandidateForModerateConfidenceOwnerAnswer(t *testing.T) {
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_held_candidate_answered",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})
+	item.ID = 902
+	decision := domain.Decision{
+		Kind:         domain.DecisionReply,
+		Relevance:    domain.RelevanceDirectMention,
+		Risk:         domain.RiskLow,
+		ReplyOutcome: domain.ReplyOutcomePartial,
+		ReplyText:    "已核对入口；生产配置仍未知。",
+	}
+	q := &fakeQueue{
+		ok:   true,
+		item: item,
+		candidate: &domain.WorkReplyCandidate{
+			WorkItemID: item.ID,
+			Status:     domain.ReplyCandidateHeld,
+			Decision:   decision,
+		},
+	}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID:        item.Event.MessageID,
+		Result:                 replymatch.ResultAnswered,
+		Confidence:             0.82,
+		Reason:                 "owner answered while candidate was held",
+		MatchedOwnerMessageIDs: []string{"om_owner_answer"},
+	}}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithReplyHandler(replier),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decider.called || resolver.calls != 1 || replier.called ||
+		!q.cancelled || q.consumed || !q.done ||
+		result.Decision.Kind != domain.DecisionIgnore ||
+		result.Decision.Reason != "held_candidate_answered" {
 		t.Fatalf("result=%+v queue=%+v resolver=%+v decider=%+v replier=%+v",
 			result, q, resolver, decider, replier)
 	}
@@ -752,7 +822,7 @@ func TestDaemonRechecksOwnerHandlingBeforeInvestigationFinalReply(t *testing.T) 
 		{
 			TargetMessageID:        "om_contextual",
 			Result:                 replymatch.ResultAnswered,
-			Confidence:             0.99,
+			Confidence:             0.82,
 			Reason:                 "owner answered while investigation was running",
 			MatchedOwnerMessageIDs: []string{"om_owner_answer"},
 		},

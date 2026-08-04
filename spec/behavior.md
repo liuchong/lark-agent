@@ -213,20 +213,24 @@ evidence but do not prove that the owner answered the target. For an ordinary
 private message that does not explicitly mention
 the owner, the resolver also decides whether the target reasonably calls for a
 response at all. A high-confidence semantic answer cancels only the matched
-target; a high-confidence `no_reply_needed` result cancels a private answer,
-acknowledgement, reaction, owner-led conversational continuation, or group
-`@Owner` social acknowledgement that contains no explicit new action obligation,
-without inventing another response. A high-confidence unanswered result admits
-only that target to the delegated agent loop after it records a target intent
-and an exact response-obligation quote from the target message. If the target is
-classified as an answer, acknowledgement, continuation, social compliment, or
-informative product/design statement and does not contain such an obligation,
-the runtime normalizes it to `no_reply_needed` instead of starting an
+target; an `answered` result with validated later owner messages or owner
+acknowledgement reaction cancels only that matched target. A `no_reply_needed`
+result cancels a private answer, acknowledgement, reaction, owner-led
+conversational continuation, or group `@Owner` social acknowledgement that
+contains no explicit new action obligation, without inventing another response.
+These suppressive outcomes use a lower safety floor than `unanswered` because
+they do not send anything on the owner's behalf. A high-confidence unanswered
+result admits only that target to the delegated agent loop after it records a
+target intent and an exact response-obligation quote from the target message. If
+the target is classified as an answer, acknowledgement, continuation, social
+compliment, or informative product/design statement and does not contain such an
+obligation, the runtime normalizes it to `no_reply_needed` instead of starting an
 investigation. Explicit group `@Owner` remains the required entry condition for
 group delegated work, but the semantic gate may still suppress messages that
-only acknowledge, compliment, react, or share information. Ambiguous, malformed,
-low-confidence, truncated, or unavailable resolution fails closed and retries
-after the configured semantic retry delay.
+only acknowledge, compliment, react, share information, or were handled by later
+owner messages. Ambiguous, malformed, truncated, unavailable, or truly
+low-confidence resolution fails closed and retries after the configured semantic
+retry delay.
 
 Immediately before semantic classification, before finishing durable
 investigation, and before sending a held candidate, the resolver reads reactions
@@ -1502,6 +1506,12 @@ The multi-step loop is accepted by these executable BDD scenarios:
   the same conversation, when semantic delegated-reply resolution runs, then
   it returns high-confidence `no_reply_needed` and neither the main reply model
   nor a sender-facing reply runs.
+- Given another human continues an owner-initiated private discussion and the
+  semantic resolver returns `answered` with valid later owner message IDs and
+  confidence above the suppressive safety floor but below
+  `policy.owner_reply_confidence_min`, when semantic delegated-reply resolution
+  runs, then the work completes as owner-handled instead of retrying to
+  dead-letter.
 - Given the owner privately asks why a remembered group-member-count limit
   cannot be found and another human replies that it was only discussed without
   detailed interaction or design, when semantic delegated-reply resolution

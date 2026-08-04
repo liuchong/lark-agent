@@ -26,6 +26,13 @@ design statement. It must contain an explicit question, request, invitation, or
 owner action obligation such as asking the owner to confirm, investigate, look
 into, handle, reply, or send something.
 
+Do not use the same confidence threshold for opposite directions. `unanswered`
+starts delegated work and should keep the configured high threshold. `answered`
+or `no_reply_needed` suppresses delegated work and sends nothing; if `answered`
+has validated later owner message IDs or an owner acknowledgement reaction, a
+moderate confidence result should complete as handled instead of retrying to an
+`owner_reply_ambiguous` dead letter.
+
 Owner acknowledgement reactions are deterministic Go evidence, not model
 claims. Read reactions on the exact target with user identity, accept only the
 configured owner's allowlisted acknowledgement emoji, and fail closed when the

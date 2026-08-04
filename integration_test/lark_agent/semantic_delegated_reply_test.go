@@ -217,6 +217,80 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 		}
 	})
 
+	t.Run("moderate confidence owner answer with matched messages suppresses exact target", func(t *testing.T) {
+		store := openSemanticIntegrationStore(t)
+		base := store.CurrentSession().StartedAt.Add(time.Second)
+		item := enqueueDueDelegatedItem(t, store, domain.NormalizedEvent{
+			Source:     domain.SourcePoll,
+			EventID:    "poll:om_5805_shape",
+			MessageID:  "om_5805_shape",
+			ChatID:     "oc_private",
+			ChatType:   "p2p",
+			SenderID:   "ou_teammate",
+			SenderType: "user",
+			Content:    "但会想一下这个场景怎么做",
+			CreatedAt:  base,
+		})
+		semanticModel := &semanticIntegrationModel{response: `{
+			"target_message_id":"om_5805_shape",
+			"result":"answered",
+			"matched_owner_message_ids":["om_owner_followup_a","om_owner_followup_b"],
+			"confidence":0.82,
+			"reason":"the owner followed up with concrete design details for how this scenario would work",
+			"target_intent":"continuation_of_owner_initiated_discussion"
+		}`}
+		builder := &semanticIntegrationBuilder{}
+		decider := &semanticIntegrationDecider{}
+		replier := &semanticIntegrationReplyHandler{}
+		daemon := app.NewDaemon(
+			store,
+			router.New(router.Config{
+				OwnerOpenID:       "ou_owner",
+				Mode:              domain.ModeAuto,
+				PrivateReplyScope: domain.PrivateReplyScopeAll,
+			}),
+			app.WithContextBuilder(builder),
+			app.WithDecider(decider),
+			app.WithReplyHandler(replier),
+			app.WithDelegatedReplyResolver(semanticIntegrationResolver{
+				store:   store,
+				matcher: replymatch.New(semanticModel, "ou_owner"),
+				messages: []domain.NormalizedEvent{
+					item.Event,
+					{
+						MessageID: "om_owner_followup_a", ChatID: "oc_private",
+						ChatType: "p2p", SenderID: "ou_owner",
+						Content:   "这个场景我倾向加更多入口，每个入口对应特殊功能。",
+						CreatedAt: base.Add(time.Minute),
+					},
+					{
+						MessageID: "om_owner_followup_b", ChatID: "oc_private",
+						ChatType: "p2p", SenderID: "ou_owner",
+						Content:   "聊天页放一个 tendo 小按钮，点击带上上下文，长按出总结/帮我回复菜单。",
+						CreatedAt: base.Add(2 * time.Minute),
+					},
+				},
+			}, 0.85, 30*time.Second),
+		)
+
+		result, err := daemon.RunOnce(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Decision.Reason != "owner_semantically_replied" ||
+			semanticModel.calls != 1 ||
+			builder.calls != 0 || decider.calls != 0 || replier.calls != 0 {
+			t.Fatalf(
+				"result=%+v semantic=%d builder=%d decider=%d replier=%d",
+				result,
+				semanticModel.calls,
+				builder.calls,
+				decider.calls,
+				replier.calls,
+			)
+		}
+	})
+
 	t.Run("unanswered human private message enters reply workflow", func(t *testing.T) {
 		store := openSemanticIntegrationStore(t)
 		base := store.CurrentSession().StartedAt.Add(time.Second)
