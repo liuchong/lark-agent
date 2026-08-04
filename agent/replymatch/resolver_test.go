@@ -236,6 +236,39 @@ func TestResolverNormalizesPrivateAnswerWithoutTargetObligationToNoReplyNeeded(t
 	}
 }
 
+func TestResolverNormalizesPrivateDesignStatementWithoutExplicitAsk(t *testing.T) {
+	base := time.Date(2026, 8, 4, 0, 32, 26, 0, time.UTC)
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_private_design",
+		"result":"unanswered",
+		"confidence":0.72,
+		"reason":"The target states a product decision about a unified menu.",
+		"target_intent":"communicate design decision",
+		"response_obligation_quote":"目前不区分两种示例类型，统一放在一个入口里处理",
+		"task_summary":"adjust sticker and GIF menu design",
+		"task_class":"simple",
+		"classification_confidence":0.72,
+		"requires_progress":false
+	}`}
+	resolution, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_private_design", ChatID: "oc_private", ChatType: "p2p",
+			SenderID: "ou_teammate", SenderType: "user",
+			Content:   "我看了一下没问题，目前不区分两种示例类型，统一放在一个入口里处理",
+			CreatedAt: base,
+		}),
+		ContextCutoff: base.Add(3 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Result != ResultNoReplyNeeded ||
+		resolution.ResponseObligationQuote != "" ||
+		resolution.TaskSummary != "" {
+		t.Fatalf("resolution=%+v", resolution)
+	}
+}
+
 func TestResolverRequiresExactPrivateTargetObligationForUnanswered(t *testing.T) {
 	base := time.Date(2026, 7, 31, 4, 22, 52, 0, time.UTC)
 	t.Run("explicit request quote is accepted", func(t *testing.T) {
@@ -297,7 +330,7 @@ func TestResolverRequiresExactPrivateTargetObligationForUnanswered(t *testing.T)
 	})
 }
 
-func TestResolverRejectsNoReplyNeededForExplicitGroupOwnerMention(t *testing.T) {
+func TestResolverRejectsNoReplyNeededForExplicitGroupOwnerRequest(t *testing.T) {
 	base := time.Date(2026, 7, 29, 5, 0, 0, 0, time.UTC)
 	model := &scriptedModel{reply: `{
 		"target_message_id":"om_group_request",
@@ -316,7 +349,99 @@ func TestResolverRejectsNoReplyNeededForExplicitGroupOwnerMention(t *testing.T) 
 		ContextCutoff: base.Add(3 * time.Minute),
 	})
 	if err == nil {
-		t.Fatal("explicit group owner mention accepted no_reply_needed")
+		t.Fatal("explicit group owner request accepted no_reply_needed")
+	}
+}
+
+func TestResolverRejectsNoReplyNeededForChineseGroupInvestigationRequest(t *testing.T) {
+	base := time.Date(2026, 8, 4, 1, 20, 0, 0, time.UTC)
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_group_investigate",
+		"result":"no_reply_needed",
+		"confidence":0.99,
+		"reason":"No reply is needed."
+	}`}
+	_, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_group_investigate", ChatID: "oc_group",
+			ChatType: "group", SenderID: "ou_teammate",
+			Content:   "@测试负责人 这个线上问题辛苦排查下",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+			CreatedAt: base,
+		}),
+		ContextCutoff: base.Add(3 * time.Minute),
+	})
+	if err == nil {
+		t.Fatal("Chinese group investigation request accepted no_reply_needed")
+	}
+}
+
+func TestResolverAllowsNoReplyNeededForCompletedStatusStatement(t *testing.T) {
+	base := time.Date(2026, 8, 4, 1, 21, 0, 0, time.UTC)
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_private_status",
+		"result":"ambiguous",
+		"confidence":0.63,
+		"reason":"The target is a completed status statement.",
+		"target_intent":"informational completed status"
+	}`}
+	resolution, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_private_status", ChatID: "oc_private",
+			ChatType: "p2p", SenderID: "ou_teammate",
+			Content:   "已确认不用改，已经处理完",
+			CreatedAt: base,
+		}),
+		ContextCutoff: base.Add(3 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Result != ResultNoReplyNeeded {
+		t.Fatalf("resolution=%+v", resolution)
+	}
+}
+
+func TestResolverAcceptsNoReplyNeededForGroupOwnerSocialAcknowledgement(t *testing.T) {
+	base := time.Date(2026, 8, 4, 1, 9, 39, 0, time.UTC)
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_group_ack",
+		"result":"ambiguous",
+		"confidence":0.55,
+		"reason":"The target is a thumbs-up and compliment on the owner's image.",
+		"target_intent":"social acknowledgement / compliment"
+	}`}
+	resolution, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_group_ack", ChatID: "oc_group",
+			ChatType: "group", SenderID: "ou_teammate",
+			Content:   "@测试负责人 [赞]这图有禅意啊",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+			CreatedAt: base,
+		}),
+		Messages: []domain.NormalizedEvent{
+			{
+				MessageID: "om_owner_image", ChatID: "oc_group",
+				ChatType: "group", SenderID: "ou_owner",
+				Content: "[图片]", CreatedAt: base.Add(-time.Minute),
+			},
+			{
+				MessageID: "om_group_ack", ChatID: "oc_group",
+				ChatType: "group", SenderID: "ou_teammate",
+				Content:   "@测试负责人 [赞]这图有禅意啊",
+				Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+				CreatedAt: base,
+			},
+		},
+		ContextCutoff: base.Add(3 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Result != ResultNoReplyNeeded ||
+		resolution.RequiresProgress ||
+		resolution.TaskSummary != "" {
+		t.Fatalf("resolution=%+v", resolution)
 	}
 }
 

@@ -181,10 +181,11 @@ semantic gate finds an outstanding conversational need for an owner response.
 A private answer to an owner-initiated question, acknowledgement, reaction, or
 ordinary continuation with no new request may be `no_reply_needed`. For ordinary
 private messages, `unanswered` must be grounded in a new question, request,
-invitation, or coordination need present in the target text itself; context may
+invitation, or action obligation present in the target text itself; context may
 explain that obligation, but must not invent it from the owner's earlier
-question. A private `owner_request` answers the configured owner's own
-assistant prompt using bot identity.
+question or from an informative product/design statement. A private
+`owner_request` answers the configured owner's own assistant prompt using bot
+identity.
 Non-owner private messages addressed to the assistant and non-owner native
 assistant mentions are ignored before model work. A direct owner mention is
 addressed to this personal-assistant
@@ -213,16 +214,19 @@ private message that does not explicitly mention
 the owner, the resolver also decides whether the target reasonably calls for a
 response at all. A high-confidence semantic answer cancels only the matched
 target; a high-confidence `no_reply_needed` result cancels a private answer,
-acknowledgement, reaction, or owner-led conversational continuation without
-inventing another response. A high-confidence unanswered result admits only
-that target to the delegated agent loop after it records a target intent and an
-exact response-obligation quote from the target message. If an ordinary private
-target is classified as an answer, acknowledgement, or continuation and does not
-contain such a quote, the runtime normalizes it to `no_reply_needed` instead of
-starting an investigation. Explicit group `@Owner` messages cannot use
-`no_reply_needed`; they remain addressed owner work unless owner content
-handled them. Ambiguous, malformed, low-confidence, truncated, or unavailable
-resolution fails closed and retries after the configured semantic retry delay.
+acknowledgement, reaction, owner-led conversational continuation, or group
+`@Owner` social acknowledgement that contains no explicit new action obligation,
+without inventing another response. A high-confidence unanswered result admits
+only that target to the delegated agent loop after it records a target intent
+and an exact response-obligation quote from the target message. If the target is
+classified as an answer, acknowledgement, continuation, social compliment, or
+informative product/design statement and does not contain such an obligation,
+the runtime normalizes it to `no_reply_needed` instead of starting an
+investigation. Explicit group `@Owner` remains the required entry condition for
+group delegated work, but the semantic gate may still suppress messages that
+only acknowledge, compliment, react, or share information. Ambiguous, malformed,
+low-confidence, truncated, or unavailable resolution fails closed and retries
+after the configured semantic retry delay.
 
 Immediately before semantic classification, before finishing durable
 investigation, and before sending a held candidate, the resolver reads reactions
@@ -1516,10 +1520,15 @@ The multi-step loop is accepted by these executable BDD scenarios:
   invitation, or coordination need that the owner has not handled, when the
   semantic deadline is evaluated, then it remains `unanswered` and may enter
   the read-only delegated workflow.
-- Given a group message explicitly mentions the owner, when semantic
-  resolution runs, then `no_reply_needed` is invalid for that target; only a
-  validated owner handling, withdrawal, or the existing policy gates may
-  suppress the delegated workflow.
+- Given a group message explicitly mentions the owner with only a reaction,
+  compliment, or social acknowledgement and no new action obligation, when
+  semantic resolution runs, then it becomes `no_reply_needed` and does not
+  enter retry/dead-letter owner-summary flow.
+- Given a group message explicitly mentions the owner with a clear request such
+  as asking the owner to confirm, investigate, look into, or handle something,
+  when semantic resolution runs, then a model-provided `no_reply_needed` result
+  is rejected and the target remains delegated owner work unless owner content
+  handled it.
 - Given the owner participated before a newer group message explicitly
   mentions the owner with substantive declarative feedback, when semantic
   resolution runs, then the older owner message does not count as handling the

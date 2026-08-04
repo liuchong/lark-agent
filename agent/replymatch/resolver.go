@@ -147,7 +147,7 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (Resolution, error)
 	}
 	resolution.OwnerAckReaction = nil
 	resolution.ContextCutoff = req.ContextCutoff
-	resolution = normalizePrivateDirection(req, r.ownerOpenID, resolution)
+	resolution = normalizeTargetDirection(req, r.ownerOpenID, resolution)
 	if err := validateResolution(req, r.ownerOpenID, resolution); err != nil {
 		return Resolution{}, err
 	}
@@ -235,6 +235,9 @@ func validateResolution(req Request, ownerOpenID string, resolution Resolution) 
 			if !strings.Contains(target.Content, quote) {
 				return invalidResolution("private response_obligation_quote must be copied from the target message")
 			}
+			if !hasExplicitResponseObligation(target, resolution) {
+				return invalidResolution("private unanswered semantic result requires an explicit target action obligation")
+			}
 		}
 		if strings.TrimSpace(resolution.TaskSummary) == "" {
 			return invalidResolution("unanswered semantic result requires task_summary")
@@ -288,29 +291,53 @@ func validateResolution(req Request, ownerOpenID string, resolution Resolution) 
 		return invalidResolution("unanswered result cannot contain matched owner messages")
 	}
 	if resolution.Result == ResultNoReplyNeeded &&
-		!ordinaryPrivateTarget(target, ownerOpenID) {
+		hasExplicitResponseObligation(target, Resolution{}) {
 		return invalidResolution(
-			"no_reply_needed is allowed only for an ordinary private target without an explicit owner mention",
+			"no_reply_needed is invalid when the target contains an explicit owner action obligation",
 		)
 	}
 	return nil
 }
 
-func normalizePrivateDirection(req Request, ownerOpenID string, resolution Resolution) Resolution {
+func normalizeTargetDirection(req Request, ownerOpenID string, resolution Resolution) Resolution {
 	target := req.Target.Event
+	if resolution.Result == ResultUnanswered &&
+		!hasExplicitResponseObligation(target, resolution) &&
+		noReplyIntent(resolution.TargetIntent, resolution.Reason) {
+		return normalizeNoReplyNeeded(
+			resolution,
+			"target does not contain an explicit owner action obligation",
+		)
+	}
+	if resolution.Result == ResultAmbiguous &&
+		!hasExplicitResponseObligation(target, resolution) &&
+		noReplyIntent(resolution.TargetIntent, resolution.Reason) {
+		return normalizeNoReplyNeeded(
+			resolution,
+			"target is conversational or informational and contains no explicit owner action obligation",
+		)
+	}
 	if resolution.Result != ResultUnanswered ||
 		!ordinaryPrivateTarget(target, ownerOpenID) ||
 		strings.TrimSpace(resolution.ResponseObligationQuote) != "" ||
-		!privateNoReplyIntent(resolution.TargetIntent) {
+		!noReplyIntent(resolution.TargetIntent, resolution.Reason) {
 		return resolution
 	}
+	return normalizeNoReplyNeeded(
+		resolution,
+		"private target is a response without a new target obligation",
+	)
+}
+
+func normalizeNoReplyNeeded(resolution Resolution, reason string) Resolution {
 	resolution.Result = ResultNoReplyNeeded
 	if resolution.Confidence < 0.85 {
 		resolution.Confidence = 0.85
 	}
 	if strings.TrimSpace(resolution.Reason) == "" {
-		resolution.Reason = "private target is a response without a new target obligation"
+		resolution.Reason = reason
 	}
+	resolution.ResponseObligationQuote = ""
 	resolution.TaskSummary = ""
 	resolution.TaskClass = ""
 	resolution.ClassificationConfidence = 0
@@ -318,13 +345,90 @@ func normalizePrivateDirection(req Request, ownerOpenID string, resolution Resol
 	return resolution
 }
 
-func privateNoReplyIntent(intent string) bool {
-	switch strings.ToLower(strings.TrimSpace(intent)) {
-	case "answer", "ack", "acknowledgement", "acknowledgment", "reaction", "continuation", "reply":
-		return true
-	default:
-		return false
+func noReplyIntent(values ...string) bool {
+	combined := strings.ToLower(strings.Join(values, " "))
+	for _, marker := range []string{
+		"answer",
+		"ack",
+		"acknowledgement",
+		"acknowledgment",
+		"reaction",
+		"continuation",
+		"reply",
+		"social",
+		"compliment",
+		"thumb",
+		"点赞",
+		"夸",
+		"sharing_information",
+		"share information",
+		"informational",
+		"descriptive",
+		"design statement",
+		"design decision",
+		"product decision",
+	} {
+		if strings.Contains(combined, marker) {
+			return true
+		}
 	}
+	return false
+}
+
+func hasExplicitResponseObligation(target domain.NormalizedEvent, resolution Resolution) bool {
+	text := strings.TrimSpace(target.Content)
+	quote := strings.TrimSpace(resolution.ResponseObligationQuote)
+	if quote != "" {
+		text += "\n" + quote
+	}
+	text = strings.ToLower(text)
+	for _, marker := range []string{
+		"?",
+		"？",
+		"请",
+		"麻烦",
+		"帮我",
+		"帮忙",
+		"需要你",
+		"你帮",
+		"你看",
+		"看下",
+		"看看",
+		"看一下",
+		"排查",
+		"排查下",
+		"查一下",
+		"确认一下",
+		"帮忙确认",
+		"帮我确认",
+		"处理一下",
+		"跟进",
+		"跟进一下",
+		"修一下",
+		"改一下",
+		"做一下",
+		"回复",
+		"发一下",
+		"同步一下",
+		"please",
+		"can you",
+		"could you",
+		"would you",
+		"help",
+		"check",
+		"confirm",
+		"investigate",
+		"fix",
+		"handle",
+		"reply",
+		"send",
+		"look into",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func ordinaryPrivateTarget(target domain.NormalizedEvent, ownerOpenID string) bool {

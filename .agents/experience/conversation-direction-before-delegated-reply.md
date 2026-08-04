@@ -10,14 +10,21 @@ needed. Before delegating a response, distinguish:
 
 The resolver needs bounded pre-target context to establish direction and
 post-target context to attribute owner handling. Keep explicit group `@Owner`
-work separate: it is addressed work and cannot be dismissed merely because it
-is declarative.
+work separate: it is the group entry condition, but it is not by itself proof
+that a reply is needed. Do not dismiss a real group request merely because it is
+declarative; do normalize social acknowledgements, compliments, reactions, and
+information-only turns without an explicit owner action obligation to
+`no_reply_needed`.
 
 For ordinary private messages, `unanswered` must be grounded in an exact quote
 from the target message itself. Context can explain why the quote matters, but
 must not invent a coding task from the owner's earlier question. If the target
 intent is answer, acknowledgement, reaction, continuation, or reply and no
 target quote exists, normalize to `no_reply_needed`.
+An exact quote is not enough when the quote is only an informative product or
+design statement. It must contain an explicit question, request, invitation, or
+owner action obligation such as asking the owner to confirm, investigate, look
+into, handle, reply, or send something.
 
 Owner acknowledgement reactions are deterministic Go evidence, not model
 claims. Read reactions on the exact target with user identity, accept only the

@@ -424,6 +424,132 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 		}
 	})
 
+	t.Run("private design statement without explicit ask needs no synthetic reply", func(t *testing.T) {
+		store := openSemanticIntegrationStore(t)
+		base := store.CurrentSession().StartedAt.Add(time.Second)
+		item := enqueueDueDelegatedItem(t, store, domain.NormalizedEvent{
+			Source:     domain.SourcePoll,
+			EventID:    "poll:om_private_design",
+			MessageID:  "om_private_design",
+			ChatID:     "oc_private",
+			ChatType:   "p2p",
+			SenderID:   "ou_teammate",
+			SenderType: "user",
+			Content:    "我看了一下没问题，目前不区分两种示例类型，统一放在一个入口里处理",
+			CreatedAt:  base,
+		})
+		semanticModel := &semanticIntegrationModel{response: `{
+			"target_message_id":"om_private_design",
+			"result":"unanswered",
+			"confidence":0.72,
+			"reason":"the target communicates a design decision",
+			"target_intent":"communicate design decision",
+			"response_obligation_quote":"目前不区分两种示例类型，统一放在一个入口里处理",
+			"task_summary":"adjust sticker and GIF menu design",
+			"task_class":"simple",
+			"classification_confidence":0.72,
+			"requires_progress":false
+		}`}
+		builder := &semanticIntegrationBuilder{}
+		decider := &semanticIntegrationDecider{}
+		replier := &semanticIntegrationReplyHandler{}
+		daemon := app.NewDaemon(
+			store,
+			router.New(router.Config{
+				OwnerOpenID:       "ou_owner",
+				Mode:              domain.ModeAuto,
+				PrivateReplyScope: domain.PrivateReplyScopeAll,
+			}),
+			app.WithContextBuilder(builder),
+			app.WithDecider(decider),
+			app.WithReplyHandler(replier),
+			app.WithDelegatedReplyResolver(semanticIntegrationResolver{
+				store:    store,
+				matcher:  replymatch.New(semanticModel, "ou_owner"),
+				messages: []domain.NormalizedEvent{item.Event},
+			}, 0.85, 30*time.Second),
+		)
+
+		result, err := daemon.RunOnce(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Decision.Reason != "delegated_reply_not_needed" ||
+			builder.calls != 0 || decider.calls != 0 || replier.calls != 0 {
+			t.Fatalf(
+				"result=%+v builder=%d decider=%d replier=%d",
+				result,
+				builder.calls,
+				decider.calls,
+				replier.calls,
+			)
+		}
+	})
+
+	t.Run("group owner mention social acknowledgement needs no synthetic reply", func(t *testing.T) {
+		store := openSemanticIntegrationStore(t)
+		base := store.CurrentSession().StartedAt.Add(time.Second)
+		item := enqueueDueDelegatedItem(t, store, domain.NormalizedEvent{
+			Source:    domain.SourcePoll,
+			EventID:   "poll:om_group_ack",
+			MessageID: "om_group_ack",
+			ChatID:    "oc_any_group",
+			ChatType:  "group",
+			SenderID:  "ou_teammate",
+			Content:   "@测试负责人 [赞]这图有禅意啊",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+			CreatedAt: base,
+		})
+		semanticModel := &semanticIntegrationModel{response: `{
+			"target_message_id":"om_group_ack",
+			"result":"ambiguous",
+			"confidence":0.55,
+			"reason":"the target is a thumbs-up and compliment on the owner's image",
+			"target_intent":"social acknowledgement / compliment"
+		}`}
+		builder := &semanticIntegrationBuilder{}
+		decider := &semanticIntegrationDecider{}
+		replier := &semanticIntegrationReplyHandler{}
+		daemon := app.NewDaemon(
+			store,
+			router.New(router.Config{
+				OwnerOpenID: "ou_owner",
+				Mode:        domain.ModeAuto,
+				ReplyScope:  domain.ReplyScopeAllGroups,
+			}),
+			app.WithContextBuilder(builder),
+			app.WithDecider(decider),
+			app.WithReplyHandler(replier),
+			app.WithDelegatedReplyResolver(semanticIntegrationResolver{
+				store:   store,
+				matcher: replymatch.New(semanticModel, "ou_owner"),
+				messages: []domain.NormalizedEvent{
+					{
+						MessageID: "om_owner_image", ChatID: "oc_any_group",
+						ChatType: "group", SenderID: "ou_owner",
+						Content: "[图片]", CreatedAt: base.Add(-time.Minute),
+					},
+					item.Event,
+				},
+			}, 0.85, 30*time.Second),
+		)
+
+		result, err := daemon.RunOnce(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Decision.Reason != "delegated_reply_not_needed" ||
+			builder.calls != 0 || decider.calls != 0 || replier.calls != 0 {
+			t.Fatalf(
+				"result=%+v builder=%d decider=%d replier=%d",
+				result,
+				builder.calls,
+				decider.calls,
+				replier.calls,
+			)
+		}
+	})
+
 	t.Run("malformed semantic result fails closed and retries later", func(t *testing.T) {
 		store := openSemanticIntegrationStore(t)
 		base := store.CurrentSession().StartedAt.Add(time.Second)
