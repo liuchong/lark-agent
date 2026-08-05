@@ -190,6 +190,7 @@ func TestMacOSInstallerInstallsCleanHomeWithoutLoading(t *testing.T) {
 	fakeStoppedState := filepath.Join(home, "fake-stopped-state")
 	fakeRollbackState := filepath.Join(home, "fake-rollback-state")
 	fakeLaunchctl := filepath.Join(fakeBinDir, "launchctl")
+	fakeSecurity := filepath.Join(fakeBinDir, "security")
 	if err := os.WriteFile(fakeLaunchctl, []byte(`#!/bin/sh
 state=${FAKE_LAUNCHCTL_STATE:?}
 pid_file=${FAKE_LAUNCHCTL_PID:?}
@@ -256,12 +257,76 @@ esac
 `), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(fakeSecurity, []byte(`#!/bin/sh
+set -eu
+store="$HOME/fake-keychain"
+mkdir -p "$store"
+service=""
+account=""
+password=""
+want_password=0
+cmd=$1
+shift
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -s) service=$2; shift 2 ;;
+    -a) account=$2; shift 2 ;;
+    -w)
+      if [ "$#" -ge 2 ] && [ "${2#-}" = "$2" ]; then
+        password=$2
+        shift 2
+      else
+        want_password=1
+        shift
+      fi
+      ;;
+    -U) shift ;;
+    *) shift ;;
+  esac
+done
+key="$store/${service}__${account}"
+case "$cmd" in
+  find-generic-password)
+    [ "$want_password" -eq 1 ] || exit 2
+    [ -f "$key" ] || exit 44
+    cat "$key"
+    ;;
+  add-generic-password)
+    [ -n "$service" ] && [ -n "$account" ] || exit 2
+    mkdir -p "$(dirname "$key")"
+    printf '%s' "$password" > "$key"
+    chmod 600 "$key"
+    ;;
+  delete-generic-password)
+    rm -f "$key"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	cfg := config.Default()
 	cfg.Lark.AppID = "cli_test"
 	cfg.Owner.OpenID = "ou_owner"
 	cfg.Owner.Name = "测试负责人"
 	cfg.Workspace.Root = t.TempDir()
 	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	envPath := filepath.Join(appSupport, "env")
+	initialModelEnv := []byte(strings.Join([]string{
+		"OPENAI_API_KEY=upgrade-key",
+		"OPENAI_BASE_URL=https://upgrade.example.test/v1",
+		"OPENAI_MODEL=upgrade-model",
+		"CUSTOM_PRIVATE_SETTING=preserved",
+		"",
+	}, "\n"))
+	if err := os.MkdirAll(appSupport, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(envPath, initialModelEnv, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -293,6 +358,7 @@ esac
 		"LARK_AGENT_APP_SECRET=redacted-test-value-one",
 		"LARK_AGENT_USER_ACCESS_TOKEN=redacted-test-value-two",
 		"LARK_AGENT_OFFLINE_LIVE_TEST=1",
+		"MODEL_MIGRATION_DOCTOR=0",
 		"GOMODCACHE="+goCaches[0],
 		"GOCACHE="+goCaches[1],
 	)
@@ -352,6 +418,27 @@ esac
 		if output, err := lint.CombinedOutput(); err != nil {
 			t.Fatalf("plutil %s: %v\n%s", path, err, output)
 		}
+	}
+	gotEnv, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(gotEnv), "OPENAI_") ||
+		!strings.Contains(string(gotEnv), "CUSTOM_PRIVATE_SETTING=preserved") {
+		t.Fatalf("installer did not migrate model env safely:\n%s", gotEnv)
+	}
+	keyPath := filepath.Join(home, "fake-keychain", "lark-agent__model/primary/api-key")
+	keyData, err := os.ReadFile(keyPath)
+	if err != nil || string(keyData) != "upgrade-key" {
+		t.Fatalf("model key was not migrated to fake Keychain: %v %q", err, keyData)
+	}
+	loadedConfig, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := loadedConfig.Model.Profiles["primary"]
+	if primary.BaseURL != "https://upgrade.example.test/v1" || primary.Name != "upgrade-model" {
+		t.Fatalf("primary profile was not migrated: %+v", primary)
 	}
 
 	wrapper := filepath.Join(
@@ -509,16 +596,6 @@ esac
 	if err := os.WriteFile(fakeLaunchctlLog, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	envPath := filepath.Join(appSupport, "env")
-	preservedEnv := []byte(strings.Join([]string{
-		"OPENAI_API_KEY=upgrade-key",
-		"OPENAI_BASE_URL=https://upgrade.example.test/v1",
-		"OPENAI_MODEL=upgrade-model",
-		"",
-	}, "\n"))
-	if err := os.WriteFile(envPath, preservedEnv, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	reinstall := exec.Command("bash", script)
 	reinstall.Dir = repoRoot(t)
 	reinstall.Env = append(append([]string{}, installerEnv...),
@@ -540,13 +617,6 @@ esac
 		strings.Contains(string(actions), "bootstrap") ||
 		strings.Contains(string(actions), "duplicate-bootstrap") {
 		t.Fatalf("unexpected reinstall launchctl order:\n%s\n%s", actions, reinstallOutput)
-	}
-	gotEnv, err := os.ReadFile(envPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(gotEnv) != string(preservedEnv) {
-		t.Fatalf("reinstall erased existing model environment:\n%s", gotEnv)
 	}
 	envInfo, err := os.Stat(envPath)
 	if err != nil {
