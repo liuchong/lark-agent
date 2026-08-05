@@ -96,7 +96,13 @@ failure type.
 Fast-path work does not enter this loop. A configured owner asking deterministic
 local questions such as time, date, ping, daemon status, help, doctor, or queue
 summary receives a local answer through the normal reply runtime without a
-coding investigation. A simple non-coding owner question may use at most the
+coding investigation. In a group chat, status, doctor, queue summary, help, and
+response-status questions such as "why didn't you reply" are treated as
+owner-private control information: the bot must reply only with a private-chat
+redirect and must not disclose task counts, work IDs, approval commands, queue
+summaries, or detailed help in the group. Time, date, ping, and simple
+availability checks may still be answered in group because they do not expose
+private state. A simple non-coding owner question may use at most the
 simple-agent budget and cannot call shell. The default simple-agent budget is
 three model turns so an evidence-backed request can perform initial search,
 read one narrowed production source, and then submit its conclusion. A coding

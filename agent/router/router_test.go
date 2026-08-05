@@ -216,7 +216,7 @@ func TestOwnerFastPathCoversDateStatusDoctorQueueAndHelp(t *testing.T) {
 	}
 	for content, want := range cases {
 		decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
-			SenderID: "owner", Content: content,
+			ChatType: "p2p", SenderID: "owner", Content: content,
 		}))
 		if err != nil {
 			t.Fatal(err)
@@ -301,6 +301,79 @@ func TestOwnerGroupSlashCommandRedirectsWithoutQueueDetails(t *testing.T) {
 		decision.WorkKind != domain.WorkKindFastPath ||
 		!strings.Contains(decision.ReplyText, "私聊") ||
 		strings.Contains(decision.ReplyText, "队列") {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestOwnerGroupControlFastPathRedirectsWithoutQueueDetails(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantNames:      []string{"Assistant"},
+		AssistantReplyScope: domain.ReplyScopeAllGroups,
+		Mode:                domain.ModeAuto,
+		StatusText: func() string {
+			return "需要你处理 9 条；正在执行或自动等待 8 条。发送 `/tasks` 查看详情。"
+		},
+		DoctorText:       func() string { return "需要你处理 7 条；疑似长时间处理中的任务 6 条。" },
+		QueueSummaryText: func() string { return "任务（共 5 条，第 1 页）：#42 secret task" },
+		HelpText:         "智能助手私聊命令：\n- `/tasks`：查看任务。",
+	})
+	for _, content := range []string{
+		"@_user_1 status",
+		"@_user_1 doctor",
+		"@_user_1 queue summary",
+		"@_user_1 help",
+		"@_user_1 为什么不回答",
+		"@_user_1 why didn't you reply",
+	} {
+		decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_control_group_fast_path",
+			ChatID:    "oc_group",
+			ChatType:  "group",
+			SenderID:  "ou_owner",
+			Content:   content,
+			Mentions:  []domain.Mention{{OpenID: "ou_bot", Name: "Assistant"}},
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision.Kind != domain.DecisionReply ||
+			decision.WorkKind != domain.WorkKindFastPath ||
+			!strings.Contains(decision.ReplyText, "私聊") ||
+			strings.Contains(decision.ReplyText, "需要你处理") ||
+			strings.Contains(decision.ReplyText, "任务（共") ||
+			strings.Contains(decision.ReplyText, "#42") ||
+			strings.Contains(decision.ReplyText, "/tasks") {
+			t.Fatalf("content=%q decision=%+v", content, decision)
+		}
+	}
+}
+
+func TestOwnerGroupControlFastPathUsesNativeMentionForNormalization(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantReplyScope: domain.ReplyScopeAllGroups,
+		Mode:                domain.ModeAuto,
+		StatusText:          func() string { return "Needs your action: 9. Use `/tasks` for details." },
+	})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_control_group_native_mention",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_owner",
+		Content:   "@Assistant status",
+		Mentions:  []domain.Mention{{Key: "@Assistant", OpenID: "ou_bot", Name: "Assistant"}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		decision.WorkKind != domain.WorkKindFastPath ||
+		!strings.Contains(decision.ReplyText, "私聊") ||
+		strings.Contains(decision.ReplyText, "Needs your action") ||
+		strings.Contains(decision.ReplyText, "/tasks") {
 		t.Fatalf("decision=%+v", decision)
 	}
 }

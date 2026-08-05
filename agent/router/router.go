@@ -100,6 +100,16 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 			decision.ReplyText = r.controlRedirectText()
 			return decision, nil
 		}
+		if privateOnlyControlFastPath(r.normalizedFastPathContent(item.Event)) {
+			decision.Kind = domain.DecisionReply
+			decision.Relevance = domain.RelevanceAssistantRequest
+			decision.WorkKind = domain.WorkKindFastPath
+			decision.Priority = domain.PriorityFastPath
+			decision.Confidence = 1
+			decision.Reason = "owner_group_control_redirect"
+			decision.ReplyText = r.controlRedirectText()
+			return decision, nil
+		}
 		if !assistantGroupScopeAllows(r.cfg.AssistantReplyScope, item.Event) {
 			decision.Reason = "outside_assistant_reply_scope"
 			return decision, nil
@@ -157,6 +167,15 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 			decision.Priority = domain.PriorityOwnerControl
 			decision.Reason = "owner_private_control_command"
 			decision.ControlCommand = &command
+			return decision, nil
+		}
+		if !isPrivateChat(item.Event.ChatType) &&
+			privateOnlyControlFastPath(r.normalizedFastPathContent(item.Event)) {
+			decision.Kind = domain.DecisionReply
+			decision.WorkKind = domain.WorkKindFastPath
+			decision.Priority = domain.PriorityFastPath
+			decision.Reason = "owner_group_control_redirect"
+			decision.ReplyText = r.controlRedirectText()
 			return decision, nil
 		}
 		if !r.cfg.DisableFastPath {
@@ -258,17 +277,13 @@ func assistantGroupScopeAllows(scope domain.ReplyScope, event domain.NormalizedE
 }
 
 func (r *Router) fastPathDecision(event domain.NormalizedEvent, base domain.Decision) (domain.Decision, bool) {
-	content := strings.ToLower(strings.TrimSpace(event.Content))
-	for _, name := range r.cfg.AssistantNames {
-		name = strings.TrimSpace(name)
-		if name != "" {
-			content = strings.TrimSpace(strings.TrimPrefix(content, strings.ToLower("@"+name)))
-		}
+	content := r.normalizedFastPathContent(event)
+	if privateOnlyControlFastPath(content) && event.ChatType != "" && !isPrivateChat(event.ChatType) {
+		return domain.Decision{}, false
 	}
-	if fields := strings.Fields(content); len(fields) > 1 && strings.HasPrefix(fields[0], "@_user_") {
-		content = strings.TrimSpace(strings.TrimPrefix(content, fields[0]))
+	if content == "" {
+		return domain.Decision{}, false
 	}
-	content = strings.TrimSpace(strings.TrimRight(content, "?？。！!"))
 	if oneOf(content, "在吗", "你好", "您好", "hi", "hello") {
 		return fastPathReply(base, "在的。", "fast_path_availability"), true
 	}
@@ -325,8 +340,64 @@ func (r *Router) fastPathDecision(event domain.NormalizedEvent, base domain.Deci
 	return domain.Decision{}, false
 }
 
+func (r *Router) normalizedFastPathContent(event domain.NormalizedEvent) string {
+	content := strings.ToLower(strings.TrimSpace(event.Content))
+	for _, name := range r.cfg.AssistantNames {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			content = strings.TrimSpace(strings.TrimPrefix(content, strings.ToLower("@"+name)))
+		}
+	}
+	for _, mention := range event.Mentions {
+		if !r.assistantMentionRef(mention) {
+			continue
+		}
+		for _, prefix := range []string{mention.Key, "@" + mention.Name} {
+			prefix = strings.ToLower(strings.TrimSpace(prefix))
+			if prefix != "" {
+				content = strings.TrimSpace(strings.TrimPrefix(content, prefix))
+			}
+		}
+	}
+	if fields := strings.Fields(content); len(fields) > 1 && strings.HasPrefix(fields[0], "@_user_") {
+		content = strings.TrimSpace(strings.TrimPrefix(content, fields[0]))
+	}
+	return strings.TrimSpace(strings.TrimRight(content, "?？。！!"))
+}
+
+func (r *Router) assistantMentionRef(mention domain.Mention) bool {
+	if mention.OpenID != "" && contains(r.cfg.AssistantOpenIDs, mention.OpenID) {
+		return true
+	}
+	if mention.Name != "" && containsFold(r.cfg.AssistantNames, mention.Name) {
+		return true
+	}
+	return false
+}
+
+func privateOnlyControlFastPath(content string) bool {
+	if isResponseStatusQuestion(content) {
+		return true
+	}
+	switch content {
+	case "状态", "状态如何", "status",
+		"doctor", "诊断",
+		"队列", "队列摘要", "queue", "queue summary",
+		"help", "帮助":
+		return true
+	default:
+		return false
+	}
+}
+
 func isResponseStatusQuestion(content string) bool {
-	for _, keyword := range []string{"为什么不说话", "为什么不回答", "为什么没回答", "为什么不回应", "怎么不说话", "怎么不回答"} {
+	for _, keyword := range []string{
+		"为什么不说话", "为什么不回答", "为什么没回答", "为什么不回应", "怎么不说话", "怎么不回答",
+		"why didn't you reply", "why didnt you reply", "why did not you reply",
+		"why didn't you answer", "why didnt you answer", "why did not you answer",
+		"why are you not replying", "why aren't you replying", "why arent you replying",
+		"why no reply", "why no answer",
+	} {
 		if strings.Contains(content, keyword) {
 			return true
 		}

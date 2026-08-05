@@ -102,6 +102,9 @@ lark-agent memory delete MEMORY_ID --confirm
 删除采用可审计墓碑，不会进入后续模型上下文；凭据样式内容会被拒绝。
 
 Owner 在群聊中发送这些命令时只收到转到私聊的提示，群里不展示任务数量和内容。
+同样，群里 `@机器人 status`、`doctor`、`queue summary`、`help` 或询问“为什么没回答”
+这类状态问题，也只会提示去智能助手私聊，不会在群里展示任务数量、工作号、审批命令或
+详细帮助。时间、日期、`ping` 和“在吗”不含私有任务状态，仍可在群里直接回答。
 非 Owner 私聊机器人或直接 `@机器人` 仍然静默。
 
 高置信度的调查或代码问题在 `policy.investigation_progress: enabled` 时会先写入可恢复
