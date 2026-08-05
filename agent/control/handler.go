@@ -584,6 +584,7 @@ func HelpText(language, topic string) string {
 		for _, spec := range commandCatalog {
 			lines = append(lines, fmt.Sprintf("- `%s`: %s.", spec.UsageEN, spec.PurposeEN))
 		}
+		lines = append(lines, "For model profile and provider diagnostics, run `lark-agent model doctor primary` locally; credentials stay in Keychain.")
 		lines = append(lines, "Natural-language equivalents are accepted only in the owner's assistant private chat when context identifies one exact command.")
 		return strings.Join(lines, "\n")
 	}
@@ -591,6 +592,7 @@ func HelpText(language, topic string) string {
 	for _, spec := range commandCatalog {
 		lines = append(lines, fmt.Sprintf("- `%s`：%s。", spec.UsageZH, spec.PurposeZH))
 	}
+	lines = append(lines, "模型档案和供应商诊断请在本机执行 `lark-agent model doctor primary`；密钥只保存在 Keychain。")
 	lines = append(lines, "只有用户与智能助手私聊且上下文能唯一确定命令时，才接受自然语言等价表达。")
 	return strings.Join(lines, "\n")
 }

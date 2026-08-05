@@ -41,9 +41,11 @@ go build -o ./lark-agent ./cmd/lark-agent
 3. 停止后备份配置、状态、二进制、wrapper、私有环境、状态栏和 plist，并暂时移除已卸载的 plist；随后执行完整 `lark-agent doctor`。
 4. doctor 通过 SDK/Keychain 验证 app id、凭据引用、Workspace 和状态库；需要真实远端权限预检时设置 `LARK_AGENT_REMOTE_DOCTOR=1`。
 5. 所有候选检查通过后才原子替换二进制。
-6. 原子更新权限为 `0600` 的当前用户私有模型环境文件，不写入 plist。升级命令未
-   显式传入的 `OPENAI_*` 项保留原值；显式传入非空值只更新对应项，显式传入空值只
-   删除对应项。
+6. 原子迁移模型配置：旧 `OPENAI_API_KEY` 写入 `primary` 档案对应的 Keychain，
+   `OPENAI_BASE_URL` 和 `OPENAI_MODEL` 写入 `model.profiles.primary`；迁移前会备份
+   配置、私有 env 和原 Keychain 值。只有配置写回、Keychain 回读和候选
+   `model doctor primary` 都通过后，才移除旧 env 中这三项；env 里的其他私有设置保留。
+   任一步失败都会恢复旧配置、env 和 Keychain。
 7. 原子安装候选状态栏并写入 LaunchAgent。
 8. 仅在新 daemon 进入 ready 后保留已加载状态；任何失败都会恢复整套旧安装，并重新加载原先处于 loaded 状态的服务。
 
@@ -61,8 +63,9 @@ go build -o ./lark-agent ./cmd/lark-agent
 - `POLL_INTERVAL`：轮询间隔，默认 `10s`。
 - `INSTALL_LOAD=0`：只安装，不加载，供隔离验证使用。
 - `OPEN_STATUS_APP=0`：安装后不打开状态栏，供隔离验证使用。
-- `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`：仅更新显式出现在安装命令
-  环境中的项。升级时全部不传会完整保留已有私有模型配置；显式传入空值可删除单项。
+- `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`：仅作为旧安装或临时 shell 的
+  迁移输入。显式传入会更新 `primary` 档案或对应 Keychain；全部不传时保留既有
+  profile/Keychain。不要把这些变量写入仓库脚本或 plist。
 
 不要把 token、私钥或模型密钥写进仓库、plist 或命令参数。
 

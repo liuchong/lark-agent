@@ -21,15 +21,21 @@ import (
 )
 
 type scriptedModel struct {
-	responses []*schema.Message
-	calls     int
-	inputs    [][]*schema.Message
-	toolNames [][]string
+	responses   []*schema.Message
+	calls       int
+	inputs      [][]*schema.Message
+	toolNames   [][]string
+	toolChoices []schema.ToolChoice
 }
 
 func (m *scriptedModel) Generate(_ context.Context, input []*schema.Message, opts ...einomodel.Option) (*schema.Message, error) {
 	m.inputs = append(m.inputs, append([]*schema.Message(nil), input...))
 	options := einomodel.GetCommonOptions(nil, opts...)
+	if options.ToolChoice != nil {
+		m.toolChoices = append(m.toolChoices, *options.ToolChoice)
+	} else {
+		m.toolChoices = append(m.toolChoices, "")
+	}
 	names := make([]string, 0, len(options.Tools))
 	for _, tool := range options.Tools {
 		if tool != nil {
@@ -133,6 +139,67 @@ func TestAgentLoopSearchesReadsAndSubmitsDecision(t *testing.T) {
 	}
 	if lastInput[len(lastInput)-2].Role != schema.Tool || lastInput[len(lastInput)-2].ToolCallID != "call_read" {
 		t.Fatalf("last input=%+v", lastInput)
+	}
+}
+
+func TestAgentLoopDefaultToolChoiceAllowsModelChoice(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"relevance_confidence":0.95,
+			"reply_confidence":0.92,
+			"risk":"low",
+			"reply_text":"已根据当前消息给出结论。",
+			"reason":"direct answer"
+		}`)}),
+	}}
+	registry, err := agenttools.NewRegistry(SubmitDecisionDefinition())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = (AgentLoop{
+		Model:    model,
+		Tools:    registry,
+		MaxTurns: 1,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		Event: domain.NormalizedEvent{MessageID: "om_choice", Content: "直接回答"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(model.toolChoices) != 1 || model.toolChoices[0] != schema.ToolChoiceAllowed {
+		t.Fatalf("tool choices=%+v", model.toolChoices)
+	}
+}
+
+func TestModelRunProgressPromptIsCodeMaintainedStatusBar(t *testing.T) {
+	prompt := modelRunProgressPrompt(runBudget{
+		Phase:           PhaseGenerate,
+		CurrentTurn:     3,
+		MaxTurns:        10,
+		ToolCalls:       2,
+		MaxToolCalls:    5,
+		ContextBytes:    800,
+		MaxContextBytes: 1000,
+		TargetLanguage:  "zh-CN",
+	}, terminalRepairContext{
+		CompletedChecks: []string{"search_workspace", "read_workspace"},
+		Unknowns:        []string{"具体序列化结构未找到"},
+		LastFailure:     "unsupported source_ref",
+	})
+	for _, want := range []string{
+		"Agent phase: generate",
+		"Current model turn: 3 of 10",
+		"Tool-call budget: 2 of 5 investigation calls used, 3 remaining",
+		"Context budget: 800 of 1000 bytes used (80%)",
+		"completed_checks=search_workspace, read_workspace",
+		"unknowns=具体序列化结构未找到",
+		"last_failed_gate=unsupported source_ref",
+		"allowed_terminal_outcomes=complete,partial,clarification",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("status bar missing %q:\n%s", want, prompt)
+		}
 	}
 }
 

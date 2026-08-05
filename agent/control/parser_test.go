@@ -165,6 +165,9 @@ func TestCommandCatalogDrivesParserHelpAndSemanticPrompt(t *testing.T) {
 	}
 	help := HelpText("zh-CN", "")
 	prompt := SemanticCatalog("zh-CN")
+	if !strings.Contains(help, "lark-agent model doctor primary") {
+		t.Fatalf("help missing model doctor: %s", help)
+	}
 	for _, spec := range specs {
 		if spec.UsageZH == "" || spec.PurposeZH == "" {
 			t.Fatalf("incomplete localized command spec: %+v", spec)

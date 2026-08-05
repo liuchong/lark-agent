@@ -667,54 +667,374 @@ func newWorkspaceCommand(out io.Writer, configPath *string) *cobra.Command {
 }
 
 func newModelCommand(in io.Reader, out io.Writer, configPath *string) *cobra.Command {
-	cmd := &cobra.Command{Use: "model", Short: "Manage model credentials"}
+	cmd := &cobra.Command{Use: "model", Short: "Manage model profiles, roles, credentials, and diagnostics"}
+	cmd.AddCommand(
+		newModelProfileCommand(out, configPath),
+		newModelRoleCommand(out, configPath),
+		newModelAuthCommand(in, out, configPath),
+		newModelDoctorCommand(out, configPath),
+	)
+	return cmd
+}
+
+func newModelProfileCommand(out io.Writer, configPath *string) *cobra.Command {
+	cmd := &cobra.Command{Use: "profile", Short: "Manage non-secret model profiles"}
 	cmd.AddCommand(&cobra.Command{
-		Use:   "login",
-		Short: "Read an OpenAI-compatible API key from stdin",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if in == nil {
-				return errs.NewValidationError(errs.SubtypeInvalidArgument, "stdin is required").WithParam("stdin")
-			}
-			// The first version validates the command surface without storing
-			// secrets in files. Keychain persistence is wired in a later step.
-			return writeData(out, map[string]any{"stored": false, "hint": "keychain storage not configured in this build"})
-		},
-	})
-	cmd.AddCommand(&cobra.Command{
-		Use:   "doctor",
-		Short: "Verify native tools and tool-result protocol against the configured provider",
+		Use:   "list",
+		Short: "List configured model profiles without credentials",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(resolveConfigPath(*configPath))
 			if err != nil {
 				return err
 			}
-			apiKey := os.Getenv("OPENAI_API_KEY")
-			modelName := firstNonEmpty(os.Getenv("OPENAI_MODEL"), cfg.Model.Name)
-			baseURL := firstNonEmpty(os.Getenv("OPENAI_BASE_URL"), cfg.Model.BaseURL)
-			if apiKey == "" {
-				return errs.NewConfigError(errs.SubtypeNotConfigured, "OPENAI_API_KEY is required for model doctor").
-					WithHint("set the daemon's OpenAI-compatible API key in its private environment")
-			}
-			if modelName == "" {
-				return errs.NewConfigError(errs.SubtypeNotConfigured, "model.name or OPENAI_MODEL is required for model doctor")
-			}
-			result, err := agentruntime.DoctorNativeTools(cmd.Context(), &agentruntime.OpenAICompatibleModel{
-				APIKey:  apiKey,
-				BaseURL: baseURL,
-				Model:   modelName,
-				Timeout: cfg.Model.Timeout,
-			})
-			if err != nil {
-				return err
-			}
 			return writeData(out, map[string]any{
-				"provider": cfg.Model.Provider,
-				"model":    modelName,
-				"tools":    result,
+				"profiles": cfg.Model.Profiles,
+				"roles":    cfg.Model.Roles,
 			})
 		},
 	})
+	var provider, protocol, baseURL, modelName, credentialKey, reasoningMode, stream string
+	setCmd := &cobra.Command{
+		Use:   "set PROFILE",
+		Short: "Create or update a model profile without storing the API key",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			name := strings.TrimSpace(args[0])
+			if name == "" {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "profile name is required")
+			}
+			if cfg.Model.Profiles == nil {
+				cfg.Model.Profiles = map[string]config.ModelProfileConfig{}
+			}
+			existing := cfg.Model.Profiles[name]
+			if provider != "" {
+				existing.Provider = provider
+			}
+			if protocol != "" {
+				existing.Protocol = protocol
+			}
+			if baseURL != "" {
+				existing.BaseURL = baseURL
+			}
+			if modelName != "" {
+				existing.Name = modelName
+			}
+			if credentialKey != "" {
+				existing.CredentialKeychainKey = credentialKey
+			}
+			if reasoningMode != "" {
+				existing.Reasoning.Mode = reasoningMode
+			}
+			if stream != "" {
+				existing.Stream = stream
+			}
+			if existing.KeychainService == "" {
+				existing.KeychainService = "lark-agent"
+			}
+			if existing.Timeout <= 0 {
+				existing.Timeout = 60 * time.Second
+			}
+			cfg.Model.Profiles[name] = existing
+			cfg.Normalize()
+			if err := config.Save(resolveConfigPath(*configPath), cfg); err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"profile": name, "updated": true})
+		},
+	}
+	setCmd.Flags().StringVar(&provider, "provider", "", "model provider: kimi, openai, or anthropic")
+	setCmd.Flags().StringVar(&protocol, "protocol", "", "model protocol: openai_chat, openai_responses, or anthropic_messages")
+	setCmd.Flags().StringVar(&baseURL, "base-url", "", "provider API base URL")
+	setCmd.Flags().StringVar(&modelName, "model", "", "provider model name")
+	setCmd.Flags().StringVar(&credentialKey, "credential-keychain-key", "", "Keychain account for this profile's API key")
+	setCmd.Flags().StringVar(&reasoningMode, "reasoning-mode", "", "reasoning mode: provider_default, enabled, or disabled")
+	setCmd.Flags().StringVar(&stream, "stream", "", "stream mode: auto, disabled, or required")
+	cmd.AddCommand(setCmd)
 	return cmd
+}
+
+func newModelRoleCommand(out io.Writer, configPath *string) *cobra.Command {
+	cmd := &cobra.Command{Use: "role", Short: "Bind runtime roles to model profiles"}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "list",
+		Short: "List role bindings",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			return writeData(out, cfg.Model.Roles)
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "set ROLE PROFILE",
+		Short: "Bind one model runtime role to a profile",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			role := strings.TrimSpace(args[0])
+			profile := strings.TrimSpace(args[1])
+			if _, ok := cfg.Model.Profiles[profile]; !ok {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "model profile does not exist: %s", profile)
+			}
+			switch role {
+			case "agent":
+				cfg.Model.Roles.Agent = profile
+			case "semantic":
+				cfg.Model.Roles.Semantic = profile
+			case "finalizer":
+				cfg.Model.Roles.Finalizer = profile
+			case "compactor":
+				cfg.Model.Roles.Compactor = profile
+			case "vision":
+				cfg.Model.Roles.Vision = profile
+			default:
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "unknown model role: %s", role)
+			}
+			cfg.Normalize()
+			if err := config.Save(resolveConfigPath(*configPath), cfg); err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"role": role, "profile": profile, "updated": true})
+		},
+	})
+	return cmd
+}
+
+type modelAuthLoginInput struct {
+	APIKey string `json:"api_key"`
+}
+
+func newModelAuthCommand(in io.Reader, out io.Writer, configPath *string) *cobra.Command {
+	cmd := &cobra.Command{Use: "auth", Short: "Manage model API keys in Keychain"}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "login PROFILE",
+		Short: "Read {\"api_key\":\"...\"} from stdin and store it in Keychain",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if in == nil {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "stdin is required").WithParam("stdin")
+			}
+			cfg, profile, err := loadModelProfile(resolveConfigPath(*configPath), args[0])
+			if err != nil {
+				return err
+			}
+			var input modelAuthLoginInput
+			if err := json.NewDecoder(in).Decode(&input); err != nil {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "decode model auth login JSON from stdin").WithCause(err)
+			}
+			apiKey := strings.TrimSpace(input.APIKey)
+			if apiKey == "" {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "api_key is required")
+			}
+			if err := secretstore.Write(cmd.Context(), modelKeychainService(profile), profile.CredentialKeychainKey, apiKey); err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{
+				"profile":          args[0],
+				"stored":           true,
+				"keychain_service": modelKeychainService(profile),
+				"account":          profile.CredentialKeychainKey,
+				"config":           cfg.Version,
+			})
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "status PROFILE",
+		Short: "Check whether a model API key is readable without printing it",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, profile, err := loadModelProfile(resolveConfigPath(*configPath), args[0])
+			if err != nil {
+				return err
+			}
+			key, readErr := secretstore.Read(cmd.Context(), modelKeychainService(profile), profile.CredentialKeychainKey, modelAPIKeyEnv(args[0]))
+			return writeData(out, map[string]any{
+				"profile":          args[0],
+				"configured":       readErr == nil && strings.TrimSpace(key) != "",
+				"keychain_service": modelKeychainService(profile),
+				"account":          profile.CredentialKeychainKey,
+				"error":            errorString(readErr),
+			})
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "logout PROFILE",
+		Short: "Delete a model API key from Keychain",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, profile, err := loadModelProfile(resolveConfigPath(*configPath), args[0])
+			if err != nil {
+				return err
+			}
+			if err := secretstore.Delete(cmd.Context(), modelKeychainService(profile), profile.CredentialKeychainKey); err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"profile": args[0], "deleted": true})
+		},
+	})
+	return cmd
+}
+
+func newModelDoctorCommand(out io.Writer, configPath *string) *cobra.Command {
+	var all bool
+	cmd := &cobra.Command{
+		Use:   "doctor [PROFILE]",
+		Short: "Verify native tools and tool-result protocol against configured profile(s)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			profiles := []string{}
+			if all {
+				for name := range cfg.Model.Profiles {
+					profiles = append(profiles, name)
+				}
+			} else if len(args) > 0 {
+				profiles = append(profiles, args[0])
+			} else {
+				profiles = append(profiles, cfg.Model.Roles.Agent)
+			}
+			results := map[string]any{}
+			for _, name := range profiles {
+				_, profile, err := loadModelProfile(resolveConfigPath(*configPath), name)
+				if err != nil {
+					return err
+				}
+				if err := ensureRuntimeModelProtocol(profile); err != nil {
+					return err
+				}
+				apiKey, err := secretstore.Read(cmd.Context(), modelKeychainService(profile), profile.CredentialKeychainKey, modelAPIKeyEnv(name))
+				if err != nil {
+					return err
+				}
+				result, err := agentruntime.DoctorNativeTools(cmd.Context(), &agentruntime.OpenAICompatibleModel{
+					APIKey:  apiKey,
+					BaseURL: profile.BaseURL,
+					Model:   profile.Name,
+					Timeout: profile.Timeout,
+				})
+				if err != nil {
+					return err
+				}
+				results[name] = map[string]any{
+					"provider": profile.Provider,
+					"protocol": profile.Protocol,
+					"model":    profile.Name,
+					"tools":    result,
+				}
+			}
+			return writeData(out, map[string]any{"profiles": results})
+		},
+	}
+	cmd.Flags().BoolVar(&all, "all", false, "doctor every configured profile")
+	return cmd
+}
+
+func loadModelProfile(path, name string) (config.Config, config.ModelProfileConfig, error) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return config.Config{}, config.ModelProfileConfig{}, err
+	}
+	profile, ok := cfg.Model.Profiles[strings.TrimSpace(name)]
+	if !ok {
+		return config.Config{}, config.ModelProfileConfig{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"model profile does not exist: %s",
+			name,
+		)
+	}
+	return cfg, profile, nil
+}
+
+func modelKeychainService(profile config.ModelProfileConfig) string {
+	if strings.TrimSpace(profile.KeychainService) != "" {
+		return profile.KeychainService
+	}
+	return "lark-agent"
+}
+
+func modelAPIKeyEnv(profileName string) string {
+	if strings.TrimSpace(profileName) == "primary" {
+		return "OPENAI_API_KEY"
+	}
+	return ""
+}
+
+func modelAdapterForProfile(
+	ctx context.Context,
+	cfg config.Config,
+	profileName string,
+) (*agentruntime.OpenAICompatibleModel, config.ModelProfileConfig, string, error) {
+	profileName = strings.TrimSpace(profileName)
+	profile, ok := cfg.Model.Profiles[profileName]
+	if !ok {
+		return nil, config.ModelProfileConfig{}, "", errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"model profile does not exist: %s",
+			profileName,
+		)
+	}
+	if err := ensureRuntimeModelProtocol(profile); err != nil {
+		return nil, profile, "", err
+	}
+	apiKey, err := secretstore.Read(
+		ctx,
+		modelKeychainService(profile),
+		profile.CredentialKeychainKey,
+		modelAPIKeyEnv(profileName),
+	)
+	if err != nil || strings.TrimSpace(apiKey) == "" {
+		return nil, profile, "", nil
+	}
+	baseURL := profile.BaseURL
+	modelName := profile.Name
+	if profileName == "primary" {
+		baseURL = firstNonEmpty(os.Getenv("OPENAI_BASE_URL"), baseURL)
+		modelName = firstNonEmpty(os.Getenv("OPENAI_MODEL"), modelName)
+	}
+	timeout := profile.Timeout
+	if timeout <= 0 {
+		timeout = cfg.Model.Timeout
+	}
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	fingerprint := fmt.Sprintf(
+		"%s:%s/%s/%s@%s",
+		profileName,
+		profile.Provider,
+		profile.Protocol,
+		modelName,
+		baseURL,
+	)
+	return &agentruntime.OpenAICompatibleModel{
+		APIKey:  apiKey,
+		BaseURL: baseURL,
+		Model:   modelName,
+		Timeout: timeout,
+	}, profile, fingerprint, nil
+}
+
+func ensureRuntimeModelProtocol(profile config.ModelProfileConfig) error {
+	if strings.TrimSpace(profile.Protocol) == "openai_chat" {
+		return nil
+	}
+	return errs.NewConfigError(
+		errs.SubtypeInvalidConfig,
+		"model profile %s uses %s protocol, but daemon model execution currently supports openai_chat profiles only",
+		strings.TrimSpace(profile.Name),
+		strings.TrimSpace(profile.Protocol),
+	).WithField("model.profiles.protocol")
 }
 
 func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Command {
@@ -1552,12 +1872,12 @@ func buildLiveOptions(
 		info["user_polling"] = false
 		info["user_token"] = "missing"
 	}
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	baseURL := firstNonEmpty(os.Getenv("OPENAI_BASE_URL"), cfg.Model.BaseURL)
-	model := firstNonEmpty(os.Getenv("OPENAI_MODEL"), cfg.Model.Name)
 	var delegatedResolver app.DelegatedReplyResolver
-	if apiKey != "" && model != "" {
-		modelFingerprint := model + "@" + baseURL
+	modelAdapter, agentProfile, modelFingerprint, err := modelAdapterForProfile(ctx, cfg, cfg.Model.Roles.Agent)
+	if err != nil {
+		return nil, nil, nil, info, err
+	}
+	if modelAdapter != nil {
 		configFingerprint, err := agentConfigFingerprint(cfg)
 		if err != nil {
 			return nil, nil, nil, info, err
@@ -1586,15 +1906,16 @@ func buildLiveOptions(
 		if err != nil {
 			return nil, nil, nil, info, err
 		}
-		modelAdapter := &agentruntime.OpenAICompatibleModel{
-			APIKey:  apiKey,
-			BaseURL: baseURL,
-			Model:   model,
-			Timeout: cfg.Model.Timeout,
+		semanticModelAdapter, _, _, err := modelAdapterForProfile(ctx, cfg, cfg.Model.Roles.Semantic)
+		if err != nil {
+			return nil, nil, nil, info, err
+		}
+		if semanticModelAdapter == nil {
+			semanticModelAdapter = modelAdapter
 		}
 		options = append(options, app.WithSemanticControlResolver(
 			control.NewSemanticResolver(
-				modelAdapter,
+				semanticModelAdapter,
 				store,
 				string(resolveConfiguredLanguage(cfg.Owner)),
 			),
@@ -1602,18 +1923,25 @@ func buildLiveOptions(
 		loopModelAdapter := modelAdapter
 		if visionModel := strings.TrimSpace(cfg.Agent.VisionModel); visionModel != "" {
 			loopModelAdapter = &agentruntime.OpenAICompatibleModel{
-				APIKey:  apiKey,
-				BaseURL: baseURL,
+				APIKey:  modelAdapter.APIKey,
+				BaseURL: modelAdapter.BaseURL,
 				Model:   visionModel,
-				Timeout: cfg.Model.Timeout,
+				Timeout: modelAdapter.Timeout,
 			}
 			info["vision_model"] = visionModel
+		}
+		finalizerModelAdapter, _, _, err := modelAdapterForProfile(ctx, cfg, cfg.Model.Roles.Finalizer)
+		if err != nil {
+			return nil, nil, nil, info, err
+		}
+		if finalizerModelAdapter == nil {
+			finalizerModelAdapter = loopModelAdapter
 		}
 		if userContextEnabled {
 			delegatedResolver = &liveDelegatedReplyResolver{
 				contexts:             imSvc,
 				store:                store,
-				matcher:              replymatch.New(modelAdapter, cfg.Owner.OpenID),
+				matcher:              replymatch.New(semanticModelAdapter, cfg.Owner.OpenID),
 				ownerOpenID:          cfg.Owner.OpenID,
 				ownerWait:            cfg.Policy.OwnerWait,
 				visionEnabled:        strings.TrimSpace(cfg.Agent.VisionModel) != "",
@@ -1629,7 +1957,7 @@ func buildLiveOptions(
 		}
 		options = append(options, app.WithDecider(agentruntime.LoopDecisionAgent{Loop: agentruntime.AgentLoop{
 			Model:             loopModelAdapter,
-			TerminalFinalizer: loopModelAdapter,
+			TerminalFinalizer: finalizerModelAdapter,
 			Tools:             registry,
 			MaxTurns:          cfg.Agent.MaxTurns,
 			MaxToolBytes:      cfg.Agent.MaxToolOutput,
@@ -1644,11 +1972,14 @@ func buildLiveOptions(
 			CodingMaxTurns:    cfg.FastPath.CodingMaxTurns,
 			GoalMaxTurns:      cfg.Goal.MaxInvestigationTurns,
 			Recorder:          store,
-			ModelFingerprint:  loopModelAdapter.Model + "@" + baseURL,
+			ModelFingerprint:  modelFingerprint,
 			ConfigFingerprint: configFingerprint,
 		}}))
 		info["model_configured"] = true
-		info["model"] = model
+		info["model_profile"] = cfg.Model.Roles.Agent
+		info["model_provider"] = agentProfile.Provider
+		info["model_protocol"] = agentProfile.Protocol
+		info["model"] = modelAdapter.Model
 		info["agent_tools"] = len(registry.Infos())
 		info["runtime_fingerprint"] = modelFingerprint + ":" + configFingerprint
 	}

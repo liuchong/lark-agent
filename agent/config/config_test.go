@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/liuchong/lark-agent/agent/domain"
 	agentlocale "github.com/liuchong/lark-agent/agent/locale"
+	"gopkg.in/yaml.v3"
 )
 
 func TestDefaultConfigRequiresWorkspace(t *testing.T) {
@@ -114,6 +116,137 @@ func TestDefaultHarnessConfig(t *testing.T) {
 	cfg.Scheduler.ForegroundWorkers = 1
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("Validate accepted no reserved interactive worker")
+	}
+}
+
+func TestDefaultModelProfilesAndRoleBindings(t *testing.T) {
+	cfg := validConfigForTest(t)
+	if cfg.Version != 5 {
+		t.Fatalf("version=%d, want 5", cfg.Version)
+	}
+	primary, ok := cfg.Model.Profiles["primary"]
+	if !ok {
+		t.Fatalf("primary profile missing: %+v", cfg.Model.Profiles)
+	}
+	if primary.Provider != "kimi" ||
+		primary.Protocol != "openai_chat" ||
+		primary.BaseURL != "https://api.kimi.com/coding/v1" ||
+		primary.Name != "k3-256k" ||
+		primary.CredentialKeychainKey != "model/primary/api-key" ||
+		primary.Reasoning.Mode != "provider_default" {
+		t.Fatalf("primary profile=%+v", primary)
+	}
+	for role, profile := range map[string]string{
+		"agent":     cfg.Model.Roles.Agent,
+		"semantic":  cfg.Model.Roles.Semantic,
+		"finalizer": cfg.Model.Roles.Finalizer,
+		"compactor": cfg.Model.Roles.Compactor,
+		"vision":    cfg.Model.Roles.Vision,
+	} {
+		if profile != "primary" {
+			t.Fatalf("role %s profile=%q", role, profile)
+		}
+	}
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(string(data)), "api_key") ||
+		strings.Contains(string(data), "sk-test") {
+		t.Fatalf("model config serialized a secret-shaped field:\n%s", data)
+	}
+}
+
+func TestLoadV4ModelConfigMigratesToPrimaryProfile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeConfig := `
+version: 4
+lark:
+  app_id: cli_test
+owner:
+  open_id: ou_owner
+  name: 测试负责人
+assistant:
+  names: ["Lark Agent"]
+model:
+  provider: openai-compatible
+  base_url: https://api.kimi.com/coding/v1
+  name: k3-256k
+  timeout: 45s
+workspace:
+  root: ` + t.TempDir() + `
+`
+	mustWriteConfigFile(t, path, writeConfig)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Version != 5 {
+		t.Fatalf("migrated version=%d", cfg.Version)
+	}
+	primary := cfg.Model.Profiles["primary"]
+	if primary.Provider != "kimi" ||
+		primary.Protocol != "openai_chat" ||
+		primary.BaseURL != "https://api.kimi.com/coding/v1" ||
+		primary.Name != "k3-256k" ||
+		primary.Timeout != 45*time.Second {
+		t.Fatalf("migrated primary=%+v", primary)
+	}
+	if cfg.Model.Roles.Agent != "primary" || cfg.Model.Roles.Finalizer != "primary" {
+		t.Fatalf("migrated roles=%+v", cfg.Model.Roles)
+	}
+}
+
+func TestLoadLegacyModelProfileCanUseNonSecretEnvDefaults(t *testing.T) {
+	t.Setenv("OPENAI_BASE_URL", "https://api.kimi.com/coding/v1")
+	t.Setenv("OPENAI_MODEL", "k3-256k")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeConfig := `
+version: 4
+lark:
+  app_id: cli_test
+owner:
+  open_id: ou_owner
+  name: 测试负责人
+assistant:
+  names: ["Lark Agent"]
+model:
+  profiles: {}
+  roles:
+    agent: primary
+workspace:
+  root: ` + t.TempDir() + `
+`
+	mustWriteConfigFile(t, path, writeConfig)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := cfg.Model.Profiles["primary"]
+	if primary.Provider != "kimi" ||
+		primary.BaseURL != "https://api.kimi.com/coding/v1" ||
+		primary.Name != "k3-256k" {
+		t.Fatalf("primary=%+v", primary)
+	}
+}
+
+func TestValidateRejectsInvalidModelRoleBinding(t *testing.T) {
+	cfg := validConfigForTest(t)
+	cfg.Model.Roles.Finalizer = "missing"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "finalizer") {
+		t.Fatalf("role binding error=%v", err)
+	}
+	cfg = validConfigForTest(t)
+	cfg.Model.Profiles["primary"] = ModelProfileConfig{
+		Provider:              "kimi",
+		Protocol:              "anthropic_messages",
+		BaseURL:               "https://api.kimi.com/coding/v1",
+		Name:                  "k3-256k",
+		CredentialKeychainKey: "model/primary/api-key",
+		Reasoning:             ModelReasoningConfig{Mode: "provider_default"},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "anthropic_messages") {
+		t.Fatalf("profile protocol error=%v", err)
 	}
 }
 
@@ -278,4 +411,11 @@ func validConfigForTest(t *testing.T) Config {
 	cfg.Owner.Name = "测试负责人"
 	cfg.Workspace.Root = t.TempDir()
 	return cfg
+}
+
+func mustWriteConfigFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }

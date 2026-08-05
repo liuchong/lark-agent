@@ -28,5 +28,61 @@
     "expected_outcome": "partial",
     "max_model_calls": 6,
     "max_tool_calls": 1
+  },
+  {
+    "name": "work_5994_kimi_thinking_tool_choice",
+    "source_work_id": 5994,
+    "failure_stage": "provider_request",
+    "expected_terminal_state": "completed_or_partial_not_retry_wait",
+    "expected_outcome": "partial",
+    "max_model_calls": 6,
+    "max_tool_calls": 2,
+    "metrics": [
+      "invalid_request_count",
+      "tool_choice_required_absent",
+      "terminal_convergence"
+    ]
+  },
+  {
+    "name": "work_6070_deterministic_provider_error",
+    "source_work_id": 6070,
+    "failure_stage": "model_attempt",
+    "expected_terminal_state": "dead_letter_without_work_retry",
+    "expected_outcome": "partial",
+    "max_model_calls": 1,
+    "max_tool_calls": 0,
+    "metrics": [
+      "provider_failure_category",
+      "work_retry_count",
+      "owner_actionability"
+    ]
+  },
+  {
+    "name": "work_5805_semantic_suppression_threshold",
+    "source_work_id": 5805,
+    "failure_stage": "semantic_owner_reply_resolution",
+    "expected_terminal_state": "completed_owner_handled",
+    "expected_outcome": "complete",
+    "max_model_calls": 1,
+    "max_tool_calls": 0,
+    "metrics": [
+      "semantic_confidence_floor",
+      "owner_reply_retry_count",
+      "unsent_candidate_preserved"
+    ]
+  },
+  {
+    "name": "work_5680_terminal_only_finalizer",
+    "source_work_id": 5680,
+    "failure_stage": "terminal_only_nonconvergence",
+    "expected_terminal_state": "partial_or_actionable_blocker",
+    "expected_outcome": "partial",
+    "max_model_calls": 6,
+    "max_tool_calls": 3,
+    "metrics": [
+      "terminal_only_refusals",
+      "finalizer_invoked",
+      "validated_sources_preserved"
+    ]
   }
 ]

@@ -41,6 +41,20 @@ type AgentLoop struct {
 	ConfigFingerprint string
 }
 
+type AgentPhase string
+
+const (
+	PhasePrepare        AgentPhase = "prepare"
+	PhaseGenerate       AgentPhase = "generate"
+	PhaseValidateTurn   AgentPhase = "validate_turn"
+	PhaseExecuteTools   AgentPhase = "execute_tools"
+	PhaseObserve        AgentPhase = "observe"
+	PhaseVerifyProgress AgentPhase = "verify_progress"
+	PhaseConverge       AgentPhase = "converge"
+	PhaseFinalize       AgentPhase = "finalize"
+	PhaseTerminal       AgentPhase = "terminal"
+)
+
 // RunRecorder persists one loop's lifecycle and trajectory.
 type RunRecorder interface {
 	StartAgentRun(context.Context, domain.NormalizedEvent, string, string) (domain.AgentRun, error)
@@ -111,7 +125,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	}
 	l.SystemPrompt = strings.TrimSpace(l.SystemPrompt) + "\n\n" + modelTurnBudgetPrompt(l.MaxTurns)
 	if l.ToolChoice == "" {
-		l.ToolChoice = schema.ToolChoiceForced
+		l.ToolChoice = schema.ToolChoiceAllowed
 	}
 	invocationScope := agenttools.InvocationScope{
 		Owner:           bundle.User.OpenID != "" && bundle.Event.SenderID == bundle.User.OpenID,
@@ -284,6 +298,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		messages = compaction.Messages
 		requestMessages := append([]*schema.Message(nil), messages...)
 		budget := runBudget{
+			Phase:            PhaseGenerate,
 			CurrentTurn:      turn + 1,
 			MaxTurns:         l.MaxTurns,
 			ToolCalls:        toolCalls,
@@ -944,6 +959,7 @@ func modelTurnProgressPrompt(currentTurn, maxTurns int) string {
 }
 
 type runBudget struct {
+	Phase            AgentPhase
 	CurrentTurn      int
 	MaxTurns         int
 	ToolCalls        int
@@ -1009,13 +1025,14 @@ func modelRunProgressPrompt(budget runBudget, repair ...terminalRepairContext) s
 		)
 	}
 	return fmt.Sprintf(
-		"%s Tool-call budget: %d of %d investigation calls used, %d remaining. "+
+		"Agent phase: %s. %s Tool-call budget: %d of %d investigation calls used, %d remaining. "+
 			"Context budget: %d of %d bytes used (%d%%), %d bytes remaining. "+
 			"Automatic compaction: %t; replaced old messages: %d. Urgency: %s. "+
 			"Required outward language: %s; use that language for all explanatory prose. "+
 			"Do not spend turns just because the ceiling is high; when a narrow answer is supported, submit it. "+
 			"When urgency is urgent, stop broad investigation, preserve explicit unknowns, "+
 			"and converge on submit_decision. %s",
+		phaseLabel(budget.Phase),
 		modelTurnProgressPrompt(budget.CurrentTurn, budget.MaxTurns),
 		budget.ToolCalls,
 		budget.MaxToolCalls,
@@ -1030,6 +1047,13 @@ func modelRunProgressPrompt(budget runBudget, repair ...terminalRepairContext) s
 		budget.TargetLanguage,
 		dynamicState,
 	)
+}
+
+func phaseLabel(phase AgentPhase) AgentPhase {
+	if phase == "" {
+		return PhaseGenerate
+	}
+	return phase
 }
 
 func terminalFinalizerMessages(
@@ -1601,11 +1625,17 @@ func (l AgentLoop) recordModelStep(ctx context.Context, runID string, sequence i
 		return errs.NewInternalError(errs.SubtypeUnknown, "encode model trajectory step").WithCause(err)
 	}
 	step := domain.AgentStep{
-		RunID:      runID,
-		Sequence:   sequence,
-		Kind:       "model",
-		OutputJSON: string(data),
-		CreatedAt:  time.Now().UTC(),
+		RunID:        runID,
+		Sequence:     sequence,
+		Kind:         "model",
+		Phase:        string(PhaseGenerate),
+		Attempt:      1,
+		FinishReason: "completed",
+		OutputJSON:   string(data),
+		CreatedAt:    time.Now().UTC(),
+	}
+	if len(assistant.ToolCalls) > 0 {
+		step.FinishReason = "tool_calls"
 	}
 	if assistant.ResponseMeta != nil && assistant.ResponseMeta.Usage != nil {
 		step.PromptTokens = assistant.ResponseMeta.Usage.PromptTokens
@@ -1627,6 +1657,8 @@ func (l AgentLoop) recordToolStep(ctx context.Context, runID string, sequence in
 		RunID:      runID,
 		Sequence:   sequence,
 		Kind:       "tool",
+		Phase:      string(PhaseExecuteTools),
+		Attempt:    1,
 		ToolCallID: call.ID,
 		ToolName:   call.Function.Name,
 		InputJSON:  call.Function.Arguments,

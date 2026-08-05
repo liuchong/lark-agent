@@ -166,6 +166,30 @@ func TestPromptIncludesAuthoritativeRuntimePolicy(t *testing.T) {
 	}
 }
 
+func TestAgentPromptSectionsKeepStablePrefixHash(t *testing.T) {
+	bundleA := Bundle{
+		Event: domain.NormalizedEvent{MessageID: "om_a", Content: "查一下 A"},
+		User:  UserProfile{OpenID: "ou_owner", Name: "Owner"},
+	}
+	bundleB := bundleA
+	bundleB.Event = domain.NormalizedEvent{MessageID: "om_b", Content: "查一下 B，时间不同"}
+
+	sectionsA := AgentPromptSections(bundleA)
+	sectionsB := AgentPromptSections(bundleB)
+	hashA := StablePromptHash(sectionsA)
+	hashB := StablePromptHash(sectionsB)
+	if hashA == "" {
+		t.Fatalf("stable prompt hash is empty")
+	}
+	if hashA != hashB {
+		t.Fatalf("stable prefix hash changed with current input: %s != %s", hashA, hashB)
+	}
+	if !sectionContains(sectionsA, PromptSectionCurrentInput, "om_a") ||
+		!sectionContains(sectionsB, PromptSectionCurrentInput, "om_b") {
+		t.Fatalf("current input sections missing: %+v %+v", sectionsA, sectionsB)
+	}
+}
+
 func TestBuilderIncludesBoundedEnvironmentContext(t *testing.T) {
 	root := t.TempDir()
 	mustWriteFile(t, filepath.Join(root, "AGENTS.md"), "reply briefly")
@@ -379,6 +403,15 @@ func containsTool(tools []ToolSpec, name string) bool {
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func sectionContains(sections []PromptSection, kind PromptSectionKind, want string) bool {
+	for _, section := range sections {
+		if section.Kind == kind && strings.Contains(section.Content, want) {
 			return true
 		}
 	}

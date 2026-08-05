@@ -16,10 +16,11 @@ the owner when the configured policy allows it. It does not execute `lark-cli`,
 import official CLI Go packages, copy official internal commands, or store Lark
 secrets in YAML.
 
-The agent is built as deterministic Go runtime plus an Eino model loop. The
-model is only one part of the system: queueing, routing, workspace boundaries,
-identity checks, idempotency, audit, and rollback decisions are enforced by
-code outside the prompt.
+The agent is built as a deterministic Go runtime plus a local model-runtime
+contract. The model is only one part of the system: queueing, routing,
+workspace boundaries, identity checks, idempotency, audit, retry policy,
+provider protocol adaptation, and rollback decisions are enforced by code
+outside the prompt.
 
 The runtime may also bridge a trusted GitHub workflow notification into Lark.
 A short-lived GitHub Action sends one bot-authored notification through the
@@ -51,6 +52,11 @@ cannot hold the whole Lark assistant hostage:
 - The agent core receives a work kind, a turn budget, and tool policy receipts.
   It may ask the model to reason, but Go enforces terminal decisions, budgets,
   source requirements, and no-progress convergence.
+- The model runtime resolves an explicit role binding (`agent`, `semantic`,
+  `finalizer`, `compactor`, or `vision`) to a named model profile. Profiles
+  declare provider, protocol, endpoint, model name, credential reference,
+  reasoning behavior, streaming behavior, timeout, and capability limits. The
+  runtime never guesses a protocol from a URL or model name.
 - Tool policy is centralized. Shell, workspace reads, code search, Lark context,
   and exploration tools all return bounded receipts and structured denial
   results when a call is outside the current work kind or permission policy.
@@ -69,8 +75,37 @@ which lane it belongs to, and how it is recovered after interruption.
 After deterministic safety routing, the model receives one bounded environment
 snapshot and decides whether it can submit a final decision immediately or
 needs more evidence. Evidence gathering is iterative: each assistant turn may
-call registered OpenAI-compatible tools, consume their results, and choose the
-next tool until it calls `submit_decision`.
+call registered tools, consume their results, and choose the next tool until it
+calls `submit_decision`. The loop talks only to the local model-runtime
+contract; provider-specific Chat Completions, Responses, Anthropic Messages, or
+Kimi-compatible details are encoded and decoded below that boundary.
+
+The local codec contract covers these model protocols. The daemon's current
+production model execution path only enables `openai_chat` profiles until the
+canonical `Turn` interface fully replaces the legacy chat-model bridge; binding
+`agent`, `semantic`, or `finalizer` to another protocol fails configuration
+doctor explicitly instead of sending the wrong wire format.
+
+The protocol contract is:
+
+- `openai_chat`, used for OpenAI-compatible Chat Completions providers and Kimi
+  provider traits. Kimi thinking is encoded through the provider-supported
+  reasoning fields; when tools are present the request must omit forced
+  `tool_choice=required` unless a profile explicitly disables incompatible
+  thinking.
+- `openai_responses`, used without server-side session state. The daemon
+  replays typed output items, reasoning handles, function calls, and function
+  call outputs from local durable state.
+- `anthropic_messages`, used with content blocks, `tool_use`/`tool_result`, and
+  signed thinking blocks according to the profile capability declaration.
+
+Every protocol adapter returns the same local `Turn`: assistant text, complete
+tool calls, normalized finish reason, request identifier, usage, cache metrics,
+and a typed provider failure when no valid turn can be produced. Tool-call IDs,
+parallel sibling order, tool-result adjacency, and provider-private thinking
+continuity blocks are preserved within the current run. Raw thinking text,
+encrypted reasoning payloads, API keys, and complete model request bodies are
+never written to SQLite, logs, fixtures, or Lark messages.
 
 The initial snapshot contains the operating system, configured workspace,
 available tools and common commands, a depth- and size-bounded directory
@@ -84,14 +119,17 @@ pre-guess code-search terms from the message. Code questions are investigated
 by the model using search, read, rules, skills, Lark-context, local Git history,
 and shell tools.
 
-The loop has hard limits for model turns, elapsed time, individual and
-cumulative tool output, and repeated no-progress model turns. Multiple tool
-calls emitted by one model turn count as one no-progress opportunity, not one
-opportunity per call. A useful successful call in that turn resets the
-no-progress streak even when a sibling call is rejected by policy. Reaching a
-limit never creates a guessed answer. The work item becomes retryable,
-dead-lettered, or a source-backed notify/approval decision according to the
-failure type.
+The loop has hard limits for model turns, per-step model attempts, elapsed
+time, individual and cumulative tool output, model-visible context, output
+reserve, and repeated no-progress model turns. Network attempts and model
+turns are counted separately: retrying a timed-out or rate-limited transport
+request does not consume a reasoning turn, while a successful model response
+with no useful progress does. Multiple tool calls emitted by one model turn
+count as one no-progress opportunity, not one opportunity per call. A useful
+successful call in that turn resets the no-progress streak even when a sibling
+call is rejected by policy. Reaching a limit never creates a guessed answer.
+The work item becomes retryable, dead-lettered, or a source-backed
+notify/approval decision according to the failure type.
 
 Fast-path work does not enter this loop. A configured owner asking deterministic
 local questions such as time, date, ping, daemon status, help, doctor, or queue
@@ -165,10 +203,13 @@ rule that external sends are runtime-only. A task-process layer describes the
 short flow for the current work kind: understand, choose direct answer,
 clarification, or investigation, plan if required, gather minimum evidence,
 classify claims, and submit a typed outcome. A dynamic run-state reminder is
-generated by Go before every request and after compaction. It reports the
-remaining turn/tool/context budgets and whether the run is in terminal-only
-mode. Terminal repair state adds successful completed tool names, typed
-unknowns, the last failed gate, and allowed terminal outcomes. A repeated
+generated by Go before every request and after compaction. It is appended near
+the end of the request rather than editing the stable system prefix. It reports
+the original user goal, current phase, current turn, remaining turn/tool/context
+budgets, per-step attempt, repeated tool fingerprints, verified sources, exact
+unknowns, last failed gate, legal next actions, and whether the run is in
+terminal-only mode. Terminal repair state adds successful completed tool names,
+typed unknowns, the last failed gate, and allowed terminal outcomes. A repeated
 fingerprint writes its occurrence count and required disposition into that
 failed-gate state. The model never supplies or maintains these counters.
 
@@ -176,6 +217,34 @@ Prompt instructions are not policy enforcement. Every tool, path, permission,
 budget, evidence, and send restriction remains enforced by Go. Dynamic prompt
 text and structured tool denials describe the same runtime policy so a weak
 model receives an actionable next state without gaining authority.
+
+The stable prompt prefix and tool schemas are rendered deterministically with
+stable ordering and a recorded hash. Time, current budgets, work phase, current
+configuration snapshot, and recent failures are dynamic state and must not be
+inserted into the stable core. If a provider reports prompt-cache usage, the
+runtime records it as diagnostics; cache hints do not change correctness.
+
+Context compaction is layered. Oversized tool results are first replaced by a
+bounded preview plus durable source references. Clearly irrelevant noise may be
+removed. Older complete provider protocol units may be replaced by structured
+checkpoints that preserve each tool call ID, tool name, argument digest, result
+digest, source references, completed checks, unknowns, and failure class. Only
+after those deterministic reductions may the `compactor` role produce a
+tool-less, task-aware summary of low-risk tool text under its own budget and
+failure limit. Architecture decisions, original user goals, permission
+constraints, failed paths, source references, modified-file records,
+verification state, unknowns, and rollback notes must survive compaction.
+Compaction failure preserves the deterministic checkpoint and cannot recursively
+trigger another model-calling recovery loop.
+
+The agent loop is a phase machine:
+`prepare`, `generate`, `validate_turn`, `execute_tools`, `observe`,
+`verify_progress`, `converge`, `finalize`, and `terminal`. Events and external
+state changes are consumed only at phase boundaries. Ordinary follow-up events
+are queued until the current assistant/tool protocol unit is complete; urgent
+cancel or withdrawn-message events may stop the current step at a safe boundary
+but must not create a fabricated tool success or persist half-finished model
+thinking.
 
 The model has two explicit Lark roles. An `assistant_request` answers the
 configured owner when that owner natively mentions the assistant in an allowed
@@ -1456,6 +1525,62 @@ reference recovery after restart.
 
 The multi-step loop is accepted by these executable BDD scenarios:
 
+- Given the `agent` role is bound to a Kimi `openai_chat` profile with
+  provider-default thinking, when a coding investigation request includes
+  tools, then the outbound provider request includes the tool definitions but
+  does not include `tool_choice=required`; the model may choose tools or submit
+  a decision and the run audit records the actual provider, protocol, model,
+  role, and request ID.
+- Given the same work is run through OpenAI Chat Completions, OpenAI Responses,
+  and Anthropic Messages mock providers, when each provider returns two
+  parallel read-only tool calls and then a terminal `submit_decision`, then the
+  local `Turn` objects preserve tool-call IDs, sibling order, tool results,
+  finish reasons, token usage, and provider-private thinking continuity without
+  leaking raw thinking to SQLite, logs, fixtures, or Lark messages.
+- Given a provider stream connects but produces no valid event for the
+  configured idle interval, when the model step is still within its per-step
+  attempt budget, then the runtime cancels that stream, records a retryable
+  `timeout` failure for the attempt, retries with backoff if allowed, and does
+  not consume a model turn or leave the work permanently processing.
+- Given a provider returns HTTP 400, 401, 403, 404, a quota-exhausted response,
+  or a profile/protocol capability mismatch, when the request fails, then the
+  work stops with one deterministic configuration/auth/protocol diagnosis and
+  does not spend the general work retry budget on the same unchanged request.
+- Given a provider returns 429, 503, 529, a network timeout, or an empty
+  response that is classified retryable, when the failure occurs, then only the
+  current model step is retried with exponential backoff and `Retry-After`
+  handling; if the per-step attempt budget is exhausted, only then may the work
+  enter the existing transient retry state.
+- Given the stable prompt core, task process, and tool schema are rendered
+  twice with the same configuration, when dynamic time, budgets, run phase, or
+  failure state changes, then the stable prefix hash remains unchanged and only
+  the appended run-state reminder changes.
+- Given Go-maintained run state says the model already called the same tool
+  with normalized identical arguments and received the same error class twice,
+  when the model attempts the same call again, then the runtime returns a
+  structured strategy-change denial or narrows to terminal convergence rather
+  than silently repeating the call or restarting the whole work item.
+- Given a context window approaches its configured limit, when compaction runs,
+  then it first preserves complete provider protocol units and deterministic
+  checkpoints; any `compactor` model summary may shorten low-risk tool text but
+  cannot remove original user goals, permissions, source references, completed
+  checks, unknowns, failure classes, or rollback notes.
+- Given the `compactor`, `finalizer`, or a background helper model itself fails
+  with a provider error, when the main work is already in an error-recovery
+  path, then the runtime does not call another model recursively from that same
+  recovery path; it preserves the deterministic checkpoint and reports the
+  precise blocked next step.
+- Given a normal event arrives while a model/tool protocol unit is incomplete,
+  when it is not an urgent cancellation or withdrawal, then it is queued until a
+  safe phase boundary and then appended as a clearly marked pending event batch;
+  the runtime never inserts it between an assistant tool call and its sibling
+  tool results.
+- Given a historical failed work item from the regression fixture such as a
+  `tool_choice required + thinking` provider rejection or a terminal-only model
+  refusal, when the harness regression suite runs the case three times, then it
+  reports Pass@1, Pass^3, tool-call legality, terminal convergence, repeated
+  call count, token/cache usage, and final stop reason without copying real
+  private chat text, secrets, or raw model thinking into the fixture.
 - Given owner asks `@assistant 几点了`, when routing runs, then the work item is
   classified as fast-path owner work, does not start a model run, and replies
   through the normal idempotent reply runtime.

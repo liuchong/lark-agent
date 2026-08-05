@@ -184,6 +184,35 @@ func TestOpenAICompatibleModelToolCallingWireFormat(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatibleModelAllowedToolChoiceOmitsWireField(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	tool := &schema.ToolInfo{Name: "search_workspace"}
+	model := &OpenAICompatibleModel{APIKey: "key", BaseURL: server.URL, Model: "test-model", Client: server.Client()}
+	_, err := model.Generate(
+		context.Background(),
+		[]*schema.Message{schema.UserMessage("find router")},
+		einomodel.WithTools([]*schema.ToolInfo{tool}),
+		einomodel.WithToolChoice(schema.ToolChoiceAllowed),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["tools"]; !ok {
+		t.Fatalf("tools missing: %+v", body)
+	}
+	if _, ok := body["tool_choice"]; ok {
+		t.Fatalf("allowed tool choice must omit wire tool_choice: %+v", body)
+	}
+}
+
 func TestOpenAICompatibleModelWithToolsReturnsIndependentModel(t *testing.T) {
 	base := &OpenAICompatibleModel{APIKey: "key", Model: "test-model"}
 	tool := &schema.ToolInfo{Name: "search_workspace"}

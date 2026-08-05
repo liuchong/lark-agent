@@ -60,6 +60,86 @@ func TestRuntimePolicySnapshotUsesValidatedActiveConfiguration(t *testing.T) {
 	}
 }
 
+func TestModelProfileAndRoleCommandsUseV5Config(t *testing.T) {
+	cfg := config.Default()
+	cfg.Lark.AppID = "cli_test"
+	cfg.Owner.OpenID = "ou_owner"
+	cfg.Owner.Name = "测试负责人"
+	cfg.Workspace.Root = t.TempDir()
+	cfg.Assistant.Names = []string{"Lark Agent"}
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	if code := Execute(strings.NewReader(""), &out, &errOut, []string{
+		"--config", configPath,
+		"model", "profile", "list",
+	}); code != 0 {
+		t.Fatalf("profile list code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "primary") ||
+		!strings.Contains(out.String(), "k3-256k") ||
+		strings.Contains(strings.ToLower(out.String()), "api_key") {
+		t.Fatalf("profile list output=%s", out.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	if code := Execute(strings.NewReader(""), &out, &errOut, []string{
+		"--config", configPath,
+		"model", "profile", "set", "finalizer",
+		"--provider", "openai",
+		"--protocol", "openai_responses",
+		"--base-url", "https://api.openai.com/v1",
+		"--model", "gpt-5.5",
+		"--credential-keychain-key", "model/finalizer/api-key",
+	}); code != 0 {
+		t.Fatalf("profile set code=%d stderr=%s", code, errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	if code := Execute(strings.NewReader(""), &out, &errOut, []string{
+		"--config", configPath,
+		"model", "role", "set", "finalizer", "finalizer",
+	}); code != 0 {
+		t.Fatalf("role set code=%d stderr=%s", code, errOut.String())
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Model.Roles.Finalizer != "finalizer" ||
+		loaded.Model.Profiles["finalizer"].Protocol != "openai_responses" {
+		t.Fatalf("loaded model config=%+v", loaded.Model)
+	}
+
+	out.Reset()
+	errOut.Reset()
+	if code := Execute(strings.NewReader(""), &out, &errOut, []string{
+		"--config", configPath,
+		"model", "role", "list",
+	}); code != 0 {
+		t.Fatalf("role list code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "finalizer") {
+		t.Fatalf("role list output=%s", out.String())
+	}
+}
+
+func TestRuntimeModelProtocolRejectsProfilesNotYetConnectedToAgentLoop(t *testing.T) {
+	err := ensureRuntimeModelProtocol(config.ModelProfileConfig{
+		Provider: "openai",
+		Protocol: "openai_responses",
+		Name:     "gpt-test",
+	})
+	if err == nil || !strings.Contains(err.Error(), "openai_chat") {
+		t.Fatalf("protocol error=%v", err)
+	}
+}
+
 type fakeSemanticContextReader struct {
 	result    serviceim.SemanticReplyContext
 	err       error

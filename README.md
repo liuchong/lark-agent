@@ -59,7 +59,7 @@
 - Go 1.25 或更新版本（从源码构建时）
 - Lark 自建应用的 `app_id`，以及写入 macOS Keychain 的 app secret；用户 token 可选，
   只用于用户身份轮询和代回复
-- 一个 OpenAI 兼容模型；密钥只放在当前用户的环境或私有工具配置中
+- 一个已配置的模型档案；模型密钥写入 macOS Keychain，不写入配置文件或日志
 
 `lark-agent` 不维护第二个 `lark-cli` Fork，也没有 Linux/Windows 安装器或传输插件
 接口。
@@ -80,13 +80,21 @@ go build -o ./lark-agent ./cmd/lark-agent
 ./lark-agent doctor --lark-only
 ```
 
-需要模型时，在安装前为当前 shell 设置模型环境：
+需要模型时，先配置模型档案并把密钥写入 Keychain。默认档案是 Kimi `k3-256k`：
 
 ```bash
-export OPENAI_API_KEY='...'
-export OPENAI_BASE_URL='https://example.com/v1'
-export OPENAI_MODEL='model-name'
+lark-agent model profile list
+lark-agent model profile set primary \
+  --provider kimi \
+  --protocol openai_chat \
+  --base-url https://api.kimi.com/coding/v1 \
+  --model k3-256k
+lark-agent model auth login primary < /path/to/private-model-key.json
+lark-agent model doctor primary
 ```
+
+安装器仍识别显式传入的 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_MODEL`，只作为
+旧安装迁移输入；成功迁移到 profile 和 Keychain 后，不再把它们作为长期唯一配置来源。
 
 安装当前用户的 macOS LaunchAgent 和状态栏：
 

@@ -17,6 +17,9 @@ func TestDoctorNativeToolsVerifiesToolCallAndToolResult(t *testing.T) {
 			t.Fatal(err)
 		}
 		if call == 1 {
+			if choice, ok := body["tool_choice"]; ok {
+				t.Fatalf("doctor must not force tool_choice: %v", choice)
+			}
 			_, _ = w.Write([]byte(`{
 				"id":"req_first",
 				"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{

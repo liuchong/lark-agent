@@ -38,6 +38,11 @@ lark-agent queue inspect --message-id om_xxx
 
 inspect 会显示接收回执、工作项、最近模型步骤、最近外部动作和中断快照，用于判断
 消息是离线积压、重复、排队、处理中、中断、已回复还是终态。
+模型诊断字段会展示真实的 role/profile/provider/protocol/model、请求 ID、phase、
+attempt、finish reason、HTTP 状态、失败类别和恢复动作；不会展示 API key、原始思考
+内容或完整请求体。看到 `invalid_request`、认证/权限、profile/协议不匹配或配额耗尽
+时，先修配置或 Keychain 并运行 `lark-agent model doctor primary`，不要用
+`queue retry` 反复跑同一个确定性失败。
 
 `queue tasks` 是面向处置的有界列表：
 

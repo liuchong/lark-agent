@@ -16,7 +16,7 @@ import (
 	"github.com/liuchong/lark-agent/internal/fsx"
 )
 
-const currentVersion = 4
+const currentVersion = 5
 
 // Config is the YAML configuration stored under the standalone lark-agent config directory.
 type Config struct {
@@ -186,12 +186,51 @@ type OwnerDirectRequestConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
 }
 
-// ModelConfig configures an OpenAI-compatible endpoint.
+// ModelConfig configures role-bound model profiles. Provider/BaseURL/Name are
+// retained as legacy v4 fields and as a temporary mirror for code paths not yet
+// switched to role-bound profiles. They are not credential fields.
 type ModelConfig struct {
-	Provider string        `json:"provider" yaml:"provider"`
-	BaseURL  string        `json:"base_url" yaml:"base_url"`
-	Name     string        `json:"name" yaml:"name"`
-	Timeout  time.Duration `json:"timeout" yaml:"timeout"`
+	Provider string                        `json:"provider,omitempty" yaml:"provider,omitempty"`
+	BaseURL  string                        `json:"base_url,omitempty" yaml:"base_url,omitempty"`
+	Name     string                        `json:"name,omitempty" yaml:"name,omitempty"`
+	Timeout  time.Duration                 `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+	Profiles map[string]ModelProfileConfig `json:"profiles,omitempty" yaml:"profiles,omitempty"`
+	Roles    ModelRoleBindingsConfig       `json:"roles,omitempty" yaml:"roles,omitempty"`
+}
+
+type ModelProfileConfig struct {
+	Provider              string                  `json:"provider" yaml:"provider"`
+	Protocol              string                  `json:"protocol" yaml:"protocol"`
+	BaseURL               string                  `json:"base_url" yaml:"base_url"`
+	Name                  string                  `json:"name" yaml:"name"`
+	KeychainService       string                  `json:"keychain_service,omitempty" yaml:"keychain_service,omitempty"`
+	CredentialKeychainKey string                  `json:"credential_keychain_key" yaml:"credential_keychain_key"`
+	Timeout               time.Duration           `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+	Stream                string                  `json:"stream,omitempty" yaml:"stream,omitempty"`
+	Reasoning             ModelReasoningConfig    `json:"reasoning,omitempty" yaml:"reasoning,omitempty"`
+	Capabilities          ModelCapabilitiesConfig `json:"capabilities,omitempty" yaml:"capabilities,omitempty"`
+}
+
+type ModelReasoningConfig struct {
+	Mode   string `json:"mode,omitempty" yaml:"mode,omitempty"`
+	Effort string `json:"effort,omitempty" yaml:"effort,omitempty"`
+}
+
+type ModelCapabilitiesConfig struct {
+	ToolUse          bool `json:"tool_use,omitempty" yaml:"tool_use,omitempty"`
+	Thinking         bool `json:"thinking,omitempty" yaml:"thinking,omitempty"`
+	ParallelToolCall bool `json:"parallel_tool_call,omitempty" yaml:"parallel_tool_call,omitempty"`
+	ImageInput       bool `json:"image_input,omitempty" yaml:"image_input,omitempty"`
+	MaxContextTokens int  `json:"max_context_tokens,omitempty" yaml:"max_context_tokens,omitempty"`
+	MaxOutputTokens  int  `json:"max_output_tokens,omitempty" yaml:"max_output_tokens,omitempty"`
+}
+
+type ModelRoleBindingsConfig struct {
+	Agent     string `json:"agent" yaml:"agent"`
+	Semantic  string `json:"semantic" yaml:"semantic"`
+	Finalizer string `json:"finalizer" yaml:"finalizer"`
+	Compactor string `json:"compactor" yaml:"compactor"`
+	Vision    string `json:"vision" yaml:"vision"`
 }
 
 // PolicyConfig controls routing and reply behavior.
@@ -254,8 +293,35 @@ func Default() Config {
 			OwnerDirect: OwnerDirectRequestConfig{Enabled: true},
 		},
 		Model: ModelConfig{
-			Provider: "openai-compatible",
+			Provider: "kimi",
+			BaseURL:  "https://api.kimi.com/coding/v1",
+			Name:     "k3-256k",
 			Timeout:  60 * time.Second,
+			Profiles: map[string]ModelProfileConfig{
+				"primary": {
+					Provider:              "kimi",
+					Protocol:              "openai_chat",
+					BaseURL:               "https://api.kimi.com/coding/v1",
+					Name:                  "k3-256k",
+					KeychainService:       "lark-agent",
+					CredentialKeychainKey: "model/primary/api-key",
+					Timeout:               60 * time.Second,
+					Stream:                "auto",
+					Reasoning:             ModelReasoningConfig{Mode: "provider_default"},
+					Capabilities: ModelCapabilitiesConfig{
+						ToolUse:          true,
+						Thinking:         true,
+						ParallelToolCall: true,
+					},
+				},
+			},
+			Roles: ModelRoleBindingsConfig{
+				Agent:     "primary",
+				Semantic:  "primary",
+				Finalizer: "primary",
+				Compactor: "primary",
+				Vision:    "primary",
+			},
 		},
 		Agent: AgentConfig{
 			MaxTurns:                  150,
@@ -337,6 +403,7 @@ func Load(path string) (Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, errs.NewConfigError(errs.SubtypeInvalidConfig, "parse agent config: %s", path).WithCause(err)
 	}
+	cfg.Normalize()
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -359,6 +426,19 @@ func Save(path string, cfg Config) error {
 		return errs.NewInternalError(errs.SubtypeFileIO, "write agent config: %s", path).WithCause(err)
 	}
 	return nil
+}
+
+// Normalize upgrades legacy in-memory shapes after YAML parsing. It never reads
+// secrets; legacy OPENAI_BASE_URL and OPENAI_MODEL may seed the primary profile.
+func (c *Config) Normalize() {
+	if c == nil {
+		return
+	}
+	legacyVersion := c.Version > 0 && c.Version < currentVersion
+	if c.Version == 0 || c.Version < currentVersion {
+		c.Version = currentVersion
+	}
+	c.Model.normalize(legacyVersion)
 }
 
 // Validate checks semantic configuration constraints.
@@ -384,6 +464,9 @@ func (c Config) Validate() error {
 		}
 	}
 	if err := validateGitHubConfig(c.GitHub); err != nil {
+		return err
+	}
+	if err := validateModelConfig(c.Model); err != nil {
 		return err
 	}
 	if c.Owner.OpenID == "" {
@@ -549,6 +632,198 @@ func (c Config) Validate() error {
 		).WithField("workspace.root")
 	}
 	return nil
+}
+
+func (m *ModelConfig) normalize(forceLegacyPrimary bool) {
+	if m == nil {
+		return
+	}
+	if forceLegacyPrimary && (strings.TrimSpace(m.Name) != "" || strings.TrimSpace(m.BaseURL) != "") {
+		m.Profiles = nil
+	}
+	if len(m.Profiles) == 0 {
+		baseURL := firstNonEmpty(os.Getenv("OPENAI_BASE_URL"), strings.TrimSpace(m.BaseURL))
+		modelName := firstNonEmpty(os.Getenv("OPENAI_MODEL"), strings.TrimSpace(m.Name))
+		provider := normalizeModelProvider(m.Provider, baseURL, modelName)
+		if baseURL == "" && provider == "kimi" {
+			baseURL = "https://api.kimi.com/coding/v1"
+		}
+		if modelName == "" && provider == "kimi" {
+			modelName = "k3-256k"
+		}
+		profile := ModelProfileConfig{
+			Provider:              provider,
+			Protocol:              "openai_chat",
+			BaseURL:               baseURL,
+			Name:                  modelName,
+			KeychainService:       "lark-agent",
+			CredentialKeychainKey: "model/primary/api-key",
+			Timeout:               m.Timeout,
+			Stream:                "auto",
+			Reasoning:             ModelReasoningConfig{Mode: "provider_default"},
+			Capabilities: ModelCapabilitiesConfig{
+				ToolUse:          true,
+				Thinking:         true,
+				ParallelToolCall: true,
+			},
+		}
+		if profile.Timeout <= 0 {
+			profile.Timeout = 60 * time.Second
+		}
+		m.Profiles = map[string]ModelProfileConfig{"primary": profile}
+	}
+	if m.Roles.Agent == "" {
+		m.Roles.Agent = "primary"
+	}
+	if m.Roles.Semantic == "" {
+		m.Roles.Semantic = m.Roles.Agent
+	}
+	if m.Roles.Finalizer == "" {
+		m.Roles.Finalizer = m.Roles.Agent
+	}
+	if m.Roles.Compactor == "" {
+		m.Roles.Compactor = m.Roles.Agent
+	}
+	if m.Roles.Vision == "" {
+		m.Roles.Vision = m.Roles.Agent
+	}
+	if primary, ok := m.Profiles[m.Roles.Agent]; ok {
+		m.Provider = primary.Provider
+		m.BaseURL = primary.BaseURL
+		m.Name = primary.Name
+		m.Timeout = primary.Timeout
+	}
+}
+
+func validateModelConfig(cfg ModelConfig) error {
+	if len(cfg.Profiles) == 0 {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "model.profiles is required").
+			WithField("model.profiles")
+	}
+	for name, profile := range cfg.Profiles {
+		if strings.TrimSpace(name) == "" {
+			return errs.NewConfigError(errs.SubtypeInvalidConfig, "model profile name is required").
+				WithField("model.profiles")
+		}
+		field := "model.profiles." + name
+		if err := validateModelProfile(field, profile); err != nil {
+			return err
+		}
+	}
+	for role, profileName := range map[string]string{
+		"agent":     cfg.Roles.Agent,
+		"semantic":  cfg.Roles.Semantic,
+		"finalizer": cfg.Roles.Finalizer,
+		"compactor": cfg.Roles.Compactor,
+		"vision":    cfg.Roles.Vision,
+	} {
+		if strings.TrimSpace(profileName) == "" {
+			return errs.NewConfigError(errs.SubtypeInvalidConfig, "model role %s is not bound", role).
+				WithField("model.roles." + role)
+		}
+		if _, ok := cfg.Profiles[profileName]; !ok {
+			return errs.NewConfigError(
+				errs.SubtypeInvalidConfig,
+				"model role %s references missing profile %q",
+				role,
+				profileName,
+			).WithField("model.roles." + role)
+		}
+	}
+	return nil
+}
+
+func validateModelProfile(field string, profile ModelProfileConfig) error {
+	provider := strings.TrimSpace(profile.Provider)
+	switch provider {
+	case "kimi", "openai", "anthropic":
+	default:
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "unsupported model provider %q", provider).
+			WithField(field + ".provider")
+	}
+	switch strings.TrimSpace(profile.Protocol) {
+	case "openai_chat":
+		if provider == "anthropic" {
+			return errs.NewConfigError(errs.SubtypeInvalidConfig, "anthropic provider must use anthropic_messages protocol").
+				WithField(field + ".protocol")
+		}
+	case "openai_responses":
+		if provider != "openai" {
+			return errs.NewConfigError(errs.SubtypeInvalidConfig, "openai_responses protocol requires openai provider").
+				WithField(field + ".protocol")
+		}
+	case "anthropic_messages":
+		if provider != "anthropic" {
+			return errs.NewConfigError(errs.SubtypeInvalidConfig, "anthropic_messages protocol requires anthropic provider").
+				WithField(field + ".protocol")
+		}
+	default:
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "unsupported model protocol %q", profile.Protocol).
+			WithField(field + ".protocol")
+	}
+	if strings.TrimSpace(profile.Name) == "" {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "model profile name is required").
+			WithField(field + ".name")
+	}
+	parsed, err := url.Parse(strings.TrimSpace(profile.BaseURL))
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "model profile base_url must be an absolute HTTP URL").
+			WithField(field + ".base_url")
+	}
+	if strings.TrimSpace(profile.CredentialKeychainKey) == "" {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "model profile credential keychain key is required").
+			WithField(field + ".credential_keychain_key")
+	}
+	if profile.KeychainService == "" {
+		profile.KeychainService = "lark-agent"
+	}
+	if profile.Timeout <= 0 {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "model profile timeout must be positive").
+			WithField(field + ".timeout")
+	}
+	if profile.Stream != "" && profile.Stream != "auto" && profile.Stream != "disabled" && profile.Stream != "required" {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "model profile stream must be auto, disabled, or required").
+			WithField(field + ".stream")
+	}
+	if profile.Reasoning.Mode != "" &&
+		profile.Reasoning.Mode != "provider_default" &&
+		profile.Reasoning.Mode != "enabled" &&
+		profile.Reasoning.Mode != "disabled" {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"model profile reasoning mode must be provider_default, enabled, or disabled",
+		).WithField(field + ".reasoning.mode")
+	}
+	return nil
+}
+
+func normalizeModelProvider(provider, baseURL, modelName string) string {
+	provider = strings.TrimSpace(provider)
+	switch provider {
+	case "kimi", "openai", "anthropic":
+		return provider
+	}
+	lowerURL := strings.ToLower(strings.TrimSpace(baseURL))
+	lowerModel := strings.ToLower(strings.TrimSpace(modelName))
+	if strings.Contains(lowerURL, "kimi.com") ||
+		strings.HasPrefix(lowerModel, "k3") ||
+		strings.Contains(lowerModel, "kimi") {
+		return "kimi"
+	}
+	if strings.Contains(lowerURL, "anthropic.com") ||
+		strings.Contains(lowerModel, "claude") {
+		return "anthropic"
+	}
+	return "openai"
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func validateGitHubConfig(cfg GitHubConfig) error {

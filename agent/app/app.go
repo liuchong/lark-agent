@@ -1407,8 +1407,7 @@ func (d *Daemon) complete(item domain.WorkItem, decision domain.Decision) error 
 }
 
 func (d *Daemon) markRetry(item domain.WorkItem, runErr error) {
-	if problem, ok := errs.ProblemOf(runErr); ok &&
-		problem.Subtype == errs.SubtypeModelNonConvergence {
+	if isPermanentRunFailure(runErr) {
 		if d.markPermanentFailure(item, runErr) {
 			return
 		}
@@ -1434,6 +1433,35 @@ func (d *Daemon) markRetry(item domain.WorkItem, runErr error) {
 	if q, ok := d.queue.(retryMarker); ok {
 		_ = q.MarkRetry(item.ID, runErr.Error())
 		d.notifyTerminalFailure(item, runErr)
+	}
+}
+
+func isPermanentRunFailure(runErr error) bool {
+	problem, ok := errs.ProblemOf(runErr)
+	if !ok {
+		return false
+	}
+	if problem.Subtype == errs.SubtypeModelNonConvergence {
+		return true
+	}
+	if problem.Category == errs.CategoryConfig ||
+		problem.Category == errs.CategoryAuthorization {
+		return true
+	}
+	if problem.Category != errs.CategoryAPI {
+		return false
+	}
+	switch problem.Code {
+	case 400, 401, 403, 404:
+		return true
+	case 429:
+		lower := strings.ToLower(problem.Message)
+		return strings.Contains(lower, "quota") ||
+			strings.Contains(lower, "balance") ||
+			strings.Contains(lower, "余额") ||
+			strings.Contains(lower, "额度")
+	default:
+		return false
 	}
 }
 

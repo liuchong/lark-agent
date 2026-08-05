@@ -45,15 +45,23 @@ swiftc macos/LarkAgentStatus/main.swift -framework AppKit -o /tmp/LarkAgentStatu
 Go 拒绝路径强制执行。
 
 `make harness-eval` 使用脱敏的脚本模型和固定工具回执，逐项显示并检查：不依赖固定
-措辞的部分成果、无需伪造代码读取的澄清、相同结果的重复调用熔断，以及无依据代码
-断言被拒绝后安全收敛。场景目录检查终态类型以及声明的模型/工具调用上限；各可执行
-用例断言对应行为所需的终态和调用边界。它不访问网络、不读取模型密钥，也不替代
-`make verify`。候选持久化、语义复查、重复发送和 Owner 终止通知由同一集成测试包中
-的其他测试覆盖。
+措辞的部分成果、无需伪造代码读取的澄清、相同结果的重复调用熔断、无依据代码断言
+被拒绝后安全收敛、terminal-only 不交卷后的 finalizer 收口，以及历史 provider
+失败不再伪装成瞬时重试。场景目录记录来源工作号、失败阶段、期望终态、模型/工具调用
+上限和指标名；各可执行用例断言对应行为所需的终态和调用边界。它不访问网络、不读取
+模型密钥，也不替代 `make verify`。候选持久化、语义复查、重复发送和 Owner 终止通知
+由同一集成测试包中的其他测试覆盖。
 
-评测 fixture 只能使用合成消息号、会话号、路径和源码，不得保存真实飞书消息、凭据
-或私有数据库内容。当前门禁固定使用脚本模型，尚不提供真实模型探针；更换真实模型
-不属于默认离线验证范围。
+真实失败轨迹只能通过 `.agents/tools/redact_agent_run_fixture.py` 生成脱敏 fixture：
+保留 provider/profile/protocol、phase、attempt、finish reason、request ID、失败类别、
+恢复动作、工具名、token 统计和正文摘要，不保存真实飞书消息、凭据、私有数据库内容、
+完整工具输出或模型思考。#5994、#6070、#5805、#5680 这类历史失败必须先进入
+`integration_test/lark_agent/testdata/harness_cases/cases.json`，再写可执行回归。
+
+评估结论必须区分模型能力、协议适配和 Harness 机制。固定 Harness 更换模型档案用于看
+模型差异；固定模型逐项关闭 preserved reasoning、状态栏、压缩、单步重试或 finalizer
+用于看机制贡献。一次只改变一个变量，真实模型 smoke 至少重复 3 次并报告波动；小样本
+只能证明协议可用，不能宣称整体 Agent 质量提升。
 
 完整交付还必须执行：
 

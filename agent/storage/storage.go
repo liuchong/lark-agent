@@ -508,6 +508,19 @@ func (s *Store) migrate() error {
 			`ALTER TABLE owner_reply_resolutions
 			 ADD COLUMN owner_ack_reaction_json TEXT NOT NULL DEFAULT ''`,
 		}},
+		{version: 18, statements: []string{
+			`ALTER TABLE agent_runs ADD COLUMN role TEXT NOT NULL DEFAULT 'agent'`,
+			`ALTER TABLE agent_runs ADD COLUMN profile TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_runs ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_runs ADD COLUMN protocol TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_runs ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_steps ADD COLUMN phase TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_steps ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE agent_steps ADD COLUMN finish_reason TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_steps ADD COLUMN http_status INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE agent_steps ADD COLUMN failure_category TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_steps ADD COLUMN recovery_action TEXT NOT NULL DEFAULT ''`,
+		}},
 	}
 	for _, migration := range migrations {
 		if version >= migration.version {
@@ -856,14 +869,40 @@ func (s *Store) StartAgentRun(ctx context.Context, event domain.NormalizedEvent,
 		ConfigFingerprint: configFingerprint,
 		StartedAt:         now,
 	}
+	run.Role, run.Profile, run.Provider, run.Protocol, run.Model = agentRunAuditFromFingerprint(modelFingerprint)
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO agent_runs(id, work_item_id, dedup_key, status, model_fingerprint, config_fingerprint, started_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		run.ID, run.WorkItemID, run.DedupKey, run.Status, run.ModelFingerprint, run.ConfigFingerprint, now.Format(time.RFC3339Nano))
+		`INSERT INTO agent_runs(
+			id, work_item_id, dedup_key, status, role, profile, provider, protocol, model,
+			model_fingerprint, config_fingerprint, started_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		run.ID, run.WorkItemID, run.DedupKey, run.Status, run.Role, run.Profile,
+		run.Provider, run.Protocol, run.Model, run.ModelFingerprint,
+		run.ConfigFingerprint, now.Format(time.RFC3339Nano))
 	if err != nil {
 		return domain.AgentRun{}, errs.NewInternalError(errs.SubtypeStorage, "start agent run").WithCause(err)
 	}
 	return run, nil
+}
+
+func agentRunAuditFromFingerprint(fingerprint string) (role, profile, provider, protocol, modelName string) {
+	role = "agent"
+	left := fingerprint
+	if at := strings.Index(left, "@"); at >= 0 {
+		left = left[:at]
+	}
+	if colon := strings.Index(left, ":"); colon >= 0 {
+		profile = left[:colon]
+		left = left[colon+1:]
+	}
+	parts := strings.Split(left, "/")
+	if len(parts) >= 3 {
+		provider = parts[0]
+		protocol = parts[1]
+		modelName = strings.Join(parts[2:], "/")
+		return role, profile, provider, protocol, modelName
+	}
+	modelName = left
+	return role, profile, provider, protocol, modelName
 }
 
 // AppendAgentStep persists one model response or tool result.
@@ -878,12 +917,15 @@ func (s *Store) AppendAgentStep(ctx context.Context, step domain.AgentStep) erro
 	defer tx.Rollback() //nolint:errcheck // commit path below closes the transaction
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO agent_steps(
-			run_id, sequence, kind, tool_call_id, tool_name, input_json, output_json,
-			request_id, prompt_tokens, completion_tokens, error, created_at
-		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		step.RunID, step.Sequence, step.Kind, step.ToolCallID, step.ToolName,
-		step.InputJSON, step.OutputJSON, step.RequestID, step.PromptTokens,
-		step.CompletionTokens, step.Error, step.CreatedAt.Format(time.RFC3339Nano))
+			run_id, sequence, kind, phase, attempt, tool_call_id, tool_name, input_json,
+			output_json, request_id, finish_reason, http_status, failure_category,
+			recovery_action, prompt_tokens, completion_tokens, error, created_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		step.RunID, step.Sequence, step.Kind, step.Phase, step.Attempt,
+		step.ToolCallID, step.ToolName, step.InputJSON, step.OutputJSON,
+		step.RequestID, step.FinishReason, step.HTTPStatus, step.FailureCategory,
+		step.RecoveryAction, step.PromptTokens, step.CompletionTokens, step.Error,
+		step.CreatedAt.Format(time.RFC3339Nano))
 	if err != nil {
 		return errs.NewInternalError(errs.SubtypeStorage, "append agent step").WithCause(err)
 	}
@@ -1393,7 +1435,9 @@ func (s *Store) RequeueLegacyCompletedMentions(ownerOpenID string) (int64, error
 func (s *Store) ListAgentRuns() ([]domain.AgentRun, error) {
 	rows, err := s.db.Query(
 		`SELECT id, work_item_id, dedup_key, status, COALESCE(model_fingerprint, ''),
-		        COALESCE(config_fingerprint, ''), COALESCE(last_error, ''), started_at, completed_at
+		        COALESCE(config_fingerprint, ''), COALESCE(last_error, ''),
+		        COALESCE(role, ''), COALESCE(profile, ''), COALESCE(provider, ''),
+		        COALESCE(protocol, ''), COALESCE(model, ''), started_at, completed_at
 		 FROM agent_runs ORDER BY started_at, id`)
 	if err != nil {
 		return nil, errs.NewInternalError(errs.SubtypeStorage, "list agent runs").WithCause(err)
@@ -1408,7 +1452,8 @@ func (s *Store) ListAgentRuns() ([]domain.AgentRun, error) {
 		var started string
 		var completed sql.NullString
 		if err := rows.Scan(&run.ID, &run.WorkItemID, &run.DedupKey, &status, &run.ModelFingerprint,
-			&run.ConfigFingerprint, &run.LastError, &started, &completed); err != nil {
+			&run.ConfigFingerprint, &run.LastError, &run.Role, &run.Profile,
+			&run.Provider, &run.Protocol, &run.Model, &started, &completed); err != nil {
 			return nil, errs.NewInternalError(errs.SubtypeStorage, "scan agent run").WithCause(err)
 		}
 		run.Status = domain.AgentRunStatus(status)
@@ -1424,8 +1469,11 @@ func (s *Store) ListAgentRuns() ([]domain.AgentRun, error) {
 // ListAgentSteps returns one run's durable trajectory.
 func (s *Store) ListAgentSteps(runID string) ([]domain.AgentStep, error) {
 	rows, err := s.db.Query(
-		`SELECT run_id, sequence, kind, tool_call_id, tool_name, input_json, output_json,
-		        request_id, prompt_tokens, completion_tokens, error, created_at
+		`SELECT run_id, sequence, kind, COALESCE(phase, ''), COALESCE(attempt, 0),
+		        tool_call_id, tool_name, input_json, output_json, request_id,
+		        COALESCE(finish_reason, ''), COALESCE(http_status, 0),
+		        COALESCE(failure_category, ''), COALESCE(recovery_action, ''),
+		        prompt_tokens, completion_tokens, error, created_at
 		 FROM agent_steps WHERE run_id = ? ORDER BY sequence`, runID)
 	if err != nil {
 		return nil, errs.NewInternalError(errs.SubtypeStorage, "list agent steps").WithCause(err)
@@ -1437,8 +1485,10 @@ func (s *Store) ListAgentSteps(runID string) ([]domain.AgentStep, error) {
 	for rows.Next() {
 		var step domain.AgentStep
 		var created string
-		if err := rows.Scan(&step.RunID, &step.Sequence, &step.Kind, &step.ToolCallID, &step.ToolName,
-			&step.InputJSON, &step.OutputJSON, &step.RequestID, &step.PromptTokens,
+		if err := rows.Scan(&step.RunID, &step.Sequence, &step.Kind, &step.Phase,
+			&step.Attempt, &step.ToolCallID, &step.ToolName, &step.InputJSON,
+			&step.OutputJSON, &step.RequestID, &step.FinishReason, &step.HTTPStatus,
+			&step.FailureCategory, &step.RecoveryAction, &step.PromptTokens,
 			&step.CompletionTokens, &step.Error, &created); err != nil {
 			return nil, errs.NewInternalError(errs.SubtypeStorage, "scan agent step").WithCause(err)
 		}
@@ -1473,14 +1523,17 @@ func (s *Store) ExportAgentRunTranscript(runID string) (string, error) {
 func (s *Store) getAgentRun(runID string) (domain.AgentRun, error) {
 	row := s.db.QueryRow(
 		`SELECT id, work_item_id, dedup_key, status, COALESCE(model_fingerprint, ''),
-		        COALESCE(config_fingerprint, ''), COALESCE(last_error, ''), started_at, completed_at
+		        COALESCE(config_fingerprint, ''), COALESCE(last_error, ''),
+		        COALESCE(role, ''), COALESCE(profile, ''), COALESCE(provider, ''),
+		        COALESCE(protocol, ''), COALESCE(model, ''), started_at, completed_at
 		 FROM agent_runs WHERE id = ?`, runID)
 	var run domain.AgentRun
 	var status string
 	var started string
 	var completed sql.NullString
 	if err := row.Scan(&run.ID, &run.WorkItemID, &run.DedupKey, &status, &run.ModelFingerprint,
-		&run.ConfigFingerprint, &run.LastError, &started, &completed); err != nil {
+		&run.ConfigFingerprint, &run.LastError, &run.Role, &run.Profile,
+		&run.Provider, &run.Protocol, &run.Model, &started, &completed); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.AgentRun{}, errs.NewValidationError(errs.SubtypeInvalidArgument, "agent run not found: %s", runID)
 		}

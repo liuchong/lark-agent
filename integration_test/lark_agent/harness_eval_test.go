@@ -17,10 +17,14 @@ import (
 )
 
 type harnessCase struct {
-	Name            string              `json:"name"`
-	ExpectedOutcome domain.ReplyOutcome `json:"expected_outcome"`
-	MaxModelCalls   int                 `json:"max_model_calls"`
-	MaxToolCalls    int                 `json:"max_tool_calls"`
+	Name                  string              `json:"name"`
+	ExpectedOutcome       domain.ReplyOutcome `json:"expected_outcome"`
+	MaxModelCalls         int                 `json:"max_model_calls"`
+	MaxToolCalls          int                 `json:"max_tool_calls"`
+	SourceWorkID          int64               `json:"source_work_id,omitempty"`
+	FailureStage          string              `json:"failure_stage,omitempty"`
+	ExpectedTerminalState string              `json:"expected_terminal_state,omitempty"`
+	Metrics               []string            `json:"metrics,omitempty"`
 }
 
 func TestHarnessEvalFixtureCatalogIsBoundedAndTyped(t *testing.T) {
@@ -38,6 +42,10 @@ func TestHarnessEvalFixtureCatalogIsBoundedAndTyped(t *testing.T) {
 	for _, testCase := range cases {
 		if testCase.Name == "" || testCase.MaxModelCalls <= 0 || testCase.MaxToolCalls < 0 {
 			t.Fatalf("invalid case=%+v", testCase)
+		}
+		if testCase.SourceWorkID > 0 &&
+			(testCase.FailureStage == "" || testCase.ExpectedTerminalState == "" || len(testCase.Metrics) == 0) {
+			t.Fatalf("historical case missing evaluation metadata=%+v", testCase)
 		}
 		switch testCase.ExpectedOutcome {
 		case domain.ReplyOutcomeComplete,

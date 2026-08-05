@@ -1343,6 +1343,7 @@ func TestWorkReplyCandidateMigrationIsSchemaVersion16(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	dropSchemaV18AuditColumns(t, store)
 	if _, err := store.db.Exec(`UPDATE schema_version SET version = 15`); err != nil {
 		t.Fatal(err)
 	}
@@ -1429,6 +1430,7 @@ func TestOwnerReplyResolutionAuditMigrationIsSchemaVersion17(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	dropSchemaV18AuditColumns(t, store)
 	if _, err := store.db.Exec(`UPDATE schema_version SET version = 16`); err != nil {
 		t.Fatal(err)
 	}
@@ -1457,6 +1459,112 @@ func TestOwnerReplyResolutionAuditMigrationIsSchemaVersion17(t *testing.T) {
 		audits[0].ResponseObligationQuote != "" ||
 		audits[0].OwnerAckReaction != nil {
 		t.Fatalf("audits=%+v", audits)
+	}
+}
+
+func TestAgentRunAuditMigrationIsSchemaVersion18(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_v18_run",
+		Content:   "inspect provider failure",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.StartAgentRun(
+		context.Background(),
+		domain.NormalizedEvent{MessageID: "om_v18_run"},
+		"primary:kimi/openai_chat/k3-256k@https://api.kimi.com/coding/v1",
+		"cfg123",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendAgentStep(context.Background(), domain.AgentStep{
+		RunID:           run.ID,
+		Sequence:        1,
+		Kind:            "model",
+		Phase:           "generate",
+		Attempt:         1,
+		RequestID:       "req_123",
+		FinishReason:    "tool_calls",
+		HTTPStatus:      400,
+		FailureCategory: "invalid_request",
+		RecoveryAction:  "stop",
+		Error:           "HTTP 400: invalid request",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dropSchemaV18AuditColumns(t, store)
+	if _, err := store.db.Exec(`UPDATE schema_version SET version = 17`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	var version int
+	if err := store.db.QueryRow(`SELECT version FROM schema_version LIMIT 1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version < 18 {
+		t.Fatalf("schema version=%d, want at least 18", version)
+	}
+	runs, err := store.ListAgentRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Role != "agent" {
+		t.Fatalf("runs=%+v", runs)
+	}
+	steps, err := store.ListAgentSteps(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Phase != "" || steps[0].HTTPStatus != 0 {
+		t.Fatalf("steps=%+v", steps)
+	}
+	run2, err := store.StartAgentRun(
+		context.Background(),
+		domain.NormalizedEvent{MessageID: "om_v18_run"},
+		"primary:kimi/openai_chat/k3-256k@https://api.kimi.com/coding/v1",
+		"cfg456",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run2.Profile != "primary" || run2.Provider != "kimi" ||
+		run2.Protocol != "openai_chat" || run2.Model != "k3-256k" {
+		t.Fatalf("run2=%+v", run2)
+	}
+}
+
+func dropSchemaV18AuditColumns(t *testing.T, store *Store) {
+	t.Helper()
+	for _, stmt := range []string{
+		`ALTER TABLE agent_runs DROP COLUMN role`,
+		`ALTER TABLE agent_runs DROP COLUMN profile`,
+		`ALTER TABLE agent_runs DROP COLUMN provider`,
+		`ALTER TABLE agent_runs DROP COLUMN protocol`,
+		`ALTER TABLE agent_runs DROP COLUMN model`,
+		`ALTER TABLE agent_steps DROP COLUMN phase`,
+		`ALTER TABLE agent_steps DROP COLUMN attempt`,
+		`ALTER TABLE agent_steps DROP COLUMN finish_reason`,
+		`ALTER TABLE agent_steps DROP COLUMN http_status`,
+		`ALTER TABLE agent_steps DROP COLUMN failure_category`,
+		`ALTER TABLE agent_steps DROP COLUMN recovery_action`,
+	} {
+		if _, err := store.db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

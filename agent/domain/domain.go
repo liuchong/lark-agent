@@ -707,6 +707,11 @@ type AgentRun struct {
 	WorkItemID        int64          `json:"work_item_id" yaml:"work_item_id"`
 	DedupKey          string         `json:"dedup_key" yaml:"dedup_key"`
 	Status            AgentRunStatus `json:"status" yaml:"status"`
+	Role              string         `json:"role,omitempty" yaml:"role,omitempty"`
+	Profile           string         `json:"profile,omitempty" yaml:"profile,omitempty"`
+	Provider          string         `json:"provider,omitempty" yaml:"provider,omitempty"`
+	Protocol          string         `json:"protocol,omitempty" yaml:"protocol,omitempty"`
+	Model             string         `json:"model,omitempty" yaml:"model,omitempty"`
 	ModelFingerprint  string         `json:"model_fingerprint,omitempty" yaml:"model_fingerprint,omitempty"`
 	ConfigFingerprint string         `json:"config_fingerprint,omitempty" yaml:"config_fingerprint,omitempty"`
 	LastError         string         `json:"last_error,omitempty" yaml:"last_error,omitempty"`
@@ -719,11 +724,17 @@ type AgentStep struct {
 	RunID            string    `json:"run_id" yaml:"run_id"`
 	Sequence         int       `json:"sequence" yaml:"sequence"`
 	Kind             string    `json:"kind" yaml:"kind"`
+	Phase            string    `json:"phase,omitempty" yaml:"phase,omitempty"`
+	Attempt          int       `json:"attempt,omitempty" yaml:"attempt,omitempty"`
 	ToolCallID       string    `json:"tool_call_id,omitempty" yaml:"tool_call_id,omitempty"`
 	ToolName         string    `json:"tool_name,omitempty" yaml:"tool_name,omitempty"`
 	InputJSON        string    `json:"input_json,omitempty" yaml:"input_json,omitempty"`
 	OutputJSON       string    `json:"output_json,omitempty" yaml:"output_json,omitempty"`
 	RequestID        string    `json:"request_id,omitempty" yaml:"request_id,omitempty"`
+	FinishReason     string    `json:"finish_reason,omitempty" yaml:"finish_reason,omitempty"`
+	HTTPStatus       int       `json:"http_status,omitempty" yaml:"http_status,omitempty"`
+	FailureCategory  string    `json:"failure_category,omitempty" yaml:"failure_category,omitempty"`
+	RecoveryAction   string    `json:"recovery_action,omitempty" yaml:"recovery_action,omitempty"`
 	PromptTokens     int       `json:"prompt_tokens,omitempty" yaml:"prompt_tokens,omitempty"`
 	CompletionTokens int       `json:"completion_tokens,omitempty" yaml:"completion_tokens,omitempty"`
 	Error            string    `json:"error,omitempty" yaml:"error,omitempty"`

@@ -34,7 +34,7 @@ func DoctorNativeTools(ctx context.Context, model *OpenAICompatibleModel) (Provi
 	}
 	first, err := model.Generate(ctx, messages,
 		einomodel.WithTools([]*schema.ToolInfo{tool}),
-		einomodel.WithToolChoice(schema.ToolChoiceForced))
+		einomodel.WithToolChoice(schema.ToolChoiceAllowed))
 	if err != nil {
 		return ProviderDoctorResult{}, err
 	}

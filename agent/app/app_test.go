@@ -1058,6 +1058,59 @@ func TestDaemonDeadLettersModelNonConvergenceWithoutRetry(t *testing.T) {
 	}
 }
 
+func TestDaemonDeadLettersDeterministicProviderErrorWithoutRetry(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_provider_400",
+		Content:   "@Owner 看看为什么工具调用失败",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	q.item.ID = 43
+	err400 := errs.NewAPIError(
+		errs.SubtypeServerError,
+		"OpenAI-compatible model returned HTTP 400: tool_choice 'required' is incompatible with thinking enabled",
+	).WithCode(400)
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(&fakeDecider{err: err400}),
+	)
+	_, err := daemon.RunOnce(context.Background())
+	if err == nil {
+		t.Fatal("deterministic provider error unexpectedly succeeded")
+	}
+	if !q.deadLetter || q.retried ||
+		!strings.Contains(q.deadReason, "HTTP 400") {
+		t.Fatalf("queue=%+v", q)
+	}
+}
+
+func TestDaemonRetriesTransientProviderError(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_provider_503",
+		Content:   "@Owner 看看为什么工具调用失败",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	q.item.ID = 44
+	err503 := errs.NewAPIError(
+		errs.SubtypeServerError,
+		"OpenAI-compatible model returned HTTP 503: overloaded",
+	).WithCode(503)
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(&fakeDecider{err: err503}),
+	)
+	_, err := daemon.RunOnce(context.Background())
+	if err == nil {
+		t.Fatal("transient provider error unexpectedly succeeded")
+	}
+	if !q.retried || q.deadLetter {
+		t.Fatalf("queue=%+v", q)
+	}
+}
+
 type fakeReplyHandler struct {
 	called           bool
 	text             string

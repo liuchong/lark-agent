@@ -67,6 +67,15 @@ lark-agent config show
   在原会话发送一次进度；该任务随后必须以结果、本人已处理或明确阻塞收口。
 - `policy.allow_chats`、`block_chats`、`block_users`：确定性的会话和用户边界。
 - `scheduler.*`：不同工作通道的 lease 和 worker 数量。
+- `model.profiles`：模型档案。每个档案明确写出供应商、协议、API URL、模型名、
+  Keychain 凭据引用、流式和思考配置。默认 `primary` 使用 Kimi `k3-256k` 与
+  `openai_chat` 协议。配置只保存 Keychain 引用，不保存 API key。
+- `model.roles`：角色绑定。`agent`、`semantic`、`finalizer`、`compactor`、`vision`
+  默认都绑定 `primary`，也可以显式绑定到不同档案；运行时不会在未授权时自动跨供应商
+  故障切换。
+  当前 daemon 主循环只启用 `openai_chat` 档案；`openai_responses` 和
+  `anthropic_messages` 已有 codec 与 fixture，但在旧 chat-model 桥完全替换前，绑定到
+  主运行角色会由 doctor 明确失败，避免把请求误发成 Chat Completions。
 - `agent.*`、`tool_policy.*`、`goal.*`：模型轮次、工具输出、无进展和长任务上限。
 - `agent.vision_model`：可选的图片理解模型名。未配置时，相关图片会明确标记为不可读，
   不会当成空证据或猜测图片内容。
@@ -95,9 +104,30 @@ lark-agent config show
 只允许提交完整结论、部分结论或澄清请求。网络、限流等明确可重试错误仍使用
 `agent.max_retries` 和原有有界退避；确定性输出错误不会借此重复整个调查。
 
-配置不保存官方 Lark 凭据，也没有模型密钥字段。Lark app secret 放在 macOS
-Keychain；用户 access token 和 refresh token 可选，只用于用户身份轮询和代回复。
-模型密钥放在当前用户环境或安装器创建的权限为 `0600` 的私有 env 文件中。
+配置不保存官方 Lark 凭据，也不保存模型 API key。Lark app secret、用户 token 和模型
+API key 都放在 macOS Keychain；用户 token 可选，只用于用户身份轮询、读取确认表情和
+代回复。旧安装中的私有 `OPENAI_*` env 只作为 `primary` 档案迁移和显式覆盖输入，成功
+迁移后不应长期作为唯一模型配置来源。
+
+模型配置常用命令：
+
+```bash
+lark-agent model profile list
+lark-agent model profile set primary \
+  --provider kimi \
+  --protocol openai_chat \
+  --base-url https://api.kimi.com/coding/v1 \
+  --model k3-256k
+lark-agent model role list
+lark-agent model role set finalizer primary
+lark-agent model auth login primary < /path/to/private-model-key.json
+lark-agent model auth status primary
+lark-agent model doctor primary
+```
+
+Kimi 开启思考能力并使用工具时，运行时只提供 `tools`，默认不发送
+`tool_choice=required`。如果模型服务返回 HTTP 400、认证/权限、profile/协议不匹配或
+配额耗尽，这类确定性错误会直接进入可诊断终态，不再消耗整单重试次数。
 
 ## GitHub 只读证据桥
 

@@ -63,7 +63,9 @@ func (m *OpenAICompatibleModel) Generate(ctx context.Context, input []*schema.Me
 			return nil, err
 		}
 		body["tools"] = tools
-		body["tool_choice"] = openAIToolChoice(cfg.ToolChoice)
+		if choice, ok := openAIToolChoice(cfg.ToolChoice); ok {
+			body["tool_choice"] = choice
+		}
 	} else {
 		body["response_format"] = map[string]string{"type": "json_object"}
 	}
@@ -250,16 +252,16 @@ func toOpenAITools(tools []*schema.ToolInfo) ([]map[string]any, error) {
 	return out, nil
 }
 
-func openAIToolChoice(choice *schema.ToolChoice) string {
+func openAIToolChoice(choice *schema.ToolChoice) (string, bool) {
 	if choice == nil {
-		return "auto"
+		return "", false
 	}
 	switch *choice {
 	case schema.ToolChoiceForbidden:
-		return "none"
+		return "none", true
 	case schema.ToolChoiceForced:
-		return "required"
+		return "required", true
 	default:
-		return "auto"
+		return "", false
 	}
 }
