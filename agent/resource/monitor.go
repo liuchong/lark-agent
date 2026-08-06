@@ -530,6 +530,9 @@ func resourceErrorSummary(err error) string {
 	if problem.Identity != "" {
 		parts = append(parts, "identity="+problem.Identity)
 	}
+	if problem.Param != "" {
+		parts = append(parts, "field="+problem.Param)
+	}
 	if len(problem.MissingScopes) > 0 {
 		parts = append(parts, "missing_scopes="+strings.Join(problem.MissingScopes, ","))
 	}

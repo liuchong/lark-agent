@@ -1,6 +1,11 @@
 package lark
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	errs "github.com/liuchong/lark-agent/internal/apperr"
+)
 
 func TestNumericCodeRejectsMissingOrUnknownShape(t *testing.T) {
 	for _, value := range []any{nil, "", "not-a-number", map[string]any{"code": 0}} {
@@ -27,5 +32,19 @@ func TestRequireSuccessCodeFailsOnUnknownSuccessfulEnvelope(t *testing.T) {
 func TestRequireSuccessCodeFailsOnNonZeroCode(t *testing.T) {
 	if err := requireSuccessCode(map[string]any{"code": float64(999), "msg": "denied"}, IdentityUser); err == nil {
 		t.Fatal("non-zero code was accepted")
+	}
+}
+
+func TestAPIProblemPreservesFieldViolation(t *testing.T) {
+	err := apiProblem(99992402, map[string]any{
+		"msg": "field validation failed",
+		"error": map[string]any{"field_violations": []any{
+			map[string]any{"field": "token", "description": "token is required"},
+		}},
+	}, IdentityUser)
+	problem, ok := errs.ProblemOf(err)
+	if !ok || problem.Param != "token" ||
+		!strings.Contains(problem.Hint, "token is required") {
+		t.Fatalf("problem=%+v", problem)
 	}
 }

@@ -204,11 +204,12 @@ func TestResourceErrorSummaryPreservesSafeProviderDiagnostics(t *testing.T) {
 		errs.NewAPIError(errs.SubtypeServerError, "field validation failed").
 			WithCode(131002).
 			WithIdentity("user").
+			WithParam("token").
 			WithHint("check token type"),
 	)
 	for _, want := range []string{
 		"field validation failed", "code=131002", "category=api",
-		"identity=user", "hint=check token type",
+		"identity=user", "field=token", "hint=check token type",
 	} {
 		if !strings.Contains(summary, want) {
 			t.Fatalf("summary missing %q: %s", want, summary)

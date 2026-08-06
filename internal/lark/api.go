@@ -414,9 +414,30 @@ func apiProblem(code int, body map[string]any, identity Identity) error {
 	if message == "" {
 		message = "lark API returned an error"
 	}
-	return errs.NewAPIError(errs.SubtypeServerError, "%s", message).
+	problem := errs.NewAPIError(errs.SubtypeServerError, "%s", message).
 		WithCode(code).
 		WithIdentity(identity)
+	if field, description := firstFieldViolation(body); field != "" || description != "" {
+		if field != "" {
+			problem = problem.WithParam(field)
+		}
+		if description != "" {
+			problem = problem.WithHint("%s", description)
+		}
+	}
+	return problem
+}
+
+func firstFieldViolation(body map[string]any) (string, string) {
+	errorBody, _ := body["error"].(map[string]any)
+	violations, _ := errorBody["field_violations"].([]any)
+	if len(violations) == 0 {
+		return "", ""
+	}
+	violation, _ := violations[0].(map[string]any)
+	field, _ := violation["field"].(string)
+	description, _ := violation["description"].(string)
+	return strings.TrimSpace(field), strings.TrimSpace(description)
 }
 
 func contextWithOptionalTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
