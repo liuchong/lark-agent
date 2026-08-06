@@ -172,6 +172,7 @@ func resolutionPrompt(req Request, ownerOpenID string) (string, error) {
 			"Use no_reply_needed only for an ordinary private message without an explicit owner mention when it is an answer to an owner-initiated question, an acknowledgement, reaction, or conversational continuation that adds no new question, request, invitation, or coordination need.",
 			"Use unanswered only when the target itself contains a new question, request, invitation, or coordination need and the owner has not handled it.",
 			"For private unanswered results, set target_intent and copy an exact response_obligation_quote from the target message text; do not quote the owner's earlier message or infer a coding task from context alone.",
+			"A target asking the owner to fix or handle something and update a status after completion is a handoff/status request; use task_class simple and requires_progress false unless the target itself asks for an immediate code explanation or investigation.",
 			"Use ambiguous when conversation direction or response need cannot be established safely.",
 			"matched_owner_message_ids may contain only supplied owner-authored messages newer than the target.",
 		},
@@ -302,6 +303,10 @@ func validateResolution(req Request, ownerOpenID string, resolution Resolution) 
 func normalizeTargetDirection(req Request, ownerOpenID string, resolution Resolution) Resolution {
 	target := req.Target.Event
 	if resolution.Result == ResultUnanswered &&
+		isStatusUpdateHandoffRequest(target, resolution) {
+		return normalizeStatusUpdateHandoff(resolution)
+	}
+	if resolution.Result == ResultUnanswered &&
 		!hasExplicitResponseObligation(target, resolution) &&
 		noReplyIntent(resolution.TargetIntent, resolution.Reason) {
 		return normalizeNoReplyNeeded(
@@ -345,6 +350,22 @@ func normalizeNoReplyNeeded(resolution Resolution, reason string) Resolution {
 	return resolution
 }
 
+func normalizeStatusUpdateHandoff(resolution Resolution) Resolution {
+	resolution.TaskClass = domain.TaskClassSimple
+	resolution.RequiresProgress = false
+	if resolution.ClassificationConfidence < 0.85 {
+		resolution.ClassificationConfidence = 0.85
+	}
+	summary := strings.TrimSpace(resolution.TaskSummary)
+	lowerSummary := strings.ToLower(summary)
+	if summary == "" ||
+		strings.Contains(lowerSummary, "investigate") ||
+		strings.Contains(summary, "调查") {
+		resolution.TaskSummary = "acknowledge the owner's fix and status update handoff"
+	}
+	return resolution
+}
+
 func noReplyIntent(values ...string) bool {
 	combined := strings.ToLower(strings.Join(values, " "))
 	for _, marker := range []string{
@@ -369,6 +390,29 @@ func noReplyIntent(values ...string) bool {
 		"product decision",
 	} {
 		if strings.Contains(combined, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isStatusUpdateHandoffRequest(target domain.NormalizedEvent, resolution Resolution) bool {
+	text := strings.ToLower(strings.Join([]string{
+		strings.TrimSpace(target.Content),
+		strings.TrimSpace(resolution.ResponseObligationQuote),
+		strings.TrimSpace(resolution.TargetIntent),
+	}, "\n"))
+	for _, marker := range []string{
+		"改下状态",
+		"改一下状态",
+		"改状态",
+		"更新状态",
+		"update its status",
+		"update the status",
+		"update status",
+		"change status",
+	} {
+		if strings.Contains(text, marker) {
 			return true
 		}
 	}

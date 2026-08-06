@@ -688,6 +688,85 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 		}
 	})
 
+	t.Run("group owner fix then status request stays direct mention", func(t *testing.T) {
+		store := openSemanticIntegrationStore(t)
+		base := store.CurrentSession().StartedAt.Add(time.Second)
+		item := enqueueDueDelegatedItem(t, store, domain.NormalizedEvent{
+			Source:    domain.SourcePoll,
+			EventID:   "poll:om_group_fix_status_simple",
+			MessageID: "om_group_fix_status_simple",
+			ChatID:    "oc_any_group",
+			ChatType:  "group",
+			SenderID:  "ou_teammate",
+			Content:   "@测试负责人 这个问题修复后改下状态哈",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+			CreatedAt: base,
+		})
+		semanticModel := &semanticIntegrationModel{response: `{
+			"target_message_id":"om_group_fix_status_simple",
+			"result":"unanswered",
+			"confidence":0.96,
+			"reason":"the owner has not handled the linked issue fix and status update request",
+			"target_intent":"Request to fix the problem in the linked record and update its status after the fix.",
+			"response_obligation_quote":"这个问题修复后改下状态哈",
+			"task_summary":"investigate the group invite short code API and update the record status",
+			"task_class":"coding",
+			"classification_confidence":0.94,
+			"requires_progress":true
+		}`}
+		builder := &semanticIntegrationBuilder{}
+		decider := &semanticIntegrationDecider{}
+		replier := &semanticIntegrationReplyHandler{}
+		daemon := app.NewDaemon(
+			store,
+			router.New(router.Config{
+				OwnerOpenID: "ou_owner",
+				Mode:        domain.ModeAuto,
+				ReplyScope:  domain.ReplyScopeAllGroups,
+			}),
+			app.WithContextBuilder(builder),
+			app.WithDecider(decider),
+			app.WithReplyHandler(replier),
+			app.WithDelegatedReplyResolver(semanticIntegrationResolver{
+				store:   store,
+				matcher: replymatch.New(semanticModel, "ou_owner"),
+				messages: []domain.NormalizedEvent{
+					item.Event,
+					{
+						MessageID: "om_later_api", ChatID: "oc_any_group",
+						ChatType: "group", SenderID: "ou_other",
+						Content:   "接口：/api/sample/perform_action",
+						CreatedAt: base.Add(2 * time.Minute),
+					},
+				},
+			}, 0.85, 30*time.Second),
+		)
+
+		result, err := daemon.RunOnce(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if builder.calls != 1 || builder.item.WorkKind == domain.WorkKindCodingQuestion ||
+			builder.item.InvestigationActive ||
+			decider.calls != 1 || replier.calls != 1 {
+			t.Fatalf(
+				"result=%+v builder=%d item=%+v decider=%d replier=%d",
+				result,
+				builder.calls,
+				builder.item,
+				decider.calls,
+				replier.calls,
+			)
+		}
+		investigation, ok, err := store.GetDelegatedInvestigation(item.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			t.Fatalf("unexpected investigation=%+v", investigation)
+		}
+	})
+
 	t.Run("malformed semantic result fails closed and retries later", func(t *testing.T) {
 		store := openSemanticIntegrationStore(t)
 		base := store.CurrentSession().StartedAt.Add(time.Second)

@@ -9,5 +9,9 @@ obligation as stronger than the semantic model's suppressive label.
 - Do not silently normalize this contradiction to ignored work. Fail the
   semantic resolution so the queue can retry, dead-letter with a useful reason,
   or continue through the normal delegated-reply path.
+- A "fix/handle it, then update status" owner mention is a handoff/status
+  request, not a coding question by itself. Do not let later thread messages
+  turn that exact target into a different API or source-code answer unless the
+  target itself asks for immediate code investigation.
 - Cover both layers: resolver unit tests catch malformed model output, and
   daemon integration tests prove the work item is not completed as ignored.

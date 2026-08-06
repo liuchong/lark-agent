@@ -459,6 +459,12 @@ resumes the same values after approval without asking the model to rewrite them.
 
 For a direct owner question, status update, handoff, or coordination request,
 the model sends a reply only when it can provide a safe and useful response.
+If the exact target asks the owner to fix or handle something and update a
+status after completion, the semantic gate treats it as a simple handoff/status
+request, not as a coding investigation, unless the target itself asks for an
+immediate code explanation or investigation. Later thread messages may provide
+context for whether the owner already handled the target, but they must not
+change this handoff into a different code question.
 An assignment, investigation, or coordination reply must first complete at
 least one bounded relevant read, such as reading the same-chat thread or
 checking the corresponding production code. Its concise reply states what was

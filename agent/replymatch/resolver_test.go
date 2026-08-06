@@ -558,6 +558,52 @@ func TestResolverClassifiesContextualCodingHandoff(t *testing.T) {
 	}
 }
 
+func TestResolverKeepsFixThenStatusRequestAsSimpleHandoff(t *testing.T) {
+	base := time.Date(2026, 8, 6, 3, 59, 41, 0, time.UTC)
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_fix_status",
+		"result":"unanswered",
+		"confidence":0.96,
+		"reason":"the owner has not handled the linked issue fix and status update request",
+		"target_intent":"Request to fix the problem in the linked record and update its status after the fix.",
+		"response_obligation_quote":"这个问题修复后改下状态哈",
+		"task_summary":"investigate the group invite short code API and update the record status",
+		"task_class":"coding",
+		"classification_confidence":0.94,
+		"requires_progress":true
+	}`}
+	resolution, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_fix_status", ChatID: "oc_rd", ChatType: "group",
+			SenderID: "ou_sender", Content: "@测试负责人 这个问题修复后改下状态哈",
+			Mentions: []domain.Mention{{OpenID: "ou_owner"}}, CreatedAt: base,
+		}),
+		Messages: []domain.NormalizedEvent{
+			{
+				MessageID: "om_fix_status", ChatID: "oc_rd", ChatType: "group",
+				SenderID: "ou_sender", Content: "@测试负责人 这个问题修复后改下状态哈",
+				Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+				CreatedAt: base,
+			},
+			{
+				MessageID: "om_later_api", ChatID: "oc_rd", ChatType: "group",
+				SenderID: "ou_other", Content: "接口：/api/sample/perform_action",
+				CreatedAt: base.Add(2 * time.Minute),
+			},
+		},
+		ContextCutoff: base.Add(3 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Result != ResultUnanswered ||
+		resolution.TaskClass != domain.TaskClassSimple ||
+		resolution.RequiresProgress ||
+		resolution.TaskSummary == "investigate the group invite short code API and update the record status" {
+		t.Fatalf("resolution=%+v", resolution)
+	}
+}
+
 func TestResolverRejectsMissingContextualTaskClassification(t *testing.T) {
 	model := &scriptedModel{reply: `{
 		"target_message_id":"om_handoff",
