@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -131,6 +132,12 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (Resolution, error)
 		schema.UserMessage(prompt),
 	})
 	if err != nil {
+		if fallback, ok := deterministicStatusHandoffFallback(
+			req,
+			r.ownerOpenID,
+		); ok {
+			return fallback, nil
+		}
 		return Resolution{}, err
 	}
 	if message == nil {
@@ -157,6 +164,119 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (Resolution, error)
 		req.Messages...,
 	)
 	return resolution, nil
+}
+
+func deterministicStatusHandoffFallback(
+	req Request,
+	ownerOpenID string,
+) (Resolution, bool) {
+	target := req.Target.Event
+	if !isGroupChatType(target.ChatType) ||
+		target.SenderID == ownerOpenID ||
+		!target.MentionsUser(ownerOpenID) ||
+		!isStatusUpdateHandoffRequest(target, Resolution{}) ||
+		!targetHasExactRecordRelation(target, req.Messages) ||
+		hasLaterSubstantiveOwnerReply(target, req.Messages, ownerOpenID) {
+		return Resolution{}, false
+	}
+	resolution := normalizeStatusUpdateHandoff(Resolution{
+		TargetMessageID:          target.MessageID,
+		Result:                   ResultUnanswered,
+		Confidence:               0.9,
+		Reason:                   "deterministic exact-record status handoff remains unanswered while semantic evaluation is unavailable",
+		TargetIntent:             "fix the issue in the exact linked record and update its workflow status",
+		ResponseObligationQuote:  strings.TrimSpace(target.Content),
+		ClassificationConfidence: 0.9,
+		ContextCutoff:            req.ContextCutoff,
+	})
+	if err := validateResolution(req, ownerOpenID, resolution); err != nil {
+		return Resolution{}, false
+	}
+	resolution.ContextMessages = append(
+		[]domain.NormalizedEvent(nil),
+		req.Messages...,
+	)
+	return resolution, true
+}
+
+func targetHasExactRecordRelation(
+	target domain.NormalizedEvent,
+	messages []domain.NormalizedEvent,
+) bool {
+	if eventHasExactRecordURL(target) {
+		return true
+	}
+	parentIDs := map[string]bool{
+		strings.TrimSpace(target.RootMessageID):    true,
+		strings.TrimSpace(target.ReplyToMessageID): true,
+	}
+	delete(parentIDs, "")
+	if len(parentIDs) == 0 {
+		return false
+	}
+	for _, message := range messages {
+		if message.ChatID == target.ChatID &&
+			parentIDs[message.MessageID] &&
+			eventHasExactRecordURL(message) {
+			return true
+		}
+	}
+	return false
+}
+
+func eventHasExactRecordURL(event domain.NormalizedEvent) bool {
+	for _, rawURL := range event.ResourceURLs {
+		parsed, err := url.Parse(strings.TrimSpace(rawURL))
+		if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+			continue
+		}
+		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+		if len(parts) == 2 &&
+			strings.EqualFold(parts[0], "record") &&
+			strings.TrimSpace(parts[1]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasLaterSubstantiveOwnerReply(
+	target domain.NormalizedEvent,
+	messages []domain.NormalizedEvent,
+	ownerOpenID string,
+) bool {
+	for _, message := range messages {
+		if message.ChatID != target.ChatID ||
+			message.SenderID != ownerOpenID ||
+			message.MessageID == target.MessageID ||
+			(!target.CreatedAt.IsZero() &&
+				!message.CreatedAt.IsZero() &&
+				!message.CreatedAt.After(target.CreatedAt)) ||
+			!sameConversationThread(target, message) ||
+			isEmptyOrRecalledMessage(message.Content) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func isEmptyOrRecalledMessage(content string) bool {
+	content = strings.ToLower(strings.TrimSpace(content))
+	if content == "" {
+		return true
+	}
+	for _, marker := range []string{
+		"message was recalled",
+		"this message was recalled",
+		"该消息已撤回",
+		"消息已撤回",
+	} {
+		if strings.Contains(content, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func resolutionPrompt(req Request, ownerOpenID string) (string, error) {

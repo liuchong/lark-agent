@@ -2,6 +2,7 @@ package replymatch
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 
 type scriptedModel struct {
 	reply  string
+	err    error
 	inputs [][]*schema.Message
 }
 
@@ -23,6 +25,9 @@ func (m *scriptedModel) Generate(
 	_ ...einomodel.Option,
 ) (*schema.Message, error) {
 	m.inputs = append(m.inputs, input)
+	if m.err != nil {
+		return nil, m.err
+	}
 	return schema.AssistantMessage(m.reply, nil), nil
 }
 
@@ -810,6 +815,96 @@ func TestResolverClassifiesFixThenStatusRequestAsResourceHandoff(t *testing.T) {
 		resolution.RequiresProgress ||
 		resolution.TaskSummary != "locate the referenced issue, verify its fix evidence, and update its workflow status" {
 		t.Fatalf("resolution=%+v", resolution)
+	}
+}
+
+func TestResolverFallsBackForExactRecordStatusHandoffOnModelOutage(t *testing.T) {
+	base := time.Date(2026, 8, 6, 3, 59, 9, 0, time.UTC)
+	modelErr := errors.New("temporary semantic model outage")
+	record := domain.NormalizedEvent{
+		MessageID: "om_record", ChatID: "oc_rd", ChatType: "group",
+		SenderID: "ou_sender", Content: "https://example.larksuite.com/record/shr_bug",
+		ResourceURLs: []string{"https://example.larksuite.com/record/shr_bug"},
+		CreatedAt:    base,
+	}
+	target := domain.NormalizedEvent{
+		MessageID: "om_fix_status", ChatID: "oc_rd", ChatType: "group",
+		RootMessageID: record.MessageID, ReplyToMessageID: record.MessageID,
+		SenderID: "ou_sender", SenderType: "user",
+		Content:   "@测试负责人 这个问题修复后改下状态哈",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		CreatedAt: base.Add(32 * time.Second),
+	}
+	resolution, err := New(
+		&scriptedModel{err: modelErr},
+		"ou_owner",
+	).Resolve(context.Background(), Request{
+		Target:        domain.NewWorkItem(target),
+		Messages:      []domain.NormalizedEvent{record, target},
+		ContextCutoff: base.Add(3 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Result != ResultUnanswered ||
+		resolution.TaskClass != domain.TaskClassResourceHandoff ||
+		resolution.ClassificationConfidence < 0.85 ||
+		resolution.RequiresProgress ||
+		resolution.TaskSummary != "locate the referenced issue, verify its fix evidence, and update its workflow status" ||
+		len(resolution.ContextMessages) != 2 {
+		t.Fatalf("resolution=%+v", resolution)
+	}
+}
+
+func TestResolverDoesNotFallbackWithoutExactUnansweredRecordHandoff(t *testing.T) {
+	base := time.Date(2026, 8, 6, 3, 59, 9, 0, time.UTC)
+	record := domain.NormalizedEvent{
+		MessageID: "om_record", ChatID: "oc_rd", ChatType: "group",
+		SenderID: "ou_sender", Content: "https://example.larksuite.com/record/shr_bug",
+		ResourceURLs: []string{"https://example.larksuite.com/record/shr_bug"},
+		CreatedAt:    base,
+	}
+	target := domain.NormalizedEvent{
+		MessageID: "om_fix_status", ChatID: "oc_rd", ChatType: "group",
+		RootMessageID: record.MessageID, ReplyToMessageID: record.MessageID,
+		SenderID: "ou_sender", SenderType: "user",
+		Content:   "@测试负责人 这个问题修复后改下状态哈",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		CreatedAt: base.Add(32 * time.Second),
+	}
+	ownerReply := domain.NormalizedEvent{
+		MessageID: "om_owner_reply", ChatID: "oc_rd", ChatType: "group",
+		RootMessageID: record.MessageID, ReplyToMessageID: target.MessageID,
+		SenderID: "ou_owner", SenderType: "user", Content: "已处理并更新状态。",
+		CreatedAt: base.Add(time.Minute),
+	}
+	for _, testCase := range []struct {
+		name     string
+		messages []domain.NormalizedEvent
+	}{
+		{
+			name:     "record relation is absent",
+			messages: []domain.NormalizedEvent{target},
+		},
+		{
+			name:     "owner already replied substantively",
+			messages: []domain.NormalizedEvent{record, target, ownerReply},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			modelErr := errors.New("temporary semantic model outage")
+			_, err := New(
+				&scriptedModel{err: modelErr},
+				"ou_owner",
+			).Resolve(context.Background(), Request{
+				Target:        domain.NewWorkItem(target),
+				Messages:      testCase.messages,
+				ContextCutoff: base.Add(3 * time.Minute),
+			})
+			if !errors.Is(err, modelErr) {
+				t.Fatalf("err=%v want model outage", err)
+			}
+		})
 	}
 }
 

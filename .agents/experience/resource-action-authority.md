@@ -21,6 +21,11 @@
 - Until the referenced resource is read, normalize its task summary to the
   resource-neutral operation (locate, verify fix evidence, update status).
   Nearby chat subjects are not authoritative issue identity.
+- A semantic-model outage may use a deterministic routing fallback only for a
+  group target that directly mentions the owner, explicitly asks for a
+  post-fix status update, and is exactly related to a record-share message,
+  with no later substantive owner reply in the scoped thread. Missing record
+  relation or any substantive owner reply keeps the result unresolved.
 - A human handoff may resolve an exact record URL only when that URL was
   extracted from the runtime-selected bounded conversation. Read it through the
   typed Lark resource API, persist the privacy-bounded projection, and

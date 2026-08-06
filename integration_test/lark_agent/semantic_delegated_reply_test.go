@@ -24,6 +24,7 @@ import (
 type semanticIntegrationModel struct {
 	response  string
 	responses []string
+	err       error
 	calls     int
 }
 
@@ -33,6 +34,9 @@ func (m *semanticIntegrationModel) Generate(
 	...einomodel.Option,
 ) (*schema.Message, error) {
 	m.calls++
+	if m.err != nil {
+		return nil, m.err
+	}
 	response := m.response
 	if len(m.responses) > 0 {
 		index := m.calls - 1
@@ -961,6 +965,83 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 		}
 		if ok {
 			t.Fatalf("unexpected investigation=%+v", investigation)
+		}
+	})
+
+	t.Run("exact record status handoff survives semantic model outage", func(t *testing.T) {
+		store := openSemanticIntegrationStore(t)
+		base := store.CurrentSession().StartedAt.Add(time.Second)
+		record := domain.NormalizedEvent{
+			Source: domain.SourcePoll, EventID: "poll:om_record_parent",
+			MessageID: "om_record_parent", ChatID: "oc_any_group",
+			ChatType: "group", SenderID: "ou_teammate", SenderType: "user",
+			Content:      "https://example.larksuite.com/record/shrExampleRecordToken001",
+			ResourceURLs: []string{"https://example.larksuite.com/record/shrExampleRecordToken001"},
+			CreatedAt:    base,
+		}
+		item := enqueueDueDelegatedItem(t, store, domain.NormalizedEvent{
+			Source: domain.SourcePoll, EventID: "poll:om_status_model_outage",
+			MessageID: "om_status_model_outage", ChatID: "oc_any_group",
+			ChatType: "group", RootMessageID: record.MessageID,
+			ReplyToMessageID: record.MessageID,
+			SenderID:         "ou_teammate", SenderType: "user",
+			Content:   "@测试负责人 这个问题修复后改下状态哈",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+			CreatedAt: base.Add(32 * time.Second),
+		})
+		semanticModel := &semanticIntegrationModel{
+			err: errors.New("temporary semantic model outage"),
+		}
+		builder := &semanticIntegrationBuilder{}
+		decider := &semanticIntegrationDecider{}
+		replier := &semanticIntegrationReplyHandler{}
+		progress := &semanticIntegrationProgress{}
+		daemon := app.NewDaemon(
+			store,
+			router.New(router.Config{
+				OwnerOpenID: "ou_owner",
+				Mode:        domain.ModeAuto,
+				ReplyScope:  domain.ReplyScopeAllGroups,
+			}),
+			app.WithContextBuilder(builder),
+			app.WithDecider(decider),
+			app.WithReplyHandler(replier),
+			app.WithDelegatedReplyResolver(semanticIntegrationResolver{
+				store:   store,
+				matcher: replymatch.New(semanticModel, "ou_owner"),
+				messages: []domain.NormalizedEvent{
+					record,
+					item.Event,
+				},
+			}, 0.85, 30*time.Second),
+			app.WithInvestigationProgressHandler(progress),
+		)
+
+		result, err := daemon.RunOnce(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Decision.Kind != domain.DecisionReply ||
+			semanticModel.calls != 1 ||
+			builder.calls != 1 ||
+			builder.item.WorkKind != domain.WorkKindResourceHandoff ||
+			builder.item.TaskClass != domain.TaskClassResourceHandoff ||
+			decider.calls != 1 ||
+			replier.calls != 1 ||
+			progress.beginCalls != 0 ||
+			progress.finalizingCalls != 0 ||
+			progress.completeCalls != 0 ||
+			progress.blockCalls != 0 {
+			t.Fatalf(
+				"result=%+v semantic=%d builder=%d item=%+v decider=%d replier=%d progress=%+v",
+				result,
+				semanticModel.calls,
+				builder.calls,
+				builder.item,
+				decider.calls,
+				replier.calls,
+				progress,
+			)
 		}
 	})
 

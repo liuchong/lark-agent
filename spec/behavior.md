@@ -1899,6 +1899,13 @@ The multi-step loop is accepted by these executable BDD scenarios:
   and re-authorization next step. It must not inspect adjacent chat subjects,
   search workspace code, propose a status mutation, or claim the issue was
   verified.
+- Given a group target directly mentions the owner, asks to update status after
+  a fix, and replies to an exact record-share message, with no later
+  substantive owner reply in the scoped segment, when the semantic model is
+  temporarily unavailable, then the deterministic gate admits only that target
+  as unanswered `resource_handoff` work. Without the exact record relation, or
+  when a later substantive owner reply exists, model failure remains ambiguous
+  and no fallback reply is sent.
 - Given a delegated resource handoff has a validated current-generation reply
   and the sender-facing send fails with a known retryable error, when the work
   retries, then the same candidate is rechecked and retried without another
