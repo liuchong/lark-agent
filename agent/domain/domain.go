@@ -441,6 +441,14 @@ type DelegatedInvestigation struct {
 	UpdatedAt        time.Time                    `json:"updated_at" yaml:"updated_at"`
 }
 
+// ArchivedDelegatedInvestigation preserves one superseded contextual
+// generation for operator inspection without making it runnable.
+type ArchivedDelegatedInvestigation struct {
+	DelegatedInvestigation
+	ArchivedReason string    `json:"archived_reason" yaml:"archived_reason"`
+	ArchivedAt     time.Time `json:"archived_at" yaml:"archived_at"`
+}
+
 const (
 	PriorityBackground      = 10
 	PriorityCodingQuestion  = 40
@@ -879,15 +887,16 @@ type WorkInspectionState struct {
 // WorkInspection combines the latest receipt, queue, run, step, action, and
 // interruption evidence for one message.
 type WorkInspection struct {
-	Receipt            *IntakeReceipt          `json:"receipt,omitempty" yaml:"receipt,omitempty"`
-	WorkItem           *WorkItem               `json:"work_item,omitempty" yaml:"work_item,omitempty"`
-	LatestRun          *AgentRun               `json:"latest_run,omitempty" yaml:"latest_run,omitempty"`
-	LatestStep         *AgentStep              `json:"latest_step,omitempty" yaml:"latest_step,omitempty"`
-	LatestAction       *ActionAttempt          `json:"latest_action,omitempty" yaml:"latest_action,omitempty"`
-	LatestInterruption *WorkInterruption       `json:"latest_interruption,omitempty" yaml:"latest_interruption,omitempty"`
-	Investigation      *DelegatedInvestigation `json:"investigation,omitempty" yaml:"investigation,omitempty"`
-	ReplyCandidate     *WorkReplyCandidate     `json:"reply_candidate,omitempty" yaml:"reply_candidate,omitempty"`
-	State              WorkInspectionState     `json:"state" yaml:"state"`
+	Receipt              *IntakeReceipt                   `json:"receipt,omitempty" yaml:"receipt,omitempty"`
+	WorkItem             *WorkItem                        `json:"work_item,omitempty" yaml:"work_item,omitempty"`
+	LatestRun            *AgentRun                        `json:"latest_run,omitempty" yaml:"latest_run,omitempty"`
+	LatestStep           *AgentStep                       `json:"latest_step,omitempty" yaml:"latest_step,omitempty"`
+	LatestAction         *ActionAttempt                   `json:"latest_action,omitempty" yaml:"latest_action,omitempty"`
+	LatestInterruption   *WorkInterruption                `json:"latest_interruption,omitempty" yaml:"latest_interruption,omitempty"`
+	Investigation        *DelegatedInvestigation          `json:"investigation,omitempty" yaml:"investigation,omitempty"`
+	InvestigationHistory []ArchivedDelegatedInvestigation `json:"investigation_history,omitempty" yaml:"investigation_history,omitempty"`
+	ReplyCandidate       *WorkReplyCandidate              `json:"reply_candidate,omitempty" yaml:"reply_candidate,omitempty"`
+	State                WorkInspectionState              `json:"state" yaml:"state"`
 }
 
 // OwnerControlName identifies a deterministic command in the owner-private

@@ -176,6 +176,9 @@ func (s *ResourceService) SetCommentSubscription(
 	if err != nil {
 		return RemoteSubscription{}, err
 	}
+	if resolved.ResourceType == ResourceTypeBase {
+		return RemoteSubscription{FileType: resolved.FileType}, nil
+	}
 	if resolved.FileToken == "" || resolved.FileType == "" {
 		return RemoteSubscription{}, errs.NewValidationError(errs.SubtypeInvalidArgument, "resource file token and type are required")
 	}

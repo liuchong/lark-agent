@@ -58,15 +58,15 @@ func TestResourceServiceResolvesWikiBaseAndRecordShare(t *testing.T) {
 	}
 }
 
-func TestResourceServiceSubscribesAndReadsTypedBaseSchema(t *testing.T) {
+func TestResourceServiceSubscribesDocumentAndReadsTypedBaseSchema(t *testing.T) {
 	caller := &resourceRoutingCaller{call: func(req APIRequest) any {
 		switch req.Path {
-		case "/open-apis/drive/v1/files/bas_bug/subscriptions":
+		case "/open-apis/drive/v1/files/doc_bug/subscriptions":
 			if req.Method != http.MethodPost || req.As != IdentityUser {
 				t.Fatalf("subscription request=%+v", req)
 			}
 			return map[string]any{"data": map[string]any{
-				"subscription_id": "sub_bug", "is_subcribe": true, "file_type": "bitable",
+				"subscription_id": "sub_bug", "is_subcribe": true, "file_type": "docx",
 			}}
 		case "/open-apis/bitable/v1/apps/bas_bug/tables/tbl_bug/fields":
 			return map[string]any{"data": map[string]any{"items": []any{
@@ -86,7 +86,7 @@ func TestResourceServiceSubscribesAndReadsTypedBaseSchema(t *testing.T) {
 	}}
 	service := NewResourceService(caller)
 	remote, err := service.EnsureCommentSubscription(context.Background(), ResourceRef{
-		ResourceType: ResourceTypeBase, AppToken: "bas_bug", FileToken: "bas_bug", FileType: "bitable",
+		ResourceType: ResourceTypeDocument, FileToken: "doc_bug", FileType: "docx",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -102,6 +102,30 @@ func TestResourceServiceSubscribesAndReadsTypedBaseSchema(t *testing.T) {
 	if len(fields) != 3 || fields[0].Name != "问题" || !fields[0].Primary ||
 		!reflect.DeepEqual(fields[1].Options, wantOptions) {
 		t.Fatalf("fields=%+v", fields)
+	}
+}
+
+func TestResourceServiceSkipsCommentSubscriptionWhenWikiResolvesToBase(t *testing.T) {
+	caller := &resourceRoutingCaller{call: func(req APIRequest) any {
+		if req.Path != "/open-apis/wiki/v2/spaces/get_node" {
+			t.Fatalf("Base must not call document comment subscription API: %+v", req)
+		}
+		return map[string]any{"data": map[string]any{"node": map[string]any{
+			"obj_type": "bitable", "obj_token": "bas_bug", "title": "Bug 管理",
+		}}}
+	}}
+	service := NewResourceService(caller)
+	remote, err := service.SetCommentSubscription(context.Background(), ResourceRef{
+		ResourceType: ResourceTypeWiki, WikiNodeToken: "wik_bug", TableID: "tbl_bug",
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote.ID != "" || remote.Active || remote.FileType != "bitable" {
+		t.Fatalf("remote=%+v", remote)
+	}
+	if len(caller.requests) != 1 {
+		t.Fatalf("requests=%+v", caller.requests)
 	}
 }
 

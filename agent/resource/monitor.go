@@ -161,12 +161,17 @@ func (m *Monitor) SyncSubscriptions(ctx context.Context) (SyncResult, error) {
 		resolved, resolveErr := m.client.ResolveResource(ctx, ref)
 		if resolveErr == nil {
 			var remote servicelark.RemoteSubscription
-			remote, resolveErr = m.client.EnsureCommentSubscription(ctx, resolved)
-			if resolveErr == nil && !remote.Active {
-				resolveErr = errs.NewPermissionError(
-					errs.SubtypeFailedPrecondition,
-					"Lark file subscription is not active",
-				)
+			if resolved.ResourceType == servicelark.ResourceTypeBase {
+				remote.Active = true
+				remote.FileType = resolved.FileType
+			} else {
+				remote, resolveErr = m.client.EnsureCommentSubscription(ctx, resolved)
+				if resolveErr == nil && !remote.Active {
+					resolveErr = errs.NewPermissionError(
+						errs.SubtypeFailedPrecondition,
+						"Lark file subscription is not active",
+					)
+				}
 			}
 			if resolveErr == nil {
 				sub.ResourceType = string(resolved.ResourceType)

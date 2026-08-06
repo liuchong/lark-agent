@@ -337,12 +337,15 @@ snapshot is incomplete and semantic classification fails closed rather than
 guessing the antecedent.
 
 When durable progress starts, the normalized context snapshot is persisted
-without ephemeral image bytes. A restart restores the original cutoff, digest,
-task classification, and normalized messages and skips initial
-reclassification against a different time window. Restored image descriptors
-are explicitly unreadable until fetched again; persisted metadata never claims
-that discarded bytes remain available. The final owner-handled check still
-reads fresh same-chat context immediately before any final reply.
+without ephemeral image bytes. That snapshot is audit evidence for the exact
+online session that classified it; it is not authority for a later process to
+resume or send. A restart leaves an unfinished delegated investigation
+interrupted and preserves any unsent reply candidate for inspection only.
+Explicit owner resume archives the prior investigation generation, cancels its
+candidate, and re-runs current deterministic and semantic routing from the
+original target and current bounded context. Restored image descriptors are
+explicitly unreadable until fetched again; persisted metadata never claims that
+discarded bytes remain available.
 
 The delegated agent context includes bounded post-target discussion so its
 response reflects what happened during the grace period. The semantic result
@@ -484,13 +487,15 @@ An unavailable, oversized, unauthorized, or provider-rejected image is recorded
 as explicitly unreadable, never as empty successful evidence.
 
 High-confidence delegated investigation or coding work may send an early
-progress reply only after a resumable investigation record and owner notice are
+progress reply only after a durable investigation record and owner notice are
 durable. The investigation then has a mandatory terminal closure: an
 evidence-backed result, an owner-handled closure, or an explicit blocked
-summary. Progress and final sends use separate stable action keys. Restart
-resumes read-only investigation without duplicating completed progress. A
-progress message may promise the required closure; no other unapproved
-delegated reply may promise future delivery, coordination, or reporting.
+summary. Progress and final sends use separate stable action keys. Restart does
+not duplicate completed progress and does not automatically resume contextual
+delegated investigation or send its draft; the owner must inspect and
+explicitly resume a new generation. A progress message may promise the required
+closure; no other unapproved delegated reply may promise future delivery,
+coordination, or reporting.
 The complete internal action key remains in the audit store, while every key
 sent to Lark's public message API is a deterministic digest no longer than
 Lark's 50-character UUID limit. Owner-notice and progress actions derive
@@ -592,7 +597,8 @@ session creation, scheduler configuration, and startup convergence succeed,
 every new process session sends one idempotent bot private message that the
 agent is online before workers may claim new work. This includes manual start,
 restart, upgrade, and successful recovery after an unexpected crash. Startup
-automatically readmits interrupted work that is safe to recompute, leaves exact
+automatically readmits stateless interrupted work that is safe to recompute,
+leaves contextual investigations and drafts interrupted, and leaves exact
 approval/input work in an actionable waiting state with one private owner
 instruction, and terminalizes externally uncertain work with one private
 reconciliation summary. The notice reports the resulting resumed,
@@ -718,11 +724,14 @@ read-only; this does not widen any write or external-side-effect authority.
 Document, Wiki, and Base monitoring is a production intake path, not a local
 subscription list. A configured resource subscription is resolved through the
 official public Lark API into its canonical file or Base coordinates and moves
-through `pending`, `active`, `degraded`, `forbidden`, or `removed`. Active
-subscriptions persist their remote subscription result, last successful
-reconciliation cursor or digest, and a typed error when degraded. A sync
-command performs real reconciliation; it never reports a pending local row as
-an active remote subscription.
+through `pending`, `active`, `degraded`, `forbidden`, or `removed`. Document
+subscriptions become active only after the remote comment subscription is
+confirmed and persist its remote ID. Base has no per-resource comment
+subscription: active means canonical Base coordinates were resolved and the
+local app-event plus typed reconciliation path is enabled; its remote
+subscription ID stays empty, and active does not claim that console event
+delivery was observed. The sync command also performs typed Base
+reconciliation and degrades unreadable resources.
 
 The daemon consumes two complementary signals:
 
@@ -1039,12 +1048,32 @@ At startup, every non-terminal item owned by an earlier session is first changed
 to `interrupted`. Recovery stores the latest durable model step, tool call,
 decision, reply action, and owner-notification action as an interruption
 snapshot. After the new session is ready, a convergence pass classifies every
-interruption. Work with no uncertain external action is reassigned to the new
-session and safely recomputed. Exact unsent approvals remain unchanged and
-produce one idempotent owner instruction. Work with an action that was executing
-at interruption is never replayed; it becomes terminal with one idempotent
-reconciliation summary. A missing lease timestamp permits neither a blind side
-effect replay nor indefinite passive suspension.
+interruption. Stateless work with no uncertain external action may be reassigned
+to the new session and safely recomputed. A contextual delegated investigation
+or any work with an unsent reply candidate remains interrupted: the new process
+must never continue its persisted task classification, model context, or draft.
+Exact unsent approvals remain unchanged and produce one idempotent owner
+instruction. Work with an action that was executing at interruption is never
+replayed; it becomes terminal with one idempotent reconciliation summary. A
+missing lease timestamp permits neither a blind side effect replay nor
+indefinite passive suspension.
+
+Given a delegated investigation persisted a task summary from unrelated nearby
+thread messages, when the daemon restarts before its final reply is sent, then
+startup convergence leaves that work interrupted, sends neither the old
+candidate nor a newly generated sender-facing reply, and exposes an owner action
+to inspect, resume, or cancel it.
+
+Given the owner explicitly resumes that interrupted work, when the new process
+claims it, then the previous investigation is archived, its unsent candidate is
+cancelled, and current routing is run from the original target without hydrating
+the prior task summary, task class, cutoff, digest, or normalized messages.
+The archived generation remains visible in `queue inspect`. An exact
+owner-approved action may cross a restart, but before it becomes claimable the
+runtime archives and removes any delegated context and cancels the redundant
+reply candidate; the approved action itself is the only sending authority.
+Cancelling interrupted work cancels its candidate and marks its investigation
+blocked so no active contextual state remains.
 
 Leases are work-kind specific and are refreshed while long runs make progress.
 Fast-path and simple work have short leases. Coding questions and background
@@ -1052,8 +1081,9 @@ goals may have longer leases, but the lease must be compatible with their
 configured loop timeout and must not leave the queue looking permanently stuck.
 If the process dies and no heartbeat updates the lease, recovery marks the
 latest run abandoned and snapshots the last durable stage. The next ready
-session automatically readmits safe recomputable work. It does not readmit an
-executing or result-uncertain side effect.
+session automatically readmits safe stateless work. It does not readmit
+delegated context, an unsent reply candidate, or an executing or
+result-uncertain side effect.
 Every claim receives a unique lease token. Heartbeat, retry, completion, Goal
 creation, and sender/owner side effects validate that exact token; an expired
 worker cannot mutate or send for a newer claim.
@@ -2225,10 +2255,17 @@ The multi-step loop is accepted by these executable BDD scenarios:
   channel misses a record/comment change, when periodic reconciliation reads a
   changed record that mentions the owner, then one deduplicated
   `resource_handoff` is created from the current record.
-- Given a local subscription row is pending but no remote subscription or
-  reconciliation has succeeded, when `subscription sync` and doctor run, then
-  they report the subscription as inactive instead of claiming monitoring is
-  enabled.
+- Given a pending document subscription has no confirmed remote comment
+  subscription, when `subscription sync` runs, then it remains inactive.
+- Given a pending Base subscription resolves to canonical coordinates, when
+  `subscription sync` runs, then no document-comment subscription API is
+  called, the remote subscription ID remains empty, and typed reconciliation
+  must succeed before the command reports the Base readable. Active Base status
+  means local app-event/reconciliation monitoring is configured, not that a
+  console event has already been observed.
+- Given a Base subscription is removed with `--remote`, when no per-resource
+  remote ID exists, then the command skips the document-comment unsubscribe API
+  and still marks the local subscription removed.
 - Given a direct owner mention says to fix the referenced issue and update its
   status, and a prior received notification identifies the Base record, when
   semantic routing runs, then it creates durable resource-handoff work and

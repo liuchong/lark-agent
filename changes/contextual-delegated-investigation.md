@@ -45,10 +45,12 @@ It contains:
 
 The snapshot is ordered chronologically and has one content digest. Raw image
 bytes are never persisted. A durable investigation stores the normalized
-messages, cutoff, digest, and classification. A restart restores that exact
-text/metadata snapshot, marks discarded image bytes explicitly unavailable,
-and skips initial reclassification; the fresh final owner-handled check still
-runs before any sender-facing reply.
+messages, cutoff, digest, and classification for audit and same-session
+continuation. The original cross-session restore design was superseded after it
+allowed stale contextual classification to produce a wrong reply after
+restart. Current behavior leaves the work interrupted; explicit owner resume
+archives this snapshot and performs a new classification as specified in
+`spec/behavior.md`.
 
 ### Attachment Boundary
 

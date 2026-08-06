@@ -1878,3 +1878,27 @@ func TestRecoveryNoticeUsesMessageResolvedLanguage(t *testing.T) {
 		t.Fatalf("recovery notice mixed languages: %s", text)
 	}
 }
+
+func TestRecoveryNoticeExplainsCrossSessionContextReview(t *testing.T) {
+	text := recoveryConvergenceText(
+		storage.RecoveryConvergenceNotice{
+			WorkItemID: 6210,
+			MessageID:  "om_cross_session_candidate",
+			Kind:       "context_review_required",
+		},
+		config.OwnerConfig{Name: "测试负责人"},
+		agentlocale.LanguageChinese,
+	)
+	for _, want := range []string{
+		"不会自动续跑或发送旧草稿",
+		"`lark-agent queue inspect --work-id 6210`",
+		"`lark-agent queue resume --work-id 6210`",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("context review notice missing %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "外部动作正在执行") {
+		t.Fatalf("context review was rendered as uncertain action: %s", text)
+	}
+}

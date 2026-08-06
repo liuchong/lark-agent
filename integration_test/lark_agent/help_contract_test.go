@@ -21,7 +21,8 @@ func TestHelpExposesStandaloneRecoveryCommands(t *testing.T) {
 		"doctor",
 		"queue",
 		"auth",
-		"安全工作会自动续跑",
+		"无状态工作可自动续跑",
+		"旧回复草稿必须由 Owner 显式恢复",
 		"外部动作绝不重放",
 	} {
 		if !strings.Contains(text, fragment) {
@@ -62,7 +63,8 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 				"--work-id",
 				"--message-id",
 				"--force-terminal",
-				"Safe cross-restart work is already re-evaluated automatically",
+				"delegated context and unsent reply candidates require explicit resume",
+				"never sends or hydrates the old draft or context",
 				"结果不确定",
 			},
 		},
@@ -140,7 +142,8 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 	for _, want := range []string{
 		"official Go SDK",
 		"com.liuchong.lark-agent",
-		"安全的只读",
+		"无状态只读",
+		"对话调查和未发送回复候选保持中断",
 		"结果不确定的外部动作绝不重放",
 		"owner.preferred_language",
 		"assistant.reply_scope",

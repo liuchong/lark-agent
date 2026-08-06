@@ -557,6 +557,28 @@ func (s *Store) migrate() error {
 			`CREATE INDEX IF NOT EXISTS idx_work_items_resource_evidence
 			 ON work_items(resource_evidence_id)`,
 		}},
+		{version: 20, statements: []string{
+			`CREATE TABLE IF NOT EXISTS delegated_investigation_history (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				investigation_id INTEGER NOT NULL,
+				work_item_id INTEGER NOT NULL REFERENCES work_items(id),
+				task_summary TEXT NOT NULL,
+				task_class TEXT NOT NULL,
+				context_cutoff TEXT NOT NULL,
+				context_digest TEXT NOT NULL,
+				status TEXT NOT NULL,
+				progress_action_id INTEGER,
+				final_action_id INTEGER,
+				last_error TEXT,
+				context_messages_json TEXT NOT NULL DEFAULT '[]',
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				archived_reason TEXT NOT NULL,
+				archived_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_delegated_investigation_history_work
+			 ON delegated_investigation_history(work_item_id, archived_at DESC, id DESC)`,
+		}},
 	}
 	for _, migration := range migrations {
 		if version >= migration.version {
@@ -568,10 +590,6 @@ func (s *Store) migrate() error {
 		}
 		for _, stmt := range migration.statements {
 			if _, err := tx.Exec(stmt); err != nil {
-				if strings.Contains(strings.ToUpper(stmt), " ADD COLUMN ") &&
-					strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
-					continue
-				}
 				_ = tx.Rollback()
 				return errs.NewInternalError(errs.SubtypeStorage, "apply agent schema migration %d", migration.version).WithCause(err)
 			}
@@ -4358,6 +4376,89 @@ func (s *Store) GetDelegatedInvestigation(
 	}
 	markExpiredInvestigationImages(investigation.ContextMessages)
 	return investigation, true, nil
+}
+
+func (s *Store) ListDelegatedInvestigationHistory(
+	ctx context.Context,
+	workItemID int64,
+) ([]domain.ArchivedDelegatedInvestigation, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT investigation_id, work_item_id, task_summary, task_class,
+		        context_cutoff, context_digest, status, progress_action_id,
+		        final_action_id, last_error, context_messages_json,
+		        created_at, updated_at, archived_reason, archived_at
+		 FROM delegated_investigation_history
+		 WHERE work_item_id = ?
+		 ORDER BY archived_at DESC, id DESC`,
+		workItemID,
+	)
+	if err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"list delegated investigation history",
+		).WithCause(err)
+	}
+	defer rows.Close() //nolint:errcheck
+	var history []domain.ArchivedDelegatedInvestigation
+	for rows.Next() {
+		var archived domain.ArchivedDelegatedInvestigation
+		var taskClass, status, cutoffRaw, contextRaw, createdRaw, updatedRaw, archivedRaw string
+		var progressActionID, finalActionID sql.NullInt64
+		var lastError sql.NullString
+		if err := rows.Scan(
+			&archived.ID,
+			&archived.WorkItemID,
+			&archived.TaskSummary,
+			&taskClass,
+			&cutoffRaw,
+			&archived.ContextDigest,
+			&status,
+			&progressActionID,
+			&finalActionID,
+			&lastError,
+			&contextRaw,
+			&createdRaw,
+			&updatedRaw,
+			&archived.ArchivedReason,
+			&archivedRaw,
+		); err != nil {
+			return nil, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"scan delegated investigation history",
+			).WithCause(err)
+		}
+		archived.TaskClass = domain.TaskClass(taskClass)
+		archived.Status = domain.DelegatedInvestigationStatus(status)
+		archived.ContextCutoff, _ = time.Parse(time.RFC3339Nano, cutoffRaw)
+		archived.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdRaw)
+		archived.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedRaw)
+		archived.ArchivedAt, _ = time.Parse(time.RFC3339Nano, archivedRaw)
+		if progressActionID.Valid {
+			archived.ProgressActionID = progressActionID.Int64
+		}
+		if finalActionID.Valid {
+			archived.FinalActionID = finalActionID.Int64
+		}
+		if lastError.Valid {
+			archived.LastError = lastError.String
+		}
+		if err := json.Unmarshal([]byte(contextRaw), &archived.ContextMessages); err != nil {
+			return nil, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"decode delegated investigation history context",
+			).WithCause(err)
+		}
+		markExpiredInvestigationImages(archived.ContextMessages)
+		history = append(history, archived)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"iterate delegated investigation history",
+		).WithCause(err)
+	}
+	return history, nil
 }
 
 func markExpiredInvestigationImages(messages []domain.NormalizedEvent) {

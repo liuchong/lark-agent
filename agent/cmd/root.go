@@ -102,12 +102,14 @@ eligible durable state identify one exact operation. Group commands disclose
 no queue details and redirect the owner to private chat; non-owner commands
 remain silent. Local operators can use queue tasks, queue acknowledge, queue
 reconcile, and memory commands for the same bounded state and closure rules.
-After restart, safe read-only and model work is automatically re-evaluated in
-the new ready session. Exact approval waits are preserved and privately
-reported. An interrupted external action is never replayed: it is terminalized
-with an exact reconciliation instruction. Use queue inspect for durable
-evidence and queue resume only for an explicitly reviewed terminal or manually
-paused item. 安全工作会自动续跑，结果不确定的外部动作绝不重放。
+After restart, stateless read-only work may be re-evaluated in the new ready
+session. Delegated conversation context and unsent reply candidates stay
+interrupted until the owner explicitly resumes a new classification. Exact
+approval waits are preserved and privately reported. An interrupted external
+action is never replayed: it is terminalized with an exact reconciliation
+instruction. Use queue inspect for durable evidence and queue resume for
+reviewed contextual, terminal, or manually paused work. 无状态工作可自动续跑，
+对话调查与旧回复草稿必须由 Owner 显式恢复，结果不确定的外部动作绝不重放。
 Intentional shutdown and every successfully ready session are reported through
 the assistant bot's private chat.
 
@@ -1042,10 +1044,11 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 	cmd := &cobra.Command{
 		Use:   "daemon",
 		Short: "Run or manage the daemon",
-		Long: "Run or manage the standalone daemon. Safe interrupted work is " +
-			"automatically re-evaluated after a ready restart; result-uncertain " +
+		Long: "Run or manage the standalone daemon. Stateless interrupted work is " +
+			"automatically re-evaluated after a ready restart; delegated context and " +
+			"unsent reply candidates require explicit owner resume; result-uncertain " +
 			"external actions are terminalized and never replayed. " +
-			"安全工作自动续跑，结果不确定的外部动作绝不重放。",
+			"无状态工作可自动续跑，对话调查与旧回复草稿必须由 Owner 显式恢复，结果不确定的外部动作绝不重放。",
 	}
 	var once, live, dryRun, includePrivate bool
 	var chatQuery string
@@ -1501,6 +1504,16 @@ func recoveryConvergenceText(
 		}
 	}
 	if language == agentlocale.LanguageEnglish {
+		if notice.Kind == "context_review_required" {
+			return fmt.Sprintf(
+				"%s, work #%d for message %s contains delegated context or an unsent draft from an earlier daemon session. It will not resume or send that draft automatically. Review it with `lark-agent queue inspect --work-id %d`; if the original request still needs work, run `lark-agent queue resume --work-id %d` to discard the old context and classify it again.",
+				name,
+				notice.WorkItemID,
+				notice.MessageID,
+				notice.WorkItemID,
+				notice.WorkItemID,
+			)
+		}
 		if notice.Kind == "approval_required" {
 			command := "`lark-agent approval list`"
 			if notice.ActionID > 0 {
@@ -1520,6 +1533,16 @@ func recoveryConvergenceText(
 			name,
 			notice.WorkItemID,
 			notice.MessageID,
+			notice.WorkItemID,
+		)
+	}
+	if notice.Kind == "context_review_required" {
+		return fmt.Sprintf(
+			"%s，工作 #%d（消息 %s）包含上一轮 Agent 会话保存的调查上下文或未发送草稿，不会自动续跑或发送旧草稿。先执行 `lark-agent queue inspect --work-id %d` 核对；原请求仍需处理时，执行 `lark-agent queue resume --work-id %d` 废弃旧上下文并重新识别。",
+			name,
+			notice.WorkItemID,
+			notice.MessageID,
+			notice.WorkItemID,
 			notice.WorkItemID,
 		)
 	}
@@ -3764,12 +3787,12 @@ func newQueueResumeCommand(out io.Writer, statePath *string) *cobra.Command {
 	var forceTerminal bool
 	cmd := &cobra.Command{
 		Use:   "resume",
-		Short: "Explicitly resume one reviewed paused, terminal, or offline message",
+		Short: "Explicitly resume one reviewed interrupted, paused, terminal, or offline message",
 		Long: "Explicitly admit one exact offline message or interrupted work item. " +
-			"Safe cross-restart work is already re-evaluated automatically. " +
+			"Stateless cross-restart work is re-evaluated automatically, while delegated context and unsent reply candidates require explicit resume. " +
 			"Result-uncertain external actions are never replayed automatically. " +
 			"Completed, ignored, cancelled, or dead-letter work additionally requires --force-terminal. " +
-			"Explicit resume cancels any held reply candidate and starts a new investigation; it never sends the old draft. " +
+			"Explicit resume archives the prior investigation, cancels any held reply candidate, and starts a newly classified investigation; it never sends or hydrates the old draft or context. " +
 			"结果不确定的外部动作不会自动重放；仅在核对外部结果后，才可显式恢复终态工作。",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := storage.OpenInspection(resolveStatePath(*statePath))
@@ -4119,7 +4142,9 @@ func newSubscriptionCommand(out io.Writer, configPath, statePath *string) *cobra
 			if err != nil {
 				return err
 			}
-			if removeRemote && sub.Status != domain.ResourceSubscriptionRemoved {
+			if removeRemote &&
+				sub.Status != domain.ResourceSubscriptionRemoved &&
+				sub.ResourceType != string(serviceim.ResourceTypeBase) {
 				cfg, err := config.Load(resolveConfigPath(*configPath))
 				if err != nil {
 					return err
@@ -4167,7 +4192,7 @@ func newSubscriptionCommand(out io.Writer, configPath, statePath *string) *cobra
 	cmd.AddCommand(removeCmd)
 	cmd.AddCommand(&cobra.Command{
 		Use:   "sync",
-		Short: "Resolve resources and activate remote monitoring subscriptions",
+		Short: "Resolve resources and activate their supported monitoring paths",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(resolveConfigPath(*configPath))
 			if err != nil {
@@ -4216,7 +4241,7 @@ func newSubscriptionCommand(out io.Writer, configPath, statePath *string) *cobra
 				"subscriptions": subs,
 				"sync":          syncResult,
 				"reconcile":     reconcileResult,
-				"remote_scope":  "base subscriptions are app/file scoped; table filtering is local and view is context only",
+				"remote_scope":  "Base record/field events are app-scoped; there is no per-resource remote subscription ID; table filtering is local and view is context only",
 			})
 		},
 	})

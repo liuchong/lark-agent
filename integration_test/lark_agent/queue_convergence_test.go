@@ -570,6 +570,281 @@ func TestHeldReplyCandidateRechecksContextWithoutRerunningModel(t *testing.T) {
 	}
 }
 
+func TestRestartDoesNotResumeDelegatedContextOrSendOldCandidate(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	first, err := storage.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := domain.NormalizedEvent{
+		Source:    domain.SourcePoll,
+		EventID:   "poll:om_cross_session_candidate",
+		MessageID: "om_cross_session_candidate",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_teammate",
+		Content:   "@测试负责人 这个问题修复后改下状态哈",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		CreatedAt: first.CurrentSession().StartedAt.Add(time.Second),
+	}
+	if _, err := first.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := first.ClaimNext("old-worker")
+	if err != nil || !ok {
+		t.Fatalf("claim ok=%v item=%+v err=%v", ok, claimed, err)
+	}
+	_, created, err := first.BeginDelegatedInvestigation(domain.DelegatedInvestigation{
+		WorkItemID:    claimed.ID,
+		TaskSummary:   "检查不相关的示例能力接口",
+		TaskClass:     domain.TaskClassCoding,
+		ContextCutoff: event.CreatedAt.Add(time.Minute),
+		ContextDigest: "sha256:old-wrong-context",
+		ContextMessages: []domain.NormalizedEvent{{
+			MessageID: "om_unrelated",
+			Content:   "示例能力接口",
+		}},
+	})
+	if err != nil || !created {
+		t.Fatalf("begin created=%v err=%v", created, err)
+	}
+	if err := first.SaveWorkReplyCandidate(claimed.ID, claimed.LeaseBy, domain.Decision{
+		Kind:           domain.DecisionReply,
+		Risk:           domain.RiskLow,
+		EvidenceStatus: domain.EvidenceVerified,
+		ReplyOutcome:   domain.ReplyOutcomeComplete,
+		ReplyText:      "示例能力相关客户端接口已暴露。",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := storage.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = current.Close() })
+	if _, err := current.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	report, err := current.ConvergeInterruptedWork(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Resumed != 0 || report.WaitingOwner != 1 {
+		t.Fatalf("cross-session delegated work was automatically resumed: %+v", report)
+	}
+	interrupted, err := current.GetWorkItem(context.Background(), claimed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if interrupted.Status != domain.StatusInterrupted {
+		t.Fatalf("status=%s want=%s", interrupted.Status, domain.StatusInterrupted)
+	}
+	candidate, found, err := current.ReadyWorkReplyCandidate(claimed.ID)
+	if err != nil || !found || candidate.Status != domain.ReplyCandidateHeld {
+		t.Fatalf("candidate=%+v found=%v err=%v", candidate, found, err)
+	}
+	replier := &completedReplyHandler{}
+	daemon := app.NewDaemon(
+		current,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		app.WithContextBuilder(convergenceContextBuilder{}),
+		app.WithDecider(&countingPartialDecider{}),
+		app.WithReplyHandler(replier),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Processed || replier.calls != 0 {
+		t.Fatalf("result=%+v replyCalls=%d", result, replier.calls)
+	}
+
+	resumedInspection, err := current.ResumeWork(context.Background(), domain.ResumeWorkRequest{
+		WorkItemID: claimed.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resumedInspection.InvestigationHistory) != 1 ||
+		resumedInspection.InvestigationHistory[0].TaskSummary != "检查不相关的示例能力接口" {
+		t.Fatalf("investigation history=%+v", resumedInspection.InvestigationHistory)
+	}
+	resumed, ok, err := current.ClaimNext("new-worker")
+	if err != nil || !ok {
+		t.Fatalf("claim resumed ok=%v item=%+v err=%v", ok, resumed, err)
+	}
+	if resumed.InvestigationActive || resumed.TaskSummary != "" ||
+		resumed.ContextDigest != "" || len(resumed.ResolvedContext) != 0 {
+		t.Fatalf("old investigation context was hydrated: %+v", resumed)
+	}
+	if _, created, err := current.BeginDelegatedInvestigation(domain.DelegatedInvestigation{
+		WorkItemID:    resumed.ID,
+		TaskSummary:   "查找示例列表刷新问题并更新 Bug 状态",
+		TaskClass:     domain.TaskClassCoding,
+		ContextCutoff: event.CreatedAt.Add(2 * time.Minute),
+		ContextDigest: "sha256:new-current-context",
+	}); err != nil || !created {
+		t.Fatalf("new investigation created=%v err=%v", created, err)
+	}
+}
+
+func TestCancelInterruptedDelegatedWorkClosesCandidateAndInvestigation(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	store, err := storage.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	event := domain.NormalizedEvent{
+		MessageID: "om_cancel_contextual_work",
+		Content:   "@测试负责人 请调查后回复",
+		CreatedAt: store.CurrentSession().StartedAt.Add(time.Second),
+	}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("cancel-context-worker")
+	if err != nil || !ok {
+		t.Fatalf("claim ok=%v item=%+v err=%v", ok, item, err)
+	}
+	if _, created, err := store.BeginDelegatedInvestigation(domain.DelegatedInvestigation{
+		WorkItemID:    item.ID,
+		TaskSummary:   "调查待取消问题",
+		TaskClass:     domain.TaskClassInvestigation,
+		ContextCutoff: event.CreatedAt.Add(time.Minute),
+		ContextDigest: "sha256:cancel-context",
+	}); err != nil || !created {
+		t.Fatalf("begin created=%v err=%v", created, err)
+	}
+	if err := store.SaveWorkReplyCandidate(item.ID, item.LeaseBy, domain.Decision{
+		Kind:      domain.DecisionReply,
+		ReplyText: "不应发送的旧草稿",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeferWaitingUserClaim(
+		item.ID,
+		item.LeaseBy,
+		"awaiting context",
+		time.Minute,
+	); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.CancelWork(context.Background(), domain.CancelWorkRequest{
+		WorkItemIDs: []int64{item.ID},
+		Reason:      "wrong contextual investigation",
+	})
+	if err != nil || result.Changed != 1 {
+		t.Fatalf("cancel result=%+v err=%v", result, err)
+	}
+	if _, found, err := store.ReadyWorkReplyCandidate(item.ID); err != nil || found {
+		t.Fatalf("candidate found=%v err=%v", found, err)
+	}
+	investigation, found, err := store.GetDelegatedInvestigation(item.ID)
+	if err != nil || !found || investigation.Status != domain.InvestigationBlocked {
+		t.Fatalf("investigation=%+v found=%v err=%v", investigation, found, err)
+	}
+}
+
+func TestApprovedCrossSessionReplyArchivesContextAndCancelsCandidate(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	first, err := storage.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	event := domain.NormalizedEvent{
+		MessageID: "om_approved_cross_session",
+		Content:   "@测试负责人 请确认后回复",
+		CreatedAt: first.CurrentSession().StartedAt.Add(time.Second),
+	}
+	if _, err := first.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := first.ClaimNext("approved-context-worker")
+	if err != nil || !ok {
+		t.Fatalf("claim ok=%v item=%+v err=%v", ok, item, err)
+	}
+	if _, created, err := first.BeginDelegatedInvestigation(domain.DelegatedInvestigation{
+		WorkItemID:    item.ID,
+		TaskSummary:   "上一会话的调查主题",
+		TaskClass:     domain.TaskClassInvestigation,
+		ContextCutoff: event.CreatedAt.Add(time.Minute),
+		ContextDigest: "sha256:approved-old-context",
+	}); err != nil || !created {
+		t.Fatalf("begin created=%v err=%v", created, err)
+	}
+	decision := domain.Decision{
+		Kind:      domain.DecisionReply,
+		Relevance: domain.RelevanceDirectMention,
+		ReplyText: "Owner 已明确批准的准确草稿",
+	}
+	if err := first.SaveWorkReplyCandidate(item.ID, item.LeaseBy, decision); err != nil {
+		t.Fatal(err)
+	}
+	actionID, err := first.RequestReplyApproval(
+		context.Background(),
+		item.DedupKey,
+		decision.ReplyText,
+		"requires exact approval",
+		"",
+		decision.Relevance,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.DecideAction(actionID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := storage.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = current.Close() })
+	if _, err := current.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	report, err := current.ConvergeInterruptedWork(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Resumed != 1 || report.WaitingOwner != 0 {
+		t.Fatalf("report=%+v", report)
+	}
+	if _, found, err := current.ReadyWorkReplyCandidate(item.ID); err != nil || found {
+		t.Fatalf("candidate found=%v err=%v", found, err)
+	}
+	if _, found, err := current.GetDelegatedInvestigation(item.ID); err != nil || found {
+		t.Fatalf("active investigation found=%v err=%v", found, err)
+	}
+	history, err := current.ListDelegatedInvestigationHistory(context.Background(), item.ID)
+	if err != nil || len(history) != 1 ||
+		history[0].TaskSummary != "上一会话的调查主题" {
+		t.Fatalf("history=%+v err=%v", history, err)
+	}
+	claimed, ok, err := current.ClaimNext("approved-new-worker")
+	if err != nil || !ok {
+		t.Fatalf("claim ok=%v item=%+v err=%v", ok, claimed, err)
+	}
+	if claimed.InvestigationActive || claimed.TaskSummary != "" {
+		t.Fatalf("approved work hydrated old context: %+v", claimed)
+	}
+	approved, found, err := current.ReadyApprovedReply(item.ID)
+	if err != nil || !found || approved.ReplyText != decision.ReplyText {
+		t.Fatalf("approved=%+v found=%v err=%v", approved, found, err)
+	}
+}
+
 func TestTerminalOwnerResolutionGenerationsSurviveResumeAndRepeatFailure(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.db")
 	store, err := storage.Open(statePath)

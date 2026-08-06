@@ -931,6 +931,75 @@ func TestConvergeInterruptedWorkResumesSafeWaitsForApprovalAndTerminalizesUncert
 	}
 }
 
+func TestConvergeInterruptedApprovalHoldsReplyCandidate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := domain.NormalizedEvent{
+		MessageID: "om_approval_candidate_restart",
+		Content:   "reply after approval",
+	}
+	if _, err := first.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := first.ClaimNext("approval-candidate-worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	if err := first.SaveWorkReplyCandidate(item.ID, item.LeaseBy, domain.Decision{
+		Kind:      domain.DecisionReply,
+		ReplyText: "held exact draft",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.RequestReplyApproval(
+		context.Background(),
+		item.DedupKey,
+		"held exact draft",
+		"approval required",
+		"",
+		domain.RelevanceDirectMention,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.db.Exec(
+		`UPDATE work_items SET status = ?, lease_by = NULL, lease_time = NULL WHERE id = ?`,
+		domain.StatusAwaitingApproval,
+		item.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = current.Close() })
+	if _, err := current.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	report, err := current.ConvergeInterruptedWork(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.WaitingOwner != 1 || report.Resumed != 0 {
+		t.Fatalf("report=%+v", report)
+	}
+	candidate, found, err := current.ReadyWorkReplyCandidate(item.ID)
+	if err != nil || !found || candidate.Status != domain.ReplyCandidateHeld {
+		t.Fatalf("candidate=%+v found=%v err=%v", candidate, found, err)
+	}
+	work, err := current.GetWorkItem(context.Background(), item.ID)
+	if err != nil || work.Status != domain.StatusAwaitingApproval {
+		t.Fatalf("work=%+v err=%v", work, err)
+	}
+}
+
 func TestOwnerResolutionNotificationIsDurableAndIdempotent(t *testing.T) {
 	store := openStore(t)
 	if _, err := store.EnqueueEvent(domain.NormalizedEvent{MessageID: "om_resolution"}); err != nil {

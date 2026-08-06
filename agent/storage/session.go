@@ -887,6 +887,16 @@ func (s *Store) ConvergeInterruptedWork(ctx context.Context) (RecoveryConvergenc
 			EXISTS(
 				SELECT 1 FROM action_attempts a
 				WHERE a.work_item_id = w.id AND a.status = ?
+			),
+			EXISTS(
+				SELECT 1 FROM delegated_investigations d
+				WHERE d.work_item_id = w.id
+				  AND d.status IN (?, ?, ?)
+			),
+			EXISTS(
+				SELECT 1 FROM work_reply_candidates c
+				WHERE c.work_item_id = w.id
+				  AND c.status IN (?, ?)
 			)
 		 FROM work_items w
 		 WHERE w.status = ?
@@ -895,6 +905,11 @@ func (s *Store) ConvergeInterruptedWork(ctx context.Context) (RecoveryConvergenc
 		domain.ActionAwaitingApproval,
 		domain.ActionAwaitingApproval,
 		domain.ActionReady,
+		domain.InvestigationPendingProgress,
+		domain.InvestigationInvestigating,
+		domain.InvestigationFinalizing,
+		domain.ReplyCandidatePending,
+		domain.ReplyCandidateHeld,
 		domain.StatusInterrupted,
 	)
 	if err != nil {
@@ -904,12 +919,14 @@ func (s *Store) ConvergeInterruptedWork(ctx context.Context) (RecoveryConvergenc
 		).WithCause(err)
 	}
 	type candidate struct {
-		id        int64
-		event     domain.NormalizedEvent
-		uncertain bool
-		awaiting  bool
-		actionID  int64
-		ready     bool
+		id         int64
+		event      domain.NormalizedEvent
+		uncertain  bool
+		awaiting   bool
+		actionID   int64
+		ready      bool
+		contextual bool
+		candidate  bool
 	}
 	var candidates []candidate
 	for rows.Next() {
@@ -922,6 +939,8 @@ func (s *Store) ConvergeInterruptedWork(ctx context.Context) (RecoveryConvergenc
 			&item.awaiting,
 			&item.actionID,
 			&item.ready,
+			&item.contextual,
+			&item.candidate,
 		); err != nil {
 			_ = rows.Close()
 			return RecoveryConvergenceReport{}, errs.NewInternalError(
@@ -947,6 +966,52 @@ func (s *Store) ConvergeInterruptedWork(ctx context.Context) (RecoveryConvergenc
 	report := RecoveryConvergenceReport{}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, item := range candidates {
+		if item.candidate {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE work_reply_candidates
+				 SET status = ?, hold_reason = ?, updated_at = ?
+				 WHERE work_item_id = ? AND status = ?`,
+				domain.ReplyCandidateHeld,
+				"daemon session changed; explicit authority is required",
+				now,
+				item.id,
+				domain.ReplyCandidatePending,
+			); err != nil {
+				return RecoveryConvergenceReport{}, errs.NewInternalError(
+					errs.SubtypeStorage,
+					"hold cross-session reply candidate",
+				).WithCause(err)
+			}
+		}
+		if !item.uncertain && item.ready && (item.contextual || item.candidate) {
+			if err := archiveDelegatedInvestigation(
+				ctx,
+				tx,
+				item.id,
+				"cross-session owner-approved action supersedes delegated context",
+				now,
+			); err != nil {
+				return RecoveryConvergenceReport{}, err
+			}
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE work_reply_candidates
+				 SET status = ?, hold_reason = ?, updated_at = ?
+				 WHERE work_item_id = ? AND status IN (?, ?)`,
+				domain.ReplyCandidateCancelled,
+				"exact owner-approved action supersedes the model reply candidate",
+				now,
+				item.id,
+				domain.ReplyCandidatePending,
+				domain.ReplyCandidateHeld,
+			); err != nil {
+				return RecoveryConvergenceReport{}, errs.NewInternalError(
+					errs.SubtypeStorage,
+					"cancel candidate superseded by approved action",
+				).WithCause(err)
+			}
+			item.contextual = false
+			item.candidate = false
+		}
 		switch {
 		case item.uncertain:
 			reason := "external action result is uncertain after process interruption; action was not replayed"
@@ -1027,6 +1092,16 @@ func (s *Store) ConvergeInterruptedWork(ctx context.Context) (RecoveryConvergenc
 				Kind:       "approval_required",
 				Reason:     "exact approval is still required",
 			})
+		case item.contextual || item.candidate:
+			report.WaitingOwner++
+			report.Notices = append(report.Notices, RecoveryConvergenceNotice{
+				WorkItemID: item.id,
+				MessageID:  item.event.MessageID,
+				Kind:       "context_review_required",
+				Reason: "cross-session delegated context and reply candidates " +
+					"require explicit owner resume",
+			})
+			continue
 		default:
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE work_items
@@ -1066,6 +1141,46 @@ func (s *Store) ConvergeInterruptedWork(ctx context.Context) (RecoveryConvergenc
 		).WithCause(err)
 	}
 	return report, nil
+}
+
+func archiveDelegatedInvestigation(
+	ctx context.Context,
+	tx *sql.Tx,
+	workItemID int64,
+	reason string,
+	archivedAt string,
+) error {
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO delegated_investigation_history(
+			investigation_id, work_item_id, task_summary, task_class,
+			context_cutoff, context_digest, status, progress_action_id,
+			final_action_id, last_error, context_messages_json,
+			created_at, updated_at, archived_reason, archived_at
+		 )
+		 SELECT id, work_item_id, task_summary, task_class,
+		        context_cutoff, context_digest, status, progress_action_id,
+		        final_action_id, last_error, context_messages_json,
+		        created_at, updated_at, ?, ?
+		 FROM delegated_investigations WHERE work_item_id = ?`,
+		strings.TrimSpace(reason),
+		archivedAt,
+		workItemID,
+	); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"archive delegated investigation",
+		).WithCause(err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM delegated_investigations WHERE work_item_id = ?`,
+		workItemID,
+	); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"clear archived delegated investigation",
+		).WithCause(err)
+	}
+	return nil
 }
 
 // BeginOwnerResolutionNotification persists one exact owner resolution message
@@ -1730,6 +1845,11 @@ func (s *Store) InspectWork(
 	if found {
 		inspection.Investigation = &investigation
 	}
+	history, err := s.ListDelegatedInvestigationHistory(ctx, item.ID)
+	if err != nil {
+		return inspection, err
+	}
+	inspection.InvestigationHistory = history
 	candidate, found, err := s.ReadyWorkReplyCandidate(item.ID)
 	if err != nil {
 		return inspection, err
@@ -1869,6 +1989,15 @@ func (s *Store) ResumeWork(
 		)
 	}
 	nowRaw := now.Format(time.RFC3339Nano)
+	if err := archiveDelegatedInvestigation(
+		ctx,
+		tx,
+		item.ID,
+		"explicit resume starts a new investigation generation",
+		nowRaw,
+	); err != nil {
+		return domain.WorkInspection{}, err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE action_attempts
 		 SET status = ?, error = ?, updated_at = ?
@@ -2140,6 +2269,39 @@ func (s *Store) CancelWork(
 			return domain.CancelWorkResult{}, errs.NewInternalError(
 				errs.SubtypeStorage,
 				"cancel unsent work actions",
+			).WithCause(err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE work_reply_candidates
+			 SET status = ?, hold_reason = ?, updated_at = ?
+			 WHERE work_item_id = ? AND status IN (?, ?)`,
+			domain.ReplyCandidateCancelled,
+			"operator cancelled: "+reason,
+			nowRaw,
+			id,
+			domain.ReplyCandidatePending,
+			domain.ReplyCandidateHeld,
+		); err != nil {
+			return domain.CancelWorkResult{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"cancel work reply candidate",
+			).WithCause(err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE delegated_investigations
+			 SET status = ?, last_error = ?, updated_at = ?
+			 WHERE work_item_id = ? AND status IN (?, ?, ?)`,
+			domain.InvestigationBlocked,
+			"operator cancelled: "+reason,
+			nowRaw,
+			id,
+			domain.InvestigationPendingProgress,
+			domain.InvestigationInvestigating,
+			domain.InvestigationFinalizing,
+		); err != nil {
+			return domain.CancelWorkResult{}, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"block cancelled delegated investigation",
 			).WithCause(err)
 		}
 		if _, err := tx.ExecContext(ctx,

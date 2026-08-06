@@ -105,8 +105,9 @@ WebSocket 事件 `drive.notice.comment_add_v1` 和
 `drive.file.bitable_record_changed_v1`、`drive.file.bitable_field_changed_v1`，并授予当前应用/用户读取云文档评论、订阅文件、
 读取 Base 字段与记录所需权限。若允许 Agent 更新状态或回复评论，还需分别授予 Base
 记录写入和云文档评论回复权限。不同飞书版本在控制台展示的权限名称可能不同，以
-`lark-agent subscription sync` 返回的缺失权限为准，不能在同步失败时把本地
-`pending` 记录当成已监控。
+`lark-agent subscription sync` 返回的文档订阅和 Base 读取错误为准，不能在同步失败
+时把本地 `pending` 记录当成已监控。Base 的 `active` 只证明本地事件/对账路径和资源
+坐标已配置；开放平台是否真实投递上述 Base 事件仍需用一次真实记录变更验收。
 
 安装后，Owner 可在智能助手私聊中发送 `/help`、`/status`、`/tasks` 和 `/memory`
 查询运行状态、待处理任务与持久记忆。任务详情会给出精确的恢复、取消、确认、核对

@@ -19,6 +19,7 @@ type fakeResourceClient struct {
 	records  []servicelark.BaseRecord
 	comment  servicelark.ResourceComment
 	remote   servicelark.RemoteSubscription
+	ensures  int
 }
 
 func (f *fakeResourceClient) ResolveResource(context.Context, servicelark.ResourceRef) (servicelark.ResourceRef, error) {
@@ -26,6 +27,7 @@ func (f *fakeResourceClient) ResolveResource(context.Context, servicelark.Resour
 }
 
 func (f *fakeResourceClient) EnsureCommentSubscription(context.Context, servicelark.ResourceRef) (servicelark.RemoteSubscription, error) {
+	f.ensures++
 	return f.remote, nil
 }
 
@@ -177,7 +179,6 @@ func TestMonitorSyncResolvesWikiAndActivatesRemoteSubscription(t *testing.T) {
 			ResourceType: servicelark.ResourceTypeBase,
 			AppToken:     "bas_bug", FileToken: "bas_bug", FileType: "bitable", TableID: "tbl_bug",
 		},
-		remote: servicelark.RemoteSubscription{ID: "sub_bug", Active: true, FileType: "bitable"},
 	}
 	store := &fakeResourceStore{subscriptions: []domain.ResourceSubscription{{
 		ID: 1, OriginalURL: "https://example.larksuite.com/wiki/wik_bug?table=tbl_bug",
@@ -191,10 +192,11 @@ func TestMonitorSyncResolvesWikiAndActivatesRemoteSubscription(t *testing.T) {
 	}
 	if result.Active != 1 || len(store.subscriptions) != 1 ||
 		store.subscriptions[0].Status != domain.ResourceSubscriptionActive ||
-		store.subscriptions[0].RemoteSubscriptionID != "sub_bug" ||
+		store.subscriptions[0].RemoteSubscriptionID != "" ||
 		store.subscriptions[0].AppToken != "bas_bug" ||
 		!reflect.DeepEqual(store.subscriptions[0].MonitorModes,
-			[]string{"base_record", "base_field", "cloud_docs_notice"}) {
+			[]string{"base_record", "base_field", "cloud_docs_notice"}) ||
+		client.ensures != 0 {
 		t.Fatalf("result=%+v subscriptions=%+v", result, store.subscriptions)
 	}
 }

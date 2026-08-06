@@ -1344,6 +1344,7 @@ func TestWorkReplyCandidateMigrationIsSchemaVersion16(t *testing.T) {
 		t.Fatal(err)
 	}
 	dropSchemaV18AuditColumns(t, store)
+	dropSchemaV19AndV20(t, store)
 	if _, err := store.db.Exec(`UPDATE schema_version SET version = 15`); err != nil {
 		t.Fatal(err)
 	}
@@ -1431,6 +1432,7 @@ func TestOwnerReplyResolutionAuditMigrationIsSchemaVersion17(t *testing.T) {
 		}
 	}
 	dropSchemaV18AuditColumns(t, store)
+	dropSchemaV19AndV20(t, store)
 	if _, err := store.db.Exec(`UPDATE schema_version SET version = 16`); err != nil {
 		t.Fatal(err)
 	}
@@ -1499,6 +1501,7 @@ func TestAgentRunAuditMigrationIsSchemaVersion18(t *testing.T) {
 		t.Fatal(err)
 	}
 	dropSchemaV18AuditColumns(t, store)
+	dropSchemaV19AndV20(t, store)
 	if _, err := store.db.Exec(`UPDATE schema_version SET version = 17`); err != nil {
 		t.Fatal(err)
 	}
@@ -1565,6 +1568,78 @@ func dropSchemaV18AuditColumns(t *testing.T, store *Store) {
 		if _, err := store.db.Exec(stmt); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func dropSchemaV19AndV20(t *testing.T, store *Store) {
+	t.Helper()
+	for _, stmt := range []string{
+		`DROP TABLE delegated_investigation_history`,
+		`DROP INDEX idx_work_items_resource_evidence`,
+		`ALTER TABLE work_items DROP COLUMN resource_evidence_id`,
+		`DROP TABLE resource_evidence`,
+	} {
+		if _, err := store.db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestDelegatedInvestigationHistoryMigrationIsSchemaVersion20(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := domain.NormalizedEvent{
+		MessageID: "om_v20_investigation",
+		Content:   "preserve active investigation",
+	}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("v20-worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	if _, created, err := store.BeginDelegatedInvestigation(domain.DelegatedInvestigation{
+		WorkItemID:    item.ID,
+		TaskSummary:   "preserved during v20 migration",
+		TaskClass:     domain.TaskClassInvestigation,
+		ContextCutoff: time.Now().UTC(),
+		ContextDigest: "sha256:v20",
+	}); err != nil || !created {
+		t.Fatalf("begin created=%v err=%v", created, err)
+	}
+	if _, err := store.db.Exec(`DROP TABLE delegated_investigation_history`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE schema_version SET version = 19`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	var version int
+	if err := store.db.QueryRow(`SELECT version FROM schema_version LIMIT 1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 20 {
+		t.Fatalf("schema version=%d, want 20", version)
+	}
+	investigation, found, err := store.GetDelegatedInvestigation(item.ID)
+	if err != nil || !found || investigation.TaskSummary != "preserved during v20 migration" {
+		t.Fatalf("investigation=%+v found=%v err=%v", investigation, found, err)
+	}
+	history, err := store.ListDelegatedInvestigationHistory(context.Background(), item.ID)
+	if err != nil || len(history) != 0 {
+		t.Fatalf("history=%+v err=%v", history, err)
 	}
 }
 

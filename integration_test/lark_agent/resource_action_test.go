@@ -112,6 +112,19 @@ func (notificationResourceClient) GetComment(
 	return servicelark.ResourceComment{}, nil
 }
 
+type baseSyncResourceClient struct {
+	notificationResourceClient
+	ensures int
+}
+
+func (c *baseSyncResourceClient) EnsureCommentSubscription(
+	context.Context,
+	servicelark.ResourceRef,
+) (servicelark.RemoteSubscription, error) {
+	c.ensures++
+	return servicelark.RemoteSubscription{ID: "must_not_be_used", Active: true}, nil
+}
+
 func TestResourceCommentActionCannotEscapeLinkedOwnerMention(t *testing.T) {
 	ctx := context.Background()
 	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -210,5 +223,49 @@ func TestApplicationResourceNotificationCreatesOwnerPrivateNotifyWork(t *testing
 	}
 	if items[0].Event.ChatID != "" || items[0].Event.SenderID != "" {
 		t.Fatalf("resource notification retained an app-facing destination: %+v", items[0].Event)
+	}
+}
+
+func TestBaseSubscriptionSyncUsesAppEventsWithoutDocumentCommentSubscription(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	url := "https://example.larksuite.com/base/bas_bug?table=tbl_bug"
+	if _, err := store.UpsertResourceSubscription(ctx, domain.ResourceSubscription{
+		OriginalURL:  url,
+		ResourceType: string(servicelark.ResourceTypeBase),
+		AppToken:     "bas_bug",
+		FileToken:    "bas_bug",
+		TableID:      "tbl_bug",
+		Status:       domain.ResourceSubscriptionPending,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	client := &baseSyncResourceClient{}
+	monitor := agentresource.NewMonitor(client, store, agentresource.Config{
+		OwnerOpenID: "ou_owner",
+	})
+	syncResult, err := monitor.SyncSubscriptions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if syncResult.Active != 1 || syncResult.Degraded != 0 || client.ensures != 0 {
+		t.Fatalf("sync=%+v commentSubscriptionCalls=%d", syncResult, client.ensures)
+	}
+	if _, err := monitor.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sub, err := store.GetResourceSubscription(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sub.Status != domain.ResourceSubscriptionActive ||
+		sub.RemoteSubscriptionID != "" ||
+		sub.AppToken != "bas_bug" ||
+		sub.TableID != "tbl_bug" {
+		t.Fatalf("subscription=%+v", sub)
 	}
 }
