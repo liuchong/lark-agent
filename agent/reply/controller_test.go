@@ -10,17 +10,19 @@ import (
 )
 
 type fakeMessenger struct {
-	replies    int
-	botReplies int
-	notices    int
-	text       string
-	notice     string
-	events     []string
+	replies             int
+	botReplies          int
+	notices             int
+	text                string
+	notice              string
+	replyIdempotencyKey string
+	events              []string
 }
 
 func (f *fakeMessenger) ReplyAsUser(_ context.Context, req tools.ReplyRequest) (tools.ReplyResult, error) {
 	f.replies++
 	f.text = req.Text
+	f.replyIdempotencyKey = req.IdempotencyKey
 	f.events = append(f.events, "reply")
 	return tools.ReplyResult{MessageID: "om_reply", ChatID: "oc_1"}, nil
 }
@@ -28,6 +30,7 @@ func (f *fakeMessenger) ReplyAsUser(_ context.Context, req tools.ReplyRequest) (
 func (f *fakeMessenger) ReplyAsBot(_ context.Context, req tools.ReplyRequest) (tools.ReplyResult, error) {
 	f.botReplies++
 	f.text = req.Text
+	f.replyIdempotencyKey = req.IdempotencyKey
 	f.events = append(f.events, "bot_reply")
 	return tools.ReplyResult{MessageID: "om_bot_reply", ChatID: "oc_private"}, nil
 }
@@ -54,13 +57,18 @@ type auditedApprovalStore struct {
 	begun        int
 	completed    int
 	completedMsg string
+	key          string
 }
 
 func (s *auditedApprovalStore) BeginReplyAction(
 	context.Context, string, string,
 ) (int64, string, string, bool, error) {
 	s.begun++
-	return 17, "message:om_private:reply", "", false, nil
+	key := s.key
+	if key == "" {
+		key = "message:om_private:reply"
+	}
+	return 17, key, "", false, nil
 }
 
 func (s *auditedApprovalStore) CompleteReplyAction(
@@ -166,6 +174,41 @@ func TestControllerAuditsNormalBotReplyBeforeCompleting(t *testing.T) {
 		store.begun != 1 || store.completed != 1 || store.completedMsg != "om_bot_reply" ||
 		m.botReplies != 1 {
 		t.Fatalf("result=%+v store=%+v messenger=%+v", result, store, m)
+	}
+}
+
+func TestControllerSendsBoundedPublicUUIDForLongDurableReplyKey(t *testing.T) {
+	m := &fakeMessenger{}
+	internalKey := "message:om_example_message_001:g7:reply"
+	store := &auditedApprovalStore{key: internalKey}
+	controller := NewController(
+		policy.NewReplyGate(policy.Config{
+			Mode: domain.ModeAuto, OwnerOpenID: "ou_owner",
+		}, threadState{}),
+		m,
+		store,
+	)
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_example_message_001",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_sender",
+	})
+	if _, err := controller.Handle(context.Background(), item, domain.Decision{
+		Kind: domain.DecisionReply, Relevance: domain.RelevanceDirectMention,
+		Confidence: 0.95, Risk: domain.RiskLow, ReplyText: "请补充 Base 权限。",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if m.replyIdempotencyKey == "" ||
+		len(m.replyIdempotencyKey) > 50 ||
+		m.replyIdempotencyKey == internalKey {
+		t.Fatalf(
+			"public key=%q len=%d internal=%q",
+			m.replyIdempotencyKey,
+			len(m.replyIdempotencyKey),
+			internalKey,
+		)
 	}
 }
 

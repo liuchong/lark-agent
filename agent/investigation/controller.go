@@ -3,7 +3,6 @@ package investigation
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"strings"
 
@@ -249,8 +248,7 @@ func (c *Controller) sendProgress(
 }
 
 func publicMessageUUID(internalKey string) string {
-	digest := sha256.Sum256([]byte(internalKey))
-	return fmt.Sprintf("investigation:%x", digest[:16])
+	return tools.PublicMessageUUID("investigation", internalKey)
 }
 
 func (c *Controller) ownerNoticeText(

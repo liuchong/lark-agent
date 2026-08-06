@@ -39,3 +39,26 @@ func TestReplyMessageToolCallsMessenger(t *testing.T) {
 		t.Fatalf("result=%+v messenger=%+v", result, m)
 	}
 }
+
+func TestPublicMessageUUIDIsStableBoundedAndNamespaceDistinct(t *testing.T) {
+	if key := PublicMessageUUID("reply", ""); key != "" {
+		t.Fatalf("empty internal key produced public UUID %q", key)
+	}
+	internalKey := "message:om_example_message_001:g7:reply"
+	replyKey := PublicMessageUUID("reply", internalKey)
+	if replyKey != PublicMessageUUID("reply", internalKey) {
+		t.Fatalf("public message UUID is not stable: %q", replyKey)
+	}
+	if replyKey == internalKey || len(replyKey) > 50 {
+		t.Fatalf("public key=%q len=%d", replyKey, len(replyKey))
+	}
+	if replyKey == PublicMessageUUID("investigation", internalKey) {
+		t.Fatalf("namespaces share public UUID %q", replyKey)
+	}
+	if replyKey == PublicMessageUUID(
+		"reply",
+		"message:om_example_message_001:g8:reply",
+	) {
+		t.Fatalf("communication generations share public UUID %q", replyKey)
+	}
+}

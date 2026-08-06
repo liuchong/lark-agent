@@ -2320,6 +2320,11 @@ The multi-step loop is accepted by these executable BDD scenarios:
   threshold and has no approval-only commitment or policy risk, when the final
   reply gate passes, then the agent privately notifies the owner and immediately
   sends the sender-facing reply without waiting for owner confirmation.
+- Given a resumed communication generation creates a durable reply action whose
+  complete generation-scoped key exceeds Lark's public UUID limit, when the
+  sender-facing reply is dispatched, then the audit store retains the complete
+  key while Lark receives a stable, generation-distinct digest no longer than
+  50 characters. The reply must not fail because the internal key is too long.
 - Given delivery of that approval notice is retried, when the same durable
   approval action is observed again, then the stable notification idempotency
   key prevents a duplicate private message.

@@ -438,18 +438,20 @@ func TestRealtimeOwnerIntakeDedupesWithPollFallback(t *testing.T) {
 }
 
 type privateReplyMessenger struct {
-	userReplies  int
-	botReplies   int
-	ownerNotices int
-	reactions    int
-	deletions    int
-	replyText    string
-	events       []string
+	userReplies         int
+	botReplies          int
+	ownerNotices        int
+	reactions           int
+	deletions           int
+	replyText           string
+	replyIdempotencyKey string
+	events              []string
 }
 
 func (m *privateReplyMessenger) ReplyAsUser(_ context.Context, req tools.ReplyRequest) (tools.ReplyResult, error) {
 	m.userReplies++
 	m.replyText = req.Text
+	m.replyIdempotencyKey = req.IdempotencyKey
 	m.events = append(m.events, "user_reply")
 	return tools.ReplyResult{MessageID: "om_user_reply"}, nil
 }
@@ -457,6 +459,7 @@ func (m *privateReplyMessenger) ReplyAsUser(_ context.Context, req tools.ReplyRe
 func (m *privateReplyMessenger) ReplyAsBot(_ context.Context, req tools.ReplyRequest) (tools.ReplyResult, error) {
 	m.botReplies++
 	m.replyText = req.Text
+	m.replyIdempotencyKey = req.IdempotencyKey
 	m.events = append(m.events, "reply")
 	return tools.ReplyResult{MessageID: "om_bot_reply"}, nil
 }
@@ -618,7 +621,7 @@ func TestResumedGenerationAutoReplyDoesNotRequireApprovalHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	item := domain.NewWorkItem(domain.NormalizedEvent{
-		MessageID:     "om_resumed_durable_auto",
+		MessageID:     "om_example_message_001",
 		ChatID:        "oc_private",
 		ChatType:      "p2p",
 		ChatPartnerID: "ou_bot",
@@ -664,7 +667,10 @@ func TestResumedGenerationAutoReplyDoesNotRequireApprovalHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.Action.Status != domain.ActionCompleted ||
-		messenger.botReplies != 1 {
+		messenger.botReplies != 1 ||
+		messenger.replyIdempotencyKey == "" ||
+		len(messenger.replyIdempotencyKey) > 50 ||
+		messenger.replyIdempotencyKey == result.Action.Idempotency {
 		t.Fatalf("result=%+v messenger=%+v", result, messenger)
 	}
 }

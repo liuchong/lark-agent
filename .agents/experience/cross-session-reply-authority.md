@@ -20,6 +20,10 @@ For delegated conversation work:
   not a storage failure; automatic low-risk replies must continue through the
   normal policy gate, while approval-required replies still create and await a
   new generation-scoped approval;
+- generation-scoped action keys remain complete in durable audit records, but
+  outbound Lark message UUIDs use stable namespace-preserving 128-bit digests;
+  passing the internal key directly can exceed Lark's 50-character limit and
+  block an otherwise valid replay;
 - mutating resource/tool actions keep independent idempotency fences so a new
   communication generation never implies replaying side effects;
 - CLI and Owner-private resume commands must share one write-first transaction

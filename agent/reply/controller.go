@@ -194,7 +194,7 @@ func (c *Controller) Handle(ctx context.Context, item domain.WorkItem, decision 
 	request := tools.ReplyRequest{
 		MessageID:      item.Event.MessageID,
 		Text:           text,
-		IdempotencyKey: action.Idempotency,
+		IdempotencyKey: tools.PublicMessageUUID("reply", action.Idempotency),
 	}
 	var replyResult tools.ReplyResult
 	if replyAsBot {
