@@ -258,7 +258,10 @@ ordinary continuation with no new request may be `no_reply_needed`. For ordinary
 private messages, `unanswered` must be grounded in a new question, request,
 invitation, or action obligation present in the target text itself; context may
 explain that obligation, but must not invent it from the owner's earlier
-question or from an informative product/design statement. A private
+question or from an informative product/design statement. Obligation matching
+must distinguish an imperative such as `你看一下这个 PR` from an attributive
+phrase such as `哦哦你看的 PR`; the latter does not become a request merely
+because it contains the substring `你看`. A private
 `owner_request` answers the configured owner's own assistant prompt using bot
 identity.
 Non-owner private messages addressed to the assistant and non-owner native

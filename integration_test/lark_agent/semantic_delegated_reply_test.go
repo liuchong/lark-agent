@@ -429,6 +429,71 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 		}
 	})
 
+	t.Run("attributive ni kan de private acknowledgement stays silent", func(t *testing.T) {
+		store := openSemanticIntegrationStore(t)
+		base := store.CurrentSession().StartedAt.Add(time.Second)
+		item := enqueueDueDelegatedItem(t, store, domain.NormalizedEvent{
+			Source:     domain.SourcePoll,
+			EventID:    "poll:om_private_pr_ack",
+			MessageID:  "om_private_pr_ack",
+			ChatID:     "oc_private",
+			ChatType:   "p2p",
+			SenderID:   "ou_teammate",
+			SenderType: "user",
+			Content:    "哦哦你看的 PR",
+			CreatedAt:  base.Add(time.Minute),
+		})
+		semanticModel := &semanticIntegrationModel{response: `{
+			"target_message_id":"om_private_pr_ack",
+			"result":"no_reply_needed",
+			"confidence":0.96,
+			"reason":"the target acknowledges that the screenshot was the PR the owner viewed and adds no request"
+		}`}
+		builder := &semanticIntegrationBuilder{}
+		decider := &semanticIntegrationDecider{}
+		replier := &semanticIntegrationReplyHandler{}
+		daemon := app.NewDaemon(
+			store,
+			router.New(router.Config{
+				OwnerOpenID:       "ou_owner",
+				Mode:              domain.ModeAuto,
+				PrivateReplyScope: domain.PrivateReplyScopeAll,
+			}),
+			app.WithContextBuilder(builder),
+			app.WithDecider(decider),
+			app.WithReplyHandler(replier),
+			app.WithDelegatedReplyResolver(semanticIntegrationResolver{
+				store:   store,
+				matcher: replymatch.New(semanticModel, "ou_owner"),
+				messages: []domain.NormalizedEvent{
+					{
+						MessageID: "om_owner_image", ChatID: "oc_private",
+						ChatType: "p2p", SenderID: "ou_owner", SenderType: "user",
+						Content: "[Image]", CreatedAt: base,
+					},
+					item.Event,
+				},
+			}, 0.85, 30*time.Second),
+		)
+
+		result, err := daemon.RunOnce(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Decision.Reason != "delegated_reply_not_needed" ||
+			semanticModel.calls != 1 ||
+			builder.calls != 0 || decider.calls != 0 || replier.calls != 0 {
+			t.Fatalf(
+				"result=%+v semantic=%d builder=%d decider=%d replier=%d",
+				result,
+				semanticModel.calls,
+				builder.calls,
+				decider.calls,
+				replier.calls,
+			)
+		}
+	})
+
 	t.Run("private answer without target obligation cannot become investigation", func(t *testing.T) {
 		store := openSemanticIntegrationStore(t)
 		base := store.CurrentSession().StartedAt.Add(time.Second)

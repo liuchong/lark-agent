@@ -188,6 +188,65 @@ func TestResolverAcceptsNoReplyNeededForAnswerToOwnerLedPrivateDiscussion(t *tes
 	}
 }
 
+func TestResolverDoesNotTreatAttributiveNiKanDeAsOwnerRequest(t *testing.T) {
+	base := time.Date(2026, 8, 6, 12, 54, 23, 0, time.UTC)
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_private_pr_ack",
+		"result":"no_reply_needed",
+		"confidence":0.96,
+		"reason":"The target acknowledges that the screenshot was the PR the owner had viewed and adds no request."
+	}`}
+	resolution, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_private_pr_ack", ChatID: "oc_private", ChatType: "p2p",
+			SenderID: "ou_teammate", SenderType: "user",
+			Content:   "哦哦你看的 PR",
+			CreatedAt: base,
+		}),
+		Messages: []domain.NormalizedEvent{
+			{
+				MessageID: "om_owner_image", ChatID: "oc_private", ChatType: "p2p",
+				SenderID: "ou_owner", SenderType: "user",
+				Content: "[Image]", CreatedAt: base.Add(-time.Minute),
+			},
+			{
+				MessageID: "om_private_pr_ack", ChatID: "oc_private", ChatType: "p2p",
+				SenderID: "ou_teammate", SenderType: "user",
+				Content: "哦哦你看的 PR", CreatedAt: base,
+			},
+		},
+		ContextCutoff: base.Add(3 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Result != ResultNoReplyNeeded {
+		t.Fatalf("resolution=%+v", resolution)
+	}
+}
+
+func TestResolverKeepsImperativeNiKanRequestAsObligation(t *testing.T) {
+	base := time.Date(2026, 8, 6, 12, 54, 23, 0, time.UTC)
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_private_pr_request",
+		"result":"no_reply_needed",
+		"confidence":0.96,
+		"reason":"No reply is needed."
+	}`}
+	_, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_private_pr_request", ChatID: "oc_private", ChatType: "p2p",
+			SenderID: "ou_teammate", SenderType: "user",
+			Content:   "你看一下这个 PR",
+			CreatedAt: base,
+		}),
+		ContextCutoff: base.Add(3 * time.Minute),
+	})
+	if err == nil {
+		t.Fatal("imperative PR review request accepted no_reply_needed")
+	}
+}
+
 func TestResolverNormalizesPrivateAnswerWithoutTargetObligationToNoReplyNeeded(t *testing.T) {
 	base := time.Date(2026, 7, 31, 4, 22, 52, 0, time.UTC)
 	model := &scriptedModel{reply: `{
