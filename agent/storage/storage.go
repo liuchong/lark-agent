@@ -579,6 +579,14 @@ func (s *Store) migrate() error {
 			`CREATE INDEX IF NOT EXISTS idx_delegated_investigation_history_work
 			 ON delegated_investigation_history(work_item_id, archived_at DESC, id DESC)`,
 		}},
+		{version: 21, statements: []string{
+			`ALTER TABLE work_items
+			 ADD COLUMN generation INTEGER NOT NULL DEFAULT 1`,
+			`ALTER TABLE action_attempts
+			 ADD COLUMN generation INTEGER NOT NULL DEFAULT 1`,
+			`CREATE INDEX IF NOT EXISTS idx_action_attempts_work_generation
+			 ON action_attempts(work_item_id, generation, kind, status, id)`,
+		}},
 	}
 	for _, migration := range migrations {
 		if version >= migration.version {
@@ -2110,12 +2118,13 @@ func (s *Store) BeginReplyAction(
 	text string,
 ) (int64, string, string, bool, error) {
 	var workItemID int64
+	var generation int
 	if err := s.db.QueryRowContext(
-		ctx, `SELECT id FROM work_items WHERE dedup_key = ?`, dedupKey,
-	).Scan(&workItemID); err != nil {
+		ctx, `SELECT id, generation FROM work_items WHERE dedup_key = ?`, dedupKey,
+	).Scan(&workItemID, &generation); err != nil {
 		return 0, "", "", false, errs.NewInternalError(errs.SubtypeStorage, "locate reply action work item").WithCause(err)
 	}
-	key := dedupKey + ":reply"
+	key := communicationActionKey(dedupKey, "reply", generation)
 	requestJSON, err := json.Marshal(map[string]string{"text": text})
 	if err != nil {
 		return 0, "", "", false, errs.NewInternalError(errs.SubtypeUnknown, "encode reply action request").WithCause(err)
@@ -2136,9 +2145,10 @@ func (s *Store) BeginReplyAction(
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		result, insertErr := tx.ExecContext(ctx,
 			`INSERT INTO action_attempts(
-				work_item_id, kind, idempotency_key, status, request_json, created_at, updated_at
-			 ) VALUES (?, 'reply', ?, ?, ?, ?, ?)`,
-			workItemID, key, domain.ActionExecuting, string(requestJSON), now, now)
+				work_item_id, generation, kind, idempotency_key, status,
+				request_json, created_at, updated_at
+			 ) VALUES (?, ?, 'reply', ?, ?, ?, ?, ?)`,
+			workItemID, generation, key, domain.ActionExecuting, string(requestJSON), now, now)
 		if insertErr != nil {
 			return 0, "", "", false, errs.NewInternalError(errs.SubtypeStorage, "start reply action audit").WithCause(insertErr)
 		}
@@ -2380,7 +2390,12 @@ func (s *Store) RequestReplyApproval(
 	relevance domain.Relevance,
 ) (int64, error) {
 	var workItemID int64
-	if err := s.db.QueryRowContext(ctx, `SELECT id FROM work_items WHERE dedup_key = ?`, dedupKey).Scan(&workItemID); err != nil {
+	var generation int
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT id, generation FROM work_items WHERE dedup_key = ?`,
+		dedupKey,
+	).Scan(&workItemID, &generation); err != nil {
 		return 0, errs.NewInternalError(errs.SubtypeStorage, "locate reply approval work item").WithCause(err)
 	}
 	request, err := json.Marshal(map[string]string{
@@ -2392,13 +2407,14 @@ func (s *Store) RequestReplyApproval(
 	if err != nil {
 		return 0, errs.NewInternalError(errs.SubtypeUnknown, "encode reply approval request").WithCause(err)
 	}
-	key := replyActionKey(dedupKey, text, reason, ownerAction, relevance)
+	key := replyActionKey(dedupKey, text, reason, ownerAction, relevance, generation)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO action_attempts(
-			work_item_id, kind, idempotency_key, status, request_json, created_at, updated_at
-		 ) VALUES (?, 'reply', ?, ?, ?, ?, ?)`,
-		workItemID, key, domain.ActionAwaitingApproval, string(request), now, now); err != nil {
+			work_item_id, generation, kind, idempotency_key, status,
+			request_json, created_at, updated_at
+		 ) VALUES (?, ?, 'reply', ?, ?, ?, ?, ?)`,
+		workItemID, generation, key, domain.ActionAwaitingApproval, string(request), now, now); err != nil {
 		return 0, errs.NewInternalError(errs.SubtypeStorage, "request reply approval").WithCause(err)
 	}
 	var actionID int64
@@ -2414,16 +2430,29 @@ func (s *Store) ConsumeReplyApproval(
 	dedupKey, text, reason, ownerAction string,
 	relevance domain.Relevance,
 ) (int64, bool, error) {
-	key := replyActionKey(dedupKey, text, reason, ownerAction, relevance)
+	var generation int
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT generation FROM work_items WHERE dedup_key = ?`,
+		dedupKey,
+	).Scan(&generation); err != nil {
+		return 0, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"locate approved reply generation",
+		).WithCause(err)
+	}
+	key := replyActionKey(dedupKey, text, reason, ownerAction, relevance, generation)
 	var actionID int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id FROM action_attempts WHERE idempotency_key = ? AND status = ?`,
-		key, domain.ActionReady).Scan(&actionID)
-	if errors.Is(err, sql.ErrNoRows) {
+		`SELECT id FROM action_attempts
+		 WHERE idempotency_key = ? AND generation = ? AND status = ?`,
+		key, generation, domain.ActionReady).Scan(&actionID)
+	if generation == 1 && errors.Is(err, sql.ErrNoRows) {
 		key = legacyReplyActionKey(dedupKey, text, reason, ownerAction)
 		err = s.db.QueryRowContext(ctx,
-			`SELECT id FROM action_attempts WHERE idempotency_key = ? AND status = ?`,
-			key, domain.ActionReady).Scan(&actionID)
+			`SELECT id FROM action_attempts
+			 WHERE idempotency_key = ? AND generation = ? AND status = ?`,
+			key, generation, domain.ActionReady).Scan(&actionID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, false, nil
 		}
@@ -2469,14 +2498,19 @@ func (s *Store) BeginPostReplyNotification(
 	decision domain.Decision,
 ) (int64, string, bool, error) {
 	var workItemID int64
-	if err := s.db.QueryRowContext(ctx, `SELECT id FROM work_items WHERE dedup_key = ?`, dedupKey).Scan(&workItemID); err != nil {
+	var generation int
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT id, generation FROM work_items WHERE dedup_key = ?`,
+		dedupKey,
+	).Scan(&workItemID, &generation); err != nil {
 		return 0, "", false, errs.NewInternalError(errs.SubtypeStorage, "locate post-reply notification work item").WithCause(err)
 	}
 	request, err := json.Marshal(decision)
 	if err != nil {
 		return 0, "", false, errs.NewInternalError(errs.SubtypeUnknown, "encode post-reply notification").WithCause(err)
 	}
-	key := postReplyNotificationActionKey(dedupKey, request)
+	key := postReplyNotificationActionKey(dedupKey, request, generation)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, "", false, errs.NewInternalError(errs.SubtypeStorage, "begin post-reply notification audit").WithCause(err)
@@ -2491,9 +2525,10 @@ func (s *Store) BeginPostReplyNotification(
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		result, insertErr := tx.ExecContext(ctx,
 			`INSERT INTO action_attempts(
-				work_item_id, kind, idempotency_key, status, request_json, created_at, updated_at
-			 ) VALUES (?, 'owner_notification', ?, ?, ?, ?, ?)`,
-			workItemID, key, domain.ActionExecuting, string(request), now, now)
+				work_item_id, generation, kind, idempotency_key, status,
+				request_json, created_at, updated_at
+			 ) VALUES (?, ?, 'owner_notification', ?, ?, ?, ?, ?)`,
+			workItemID, generation, key, domain.ActionExecuting, string(request), now, now)
 		if insertErr != nil {
 			return 0, "", false, errs.NewInternalError(errs.SubtypeStorage, "start post-reply notification audit").WithCause(insertErr)
 		}
@@ -2543,15 +2578,18 @@ func (s *Store) ReadyPostReplyNotification(workItemID int64) (int64, string, dom
 	var key string
 	var requestJSON string
 	err := s.db.QueryRow(
-		`SELECT id, idempotency_key, COALESCE(request_json, '')
-		 FROM action_attempts
-		 WHERE work_item_id = ? AND kind = 'owner_notification' AND status IN (?, ?, ?)
+		`SELECT notice.id, notice.idempotency_key, COALESCE(notice.request_json, '')
+		 FROM action_attempts notice
+		 JOIN work_items work ON work.id = notice.work_item_id
+		 WHERE notice.work_item_id = ? AND notice.generation = work.generation
+		   AND notice.kind = 'owner_notification' AND notice.status IN (?, ?, ?)
 		   AND EXISTS(
 				SELECT 1 FROM action_attempts reply
-				WHERE reply.work_item_id = action_attempts.work_item_id
+				WHERE reply.work_item_id = notice.work_item_id
+				  AND reply.generation = work.generation
 				  AND reply.kind = 'reply' AND reply.status = ?
 		   )
-		 ORDER BY id LIMIT 1`,
+		 ORDER BY notice.id LIMIT 1`,
 		workItemID,
 		domain.ActionExecuting,
 		domain.ActionBlocked,
@@ -2713,7 +2751,8 @@ func (s *Store) ReadyApprovedReply(workItemID int64) (domain.Decision, bool, err
 		`SELECT a.request_json, COALESCE(w.decision_json, '')
 		 FROM action_attempts a
 		 JOIN work_items w ON w.id = a.work_item_id
-		 WHERE a.work_item_id = ? AND a.kind = 'reply' AND a.status = ?
+		 WHERE a.work_item_id = ? AND a.generation = w.generation
+		   AND a.kind = 'reply' AND a.status = ?
 		 ORDER BY a.id LIMIT 1`,
 		workItemID, domain.ActionReady).Scan(&requestJSON, &decisionJSON)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -3028,10 +3067,15 @@ func shellActionKey(dedupKey, command, cwd string) string {
 func replyActionKey(
 	dedupKey, text, reason, ownerAction string,
 	relevance domain.Relevance,
+	generation int,
 ) string {
+	generationKey := ""
+	if generation > 1 {
+		generationKey = fmt.Sprintf("\x00generation:%d", generation)
+	}
 	sum := sha256.Sum256([]byte(
 		dedupKey + "\x00" + text + "\x00" + reason + "\x00" + ownerAction +
-			"\x00" + string(relevance),
+			"\x00" + string(relevance) + generationKey,
 	))
 	return fmt.Sprintf("reply:%x", sum[:])
 }
@@ -3094,8 +3138,23 @@ func validReplyApprovalRelevance(relevance domain.Relevance) bool {
 	}
 }
 
-func postReplyNotificationActionKey(dedupKey string, decisionJSON []byte) string {
-	sum := sha256.Sum256(append([]byte(dedupKey+"\x00"), decisionJSON...))
+func communicationActionKey(dedupKey, suffix string, generation int) string {
+	if generation <= 1 {
+		return dedupKey + ":" + suffix
+	}
+	return fmt.Sprintf("%s:g%d:%s", dedupKey, generation, suffix)
+}
+
+func postReplyNotificationActionKey(
+	dedupKey string,
+	decisionJSON []byte,
+	generation int,
+) string {
+	identity := fmt.Sprintf("%s\x00generation:%d\x00", dedupKey, generation)
+	if generation <= 1 {
+		identity = dedupKey + "\x00"
+	}
+	sum := sha256.Sum256(append([]byte(identity), decisionJSON...))
 	return fmt.Sprintf("on:%x", sum[:23])
 }
 
@@ -4165,17 +4224,18 @@ func (s *Store) BeginInvestigationMessageAction(
 		).WithParam("stage")
 	}
 	var dedupKey string
+	var generation int
 	if err := s.db.QueryRowContext(
 		ctx,
-		`SELECT dedup_key FROM work_items WHERE id = ?`,
+		`SELECT dedup_key, generation FROM work_items WHERE id = ?`,
 		workItemID,
-	).Scan(&dedupKey); err != nil {
+	).Scan(&dedupKey, &generation); err != nil {
 		return domain.Action{}, false, "", errs.NewInternalError(
 			errs.SubtypeStorage,
 			"locate investigation work item",
 		).WithCause(err)
 	}
-	key := dedupKey + ":" + suffix
+	key := communicationActionKey(dedupKey, suffix, generation)
 	requestJSON, err := json.Marshal(map[string]string{"text": text})
 	if err != nil {
 		return domain.Action{}, false, "", errs.NewInternalError(
@@ -4204,10 +4264,11 @@ func (s *Store) BeginInvestigationMessageAction(
 		result, insertErr := tx.ExecContext(
 			ctx,
 			`INSERT INTO action_attempts(
-				work_item_id, kind, idempotency_key, status, request_json,
+				work_item_id, generation, kind, idempotency_key, status, request_json,
 				created_at, updated_at
-			 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			workItemID,
+			generation,
 			kind,
 			key,
 			domain.ActionExecuting,
@@ -5300,7 +5361,7 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-const workItemSelect = `SELECT id, dedup_key, status, work_kind, priority,
+const workItemSelect = `SELECT id, dedup_key, status, work_kind, priority, generation,
 		duplicate_of, session_id, COALESCE(resource_evidence_id, 0), event_json, lease_by, lease_time, retry_count,
 		next_attempt_at, created_at, updated_at
 	FROM work_items`
@@ -5311,7 +5372,7 @@ func scanWorkItem(row rowScanner) (domain.WorkItem, error) {
 	var sessionID, leaseBy, leaseTime, nextAttemptAt sql.NullString
 	var duplicateOf sql.NullInt64
 	if err := row.Scan(&item.ID, &item.DedupKey, &status, &workKind,
-		&item.Priority, &duplicateOf, &sessionID, &item.ResourceEvidenceID, &eventJSON, &leaseBy,
+		&item.Priority, &item.Generation, &duplicateOf, &sessionID, &item.ResourceEvidenceID, &eventJSON, &leaseBy,
 		&leaseTime, &item.RetryCount, &nextAttemptAt, &createdAt, &updatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.WorkItem{}, err

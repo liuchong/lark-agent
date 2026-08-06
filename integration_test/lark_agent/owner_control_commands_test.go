@@ -142,6 +142,16 @@ func TestOwnerPrivateControlCommandsCompleteWithoutModel(t *testing.T) {
 		SenderID:      "ou_owner",
 		Content:       "/task resume " + int64Text(target.ID) + " confirm",
 	})
+	resumed, err := store.InspectWork(context.Background(), domain.WorkInspectionQuery{
+		WorkItemID: target.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.WorkItem == nil || resumed.WorkItem.Generation != 2 ||
+		resumed.WorkItem.Status != domain.StatusReceived {
+		t.Fatalf("resumed=%+v", resumed)
+	}
 	if err := store.MarkDeadLetter(target.ID, "恢复后再次失败"); err != nil {
 		t.Fatal(err)
 	}

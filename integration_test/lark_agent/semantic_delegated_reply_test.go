@@ -890,6 +890,135 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 			)
 		}
 	})
+
+	t.Run("explicit replay ignores completed prior-generation reply", func(t *testing.T) {
+		store := openSemanticIntegrationStore(t)
+		if _, err := store.MarkCurrentSessionReady(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		base := store.CurrentSession().StartedAt.Add(time.Second)
+		link := domain.NormalizedEvent{
+			MessageID: "om_replay_record",
+			ChatID:    "oc_any_group",
+			ChatType:  "group",
+			SenderID:  "ou_teammate",
+			Content:   "https://example.larksuite.com/record/shrExampleRecordToken001",
+			CreatedAt: base,
+		}
+		target := domain.NormalizedEvent{
+			Source:           domain.SourcePoll,
+			EventID:          "poll:om_replay_handoff",
+			MessageID:        "om_replay_handoff",
+			ChatID:           "oc_any_group",
+			ChatType:         "group",
+			RootMessageID:    link.MessageID,
+			ReplyToMessageID: link.MessageID,
+			SenderID:         "ou_teammate",
+			Content:          "@测试负责人 这个问题修复后改下状态哈",
+			Mentions:         []domain.Mention{{OpenID: "ou_owner"}},
+			CreatedAt:        base.Add(time.Second),
+		}
+		if _, err := store.EnqueueEvent(target); err != nil {
+			t.Fatal(err)
+		}
+		first, ok, err := store.ClaimNext("first-generation")
+		if err != nil || !ok {
+			t.Fatalf("first=%+v ok=%v err=%v", first, ok, err)
+		}
+		stale := domain.Decision{
+			Kind:        domain.DecisionReply,
+			Relevance:   domain.RelevanceDirectMention,
+			WorkKind:    domain.WorkKindDirectMention,
+			ReplyText:   "上一代错误地回复了示例能力接口。",
+			OwnerAction: "上一代错误通知",
+			Reason:      "stale unrelated context",
+		}
+		replyActionID, _, _, completed, err := store.BeginReplyAction(
+			context.Background(), first.DedupKey, stale.ReplyText,
+		)
+		if err != nil || completed {
+			t.Fatalf("reply action=%d completed=%v err=%v", replyActionID, completed, err)
+		}
+		if err := store.CompleteReplyAction(
+			context.Background(), replyActionID, "om_stale_sent", "",
+		); err != nil {
+			t.Fatal(err)
+		}
+		noticeActionID, _, completed, err := store.BeginPostReplyNotification(
+			context.Background(), first.DedupKey, stale,
+		)
+		if err != nil || completed {
+			t.Fatalf("notice action=%d completed=%v err=%v", noticeActionID, completed, err)
+		}
+		if err := store.CompletePostReplyNotification(
+			context.Background(), noticeActionID, "",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Complete(first.ID, stale); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ResumeWork(context.Background(), domain.ResumeWorkRequest{
+			WorkItemID:    first.ID,
+			ForceTerminal: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		semanticModel := &semanticIntegrationModel{response: `{
+			"target_message_id":"om_replay_handoff",
+			"result":"unanswered",
+			"confidence":0.96,
+			"reason":"the target assigns the linked issue and asks for its status to be updated after the fix",
+			"target_intent":"handoff_status_request",
+			"response_obligation_quote":"这个问题修复后改下状态哈",
+			"task_summary":"修复 record 链接中记录的问题并在完成后更新状态",
+			"task_class":"resource_handoff",
+			"classification_confidence":0.96,
+			"requires_progress":true
+		}`}
+		builder := &semanticIntegrationBuilder{}
+		decider := &semanticIntegrationDecider{}
+		replier := &semanticIntegrationReplyHandler{}
+		daemon := app.NewDaemon(
+			store,
+			router.New(router.Config{
+				OwnerOpenID: "ou_owner",
+				Mode:        domain.ModeAuto,
+				ReplyScope:  domain.ReplyScopeAllGroups,
+			}),
+			app.WithContextBuilder(builder),
+			app.WithDecider(decider),
+			app.WithReplyHandler(replier),
+			app.WithDelegatedReplyResolver(semanticIntegrationResolver{
+				store:    store,
+				matcher:  replymatch.New(semanticModel, "ou_owner"),
+				messages: []domain.NormalizedEvent{link, target},
+			}, 0.85, 30*time.Second),
+		)
+
+		result, err := daemon.RunOnce(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if semanticModel.calls != 1 ||
+			builder.calls != 1 ||
+			builder.item.WorkKind != domain.WorkKindResourceHandoff ||
+			builder.item.TaskClass != domain.TaskClassResourceHandoff ||
+			decider.calls != 1 ||
+			replier.calls != 1 ||
+			result.Decision.ReplyText == stale.ReplyText {
+			t.Fatalf(
+				"result=%+v semantic=%d builder=%d item=%+v decider=%d replier=%d",
+				result,
+				semanticModel.calls,
+				builder.calls,
+				builder.item,
+				decider.calls,
+				replier.calls,
+			)
+		}
+	})
 }
 
 func TestOwnerAuthoredHumanPrivateMessageIsDroppedBeforeDurableIntake(t *testing.T) {

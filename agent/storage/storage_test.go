@@ -3,9 +3,11 @@ package storage
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -1573,11 +1575,25 @@ func dropSchemaV18AuditColumns(t *testing.T, store *Store) {
 
 func dropSchemaV19AndV20(t *testing.T, store *Store) {
 	t.Helper()
+	dropSchemaV21(t, store)
 	for _, stmt := range []string{
 		`DROP TABLE delegated_investigation_history`,
 		`DROP INDEX idx_work_items_resource_evidence`,
 		`ALTER TABLE work_items DROP COLUMN resource_evidence_id`,
 		`DROP TABLE resource_evidence`,
+	} {
+		if _, err := store.db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func dropSchemaV21(t *testing.T, store *Store) {
+	t.Helper()
+	for _, stmt := range []string{
+		`DROP INDEX idx_action_attempts_work_generation`,
+		`ALTER TABLE action_attempts DROP COLUMN generation`,
+		`ALTER TABLE work_items DROP COLUMN generation`,
 	} {
 		if _, err := store.db.Exec(stmt); err != nil {
 			t.Fatal(err)
@@ -1611,6 +1627,7 @@ func TestDelegatedInvestigationHistoryMigrationIsSchemaVersion20(t *testing.T) {
 	}); err != nil || !created {
 		t.Fatalf("begin created=%v err=%v", created, err)
 	}
+	dropSchemaV21(t, store)
 	if _, err := store.db.Exec(`DROP TABLE delegated_investigation_history`); err != nil {
 		t.Fatal(err)
 	}
@@ -1630,8 +1647,8 @@ func TestDelegatedInvestigationHistoryMigrationIsSchemaVersion20(t *testing.T) {
 	if err := store.db.QueryRow(`SELECT version FROM schema_version LIMIT 1`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 20 {
-		t.Fatalf("schema version=%d, want 20", version)
+	if version != 21 {
+		t.Fatalf("schema version=%d, want 21", version)
 	}
 	investigation, found, err := store.GetDelegatedInvestigation(item.ID)
 	if err != nil || !found || investigation.TaskSummary != "preserved during v20 migration" {
@@ -1902,6 +1919,363 @@ func TestPostReplyNotificationRecoversWithoutReplyReplay(t *testing.T) {
 	_, _, completed, err = store.BeginPostReplyNotification(context.Background(), item.DedupKey, decision)
 	if err != nil || !completed {
 		t.Fatalf("completed=%v err=%v", completed, err)
+	}
+}
+
+func TestExplicitResumeStartsNewCommunicationGeneration(t *testing.T) {
+	store := openStore(t)
+	event := domain.NormalizedEvent{
+		MessageID: "om_explicit_resume_generation",
+		Content:   "@测试负责人 修好后更新状态",
+	}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("first-generation")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	if _, created, err := store.BeginDelegatedInvestigation(domain.DelegatedInvestigation{
+		WorkItemID:    item.ID,
+		TaskSummary:   "核对问题并更新状态",
+		TaskClass:     domain.TaskClassInvestigation,
+		ContextCutoff: time.Now().UTC(),
+		ContextDigest: "sha256:first-generation",
+	}); err != nil || !created {
+		t.Fatalf("begin old investigation created=%v err=%v", created, err)
+	}
+	oldProgress, send, _, err := store.BeginInvestigationMessageAction(
+		context.Background(), item.ID, "progress", "正在核对问题",
+	)
+	if err != nil || !send {
+		t.Fatalf("old progress=%+v send=%v err=%v", oldProgress, send, err)
+	}
+	if err := store.CompleteInvestigationMessageAction(
+		context.Background(), oldProgress.ID, "om_old_progress", "",
+	); err != nil {
+		t.Fatal(err)
+	}
+	decision := domain.Decision{
+		Kind:        domain.DecisionReply,
+		ReplyText:   "上一代错误回复",
+		OwnerAction: "上一代错误通知",
+		Reason:      "stale classification",
+	}
+	oldReplyID, oldReplyKey, _, completed, err := store.BeginReplyAction(
+		context.Background(), item.DedupKey, decision.ReplyText,
+	)
+	if err != nil || completed {
+		t.Fatalf("reply id=%d key=%q completed=%v err=%v", oldReplyID, oldReplyKey, completed, err)
+	}
+	if err := store.CompleteReplyAction(
+		context.Background(), oldReplyID, "om_old_reply", "",
+	); err != nil {
+		t.Fatal(err)
+	}
+	oldNoticeID, oldNoticeKey, completed, err := store.BeginPostReplyNotification(
+		context.Background(), item.DedupKey, decision,
+	)
+	if err != nil || completed {
+		t.Fatalf("notice id=%d key=%q completed=%v err=%v", oldNoticeID, oldNoticeKey, completed, err)
+	}
+	if err := store.CompletePostReplyNotification(
+		context.Background(), oldNoticeID, "",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Complete(item.ID, decision); err != nil {
+		t.Fatal(err)
+	}
+
+	resumed, err := store.ResumeWork(context.Background(), domain.ResumeWorkRequest{
+		WorkItemID:    item.ID,
+		ForceTerminal: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.WorkItem == nil || resumed.WorkItem.Generation != 2 {
+		t.Fatalf("resumed=%+v", resumed.WorkItem)
+	}
+	if _, _, _, found, err := store.ReadyPostReplyNotification(item.ID); err != nil || found {
+		t.Fatalf("stale post-reply notification found=%v err=%v", found, err)
+	}
+	if _, created, err := store.BeginDelegatedInvestigation(domain.DelegatedInvestigation{
+		WorkItemID:    item.ID,
+		TaskSummary:   "重新核对问题并更新状态",
+		TaskClass:     domain.TaskClassInvestigation,
+		ContextCutoff: time.Now().UTC(),
+		ContextDigest: "sha256:second-generation",
+	}); err != nil || !created {
+		t.Fatalf("begin new investigation created=%v err=%v", created, err)
+	}
+	newProgress, send, _, err := store.BeginInvestigationMessageAction(
+		context.Background(), item.ID, "progress", "正在核对问题",
+	)
+	if err != nil || !send ||
+		newProgress.ID == oldProgress.ID ||
+		newProgress.Idempotency == oldProgress.Idempotency {
+		t.Fatalf(
+			"new progress=%+v send=%v old=%+v err=%v",
+			newProgress, send, oldProgress, err,
+		)
+	}
+
+	newReplyID, newReplyKey, _, completed, err := store.BeginReplyAction(
+		context.Background(), item.DedupKey, decision.ReplyText,
+	)
+	if err != nil || completed || newReplyID == oldReplyID || newReplyKey == oldReplyKey {
+		t.Fatalf(
+			"new reply id=%d key=%q completed=%v old=(%d,%q) err=%v",
+			newReplyID, newReplyKey, completed, oldReplyID, oldReplyKey, err,
+		)
+	}
+	if err := store.CompleteReplyAction(
+		context.Background(), newReplyID, "om_new_reply", "",
+	); err != nil {
+		t.Fatal(err)
+	}
+	newNoticeID, newNoticeKey, completed, err := store.BeginPostReplyNotification(
+		context.Background(), item.DedupKey, decision,
+	)
+	if err != nil || completed || newNoticeID == oldNoticeID || newNoticeKey == oldNoticeKey {
+		t.Fatalf(
+			"new notice id=%d key=%q completed=%v old=(%d,%q) err=%v",
+			newNoticeID, newNoticeKey, completed, oldNoticeID, oldNoticeKey, err,
+		)
+	}
+}
+
+func TestExplicitResumeDoesNotReusePriorApprovedReply(t *testing.T) {
+	store := openStore(t)
+	if _, err := store.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	event := domain.NormalizedEvent{
+		MessageID: "om_explicit_resume_approved",
+		Content:   "@测试负责人 请确认后回复",
+	}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("first-generation")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	oldActionID, err := store.RequestReplyApproval(
+		context.Background(),
+		item.DedupKey,
+		"同一份草稿",
+		"同一依据",
+		"",
+		domain.RelevanceDirectMention,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DecideAction(oldActionID, true); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNext("complete-first-generation")
+	if err != nil || !ok || claimed.ID != item.ID {
+		t.Fatalf("claimed=%+v ok=%v err=%v", claimed, ok, err)
+	}
+	if err := store.Complete(claimed.ID, domain.Decision{
+		Kind:      domain.DecisionReply,
+		Relevance: domain.RelevanceDirectMention,
+		ReplyText: "同一份草稿",
+		Reason:    "同一依据",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResumeWork(context.Background(), domain.ResumeWorkRequest{
+		WorkItemID:    item.ID,
+		ForceTerminal: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if approved, found, err := store.ReadyApprovedReply(item.ID); err != nil || found {
+		t.Fatalf("stale approved=%+v found=%v err=%v", approved, found, err)
+	}
+	newActionID, err := store.RequestReplyApproval(
+		context.Background(),
+		item.DedupKey,
+		"同一份草稿",
+		"同一依据",
+		"",
+		domain.RelevanceDirectMention,
+	)
+	if err != nil || newActionID == oldActionID {
+		t.Fatalf("new action=%d old=%d err=%v", newActionID, oldActionID, err)
+	}
+}
+
+func TestExplicitResumeRejectsUnreconciledUncertainCommunication(t *testing.T) {
+	store := openStore(t)
+	if _, err := store.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_uncertain_resume_generation",
+		Content:   "@测试负责人 请回复",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("uncertain-generation")
+	if err != nil || !ok {
+		t.Fatalf("item=%+v ok=%v err=%v", item, ok, err)
+	}
+	if err := store.MarkDeadLetter(item.ID, "process stopped during reply"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := store.db.Exec(
+		`INSERT INTO action_attempts(
+			work_item_id, generation, kind, idempotency_key, status, error,
+			created_at, updated_at
+		 ) VALUES (?, ?, 'reply', ?, ?, ?, ?, ?)`,
+		item.ID,
+		item.Generation,
+		"uncertain-generation-reply",
+		domain.ActionBlocked,
+		"execution result is uncertain after process interruption",
+		now,
+		now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		`INSERT INTO work_interruptions(
+			work_item_id, stage, action_kind, action_status, reason, interrupted_at
+		 ) VALUES (?, 'action', 'reply', ?, 'process stopped during send', ?)`,
+		item.ID,
+		domain.ActionExecuting,
+		now,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.ResumeWork(context.Background(), domain.ResumeWorkRequest{
+		WorkItemID:    item.ID,
+		ForceTerminal: true,
+	}); err == nil {
+		t.Fatal("explicit resume accepted an unreconciled uncertain reply")
+	}
+	inspection, err := store.InspectWork(context.Background(), domain.WorkInspectionQuery{
+		WorkItemID: item.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.WorkItem == nil ||
+		inspection.WorkItem.Generation != 1 ||
+		inspection.WorkItem.Status != domain.StatusDeadLetter {
+		t.Fatalf("inspection=%+v", inspection)
+	}
+}
+
+func TestConcurrentExplicitResumeAdvancesExactlyOneGeneration(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	setup, err := Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = setup.Close() })
+	if _, err := setup.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setup.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_concurrent_resume_generation",
+		Content:   "@测试负责人 请重新调查",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := setup.ClaimNext("concurrent-generation")
+	if err != nil || !ok {
+		t.Fatalf("item=%+v ok=%v err=%v", item, ok, err)
+	}
+	if err := setup.Complete(item.ID, domain.Decision{
+		Kind:   domain.DecisionRecord,
+		Reason: "first generation completed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := OpenInspection(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	second, err := OpenInspection(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+
+	blocker, err := sql.Open("sqlite", statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = blocker.Close() })
+	if _, err := blocker.Exec(`PRAGMA busy_timeout=5000`); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := blocker.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lock.Exec(
+		`UPDATE work_items SET updated_at = updated_at WHERE id = ?`,
+		item.ID,
+	); err != nil {
+		_ = lock.Rollback()
+		t.Fatal(err)
+	}
+
+	stores := []*Store{first, second}
+	results := make(chan error, len(stores))
+	started := make(chan struct{}, len(stores))
+	var workers sync.WaitGroup
+	for _, candidate := range stores {
+		workers.Add(1)
+		go func(store *Store) {
+			defer workers.Done()
+			started <- struct{}{}
+			_, resumeErr := store.ResumeWork(context.Background(), domain.ResumeWorkRequest{
+				WorkItemID:    item.ID,
+				ForceTerminal: true,
+			})
+			results <- resumeErr
+		}(candidate)
+	}
+	for range stores {
+		<-started
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := lock.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	workers.Wait()
+	close(results)
+
+	successes := 0
+	for resumeErr := range results {
+		if resumeErr == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful resumes=%d, want 1", successes)
+	}
+	inspection, err := setup.InspectWork(context.Background(), domain.WorkInspectionQuery{
+		WorkItemID: item.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.WorkItem == nil ||
+		inspection.WorkItem.Generation != 2 ||
+		inspection.WorkItem.Status != domain.StatusReceived {
+		t.Fatalf("inspection=%+v", inspection)
 	}
 }
 

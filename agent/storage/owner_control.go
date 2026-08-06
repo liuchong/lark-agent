@@ -676,103 +676,14 @@ func (s *Store) resumeOwnerWorkTx(
 			"work resume requires an active daemon session",
 		)
 	}
-	var status string
-	if err := tx.QueryRowContext(
+	if err := s.resumeWorkGenerationTx(
 		ctx,
-		`SELECT status FROM work_items WHERE id = ?`,
+		tx,
 		workItemID,
-	).Scan(&status); errors.Is(err, sql.ErrNoRows) {
-		return 0, errs.NewValidationError(
-			errs.SubtypeInvalidArgument,
-			"work item %d was not found",
-			workItemID,
-		)
-	} else if err != nil {
-		return 0, errs.NewInternalError(
-			errs.SubtypeStorage,
-			"read owner-selected work for resume",
-		).WithCause(err)
-	}
-	var uncertain int
-	if err := tx.QueryRowContext(
-		ctx,
-		`SELECT COUNT(*) FROM work_interruptions
-		 WHERE work_item_id = ? AND resumed_at IS NULL AND action_status = ?`,
-		workItemID,
-		domain.ActionExecuting,
-	).Scan(&uncertain); err != nil {
-		return 0, errs.NewInternalError(
-			errs.SubtypeStorage,
-			"check owner resume uncertainty",
-		).WithCause(err)
-	}
-	if uncertain > 0 {
-		return 0, errs.NewValidationError(
-			errs.SubtypeFailedPrecondition,
-			"work item %d has an unresolved external result; reconcile it first",
-			workItemID,
-		)
-	}
-	itemStatus := domain.WorkItemStatus(status)
-	if isTerminalStatus(itemStatus) && !confirm {
-		return 0, errs.NewValidationError(
-			errs.SubtypeFailedPrecondition,
-			"terminal work requires confirm",
-		)
-	}
-	if itemStatus != domain.StatusInterrupted && !isTerminalStatus(itemStatus) {
-		return 0, errs.NewValidationError(
-			errs.SubtypeFailedPrecondition,
-			"work item %d is already active in status %s",
-			workItemID,
-			status,
-		)
-	}
-	if _, err := tx.ExecContext(
-		ctx,
-		`UPDATE work_items
-		 SET status = ?, session_id = ?, decision_json = NULL, lease_by = NULL,
-		     lease_time = NULL, retry_count = 0, owner_reply_retry_count = 0,
-		     next_attempt_at = NULL, updated_at = ?
-		 WHERE id = ?`,
-		domain.StatusReceived,
-		s.session.ID,
+		confirm,
 		now,
-		workItemID,
 	); err != nil {
-		return 0, errs.NewInternalError(
-			errs.SubtypeStorage,
-			"resume owner-selected work",
-		).WithCause(err)
-	}
-	if _, err := tx.ExecContext(
-		ctx,
-		`UPDATE work_interruptions SET resumed_at = ?
-		 WHERE work_item_id = ? AND resumed_at IS NULL`,
-		now,
-		workItemID,
-	); err != nil {
-		return 0, errs.NewInternalError(
-			errs.SubtypeStorage,
-			"close owner-selected interruption",
-		).WithCause(err)
-	}
-	if _, err := tx.ExecContext(
-		ctx,
-		`UPDATE work_reply_candidates
-		 SET status = ?, hold_reason = ?, updated_at = ?
-		 WHERE work_item_id = ? AND status IN (?, ?)`,
-		domain.ReplyCandidateCancelled,
-		"explicit owner resume starts a new investigation",
-		now,
-		workItemID,
-		domain.ReplyCandidatePending,
-		domain.ReplyCandidateHeld,
-	); err != nil {
-		return 0, errs.NewInternalError(
-			errs.SubtypeStorage,
-			"cancel reply candidate before owner resume",
-		).WithCause(err)
+		return 0, err
 	}
 	return 1, nil
 }

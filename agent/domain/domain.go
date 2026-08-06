@@ -478,6 +478,7 @@ type WorkItem struct {
 	Status              WorkItemStatus    `json:"status" yaml:"status"`
 	WorkKind            WorkKind          `json:"work_kind,omitempty" yaml:"work_kind,omitempty"`
 	Priority            int               `json:"priority,omitempty" yaml:"priority,omitempty"`
+	Generation          int               `json:"generation,omitempty" yaml:"generation,omitempty"`
 	DuplicateOf         int64             `json:"duplicate_of,omitempty" yaml:"duplicate_of,omitempty"`
 	SessionID           string            `json:"session_id,omitempty" yaml:"session_id,omitempty"`
 	Event               NormalizedEvent   `json:"event" yaml:"event"`

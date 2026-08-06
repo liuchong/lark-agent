@@ -1958,45 +1958,116 @@ func (s *Store) ResumeWork(
 		).WithCause(err)
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE work_items SET updated_at = updated_at WHERE id = ?`,
+	nowRaw := now.Format(time.RFC3339Nano)
+	if err := s.resumeWorkGenerationTx(
+		ctx,
+		tx,
 		item.ID,
+		request.ForceTerminal,
+		nowRaw,
 	); err != nil {
+		return domain.WorkInspection{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return domain.WorkInspection{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit explicit work resume",
+		).WithCause(err)
+	}
+	return s.InspectWork(ctx, domain.WorkInspectionQuery{WorkItemID: item.ID})
+}
+
+func (s *Store) resumeWorkGenerationTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	workItemID int64,
+	forceTerminal bool,
+	now string,
+) error {
+	if _, err := tx.ExecContext(
+		ctx,
+		`UPDATE work_items SET updated_at = updated_at WHERE id = ?`,
+		workItemID,
+	); err != nil {
+		return errs.NewInternalError(
 			errs.SubtypeStorage,
 			"lock work for explicit resume",
 		).WithCause(err)
 	}
-	var executingOwnerNotices int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM action_attempts
-		 WHERE work_item_id = ?
-		   AND kind = 'owner_resolution'
-		   AND status = ?`,
-		item.ID,
-		domain.ActionExecuting,
-	).Scan(&executingOwnerNotices); err != nil {
-		return domain.WorkInspection{}, errs.NewInternalError(
+	var statusRaw string
+	var generation int
+	if err := tx.QueryRowContext(
+		ctx,
+		`SELECT status, generation FROM work_items WHERE id = ?`,
+		workItemID,
+	).Scan(&statusRaw, &generation); errors.Is(err, sql.ErrNoRows) {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"work item %d was not found",
+			workItemID,
+		)
+	} else if err != nil {
+		return errs.NewInternalError(
 			errs.SubtypeStorage,
-			"check terminal notification before explicit resume",
+			"read locked work for explicit resume",
 		).WithCause(err)
 	}
-	if executingOwnerNotices > 0 {
-		return domain.WorkInspection{}, errs.NewValidationError(
+	status := domain.WorkItemStatus(statusRaw)
+	if isTerminalStatus(status) && !forceTerminal {
+		return errs.NewValidationError(
 			errs.SubtypeFailedPrecondition,
-			"work item %d has an executing or result-uncertain owner notification",
-			item.ID,
+			"terminal work requires confirm",
 		)
 	}
-	nowRaw := now.Format(time.RFC3339Nano)
+	if status != domain.StatusInterrupted && !isTerminalStatus(status) {
+		return errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"work item %d is already active in status %s",
+			workItemID,
+			status,
+		)
+	}
+	var executingActions int
+	if err := tx.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM action_attempts
+		 WHERE work_item_id = ? AND status = ?`,
+		workItemID,
+		domain.ActionExecuting,
+	).Scan(&executingActions); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"check executing actions before explicit resume",
+		).WithCause(err)
+	}
+	var uncertainInterruptions int
+	if err := tx.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM work_interruptions
+		 WHERE work_item_id = ? AND resumed_at IS NULL AND action_status = ?`,
+		workItemID,
+		domain.ActionExecuting,
+	).Scan(&uncertainInterruptions); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"check unresolved external result before explicit resume",
+		).WithCause(err)
+	}
+	if executingActions > 0 || uncertainInterruptions > 0 {
+		return errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"work item %d has an unresolved external result; reconcile it first",
+			workItemID,
+		)
+	}
 	if err := archiveDelegatedInvestigation(
 		ctx,
 		tx,
-		item.ID,
+		workItemID,
 		"explicit resume starts a new investigation generation",
-		nowRaw,
+		now,
 	); err != nil {
-		return domain.WorkInspection{}, err
+		return err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE action_attempts
@@ -2006,25 +2077,71 @@ func (s *Store) ResumeWork(
 		   AND status = ?`,
 		domain.ActionCancelled,
 		"terminal generation explicitly resumed",
-		nowRaw,
-		item.ID,
+		now,
+		workItemID,
 		domain.ActionBlocked,
 	); err != nil {
-		return domain.WorkInspection{}, errs.NewInternalError(
+		return errs.NewInternalError(
 			errs.SubtypeStorage,
 			"cancel stale terminal notification before resume",
 		).WithCause(err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE work_items SET status = ?, session_id = ?, decision_json = NULL,
-		        lease_by = NULL, lease_time = NULL, retry_count = 0,
-		        owner_reply_retry_count = 0,
-		        next_attempt_at = NULL, updated_at = ? WHERE id = ?`,
-		domain.StatusReceived, s.session.ID, nowRaw, item.ID); err != nil {
-		return domain.WorkInspection{}, errs.NewInternalError(
+		`UPDATE action_attempts
+		 SET status = ?, error = ?, updated_at = ?
+		 WHERE work_item_id = ? AND generation = ?
+		   AND kind IN (
+			'reply', 'owner_notification',
+			'investigation_owner_notice', 'investigation_progress'
+		   )
+		   AND status IN (?, ?, ?)`,
+		domain.ActionCancelled,
+		"communication generation explicitly resumed",
+		now,
+		workItemID,
+		generation,
+		domain.ActionAwaitingApproval,
+		domain.ActionReady,
+		domain.ActionBlocked,
+	); err != nil {
+		return errs.NewInternalError(
 			errs.SubtypeStorage,
-			"resume interrupted work",
+			"cancel stale communication actions before resume",
 		).WithCause(err)
+	}
+	result, err := tx.ExecContext(ctx,
+		`UPDATE work_items
+		 SET status = ?, session_id = ?, generation = generation + 1,
+		     decision_json = NULL, lease_by = NULL, lease_time = NULL,
+		     retry_count = 0, owner_reply_retry_count = 0,
+		     next_attempt_at = NULL, updated_at = ?
+		 WHERE id = ? AND status = ? AND generation = ?`,
+		domain.StatusReceived,
+		s.session.ID,
+		now,
+		workItemID,
+		status,
+		generation,
+	)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"resume work generation",
+		).WithCause(err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read resumed work generation",
+		).WithCause(err)
+	}
+	if changed != 1 {
+		return errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"work item %d changed while it was being resumed",
+			workItemID,
+		)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE work_reply_candidates
@@ -2032,36 +2149,28 @@ func (s *Store) ResumeWork(
 		 WHERE work_item_id = ? AND status IN (?, ?)`,
 		domain.ReplyCandidateCancelled,
 		"explicit resume starts a new investigation",
-		nowRaw,
-		item.ID,
+		now,
+		workItemID,
 		domain.ReplyCandidatePending,
 		domain.ReplyCandidateHeld,
 	); err != nil {
-		return domain.WorkInspection{}, errs.NewInternalError(
+		return errs.NewInternalError(
 			errs.SubtypeStorage,
 			"cancel reply candidate before explicit resume",
 		).WithCause(err)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE work_interruptions SET resumed_at = ?
-		 WHERE id = (
-			SELECT id FROM work_interruptions
-			WHERE work_item_id = ? AND resumed_at IS NULL
-			ORDER BY interrupted_at DESC, id DESC LIMIT 1
-		 )`,
-		nowRaw, item.ID); err != nil {
-		return domain.WorkInspection{}, errs.NewInternalError(
+		 WHERE work_item_id = ? AND resumed_at IS NULL`,
+		now,
+		workItemID,
+	); err != nil {
+		return errs.NewInternalError(
 			errs.SubtypeStorage,
 			"record explicit work resume",
 		).WithCause(err)
 	}
-	if err := tx.Commit(); err != nil {
-		return domain.WorkInspection{}, errs.NewInternalError(
-			errs.SubtypeStorage,
-			"commit explicit work resume",
-		).WithCause(err)
-	}
-	return s.InspectWork(ctx, domain.WorkInspectionQuery{WorkItemID: item.ID})
+	return nil
 }
 
 // CancelWork durably closes operator-audited queue items without deleting

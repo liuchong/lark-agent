@@ -12,6 +12,18 @@ For delegated conversation work:
 - explicit owner resume archives the prior investigation, cancels its draft,
   and re-runs current routing and semantic classification from the original
   target;
+- completed replies, owner notifications, and staged investigation messages
+  remain immutable audit evidence for their original communication generation,
+  but cannot short-circuit or provide idempotency identity to an explicitly
+  resumed generation;
+- mutating resource/tool actions keep independent idempotency fences so a new
+  communication generation never implies replaying side effects;
+- CLI and Owner-private resume commands must share one write-first transaction
+  that re-reads status and generation under the lock; otherwise concurrent
+  resumes or divergent control paths can reuse old authority;
+- a blocked action derived from an executing interruption remains
+  result-uncertain until reconciliation and cannot be cancelled as an ordinary
+  failed communication during resume;
 - sender-facing output may be sent only when it was generated and validated in
   the current online session, unless it is an exact owner-approved action whose
   approval record is the authority.

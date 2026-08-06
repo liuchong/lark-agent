@@ -136,6 +136,82 @@ func TestOwnerReconciliationNeverBlindlyReplaysUncertainAction(t *testing.T) {
 	}
 }
 
+func TestOwnerResumeStartsNewCommunicationGeneration(t *testing.T) {
+	store := openStore(t)
+	if _, err := store.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	item := enqueueOwnerControlTestItem(t, store, domain.NormalizedEvent{
+		MessageID: "om_owner_resume_generation",
+		Content:   "@测试负责人 修复后更新状态",
+	})
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := store.db.Exec(
+		`UPDATE work_items SET status = ?, updated_at = ? WHERE id = ?`,
+		domain.StatusDeadLetter, now, item.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	oldDecision := domain.Decision{
+		Kind:        domain.DecisionReply,
+		Relevance:   domain.RelevanceDirectMention,
+		ReplyText:   "上一代错误回复",
+		OwnerAction: "上一代错误通知",
+	}
+	replyID, _, _, completed, err := store.BeginReplyAction(
+		context.Background(), item.DedupKey, oldDecision.ReplyText,
+	)
+	if err != nil || completed {
+		t.Fatalf("reply id=%d completed=%v err=%v", replyID, completed, err)
+	}
+	if err := store.CompleteReplyAction(
+		context.Background(), replyID, "om_old_owner_reply", "",
+	); err != nil {
+		t.Fatal(err)
+	}
+	noticeID, _, completed, err := store.BeginPostReplyNotification(
+		context.Background(), item.DedupKey, oldDecision,
+	)
+	if err != nil || completed {
+		t.Fatalf("notice id=%d completed=%v err=%v", noticeID, completed, err)
+	}
+	if err := store.CompletePostReplyNotification(
+		context.Background(), noticeID, "",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := store.ExecuteOwnerMutation(
+		context.Background(),
+		"om_owner_resume_generation_command",
+		domain.OwnerControlCommand{
+			Name:       domain.OwnerControlTaskResume,
+			WorkItemID: item.ID,
+			Confirm:    true,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Changed != 1 {
+		t.Fatalf("result=%+v", result)
+	}
+	inspection, err := store.InspectWork(context.Background(), domain.WorkInspectionQuery{
+		WorkItemID: item.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.WorkItem == nil ||
+		inspection.WorkItem.Generation != 2 ||
+		inspection.WorkItem.Status != domain.StatusReceived {
+		t.Fatalf("inspection=%+v", inspection)
+	}
+	if _, _, _, found, err := store.ReadyPostReplyNotification(item.ID); err != nil || found {
+		t.Fatalf("stale post-reply notification found=%v err=%v", found, err)
+	}
+}
+
 func enqueueOwnerControlTestItem(
 	t *testing.T,
 	store *Store,

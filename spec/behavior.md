@@ -349,6 +349,12 @@ candidate, and re-runs current deterministic and semantic routing from the
 original target and current bounded context. Restored image descriptors are
 explicitly unreadable until fetched again; persisted metadata never claims that
 discarded bytes remain available.
+Completed sender replies, owner notifications, and staged investigation
+messages belong to the generation that created them. They remain immutable
+audit evidence, but an explicit resume must not treat them as completion of the
+new generation or reuse their idempotency identities. The new generation may
+send a newly classified result, while mutating resource/tool actions retain
+their independent idempotency fences.
 
 The delegated agent context includes bounded post-target discussion so its
 response reflects what happened during the grace period. The semantic result
@@ -1091,6 +1097,17 @@ The archived generation remains visible in `queue inspect`. An exact
 owner-approved action may cross a restart, but before it becomes claimable the
 runtime archives and removes any delegated context and cancels the redundant
 reply candidate; the approved action itself is the only sending authority.
+Given a completed reply and post-reply notification from an earlier generation,
+when the owner explicitly resumes the work, then neither completed action may
+short-circuit the new claim. The semantic resolver runs again, and any new
+sender reply, owner notification, or staged investigation message receives a
+generation-specific idempotency identity.
+The CLI `queue resume` path and the Owner-private `/task resume` path use the
+same generation transaction. Given an unresolved interruption whose external
+action result is uncertain, either path refuses resume until reconciliation.
+Given concurrent resume attempts for one terminal generation, exactly one
+advances the work to the next generation; the other observes the now-active
+state and cannot increment it again or clear its lease.
 Cancelling interrupted work cancels its candidate and marks its investigation
 blocked so no active contextual state remains.
 
