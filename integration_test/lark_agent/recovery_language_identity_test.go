@@ -98,6 +98,23 @@ func (fixedDelegatedDecision) Decide(
 	}, nil
 }
 
+type fixedResourceHandoffDecision struct{}
+
+func (fixedResourceHandoffDecision) Decide(
+	context.Context,
+	agentcontext.Bundle,
+) (domain.Decision, error) {
+	return domain.Decision{
+		Kind:       domain.DecisionReply,
+		Relevance:  domain.RelevanceDirectMention,
+		WorkKind:   domain.WorkKindResourceHandoff,
+		Confidence: 0.95,
+		Risk:       domain.RiskLow,
+		Language:   string(agentlocale.LanguageChinese),
+		ReplyText:  "当前缺少 Base 记录读取权限，无法更新状态。",
+	}, nil
+}
+
 type capturingReply struct {
 	decision domain.Decision
 	order    *[]string
@@ -266,6 +283,50 @@ func TestDelegatedReplyNotifiesNamedOwnerBeforeSenderFacingAssistantReply(t *tes
 	}
 	if strings.Contains(captured.decision.ReplyText, "用户") {
 		t.Fatalf("generic user identity leaked: %s", captured.decision.ReplyText)
+	}
+}
+
+func TestResourceHandoffReplyDoesNotClaimSkippedOwnerNotification(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	event := domain.NormalizedEvent{
+		MessageID: "om_resource_identity",
+		ChatID:    "oc_group",
+		SenderID:  "ou_teammate",
+		Content:   "@测试负责人 修复后改下状态",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner", Name: "测试负责人"}},
+	}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	captured := &capturingReply{order: &order}
+	daemon := app.NewDaemon(
+		store,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		app.WithContextBuilder(convergenceContextBuilder{}),
+		app.WithDecider(fixedResourceHandoffDecision{}),
+		app.WithDecisionPresenter(agentlocale.DelegatedPresenter{
+			OwnerOpenID: "ou_owner",
+			OwnerName:   "测试负责人",
+			Preferred:   agentlocale.LanguageChinese,
+			Fallback:    agentlocale.LanguageChinese,
+		}),
+		app.WithReplyHandler(captured),
+		app.WithNotificationHandler(orderedOwnerNotifier{order: &order}),
+	)
+	if _, err := daemon.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(order, ","), "sender_reply"; got != want {
+		t.Fatalf("delivery order=%q want %q", got, want)
+	}
+	if !strings.HasPrefix(captured.decision.ReplyText, "🤖 智能助手：") ||
+		strings.Contains(captured.decision.ReplyText, "通知测试负责人") {
+		t.Fatalf("sender reply=%q", captured.decision.ReplyText)
 	}
 }
 

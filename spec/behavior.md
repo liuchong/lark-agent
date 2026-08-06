@@ -2325,6 +2325,11 @@ The multi-step loop is accepted by these executable BDD scenarios:
   sender-facing reply is dispatched, then the audit store retains the complete
   key while Lark receives a stable, generation-distinct digest no longer than
   50 characters. The reply must not fail because the internal key is too long.
+- Given conversational `resource_handoff` work intentionally skips the
+  duplicate owner-notification action, when its sender-facing clarification is
+  rendered, then it identifies itself as the assistant but does not claim that
+  the owner was notified. Ordinary delegated replies that actually complete the
+  owner notice retain that disclosure.
 - Given delivery of that approval notice is retried, when the same durable
   approval action is observed again, then the stable notification idempotency
   key prevents a duplicate private message.

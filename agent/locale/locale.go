@@ -152,6 +152,20 @@ func RenderDelegatedReply(language Language, ownerName, content string) (string,
 	), nil
 }
 
+func renderDelegatedReplyWithoutOwnerNotice(language Language, content string) (string, error) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return "", errs.NewValidationError(
+			errs.SubtypeInvalidResponse,
+			"delegated reply content is required",
+		)
+	}
+	if language == LanguageEnglish {
+		return "🤖 Intelligent Assistant: " + content, nil
+	}
+	return "🤖 智能助手：" + content, nil
+}
+
 // DelegatedPresenter applies the deterministic delegated identity immediately
 // before the exact reply draft is persisted or sent.
 type DelegatedPresenter struct {
@@ -193,7 +207,20 @@ func (p DelegatedPresenter) Present(item domain.WorkItem, decision domain.Decisi
 			}
 		}
 	}
-	rendered, err := RenderDelegatedReply(language, ownerName, decision.ReplyText)
+	var rendered string
+	var err error
+	if decision.WorkKind == domain.WorkKindResourceHandoff {
+		rendered, err = renderDelegatedReplyWithoutOwnerNotice(
+			language,
+			decision.ReplyText,
+		)
+	} else {
+		rendered, err = RenderDelegatedReply(
+			language,
+			ownerName,
+			decision.ReplyText,
+		)
+	}
 	if err != nil {
 		return domain.Decision{}, err
 	}

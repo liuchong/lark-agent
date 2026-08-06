@@ -42,4 +42,6 @@
 - A validated conversational resource-handoff reply must be persisted as the
   current-generation candidate before the sender-facing send. It creates no
   separate owner notice. A known send failure retries that candidate after
-  current routing and semantic checks without rerunning the answer model.
+  current routing and semantic checks without rerunning the answer model. Its
+  deterministic sender-facing wrapper must therefore identify the assistant
+  without claiming that the owner was notified.

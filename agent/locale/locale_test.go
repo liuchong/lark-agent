@@ -3,6 +3,8 @@ package locale
 import (
 	"strings"
 	"testing"
+
+	"github.com/liuchong/lark-agent/agent/domain"
 )
 
 func TestResolveLanguageHonorsConfiguredPreference(t *testing.T) {
@@ -58,6 +60,36 @@ func TestRenderDelegatedReplyNamesAssistantAndOwner(t *testing.T) {
 func TestRenderDelegatedReplyRequiresOwnerName(t *testing.T) {
 	if _, err := RenderDelegatedReply(LanguageChinese, "", "已检查当前公开代码。"); err == nil {
 		t.Fatal("missing owner name must fail")
+	}
+}
+
+func TestDelegatedPresenterDoesNotClaimOwnerNoticeForResourceHandoff(t *testing.T) {
+	presenter := DelegatedPresenter{
+		OwnerOpenID: "ou_owner",
+		OwnerName:   "测试负责人",
+		Preferred:   LanguageChinese,
+		Fallback:    LanguageChinese,
+	}
+	decision, err := presenter.Present(
+		domain.NewWorkItem(domain.NormalizedEvent{
+			SenderID: "ou_teammate",
+			Content:  "@测试负责人 修复后改下状态",
+			Mentions: []domain.Mention{{OpenID: "ou_owner", Name: "测试负责人"}},
+		}),
+		domain.Decision{
+			Kind:      domain.DecisionReply,
+			Relevance: domain.RelevanceDirectMention,
+			WorkKind:  domain.WorkKindResourceHandoff,
+			ReplyText: "当前缺少 Base 记录读取权限。",
+			Language:  string(LanguageChinese),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(decision.ReplyText, "🤖 智能助手：") ||
+		strings.Contains(decision.ReplyText, "通知测试负责人") {
+		t.Fatalf("reply=%q", decision.ReplyText)
 	}
 }
 
