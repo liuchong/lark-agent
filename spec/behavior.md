@@ -287,7 +287,13 @@ same-chat window containing a short pre-target conversation-direction window,
 the target, related pending targets, intervening discussion, and owner-authored
 messages after the target. It evaluates each target independently. Reply/thread
 relations, adjacency, and the mere presence of a later owner message are
-evidence but do not prove that the owner answered the target. For an ordinary
+evidence but do not prove that the owner answered the target. In a group, a
+newer unthreaded direct owner mention from another sender starts a new
+conversation segment. Owner messages in that newer segment cannot satisfy the
+older target unless they are structurally linked back to the older target. The
+semantic resolver and delegated Agent omit that unrelated later segment from
+the older target's shared context so its subject cannot be replaced by the
+newer request. For an ordinary
 private message that does not explicitly mention
 the owner, the resolver also decides whether the target reasonably calls for a
 response at all. A high-confidence semantic answer cancels only the matched
@@ -1850,6 +1856,12 @@ The multi-step loop is accepted by these executable BDD scenarios:
   mentions the owner with substantive declarative feedback, when semantic
   resolution runs, then the older owner message does not count as handling the
   newer target and the target remains unanswered.
+- Given an unanswered group handoff asks the owner to fix a linked issue and
+  update its status, then another sender starts a newer unthreaded `@Owner`
+  request and the owner answers that newer request, when the older handoff is
+  resolved, then the newer segment cannot count as an answer or redefine the
+  linked issue. The older target remains a resource handoff, and its semantic
+  and Agent context exclude the newer request and its owner reply.
 - Given the messages before a delegated target discuss a production
   sample-event failure, a nearby image contains `1408 SampleEventDisabled`, the
   target says the sender's computer disconnected, and later messages clarify

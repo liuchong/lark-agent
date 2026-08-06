@@ -118,6 +118,7 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (Resolution, error)
 			"semantic owner-reply model is not configured",
 		)
 	}
+	req = scopeTargetRequest(req, r.ownerOpenID)
 	prompt, err := resolutionPrompt(req, r.ownerOpenID)
 	if err != nil {
 		return Resolution{}, err
@@ -151,6 +152,10 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (Resolution, error)
 	if err := validateResolution(req, r.ownerOpenID, resolution); err != nil {
 		return Resolution{}, err
 	}
+	resolution.ContextMessages = append(
+		[]domain.NormalizedEvent(nil),
+		req.Messages...,
+	)
 	return resolution, nil
 }
 
@@ -168,6 +173,7 @@ func resolutionPrompt(req Request, ownerOpenID string) (string, error) {
 			"Classify only the exact target_message_id.",
 			"A later owner message counts only when its meaning substantively answers the target.",
 			"Adjacency, a quote, or unrelated owner discussion is not sufficient by itself.",
+			"A newer unthreaded direct owner mention from another group sender starts a new conversation segment; owner messages in that later segment cannot answer the older target.",
 			"Use answered when later owner content substantively handles the target.",
 			"Use no_reply_needed only for an ordinary private message without an explicit owner mention when it is an answer to an owner-initiated question, an acknowledgement, reaction, or conversational continuation that adds no new question, request, invitation, or coordination need.",
 			"Use unanswered only when the target itself contains a new question, request, invitation, or coordination need and the owner has not handled it.",
@@ -199,6 +205,141 @@ func resolutionPrompt(req Request, ownerOpenID string) (string, error) {
 		"Use coding for source, configuration, deployment, API, or error-code investigation even when the target's final sentence is ambiguous. " +
 		"requires_progress is true only when durable investigation is needed.\n" +
 		string(data), nil
+}
+
+func scopeTargetRequest(req Request, ownerOpenID string) Request {
+	boundary, found := firstNewerGroupOwnerSegment(
+		req.Target.Event,
+		req.Messages,
+		ownerOpenID,
+	)
+	if !found {
+		req.Messages = sameChatMessages(req.Target.Event.ChatID, req.Messages)
+		return req
+	}
+	req.Messages = messagesBeforeTargetBoundary(
+		req.Target.Event,
+		req.Messages,
+		boundary,
+	)
+	scopedPending := make([]domain.WorkItem, 0, len(req.Pending))
+	for _, item := range req.Pending {
+		if messageInsideTargetBoundary(req.Target.Event, item.Event, boundary) {
+			scopedPending = append(scopedPending, item)
+		}
+	}
+	req.Pending = scopedPending
+	return req
+}
+
+func firstNewerGroupOwnerSegment(
+	target domain.NormalizedEvent,
+	messages []domain.NormalizedEvent,
+	ownerOpenID string,
+) (time.Time, bool) {
+	if !isGroupChatType(target.ChatType) {
+		return time.Time{}, false
+	}
+	var boundary time.Time
+	for _, message := range messages {
+		if message.ChatID != target.ChatID ||
+			message.MessageID == target.MessageID ||
+			message.SenderID == "" ||
+			message.SenderID == ownerOpenID ||
+			message.SenderID == target.SenderID ||
+			message.CreatedAt.IsZero() ||
+			!message.CreatedAt.After(target.CreatedAt) ||
+			!message.MentionsUser(ownerOpenID) ||
+			message.RootMessageID != "" ||
+			message.ReplyToMessageID != "" ||
+			message.ThreadID != "" ||
+			sameConversationThread(target, message) {
+			continue
+		}
+		if boundary.IsZero() || message.CreatedAt.Before(boundary) {
+			boundary = message.CreatedAt
+		}
+	}
+	return boundary, !boundary.IsZero()
+}
+
+func isGroupChatType(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "group", "topic", "topic_group":
+		return true
+	default:
+		return false
+	}
+}
+
+func sameChatMessages(
+	chatID string,
+	messages []domain.NormalizedEvent,
+) []domain.NormalizedEvent {
+	scoped := make([]domain.NormalizedEvent, 0, len(messages))
+	for _, message := range messages {
+		if message.ChatID == chatID {
+			scoped = append(scoped, message)
+		}
+	}
+	return scoped
+}
+
+func messagesBeforeTargetBoundary(
+	target domain.NormalizedEvent,
+	messages []domain.NormalizedEvent,
+	boundary time.Time,
+) []domain.NormalizedEvent {
+	scoped := make([]domain.NormalizedEvent, 0, len(messages))
+	for _, message := range messages {
+		if messageInsideTargetBoundary(target, message, boundary) {
+			scoped = append(scoped, message)
+		}
+	}
+	return scoped
+}
+
+func messageInsideTargetBoundary(
+	target domain.NormalizedEvent,
+	message domain.NormalizedEvent,
+	boundary time.Time,
+) bool {
+	if message.ChatID != target.ChatID {
+		return false
+	}
+	if message.MessageID == target.MessageID ||
+		message.CreatedAt.IsZero() ||
+		message.CreatedAt.Before(boundary) {
+		return true
+	}
+	return sameConversationThread(target, message)
+}
+
+func sameConversationThread(
+	target domain.NormalizedEvent,
+	message domain.NormalizedEvent,
+) bool {
+	if target.MessageID == "" || message.MessageID == "" {
+		return false
+	}
+	if target.MessageID == message.MessageID ||
+		message.ReplyToMessageID == target.MessageID ||
+		message.RootMessageID == target.MessageID {
+		return true
+	}
+	if target.ThreadID != "" && target.ThreadID == message.ThreadID {
+		return true
+	}
+	targetRoot := strings.TrimSpace(target.RootMessageID)
+	if targetRoot == "" {
+		targetRoot = strings.TrimSpace(target.ReplyToMessageID)
+	}
+	if targetRoot == "" {
+		return false
+	}
+	return message.MessageID == targetRoot ||
+		message.RootMessageID == targetRoot ||
+		message.ReplyToMessageID == targetRoot
 }
 
 func boundedEvent(event domain.NormalizedEvent) domain.NormalizedEvent {

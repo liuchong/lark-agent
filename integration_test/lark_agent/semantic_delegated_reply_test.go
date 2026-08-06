@@ -833,6 +833,101 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 		}
 	})
 
+	t.Run("newer owner mention segment cannot answer or redefine older handoff", func(t *testing.T) {
+		store := openSemanticIntegrationStore(t)
+		base := store.CurrentSession().StartedAt.Add(time.Second)
+		link := domain.NormalizedEvent{
+			MessageID: "om_old_record", ChatID: "oc_any_group", ChatType: "group",
+			SenderID:  "ou_requester",
+			Content:   "https://example.larksuite.com/record/shrExampleRecordToken001",
+			CreatedAt: base,
+		}
+		item := enqueueDueDelegatedItem(t, store, domain.NormalizedEvent{
+			Source:           domain.SourcePoll,
+			EventID:          "poll:om_old_fix_status",
+			MessageID:        "om_old_fix_status",
+			ChatID:           "oc_any_group",
+			ChatType:         "group",
+			RootMessageID:    link.MessageID,
+			ReplyToMessageID: link.MessageID,
+			SenderID:         "ou_requester",
+			Content:          "@测试负责人 这个问题修复后改下状态哈",
+			Mentions:         []domain.Mention{{OpenID: "ou_owner"}},
+			CreatedAt:        base.Add(32 * time.Second),
+		})
+		newerRequest := domain.NormalizedEvent{
+			MessageID: "om_new_avatar_request", ChatID: "oc_any_group",
+			ChatType: "group", SenderID: "ou_other",
+			Content:   "另一个无关示例需求尚未完成 @测试负责人",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+			CreatedAt: base.Add(8*time.Hour + 25*time.Minute),
+		}
+		newerAnswer := domain.NormalizedEvent{
+			MessageID: "om_new_avatar_answer", ChatID: "oc_any_group",
+			ChatType: "group", SenderID: "ou_owner",
+			Content:   "做了，我刚把代码合了，等会儿部署完了我跟你说",
+			CreatedAt: base.Add(9*time.Hour + 2*time.Minute),
+		}
+		semanticModel := &semanticIntegrationModel{response: `{
+			"target_message_id":"om_old_fix_status",
+			"result":"unanswered",
+			"confidence":0.96,
+			"reason":"the owner has not handled the linked issue status handoff",
+			"target_intent":"handoff_status_request",
+			"response_obligation_quote":"这个问题修复后改下状态哈",
+			"task_summary":"locate the linked issue, verify its fix, and update its workflow status",
+			"task_class":"resource_handoff",
+			"classification_confidence":0.96,
+			"requires_progress":true
+		}`}
+		builder := &semanticIntegrationBuilder{}
+		decider := &semanticIntegrationDecider{}
+		replier := &semanticIntegrationReplyHandler{}
+		daemon := app.NewDaemon(
+			store,
+			router.New(router.Config{
+				OwnerOpenID: "ou_owner",
+				Mode:        domain.ModeAuto,
+				ReplyScope:  domain.ReplyScopeAllGroups,
+			}),
+			app.WithContextBuilder(builder),
+			app.WithDecider(decider),
+			app.WithReplyHandler(replier),
+			app.WithDelegatedReplyResolver(semanticIntegrationResolver{
+				store:   store,
+				matcher: replymatch.New(semanticModel, "ou_owner"),
+				messages: []domain.NormalizedEvent{
+					link, item.Event, newerRequest, newerAnswer,
+				},
+			}, 0.85, 30*time.Second),
+		)
+
+		result, err := daemon.RunOnce(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if builder.calls != 1 ||
+			builder.item.WorkKind != domain.WorkKindResourceHandoff ||
+			builder.item.TaskClass != domain.TaskClassResourceHandoff ||
+			len(builder.item.ResolvedContext) != 2 ||
+			decider.calls != 1 || replier.calls != 1 {
+			t.Fatalf(
+				"result=%+v builder=%d item=%+v decider=%d replier=%d",
+				result,
+				builder.calls,
+				builder.item,
+				decider.calls,
+				replier.calls,
+			)
+		}
+		for _, message := range builder.item.ResolvedContext {
+			if message.MessageID == newerRequest.MessageID ||
+				message.MessageID == newerAnswer.MessageID {
+				t.Fatalf("unrelated later segment leaked into Agent context: %+v", message)
+			}
+		}
+	})
+
 	t.Run("malformed semantic result fails closed and retries later", func(t *testing.T) {
 		store := openSemanticIntegrationStore(t)
 		base := store.CurrentSession().StartedAt.Add(time.Second)

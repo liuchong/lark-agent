@@ -73,6 +73,156 @@ func TestResolverMatchesOnlyTheAnsweredPendingTarget(t *testing.T) {
 	}
 }
 
+func TestResolverScopesOutOwnerReplyAfterNewerOtherSenderMention(t *testing.T) {
+	base := time.Date(2026, 8, 6, 3, 59, 9, 0, time.UTC)
+	link := domain.NormalizedEvent{
+		MessageID: "om_record_link", ChatID: "oc_group", ChatType: "topic_group",
+		SenderID: "ou_requester", Content: "https://example.test/record/bug",
+		CreatedAt: base,
+	}
+	target := domain.NormalizedEvent{
+		MessageID: "om_fix_status", ChatID: "oc_group", ChatType: "topic_group",
+		RootMessageID: link.MessageID, ReplyToMessageID: link.MessageID,
+		SenderID: "ou_requester", Content: "@测试负责人 这个问题修复后改下状态哈",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		CreatedAt: base.Add(32 * time.Second),
+	}
+	newerRequest := domain.NormalizedEvent{
+		MessageID: "om_newer_request", ChatID: "oc_group", ChatType: "topic_group",
+		SenderID: "ou_other", Content: "另一个无关示例需求尚未完成 @测试负责人",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		CreatedAt: base.Add(8*time.Hour + 25*time.Minute),
+	}
+	newerAnswer := domain.NormalizedEvent{
+		MessageID: "om_newer_answer", ChatID: "oc_group", ChatType: "topic_group",
+		SenderID:  "ou_owner",
+		Content:   "做了，我刚把代码合了，等会儿部署完了我跟你说",
+		CreatedAt: base.Add(9*time.Hour + 2*time.Minute),
+	}
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_fix_status",
+		"result":"unanswered",
+		"confidence":0.96,
+		"reason":"the owner has not handled the linked issue status handoff",
+		"target_intent":"handoff_status_request",
+		"response_obligation_quote":"这个问题修复后改下状态哈",
+		"task_summary":"locate the linked issue and update its status after verifying the fix",
+		"task_class":"resource_handoff",
+		"classification_confidence":0.96,
+		"requires_progress":true
+	}`}
+
+	resolution, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(target),
+		Messages: []domain.NormalizedEvent{
+			link, target, newerRequest, newerAnswer,
+		},
+		ContextCutoff: base.Add(10 * time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Result != ResultUnanswered ||
+		resolution.TaskClass != domain.TaskClassResourceHandoff ||
+		len(resolution.ContextMessages) != 2 {
+		t.Fatalf("resolution=%+v", resolution)
+	}
+	if len(model.inputs) != 1 {
+		t.Fatalf("model calls=%d", len(model.inputs))
+	}
+	prompt := model.inputs[0][1].Content
+	if !strings.Contains(prompt, link.MessageID) ||
+		!strings.Contains(prompt, target.MessageID) ||
+		strings.Contains(prompt, newerRequest.MessageID) ||
+		strings.Contains(prompt, newerAnswer.MessageID) ||
+		strings.Contains(prompt, "无关示例需求") {
+		t.Fatalf("prompt retained unrelated later segment: %s", prompt)
+	}
+}
+
+func TestResolverRejectsOwnerAnswerFromNewerOtherSenderSegment(t *testing.T) {
+	base := time.Date(2026, 8, 6, 3, 59, 41, 0, time.UTC)
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_fix_status",
+		"result":"answered",
+		"matched_owner_message_ids":["om_newer_answer"],
+		"confidence":0.92,
+		"reason":"the owner said the code was merged"
+	}`}
+	_, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_fix_status", ChatID: "oc_group", ChatType: "group",
+			SenderID: "ou_requester", Content: "@测试负责人 这个问题修复后改下状态哈",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+			CreatedAt: base,
+		}),
+		Messages: []domain.NormalizedEvent{
+			{
+				MessageID: "om_newer_request", ChatID: "oc_group", ChatType: "group",
+				SenderID: "ou_other", Content: "另一个无关示例需求尚未完成 @测试负责人",
+				Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+				CreatedAt: base.Add(8 * time.Hour),
+			},
+			{
+				MessageID: "om_newer_answer", ChatID: "oc_group", ChatType: "group",
+				SenderID: "ou_owner", Content: "做了，我刚把代码合了",
+				CreatedAt: base.Add(9 * time.Hour),
+			},
+		},
+		ContextCutoff: base.Add(10 * time.Hour),
+	})
+	if err == nil {
+		t.Fatal("owner reply from a newer unrelated owner-mention segment was accepted")
+	}
+}
+
+func TestResolverDoesNotTreatAnotherThreadMentionAsMainChatBoundary(t *testing.T) {
+	base := time.Date(2026, 8, 6, 3, 59, 41, 0, time.UTC)
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_target",
+		"result":"answered",
+		"matched_owner_message_ids":["om_owner_answer"],
+		"confidence":0.96,
+		"reason":"the owner explicitly confirmed the target release date"
+	}`}
+	resolution, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_target", ChatID: "oc_group", ChatType: "group",
+			SenderID: "ou_requester", Content: "@测试负责人 发布日期是哪天？",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+			CreatedAt: base,
+		}),
+		Messages: []domain.NormalizedEvent{
+			{
+				MessageID: "om_target", ChatID: "oc_group", ChatType: "group",
+				SenderID: "ou_requester", Content: "@测试负责人 发布日期是哪天？",
+				Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+				CreatedAt: base,
+			},
+			{
+				MessageID: "om_other_thread", ChatID: "oc_group", ChatType: "group",
+				ThreadID: "omt_other", SenderID: "ou_other",
+				Content:   "@测试负责人 看下另一个线程",
+				Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+				CreatedAt: base.Add(time.Minute),
+			},
+			{
+				MessageID: "om_owner_answer", ChatID: "oc_group", ChatType: "group",
+				SenderID: "ou_owner", Content: "原问题的发布日期是 8 月 8 日。",
+				CreatedAt: base.Add(2 * time.Minute),
+			},
+		},
+		ContextCutoff: base.Add(3 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolution.Result != ResultAnswered ||
+		len(resolution.ContextMessages) != 3 {
+		t.Fatalf("resolution=%+v", resolution)
+	}
+}
+
 func TestResolverRejectsInventedOrNonOwnerMatchedMessageID(t *testing.T) {
 	base := time.Date(2026, 7, 29, 1, 0, 0, 0, time.UTC)
 	for _, matchedID := range []string{"om_invented", "om_other_human"} {

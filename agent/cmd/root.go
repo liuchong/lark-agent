@@ -2598,6 +2598,9 @@ func (r liveDelegatedReplyResolver) Resolve(
 	}
 	target := item
 	if event, ok := latest[item.Event.MessageID]; ok {
+		if strings.TrimSpace(event.ChatType) == "" {
+			event.ChatType = item.Event.ChatType
+		}
 		target.Event = event
 	}
 	for index := range pending {
@@ -2655,11 +2658,15 @@ func (r liveDelegatedReplyResolver) Resolve(
 	if resolution.ContextCutoff.IsZero() {
 		resolution.ContextCutoff = larkContext.ContextCutoff
 	}
+	resolvedMessages := resolution.ContextMessages
+	if len(resolvedMessages) == 0 {
+		resolvedMessages = messages
+	}
 	resolution.ContextMessages = append(
 		[]domain.NormalizedEvent(nil),
-		messages...,
+		resolvedMessages...,
 	)
-	contextJSON, digestErr := json.Marshal(messages)
+	contextJSON, digestErr := json.Marshal(resolvedMessages)
 	if digestErr != nil {
 		return replymatch.Resolution{}, errs.NewInternalError(
 			errs.SubtypeUnknown,

@@ -341,7 +341,8 @@ func (m *fakeSemanticMatcher) Resolve(
 func TestLiveDelegatedReplyResolverUsesLatestLarkContextAndAllPendingTargets(t *testing.T) {
 	base := time.Date(2026, 7, 29, 4, 0, 0, 0, time.UTC)
 	target := domain.NewWorkItem(domain.NormalizedEvent{
-		MessageID: "om_target", ChatID: "oc_group", Content: "旧内容", CreatedAt: base,
+		MessageID: "om_target", ChatID: "oc_group", ChatType: "group",
+		Content: "旧内容", CreatedAt: base,
 	})
 	target.ID = 7
 	other := domain.NewWorkItem(domain.NormalizedEvent{
@@ -354,6 +355,10 @@ func TestLiveDelegatedReplyResolverUsesLatestLarkContextAndAllPendingTargets(t *
 		Result:          replymatch.ResultUnanswered,
 		Confidence:      0.96,
 		Reason:          "owner discussion did not answer the exact target",
+		ContextMessages: []domain.NormalizedEvent{{
+			MessageID: "om_target", ChatID: "oc_group", Content: "编辑后的内容",
+			CreatedAt: base,
+		}},
 	}}
 	cutoff := base.Add(3 * time.Minute)
 	resolver := liveDelegatedReplyResolver{
@@ -381,7 +386,11 @@ func TestLiveDelegatedReplyResolverUsesLatestLarkContextAndAllPendingTargets(t *
 	if result.Result != replymatch.ResultUnanswered || matcher.calls != 1 ||
 		len(matcher.request.Pending) != 2 ||
 		matcher.request.Target.Event.Content != "编辑后的内容" ||
+		matcher.request.Target.Event.ChatType != "group" ||
+		len(result.ContextMessages) != 1 ||
+		result.ContextMessages[0].MessageID != "om_target" ||
 		len(store.recorded) != 1 ||
+		len(store.recorded[0].ContextMessages) != 1 ||
 		!store.recorded[0].ContextCutoff.Equal(cutoff) {
 		t.Fatalf(
 			"result=%+v matcher=%+v request=%+v recorded=%+v",

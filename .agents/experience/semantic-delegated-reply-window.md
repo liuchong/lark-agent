@@ -12,6 +12,11 @@ Reusable verified rules:
   malformed model output, and low confidence fail closed.
 - Validate every matched message ID against supplied same-chat,
   owner-authored, post-target messages. The semantic matcher has no tools.
+- In a group, an unthreaded direct owner mention from another sender starts a
+  newer conversation segment. Exclude that boundary and its later unlinked
+  messages from both semantic classification and the delegated Agent context;
+  otherwise a valid owner reply to the newer request can suppress or redefine
+  an older unrelated target.
 - Re-read before the external reply action. Lark has no compare-and-send
   primitive, so the final semantic read is the last enforceable boundary.
 - Once that semantic gate classifies an exact target as unanswered and admits
