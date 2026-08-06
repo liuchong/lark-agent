@@ -32,6 +32,11 @@ type Store interface {
 	RecordWorkIntake(context.Context, domain.WorkItem) (domain.IntakeReceipt, error)
 }
 
+type conversationalEvidenceStore interface {
+	GetWorkItemByDedupKey(context.Context, string) (domain.WorkItem, error)
+	LinkResourceEvidenceToWork(context.Context, string, int64) error
+}
+
 type Config struct {
 	OwnerOpenID        string
 	StatusFieldNames   []string
@@ -86,6 +91,83 @@ func NewMonitor(client Client, store Store, cfg Config) *Monitor {
 		client: client, store: store, ownerOpenID: strings.TrimSpace(cfg.OwnerOpenID),
 		statusFieldNames: statusNames, assigneeFieldNames: assigneeNames, now: now,
 	}
+}
+
+// ResolveResourceEvidence turns an exact record URL from the bounded
+// conversation into durable evidence linked to the existing handoff.
+func (m *Monitor) ResolveResourceEvidence(
+	ctx context.Context,
+	dedupKey string,
+	rawURL string,
+) (domain.ResourceEvidence, error) {
+	if m == nil || m.client == nil || m.store == nil {
+		return domain.ResourceEvidence{}, errs.NewConfigError(
+			errs.SubtypeNotConfigured,
+			"resource monitor is not configured",
+		)
+	}
+	conversationStore, ok := m.store.(conversationalEvidenceStore)
+	if !ok {
+		return domain.ResourceEvidence{}, errs.NewConfigError(
+			errs.SubtypeNotConfigured,
+			"resource evidence linking is not configured",
+		)
+	}
+	item, err := conversationStore.GetWorkItemByDedupKey(ctx, dedupKey)
+	if err != nil {
+		return domain.ResourceEvidence{}, err
+	}
+	if item.WorkKind != domain.WorkKindResourceHandoff ||
+		item.Event.SenderType != "user" ||
+		strings.TrimSpace(item.Event.ChatID) == "" {
+		return domain.ResourceEvidence{}, errs.NewPermissionError(
+			errs.SubtypeMissingScope,
+			"only an admitted human conversational resource handoff can resolve a shared record",
+		)
+	}
+	ref, err := servicelark.ParseResourceURL(strings.TrimSpace(rawURL))
+	if err != nil {
+		return domain.ResourceEvidence{}, err
+	}
+	resolved, err := m.client.ResolveResource(ctx, ref)
+	if err != nil {
+		return domain.ResourceEvidence{}, err
+	}
+	if resolved.ResourceType != servicelark.ResourceTypeBase ||
+		strings.TrimSpace(resolved.AppToken) == "" ||
+		strings.TrimSpace(resolved.TableID) == "" ||
+		strings.TrimSpace(resolved.RecordID) == "" {
+		return domain.ResourceEvidence{}, errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"conversational resource URL must resolve to one exact Base record",
+		)
+	}
+	evidence, err := m.evidenceFromResolvedResource(
+		ctx,
+		resolved,
+		domain.ResourceEvidenceConversation,
+	)
+	if err != nil {
+		return domain.ResourceEvidence{}, err
+	}
+	evidence.SourceID = item.Event.MessageID
+	evidence.DedupKey = "conversation:" + item.Event.MessageID + ":" + resourceIdentity(resolved)
+	evidence.OriginalURL = strings.TrimSpace(rawURL)
+	evidence.ObservedAt = m.now().UTC()
+	if evidence.IssueKey == "" {
+		evidence.IssueKey = issueKey(item.Event.Content)
+	}
+	evidence.OwnerMentioned = item.Event.ChatType == "p2p" ||
+		item.Event.MentionsUser(m.ownerOpenID)
+	evidence.ContentDigest = digestEvidence(evidence)
+	stored, _, err := m.store.RecordResourceEvidence(ctx, evidence)
+	if err != nil {
+		return domain.ResourceEvidence{}, err
+	}
+	if err := conversationStore.LinkResourceEvidenceToWork(ctx, dedupKey, stored.ID); err != nil {
+		return domain.ResourceEvidence{}, err
+	}
+	return stored, nil
 }
 
 func (m *Monitor) IngestResourceNotification(

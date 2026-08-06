@@ -120,6 +120,29 @@ func TestResourceToolsAreVisibleOnlyForResourceHandoffs(t *testing.T) {
 	}
 }
 
+func TestResourceEvidenceRejectsURLOutsideBoundedConversation(t *testing.T) {
+	store := authorizedResourceToolStore()
+	registry, err := NewRegistry(ResourceDefinitions(ResourceToolOptions{
+		Mode: domain.ModeAuto, Evidence: store,
+	})...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithWorkItemDedup(context.Background(), "work:resource")
+	ctx = WithInvocationScope(ctx, InvocationScope{
+		ReadOnly:     true,
+		WorkKind:     domain.WorkKindResourceHandoff,
+		ResourceURLs: []string{"https://example.larksuite.com/base/allowed"},
+	})
+	if _, err := registry.Execute(
+		ctx,
+		"get_resource_evidence",
+		json.RawMessage(`{"resource_url":"https://example.larksuite.com/base/other"}`),
+	); err == nil || !strings.Contains(err.Error(), "bounded conversation") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestResourceStatusUpdateRequestsApprovalBeforeWriting(t *testing.T) {
 	store := authorizedResourceToolStore()
 	client := &fakeResourceMutationClient{}

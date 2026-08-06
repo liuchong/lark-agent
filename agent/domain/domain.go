@@ -218,6 +218,7 @@ const (
 	ResourceEvidenceCommentEvent ResourceEvidenceSource = "comment_event"
 	ResourceEvidenceRecordEvent  ResourceEvidenceSource = "record_event"
 	ResourceEvidenceReconcile    ResourceEvidenceSource = "reconcile"
+	ResourceEvidenceConversation ResourceEvidenceSource = "conversation"
 )
 
 // ResourceEvidence is the privacy-bounded durable projection of a trusted

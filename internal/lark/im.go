@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1480,6 +1481,10 @@ func parseMessage(raw any) Message {
 	return msg
 }
 
+var resourceURLPattern = regexp.MustCompile(
+	`https?://[A-Za-z0-9.-]+(?::[0-9]+)?/(?:wiki|base|record|doc|docs|docx|sheet|sheets)/[A-Za-z0-9_-]+(?:\?[A-Za-z0-9._~%!$&'()*+,;=:@/?#-]*)?`,
+)
+
 func resourceURLsFromContent(raw any) []string {
 	value := raw
 	if encoded, ok := raw.(string); ok {
@@ -1501,8 +1506,7 @@ func resourceURLsFromContent(raw any) []string {
 				walk(child)
 			}
 		case string:
-			for _, candidate := range strings.Fields(typed) {
-				candidate = strings.Trim(candidate, `"'()[]{}<>,，。；;`)
+			for _, candidate := range resourceURLPattern.FindAllString(typed, -1) {
 				parsed, err := url.Parse(candidate)
 				if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 					continue

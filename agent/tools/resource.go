@@ -17,6 +17,10 @@ type ResourceEvidenceStore interface {
 	FindResourceEvidence(context.Context, domain.ResourceEvidenceQuery) ([]domain.ResourceEvidence, error)
 }
 
+type ResourceEvidenceResolver interface {
+	ResolveResourceEvidence(context.Context, string, string) (domain.ResourceEvidence, error)
+}
+
 type ResourceActionStore interface {
 	RequestResourceAction(context.Context, string, string, string) (int64, error)
 	ConsumeResourceAction(context.Context, string, string, string) (int64, bool, error)
@@ -48,6 +52,7 @@ type ResourceFieldUpdate struct {
 type ResourceToolOptions struct {
 	Mode     domain.Mode
 	Evidence ResourceEvidenceStore
+	Resolver ResourceEvidenceResolver
 	Actions  ResourceActionStore
 	Client   ResourceMutationClient
 }
@@ -70,7 +75,7 @@ type resourceCommentReplyArgs struct {
 
 func ResourceDefinitions(options ResourceToolOptions) []Definition {
 	return []Definition{
-		resourceEvidenceDefinition(options.Evidence),
+		resourceEvidenceDefinition(options),
 		inspectBaseSchemaDefinition(options.Client),
 		updateBaseStatusDefinition(options),
 		replyResourceCommentDefinition(options),
@@ -106,25 +111,28 @@ func inspectBaseSchemaDefinition(client ResourceMutationClient) Definition {
 	}
 }
 
-func resourceEvidenceDefinition(store ResourceEvidenceStore) Definition {
+func resourceEvidenceDefinition(options ResourceToolOptions) Definition {
 	return Definition{
 		ResourceHandoffOnly: true,
 		NonOwnerReadOnly:    true,
 		Info: toolInfo(
 			"get_resource_evidence",
-			"Read the trusted resource evidence linked to this handoff and optionally find related document/Base evidence by issue key or title terms.",
+			"Read trusted evidence linked to this handoff. For a conversational record share with no linked evidence, pass the exact resource_url from the bounded conversation to resolve, persist, and link the current record through the typed Lark API.",
 			map[string]*schema.ParameterInfo{
-				"terms": {Type: schema.Array, ElemInfo: &schema.ParameterInfo{Type: schema.String}},
-				"limit": {Type: schema.Integer},
+				"resource_url": {Type: schema.String},
+				"terms":        {Type: schema.Array, ElemInfo: &schema.ParameterInfo{Type: schema.String}},
+				"limit":        {Type: schema.Integer},
 			},
 		),
 		Execute: func(ctx context.Context, raw json.RawMessage) (Execution, error) {
+			store := options.Evidence
 			if store == nil {
 				return Execution{}, errs.NewConfigError(errs.SubtypeNotConfigured, "resource evidence store is not configured")
 			}
 			var args struct {
-				Terms []string `json:"terms"`
-				Limit int      `json:"limit"`
+				ResourceURL string   `json:"resource_url"`
+				Terms       []string `json:"terms"`
+				Limit       int      `json:"limit"`
 			}
 			if err := decodeArgs(raw, &args); err != nil {
 				return Execution{}, err
@@ -135,10 +143,44 @@ func resourceEvidenceDefinition(store ResourceEvidenceStore) Definition {
 			}
 			current, err := store.GetResourceEvidenceForWork(ctx, dedupKey)
 			hasCurrent := err == nil
+			resourceURL := strings.TrimSpace(args.ResourceURL)
+			if resourceURL != "" {
+				scope, ok := invocationScope(ctx)
+				if !ok || !containsExactResourceURL(scope.ResourceURLs, resourceURL) {
+					return Execution{}, errs.NewPermissionError(
+						errs.SubtypeMissingScope,
+						"resource_url is not present in the bounded conversation",
+					)
+				}
+				if hasCurrent {
+					if strings.TrimSpace(current.OriginalURL) != resourceURL {
+						return Execution{}, errs.NewValidationError(
+							errs.SubtypeFailedPrecondition,
+							"work item already has different authoritative resource evidence",
+						)
+					}
+				} else {
+					if options.Resolver == nil {
+						return Execution{}, errs.NewConfigError(
+							errs.SubtypeNotConfigured,
+							"conversational resource resolver is not configured",
+						)
+					}
+					current, err = options.Resolver.ResolveResourceEvidence(
+						ctx,
+						dedupKey,
+						resourceURL,
+					)
+					if err != nil {
+						return Execution{}, err
+					}
+					hasCurrent = true
+				}
+			}
 			if !hasCurrent && len(args.Terms) == 0 {
 				return Execution{}, errs.NewValidationError(
 					errs.SubtypeFailedPrecondition,
-					"this conversational resource handoff has no directly linked evidence; provide exact issue title or key terms to search related evidence",
+					"this conversational resource handoff has no directly linked evidence; pass an exact resource_url from the bounded conversation or provide exact issue title or key terms",
 				)
 			}
 			var related []domain.ResourceEvidence
@@ -160,6 +202,15 @@ func resourceEvidenceDefinition(store ResourceEvidenceStore) Definition {
 			return jsonExecution(report, sources, nil)
 		},
 	}
+}
+
+func containsExactResourceURL(allowed []string, target string) bool {
+	for _, candidate := range allowed {
+		if strings.TrimSpace(candidate) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func updateBaseStatusDefinition(options ResourceToolOptions) Definition {

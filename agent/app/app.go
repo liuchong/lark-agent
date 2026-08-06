@@ -471,7 +471,9 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 		}
 	}
 	var decision domain.Decision
-	if item.WorkKind == domain.WorkKindResourceHandoff {
+	trustedResourceEvent := item.WorkKind == domain.WorkKindResourceHandoff &&
+		(item.Event.SenderType == "resource" || item.Event.ChatID == "")
+	if trustedResourceEvent {
 		routed, routeErr := d.router.Route(ctx, item)
 		if routeErr != nil {
 			d.markRetry(item, routeErr)
@@ -776,7 +778,11 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 	}
 	var candidates replyCandidateStore
 	candidateSaved := false
-	if item.InvestigationActive && decision.Kind == domain.DecisionReply {
+	holdReplyCandidate := item.InvestigationActive ||
+		(decision.WorkKind == domain.WorkKindResourceHandoff &&
+			item.Event.SenderType == "user" &&
+			item.Event.ChatID != "")
+	if holdReplyCandidate && decision.Kind == domain.DecisionReply {
 		var supported bool
 		candidates, supported = d.queue.(replyCandidateStore)
 		if supported {
@@ -988,6 +994,23 @@ func (d *Daemon) resolveHeldReplyCandidate(
 	}
 	switch resolution.Result {
 	case replymatch.ResultUnanswered:
+		if candidate.Decision.WorkKind == domain.WorkKindResourceHandoff &&
+			resolution.TaskClass != domain.TaskClassResourceHandoff {
+			if err := candidates.CancelWorkReplyCandidate(
+				item.ID,
+				item.LeaseBy,
+				"candidate_task_class_changed",
+			); err != nil {
+				d.markRetry(item, err)
+				return Result{}, err
+			}
+			return d.deferDelegatedReply(
+				item,
+				candidate.Decision,
+				"candidate_task_class_changed",
+				d.replyResolutionRetry,
+			)
+		}
 		return d.finishCandidateDecision(ctx, item, candidate.Decision, candidates)
 	default:
 		if err := candidates.HoldWorkReplyCandidate(
@@ -1206,6 +1229,7 @@ func (d *Daemon) finishDecisionWithState(
 	}
 	ownerNotified := false
 	if decision.Kind == domain.DecisionReply &&
+		decision.WorkKind != domain.WorkKindResourceHandoff &&
 		!isAssistantFacingRequest(decision.Relevance) &&
 		(approvalGranted || !replyRequiresApproval(d.replier, decision)) &&
 		d.notifier != nil {
@@ -1265,6 +1289,7 @@ func (d *Daemon) finishDecisionWithState(
 		}
 	}
 	if decision.Kind == domain.DecisionReply &&
+		decision.WorkKind != domain.WorkKindResourceHandoff &&
 		!isAssistantFacingRequest(decision.Relevance) &&
 		d.notifier != nil &&
 		!ownerNotified {

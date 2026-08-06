@@ -47,6 +47,21 @@ func (c *resourceActionClient) ReplyToComment(
 
 type notificationResourceClient struct{}
 
+type nonRecordResourceClient struct {
+	notificationResourceClient
+}
+
+func (nonRecordResourceClient) ResolveResource(
+	_ context.Context,
+	ref servicelark.ResourceRef,
+) (servicelark.ResourceRef, error) {
+	ref.ResourceType = servicelark.ResourceTypeBase
+	ref.AppToken = "bas_bug"
+	ref.TableID = "tbl_bug"
+	ref.RecordID = ""
+	return ref, nil
+}
+
 func (notificationResourceClient) ResolveResource(
 	_ context.Context,
 	ref servicelark.ResourceRef,
@@ -223,6 +238,116 @@ func TestApplicationResourceNotificationCreatesOwnerPrivateNotifyWork(t *testing
 	}
 	if items[0].Event.ChatID != "" || items[0].Event.SenderID != "" {
 		t.Fatalf("resource notification retained an app-facing destination: %+v", items[0].Event)
+	}
+}
+
+func TestConversationalResourceHandoffResolvesAndLinksSharedRecord(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	recordURL := "https://example.larksuite.com/base/bas_bug?table=tbl_bug&record=rec_bug"
+	event := domain.NormalizedEvent{
+		Source: domain.SourcePoll, EventID: "poll:om_handoff", MessageID: "om_handoff",
+		ChatID: "oc_group", ChatType: "group", SenderID: "ou_teammate",
+		SenderType:   "user",
+		Content:      "@测试负责人 这个问题修复后改下状态哈",
+		Mentions:     []domain.Mention{{OpenID: "ou_owner"}},
+		ResourceURLs: []string{recordURL}, CreatedAt: time.Now().UTC(),
+	}
+	item := domain.NewWorkItem(event)
+	item.WorkKind = domain.WorkKindResourceHandoff
+	item.TaskClass = domain.TaskClassResourceHandoff
+	receipt, err := store.RecordWorkIntake(ctx, item)
+	if err != nil || receipt.Disposition != domain.IntakeAdmitted {
+		t.Fatalf("receipt=%+v err=%v", receipt, err)
+	}
+	monitor := agentresource.NewMonitor(notificationResourceClient{}, store, agentresource.Config{
+		OwnerOpenID: "ou_owner",
+	})
+	registry, err := agenttools.NewRegistry(agenttools.ResourceDefinitions(agenttools.ResourceToolOptions{
+		Mode: domain.ModeAuto, Evidence: store, Resolver: monitor,
+		Actions: store, Client: &resourceActionClient{},
+	})...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx = agenttools.WithWorkItemDedup(ctx, item.DedupKey)
+	ctx = agenttools.WithInvocationScope(ctx, agenttools.InvocationScope{
+		ReadOnly: true, WorkKind: domain.WorkKindResourceHandoff,
+		ResourceURLs: []string{recordURL},
+	})
+	result, err := registry.Execute(ctx, "get_resource_evidence", json.RawMessage(
+		`{"resource_url":"`+recordURL+`"}`,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"归档示例条目后列表未刷新",
+		`"status_value":"待修改"`,
+		`"app_token":"bas_bug"`,
+		`"table_id":"tbl_bug"`,
+		`"record_id":"rec_bug"`,
+	} {
+		if !strings.Contains(result.Content, expected) {
+			t.Fatalf("result missing %q: %s", expected, result.Content)
+		}
+	}
+	evidence, err := store.GetResourceEvidenceForWork(ctx, item.DedupKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evidence.SourceKind != domain.ResourceEvidenceConversation ||
+		evidence.SourceID != event.MessageID || !evidence.OwnerMentioned {
+		t.Fatalf("evidence=%+v", evidence)
+	}
+}
+
+func TestConversationalResourceHandoffRejectsNonRecordURLWithoutLinking(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	resourceURL := "https://example.larksuite.com/base/bas_bug?table=tbl_bug"
+	event := domain.NormalizedEvent{
+		Source: domain.SourcePoll, EventID: "poll:om_table_handoff", MessageID: "om_table_handoff",
+		ChatID: "oc_group", ChatType: "group", SenderID: "ou_teammate", SenderType: "user",
+		Content:      "@测试负责人 这个问题修复后改下状态哈",
+		Mentions:     []domain.Mention{{OpenID: "ou_owner"}},
+		ResourceURLs: []string{resourceURL}, CreatedAt: time.Now().UTC(),
+	}
+	item := domain.NewWorkItem(event)
+	item.WorkKind = domain.WorkKindResourceHandoff
+	receipt, err := store.RecordWorkIntake(ctx, item)
+	if err != nil || receipt.Disposition != domain.IntakeAdmitted {
+		t.Fatalf("receipt=%+v err=%v", receipt, err)
+	}
+	monitor := agentresource.NewMonitor(nonRecordResourceClient{}, store, agentresource.Config{
+		OwnerOpenID: "ou_owner",
+	})
+	registry, err := agenttools.NewRegistry(agenttools.ResourceDefinitions(agenttools.ResourceToolOptions{
+		Mode: domain.ModeAuto, Evidence: store, Resolver: monitor,
+	})...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx = agenttools.WithWorkItemDedup(ctx, item.DedupKey)
+	ctx = agenttools.WithInvocationScope(ctx, agenttools.InvocationScope{
+		ReadOnly: true, WorkKind: domain.WorkKindResourceHandoff,
+		ResourceURLs: []string{resourceURL},
+	})
+	if _, err := registry.Execute(ctx, "get_resource_evidence", json.RawMessage(
+		`{"resource_url":"`+resourceURL+`"}`,
+	)); err == nil {
+		t.Fatal("non-record resource URL should be rejected")
+	}
+	if evidence, err := store.GetResourceEvidenceForWork(ctx, item.DedupKey); err == nil {
+		t.Fatalf("unexpected linked evidence=%+v", evidence)
 	}
 }
 

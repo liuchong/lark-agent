@@ -1054,6 +1054,65 @@ func (s *Store) GetResourceEvidenceForWork(
 		FROM resource_evidence WHERE id = ?`, evidenceID))
 }
 
+// GetWorkItemByDedupKey returns the durable work owning one tool invocation.
+func (s *Store) GetWorkItemByDedupKey(
+	ctx context.Context,
+	dedupKey string,
+) (domain.WorkItem, error) {
+	item, err := scanWorkItem(s.db.QueryRowContext(
+		ctx,
+		workItemSelect+` WHERE dedup_key = ?`,
+		dedupKey,
+	))
+	if err != nil {
+		return domain.WorkItem{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read work item by dedup key",
+		).WithCause(err)
+	}
+	return item, nil
+}
+
+// LinkResourceEvidenceToWork binds first-party evidence without allowing a
+// later tool call to replace an already-authoritative resource.
+func (s *Store) LinkResourceEvidenceToWork(
+	ctx context.Context,
+	dedupKey string,
+	evidenceID int64,
+) error {
+	result, err := s.db.ExecContext(
+		ctx,
+		`UPDATE work_items
+		    SET resource_evidence_id = ?, updated_at = ?
+		  WHERE dedup_key = ?
+		    AND (COALESCE(resource_evidence_id, 0) = 0 OR resource_evidence_id = ?)`,
+		evidenceID,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		dedupKey,
+		evidenceID,
+	)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"link resource evidence to work",
+		).WithCause(err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read linked resource evidence result",
+		).WithCause(err)
+	}
+	if changed != 1 {
+		return errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"work item already has different authoritative resource evidence",
+		)
+	}
+	return nil
+}
+
 const resourceEvidenceColumns = `id, dedup_key, source_kind, source_id,
 	COALESCE(subscription_id, 0), resource_type, original_url, file_token, app_token,
 	table_id, view_id, record_id, comment_id, title, issue_key, status_field_id,

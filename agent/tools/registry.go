@@ -81,6 +81,7 @@ type InvocationScope struct {
 	ChatID          string
 	WorkKind        domain.WorkKind
 	GitHubReference *domain.GitHubReference
+	ResourceURLs    []string
 }
 
 // WithWorkItemDedup makes the current durable work identity available to tools.

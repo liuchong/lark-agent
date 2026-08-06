@@ -2,6 +2,7 @@ package larkagent_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -21,8 +22,9 @@ import (
 )
 
 type semanticIntegrationModel struct {
-	response string
-	calls    int
+	response  string
+	responses []string
+	calls     int
 }
 
 func (m *semanticIntegrationModel) Generate(
@@ -31,13 +33,42 @@ func (m *semanticIntegrationModel) Generate(
 	...einomodel.Option,
 ) (*schema.Message, error) {
 	m.calls++
-	return schema.AssistantMessage(m.response, nil), nil
+	response := m.response
+	if len(m.responses) > 0 {
+		index := m.calls - 1
+		if index >= len(m.responses) {
+			index = len(m.responses) - 1
+		}
+		response = m.responses[index]
+	}
+	return schema.AssistantMessage(response, nil), nil
 }
 
 type semanticIntegrationResolver struct {
 	store    *storage.Store
 	matcher  *replymatch.Resolver
 	messages []domain.NormalizedEvent
+}
+
+type semanticSequenceResolver struct {
+	resolutions []replymatch.Resolution
+	calls       int
+}
+
+func (r *semanticSequenceResolver) Resolve(
+	_ context.Context,
+	item domain.WorkItem,
+) (replymatch.Resolution, error) {
+	index := r.calls
+	r.calls++
+	if index >= len(r.resolutions) {
+		index = len(r.resolutions) - 1
+	}
+	resolution := r.resolutions[index]
+	resolution.TargetMessageID = item.Event.MessageID
+	resolution.ContextCutoff = time.Now().UTC()
+	resolution.ContextMessages = []domain.NormalizedEvent{item.Event}
+	return resolution, nil
 }
 
 func (r semanticIntegrationResolver) Resolve(
@@ -96,6 +127,60 @@ func (d *semanticIntegrationDecider) Decide(
 
 type semanticIntegrationReplyHandler struct {
 	calls int
+}
+
+type semanticSequenceDecider struct {
+	calls int
+}
+
+func (d *semanticSequenceDecider) Decide(
+	context.Context,
+	agentcontext.Bundle,
+) (domain.Decision, error) {
+	d.calls++
+	return domain.Decision{
+		Kind:        domain.DecisionReply,
+		Relevance:   domain.RelevanceInferred,
+		Confidence:  0.99,
+		Risk:        domain.RiskLow,
+		ReplyText:   "candidate reply " + string(rune('0'+d.calls)),
+		OwnerAction: "owner notice " + string(rune('0'+d.calls)),
+		Reason:      "resource handoff checked",
+	}, nil
+}
+
+type semanticRetryReplyHandler struct {
+	calls int
+	texts []string
+}
+
+func (h *semanticRetryReplyHandler) Handle(
+	_ context.Context,
+	_ domain.WorkItem,
+	decision domain.Decision,
+) (reply.Result, error) {
+	h.calls++
+	h.texts = append(h.texts, decision.ReplyText)
+	if h.calls == 1 {
+		return reply.Result{}, errors.New("temporary sender-facing send failure")
+	}
+	return reply.Result{Action: domain.Action{Status: domain.ActionCompleted}}, nil
+}
+
+type semanticIntegrationNotifier struct {
+	calls int
+	texts []string
+}
+
+func (n *semanticIntegrationNotifier) HandleNotification(
+	_ context.Context,
+	_ domain.WorkItem,
+	decision domain.Decision,
+	_ string,
+) error {
+	n.calls++
+	n.texts = append(n.texts, decision.OwnerAction)
+	return nil
 }
 
 type semanticIntegrationProgress struct {
@@ -876,6 +961,152 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 		}
 		if ok {
 			t.Fatalf("unexpected investigation=%+v", investigation)
+		}
+	})
+
+	t.Run("resource handoff send retry reuses candidate without owner notice", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			event domain.NormalizedEvent
+		}{
+			{
+				name: "group direct mention",
+				event: domain.NormalizedEvent{
+					Source: domain.SourcePoll, EventID: "poll:om_group_fix_status_retry",
+					MessageID: "om_group_fix_status_retry", ChatID: "oc_any_group",
+					ChatType: "group", SenderID: "ou_teammate", SenderType: "user",
+					Content:  "@测试负责人 这个问题修复后改下状态哈",
+					Mentions: []domain.Mention{{OpenID: "ou_owner"}},
+				},
+			},
+			{
+				name: "private message",
+				event: domain.NormalizedEvent{
+					Source: domain.SourcePoll, EventID: "poll:om_private_fix_status_retry",
+					MessageID: "om_private_fix_status_retry", ChatID: "oc_private",
+					ChatType: "p2p", SenderID: "ou_teammate", SenderType: "user",
+					Content: "这个问题修复后改下状态哈",
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				store := openSemanticIntegrationStore(t)
+				tc.event.CreatedAt = store.CurrentSession().StartedAt.Add(time.Second)
+				item := enqueueDueDelegatedItem(t, store, tc.event)
+				semanticModel := &semanticIntegrationModel{response: `{
+					"target_message_id":"` + item.Event.MessageID + `",
+					"result":"unanswered",
+					"confidence":0.96,
+					"reason":"the owner has not handled the linked issue status handoff",
+					"target_intent":"handoff_status_request",
+					"response_obligation_quote":"这个问题修复后改下状态哈",
+					"task_summary":"use the linked issue",
+					"task_class":"resource_handoff",
+					"classification_confidence":0.96,
+					"requires_progress":false
+				}`}
+				builder := &semanticIntegrationBuilder{}
+				decider := &semanticSequenceDecider{}
+				replier := &semanticRetryReplyHandler{}
+				notifier := &semanticIntegrationNotifier{}
+				daemon := app.NewDaemon(
+					store,
+					router.New(router.Config{
+						OwnerOpenID: "ou_owner", Mode: domain.ModeAuto,
+						ReplyScope:        domain.ReplyScopeAllGroups,
+						PrivateReplyScope: domain.PrivateReplyScopeAll,
+					}),
+					app.WithContextBuilder(builder),
+					app.WithDecider(decider),
+					app.WithReplyHandler(replier),
+					app.WithNotificationHandler(notifier),
+					app.WithDelegatedReplyResolver(semanticIntegrationResolver{
+						store: store, matcher: replymatch.New(semanticModel, "ou_owner"),
+						messages: []domain.NormalizedEvent{item.Event},
+					}, 0.85, 30*time.Second),
+				)
+
+				if _, err := daemon.RunOnce(context.Background()); err == nil {
+					t.Fatal("first sender-facing send should fail")
+				}
+				if changed, err := store.RetryWorkItems([]int64{item.ID}); err != nil || changed != 1 {
+					t.Fatalf("RetryWorkItems changed=%d err=%v", changed, err)
+				}
+				result, err := daemon.RunOnce(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if result.Decision.Kind != domain.DecisionReply ||
+					semanticModel.calls != 2 || builder.calls != 1 || decider.calls != 1 ||
+					replier.calls != 2 || notifier.calls != 0 ||
+					len(replier.texts) != 2 || replier.texts[0] != replier.texts[1] ||
+					len(notifier.texts) != 0 {
+					t.Fatalf(
+						"result=%+v semantic=%d builder=%d decider=%d replier=%+v notifier=%+v",
+						result, semanticModel.calls, builder.calls, decider.calls, replier, notifier,
+					)
+				}
+			})
+		}
+	})
+
+	t.Run("resource handoff candidate is cancelled when current task class changes", func(t *testing.T) {
+		store := openSemanticIntegrationStore(t)
+		base := store.CurrentSession().StartedAt.Add(time.Second)
+		item := enqueueDueDelegatedItem(t, store, domain.NormalizedEvent{
+			Source: domain.SourcePoll, EventID: "poll:om_resource_reclassified",
+			MessageID: "om_resource_reclassified", ChatID: "oc_any_group",
+			ChatType: "group", SenderID: "ou_teammate", SenderType: "user",
+			Content:  "@测试负责人 这个问题修复后改下状态哈",
+			Mentions: []domain.Mention{{OpenID: "ou_owner"}}, CreatedAt: base,
+		})
+		semanticResolver := &semanticSequenceResolver{resolutions: []replymatch.Resolution{
+			{
+				Result: replymatch.ResultUnanswered, Confidence: 0.96,
+				TaskSummary: "current resource handoff", TaskClass: domain.TaskClassResourceHandoff,
+				ClassificationConfidence: 0.96,
+			},
+			{
+				Result: replymatch.ResultUnanswered, Confidence: 0.96,
+				TaskSummary: "current coding task", TaskClass: domain.TaskClassCoding,
+				ClassificationConfidence: 0.96, RequiresProgress: true,
+			},
+		}}
+		builder := &semanticIntegrationBuilder{}
+		decider := &semanticSequenceDecider{}
+		replier := &semanticRetryReplyHandler{}
+		daemon := app.NewDaemon(
+			store,
+			router.New(router.Config{
+				OwnerOpenID: "ou_owner", Mode: domain.ModeAuto,
+				ReplyScope: domain.ReplyScopeAllGroups,
+			}),
+			app.WithContextBuilder(builder),
+			app.WithDecider(decider),
+			app.WithReplyHandler(replier),
+			app.WithDelegatedReplyResolver(semanticResolver, 0.85, 30*time.Second),
+		)
+		if _, err := daemon.RunOnce(context.Background()); err == nil {
+			t.Fatal("first sender-facing send should fail")
+		}
+		if changed, err := store.RetryWorkItems([]int64{item.ID}); err != nil || changed != 1 {
+			t.Fatalf("RetryWorkItems changed=%d err=%v", changed, err)
+		}
+		result, err := daemon.RunOnce(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidate, found, err := store.ReadyWorkReplyCandidate(item.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Decision.Reason != "candidate_task_class_changed" ||
+			semanticResolver.calls != 2 || builder.calls != 1 || decider.calls != 1 ||
+			replier.calls != 1 || found {
+			t.Fatalf(
+				"result=%+v semantic=%d builder=%d decider=%d replier=%+v candidate=%+v found=%t",
+				result, semanticResolver.calls, builder.calls, decider.calls, replier, candidate, found,
+			)
 		}
 	})
 

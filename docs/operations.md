@@ -303,6 +303,10 @@ WebSocket 的评论通知和 Base 记录变更事件。应用消息只用于提�
 `read_workspace_rules` 读取该项目适用的 `AGENTS.md` 与附属规则，然后核对实现、回归
 测试和 Git 历史。只有唯一记录、Owner 为经办人或明确被提及、实时状态字段和选项仍
 匹配、修复证据满足项目规则时，才能执行状态更新。
+真人会话中“修复后更新状态”这类交接如果引用了一条记录，Agent 只接受当前有界会话
+中实际出现、且能解析为唯一 Base app/table/record 坐标的链接；文档、Base 首页或仅
+表格链接不会取得状态修改权限。该交接直接把核对结果回复原发送者，不另发一条 Owner
+预通知。
 
 Base 状态更新和评论回复都是持久化外部动作：`auto` 模式在全部硬门禁通过后执行一次
 并回读验证；`approval` 模式先产生精确动作号，可用 `/approval approve 动作号 confirm`
@@ -410,7 +414,8 @@ run 的 PR 头，不下载 artifacts，不执行外部贡献代码。
 说明“检查了什么、初步发现或未知是什么、给 Owner 传递了什么”。如果 inspect 里只有
 `submit_decision`，正文又只是“已提醒”或后续承诺，发送前质量门禁应将其打回。
 低风险答复的 `reply_confidence` 达到 `policy.reply_confidence_min`（默认 `0.70`）
-时会先私聊通知 Owner，再立即代回复，不等待 Owner 确认；低于阈值进入审批。
+时通常会先私聊通知 Owner，再立即代回复，不等待 Owner 确认；真人会话的
+`resource_handoff` 不发送这条重复预通知。低于阈值进入审批。
 中高风险、承诺、删除修改和结果不确定的外部动作即使可信度很高也不会直接发送。
 模型请求中会同时携带经过配置校验的非敏感运行策略。排查助手错误描述自身行为时，
 应核对模型输入里的 `runtime_policy`：其中 `owner_reply_confidence_min` 是判断

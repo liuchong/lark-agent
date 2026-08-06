@@ -21,3 +21,15 @@
 - Until the referenced resource is read, normalize its task summary to the
   resource-neutral operation (locate, verify fix evidence, update status).
   Nearby chat subjects are not authoritative issue identity.
+- A human handoff may resolve an exact record URL only when that URL was
+  extracted from the runtime-selected bounded conversation. Read it through the
+  typed Lark resource API, persist the privacy-bounded projection, and
+  atomically link it to the work item before using it for authorization.
+  Never replace an already-linked resource with a later model-proposed URL.
+  A conversational status handoff requires one exact Base record with app,
+  table, and record coordinates; a document, app, or table-only URL must fail
+  before evidence persistence.
+- A validated conversational resource-handoff reply must be persisted as the
+  current-generation candidate before the sender-facing send. It creates no
+  separate owner notice. A known send failure retries that candidate after
+  current routing and semantic checks without rerunning the answer model.

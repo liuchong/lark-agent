@@ -467,6 +467,12 @@ does not send the sender-facing reply. If a process interruption makes the
 notice result uncertain, it is not replayed. Compatibility recovery treats an
 older post-reply notice as finish-only work only when a completed durable reply
 action proves that the sender-facing reply already succeeded.
+Before an applicable delegated owner notice, delegated work persists the exact
+validated reply as a current-generation candidate. A conversational
+`resource_handoff` also persists its candidate before the sender-facing send,
+but creates no separate owner notice. If the send then fails with a known
+retryable result, the next attempt re-checks current semantic context and
+reuses that exact candidate without rerunning the answer model.
 
 The structured decision separates `reply_text` from `owner_action`.
 `reply_text` is the exact sender-facing message. `owner_action` is the concise
@@ -490,6 +496,12 @@ delegated-investigation progress/owner-notice lifecycle, which is reserved for
 `investigation` and `coding` tasks. Before the referenced resource has been
 read, the semantic gate keeps the task summary resource-neutral; adjacent
 conversation subjects cannot be promoted into the issue identity.
+For a human conversational handoff, the current semantic gate runs again on
+each fresh attempt even if a prior attempt persisted `resource_handoff` as the
+scheduler lane. A record share URL in the bounded conversation can be passed to
+`get_resource_evidence`; the runtime resolves it through the typed Lark
+resource API, persists the current record evidence, and links that evidence to
+the existing work item before any status proposal.
 An assignment, investigation, or coordination reply must first complete at
 least one bounded relevant read, such as reading the same-chat thread or
 checking the corresponding production code. Its concise reply states what was
@@ -1872,6 +1884,18 @@ The multi-step loop is accepted by these executable BDD scenarios:
   daemon configured with delegated-investigation progress, then the task uses
   a resource-neutral summary, does not create investigation progress or an
   owner notice, and lets the resource tools establish the issue identity.
+- Given a conversational resource handoff contains a Lark record share URL but
+  has no pre-linked evidence, when `get_resource_evidence` receives that URL,
+  then it resolves and reads the exact record through the typed resource API,
+  durably links the resulting evidence to the work item, and returns its
+  current title, status, assignee, and Base coordinates.
+- Given a bounded conversation URL resolves only to a document, Base app, or
+  table without one exact Base record, when conversational evidence resolution
+  runs, then it rejects the URL without persisting or linking authority.
+- Given a delegated resource handoff has a validated current-generation reply
+  and the sender-facing send fails with a known retryable error, when the work
+  retries, then the same candidate is rechecked and retried without another
+  model decision, and no separate owner notice is sent on either attempt.
 - Given the messages before a delegated target discuss a production
   sample-event failure, a nearby image contains `1408 SampleEventDisabled`, the
   target says the sender's computer disconnected, and later messages clarify

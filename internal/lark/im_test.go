@@ -84,6 +84,18 @@ func TestParseMessageExtractsResourceURLsFromApplicationCard(t *testing.T) {
 	}
 }
 
+func TestParseMessageExtractsResourceURLFromRichTextReplyParent(t *testing.T) {
+	message := parseMessage(map[string]any{
+		"message_id": "om_record_parent",
+		"msg_type":   "text",
+		"content":    `<p>https://example.larksuite.com/record/shrExampleRecordToken001</p>`,
+	})
+	if len(message.ResourceURLs) != 1 ||
+		message.ResourceURLs[0] != "https://example.larksuite.com/record/shrExampleRecordToken001" {
+		t.Fatalf("message=%+v", message)
+	}
+}
+
 func TestParseMessagePreservesImageContextMetadata(t *testing.T) {
 	message := parseMessage(map[string]any{
 		"message_id": "om_image",

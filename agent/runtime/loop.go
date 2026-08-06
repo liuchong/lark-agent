@@ -135,6 +135,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		ChatID:          bundle.Event.ChatID,
 		WorkKind:        bundle.WorkKind,
 		GitHubReference: bundle.GitHubReference,
+		ResourceURLs:    bundleResourceURLs(bundle),
 	}
 	requestedWorkspaceScope := requestedCodingWorkspaceScope(bundle)
 	visibleToolInfos := l.Tools.InfosFor(invocationScope)
@@ -949,6 +950,29 @@ func (l AgentLoop) maxTurnsForWorkKind(kind domain.WorkKind) int {
 		}
 	}
 	return l.MaxTurns
+}
+
+func bundleResourceURLs(bundle agentcontext.Bundle) []string {
+	seen := make(map[string]struct{})
+	var urls []string
+	add := func(values []string) {
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			if _, ok := seen[value]; ok {
+				continue
+			}
+			seen[value] = struct{}{}
+			urls = append(urls, value)
+		}
+	}
+	add(bundle.Event.ResourceURLs)
+	for _, message := range bundle.Conversation {
+		add(message.ResourceURLs)
+	}
+	return urls
 }
 
 func modelTurnBudgetPrompt(maxTurns int) string {

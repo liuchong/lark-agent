@@ -1942,7 +1942,8 @@ func buildLiveOptions(
 		}
 		definitions = append(definitions, agenttools.ResourceDefinitions(agenttools.ResourceToolOptions{
 			Mode: cfg.Policy.Mode, Evidence: store, Actions: store,
-			Client: resourceToolClient{service: resourceSvc},
+			Resolver: resourceMonitor,
+			Client:   resourceToolClient{service: resourceSvc},
 		})...)
 		definitions = append(definitions,
 			agenttools.ShellDefinition(scope, agenttools.ShellOptions{
