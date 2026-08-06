@@ -496,17 +496,11 @@ func normalizeNoReplyNeeded(resolution Resolution, reason string) Resolution {
 
 func normalizeStatusUpdateHandoff(resolution Resolution) Resolution {
 	resolution.TaskClass = domain.TaskClassResourceHandoff
-	resolution.RequiresProgress = true
+	resolution.RequiresProgress = false
 	if resolution.ClassificationConfidence < 0.85 {
 		resolution.ClassificationConfidence = 0.85
 	}
-	summary := strings.TrimSpace(resolution.TaskSummary)
-	lowerSummary := strings.ToLower(summary)
-	if summary == "" ||
-		strings.Contains(lowerSummary, "investigate") ||
-		strings.Contains(summary, "调查") {
-		resolution.TaskSummary = "locate the referenced issue, verify its fix evidence, and update its workflow status"
-	}
+	resolution.TaskSummary = "locate the referenced issue, verify its fix evidence, and update its workflow status"
 	return resolution
 }
 

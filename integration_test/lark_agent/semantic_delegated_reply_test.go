@@ -98,6 +98,47 @@ type semanticIntegrationReplyHandler struct {
 	calls int
 }
 
+type semanticIntegrationProgress struct {
+	beginCalls      int
+	finalizingCalls int
+	completeCalls   int
+	blockCalls      int
+}
+
+func (p *semanticIntegrationProgress) Begin(
+	context.Context,
+	domain.WorkItem,
+	replymatch.Resolution,
+) error {
+	p.beginCalls++
+	return nil
+}
+
+func (p *semanticIntegrationProgress) Finalizing(
+	context.Context,
+	domain.WorkItem,
+) error {
+	p.finalizingCalls++
+	return nil
+}
+
+func (p *semanticIntegrationProgress) Complete(
+	context.Context,
+	domain.WorkItem,
+) error {
+	p.completeCalls++
+	return nil
+}
+
+func (p *semanticIntegrationProgress) Block(
+	context.Context,
+	domain.WorkItem,
+	error,
+) error {
+	p.blockCalls++
+	return nil
+}
+
 type ownerOutboundPrivatePollIM struct {
 	now time.Time
 }
@@ -782,6 +823,7 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 		builder := &semanticIntegrationBuilder{}
 		decider := &semanticIntegrationDecider{}
 		replier := &semanticIntegrationReplyHandler{}
+		progress := &semanticIntegrationProgress{}
 		daemon := app.NewDaemon(
 			store,
 			router.New(router.Config{
@@ -805,6 +847,7 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 					},
 				},
 			}, 0.85, 30*time.Second),
+			app.WithInvestigationProgressHandler(progress),
 		)
 
 		result, err := daemon.RunOnce(context.Background())
@@ -814,14 +857,17 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 		if builder.calls != 1 || builder.item.WorkKind != domain.WorkKindResourceHandoff ||
 			builder.item.TaskClass != domain.TaskClassResourceHandoff ||
 			builder.item.InvestigationActive ||
-			decider.calls != 1 || replier.calls != 1 {
+			decider.calls != 1 || replier.calls != 1 ||
+			progress.beginCalls != 0 || progress.finalizingCalls != 0 ||
+			progress.completeCalls != 0 || progress.blockCalls != 0 {
 			t.Fatalf(
-				"result=%+v builder=%d item=%+v decider=%d replier=%d",
+				"result=%+v builder=%d item=%+v decider=%d replier=%d progress=%+v",
 				result,
 				builder.calls,
 				builder.item,
 				decider.calls,
 				replier.calls,
+				progress,
 			)
 		}
 		investigation, ok, err := store.GetDelegatedInvestigation(item.ID)

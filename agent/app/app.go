@@ -610,7 +610,10 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 					return Result{}, err
 				}
 			}
-			if resolution.RequiresProgress && d.investigationProgress != nil {
+			if resolution.RequiresProgress &&
+				d.investigationProgress != nil &&
+				(resolution.TaskClass == domain.TaskClassInvestigation ||
+					resolution.TaskClass == domain.TaskClassCoding) {
 				if err := d.investigationProgress.Begin(ctx, item, resolution); err != nil {
 					d.markRetry(item, err)
 					return Result{}, err
@@ -1281,7 +1284,8 @@ func (d *Daemon) finishDecisionWithState(
 			return Result{}, err
 		}
 	}
-	if d.investigationProgress != nil &&
+	if item.InvestigationActive &&
+		d.investigationProgress != nil &&
 		(decision.Kind == domain.DecisionReply ||
 			decision.Kind == domain.DecisionIgnore) {
 		if err := d.investigationProgress.Complete(ctx, item); err != nil {

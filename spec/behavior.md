@@ -485,6 +485,11 @@ The handoff must locate the referenced issue or record, determine the required
 status change, inspect the relevant project rules and current implementation
 evidence, and either complete one authorized status action or report the exact
 missing evidence.
+It runs as bounded `resource_handoff` work and does not create the separate
+delegated-investigation progress/owner-notice lifecycle, which is reserved for
+`investigation` and `coding` tasks. Before the referenced resource has been
+read, the semantic gate keeps the task summary resource-neutral; adjacent
+conversation subjects cannot be promoted into the issue identity.
 An assignment, investigation, or coordination reply must first complete at
 least one bounded relevant read, such as reading the same-chat thread or
 checking the corresponding production code. Its concise reply states what was
@@ -1862,6 +1867,11 @@ The multi-step loop is accepted by these executable BDD scenarios:
   resolved, then the newer segment cannot count as an answer or redefine the
   linked issue. The older target remains a resource handoff, and its semantic
   and Agent context exclude the newer request and its owner reply.
+- Given a status-update handoff quotes a record link while adjacent chat
+  discusses another subject, when the semantic gate admits the handoff in a
+  daemon configured with delegated-investigation progress, then the task uses
+  a resource-neutral summary, does not create investigation progress or an
+  owner notice, and lets the resource tools establish the issue identity.
 - Given the messages before a delegated target discuss a production
   sample-event failure, a nearby image contains `1408 SampleEventDisabled`, the
   target says the sender's computer disconnected, and later messages clarify

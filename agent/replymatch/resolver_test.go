@@ -776,7 +776,7 @@ func TestResolverClassifiesFixThenStatusRequestAsResourceHandoff(t *testing.T) {
 		"reason":"the owner has not handled the linked issue fix and status update request",
 		"target_intent":"Request to fix the problem in the linked record and update its status after the fix.",
 		"response_obligation_quote":"这个问题修复后改下状态哈",
-		"task_summary":"investigate the group invite short code API and update the record status",
+		"task_summary":"Fix the linked record discussed alongside the group invite short-code API and update its status.",
 		"task_class":"coding",
 		"classification_confidence":0.94,
 		"requires_progress":true
@@ -807,8 +807,8 @@ func TestResolverClassifiesFixThenStatusRequestAsResourceHandoff(t *testing.T) {
 	}
 	if resolution.Result != ResultUnanswered ||
 		resolution.TaskClass != domain.TaskClassResourceHandoff ||
-		!resolution.RequiresProgress ||
-		resolution.TaskSummary == "investigate the group invite short code API and update the record status" {
+		resolution.RequiresProgress ||
+		resolution.TaskSummary != "locate the referenced issue, verify its fix evidence, and update its workflow status" {
 		t.Fatalf("resolution=%+v", resolution)
 	}
 }

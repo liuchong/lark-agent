@@ -15,3 +15,9 @@
   semantic value shape used by evidence projection. Lark single-select values
   may appear as either strings or objects containing `name`, `text`, or
   `value`.
+- A conversational status-update handoff is `resource_handoff` work, not a
+  delegated `investigation` or `coding` progress lifecycle. Do not create or
+  complete investigation progress records for it.
+- Until the referenced resource is read, normalize its task summary to the
+  resource-neutral operation (locate, verify fix evidence, update status).
+  Nearby chat subjects are not authoritative issue identity.
