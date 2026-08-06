@@ -46,7 +46,8 @@ go build -o ./lark-agent ./cmd/lark-agent
    配置、私有 env 和原 Keychain 值。只有配置写回、Keychain 回读和候选
    `model doctor primary` 都通过后，才移除旧 env 中这三项；env 里的其他私有设置保留。
    任一步失败都会恢复旧配置、env 和 Keychain。
-7. 原子安装候选状态栏并写入 LaunchAgent。
+7. 原子安装候选状态栏、品牌 App 图标和单色模板状态栏图标，并写入 LaunchAgent。
+   状态栏图标由 AppKit 按当前菜单栏自动渲染为白色或黑色，不使用固定颜色位图。
 8. 仅在新 daemon 进入 ready 后保留已加载状态；任何失败都会恢复整套旧安装，并重新加载原先处于 loaded 状态的服务。
 
 本安装器只处理新的独立配置和状态，不读取旧目录，不迁移历史数据。

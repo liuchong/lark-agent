@@ -14,7 +14,10 @@ INSTALL_BACKUP="$APP_SUPPORT/.install-backup.$$"
 APP_DIR="$HOME/Applications/Lark Agent.app"
 APP_CONTENTS="$APP_DIR/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
+APP_RESOURCES="$APP_CONTENTS/Resources"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
+APP_ICON="$APP_RESOURCES/LarkAgent.icns"
+STATUS_ICON="$APP_RESOURCES/StatusIconTemplate.png"
 STATUS_APP="$APP_MACOS/LarkAgentStatus"
 STATUS_CANDIDATE="$APP_MACOS/.LarkAgentStatus.candidate.$$"
 LAUNCH_AGENT_PLIST="$HOME/Library/LaunchAgents/com.liuchong.lark-agent.plist"
@@ -49,6 +52,8 @@ backup_installation() {
     "$CONF_FILE" \
     "$ENV_FILE" \
     "$INFO_PLIST" \
+    "$APP_ICON" \
+    "$STATUS_ICON" \
     "$STATUS_APP" \
     "$LAUNCH_AGENT_PLIST" \
     "$CONFIG_PATH" \
@@ -225,6 +230,7 @@ migrate_legacy_model_env() {
 mkdir -p \
   "$BIN_DIR" \
   "$APP_MACOS" \
+  "$APP_RESOURCES" \
   "$HOME/Library/Logs/lark-agent" \
   "$(dirname "$CONFIG_PATH")" \
   "$(dirname "$STATE_PATH")"
@@ -245,6 +251,14 @@ fi
 
 echo "Building menu bar status app candidate..."
 swiftc "$ROOT/macos/LarkAgentStatus/main.swift" -framework AppKit -o "$STATUS_CANDIDATE"
+for asset in \
+  "$ROOT/assets/brand/LarkAgent.icns" \
+  "$ROOT/assets/brand/lark-agent-status-template.png"; do
+  if [ ! -f "$asset" ]; then
+    echo "Required brand asset is missing: $asset" >&2
+    exit 1
+  fi
+done
 
 if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
   service_was_loaded=1
@@ -315,6 +329,8 @@ cat > "$INFO_PLIST" <<'EOF'
   <string>com.liuchong.lark-agent.status</string>
   <key>CFBundleName</key>
   <string>Lark Agent</string>
+  <key>CFBundleIconFile</key>
+  <string>LarkAgent</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>LSUIElement</key>
@@ -323,6 +339,8 @@ cat > "$INFO_PLIST" <<'EOF'
 </plist>
 EOF
 
+install -m 644 "$ROOT/assets/brand/LarkAgent.icns" "$APP_ICON"
+install -m 644 "$ROOT/assets/brand/lark-agent-status-template.png" "$STATUS_ICON"
 mv -f "$STATUS_CANDIDATE" "$STATUS_APP"
 
 install_args=(

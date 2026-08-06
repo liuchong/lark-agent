@@ -576,6 +576,16 @@ bar controller. The installed service uses label `com.liuchong.lark-agent` and
 runs the installed `lark-agent daemon run` binary with explicit `--config` and
 `--state` paths. The menu bar App is a thin controller: it shows LaunchAgent
 status and invokes `daemon status/start/stop/restart` and `mode paused|auto`.
+The App bundle carries the repository's branded macOS icon through
+`CFBundleIconFile`. The menu bar uses the matching monochrome template mark,
+not a fixed-color or fixed-white bitmap: AppKit tints the template white or
+black to match the active macOS menu bar. Status counts may appear beside the
+mark, but the legacy `LA` text is not the primary status item.
+
+Given a clean or upgraded installation, when the status App bundle is written,
+then its branded `.icns` and monochrome template resource are installed,
+`Info.plist` references the branded icon, and the status controller loads the
+template resource with template rendering enabled.
 
 The user-level installation may write files only under the current user's
 `~/.config/lark-agent`, `~/Applications`,

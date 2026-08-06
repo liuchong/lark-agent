@@ -16,6 +16,24 @@ import (
 	"github.com/liuchong/lark-agent/agent/storage"
 )
 
+func TestStatusAppUsesMacOSTemplateIcon(t *testing.T) {
+	sourcePath := filepath.Join(repoRoot(t), "macos", "LarkAgentStatus", "main.swift")
+	source, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	for _, expected := range []string{
+		`forResource: "StatusIconTemplate"`,
+		"image.isTemplate = true",
+		"statusItem.button?.imagePosition = .imageOnly",
+	} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("status app does not enable macOS template rendering; missing %q", expected)
+		}
+	}
+}
+
 func TestQueueRetryCannotBypassExplicitPriorSessionResume(t *testing.T) {
 	bin := buildAgentBinary(t)
 	statePath := filepath.Join(t.TempDir(), "state.db")
@@ -394,9 +412,13 @@ esac
 		"com.liuchong.lark-agent.plist",
 	)
 	infoPlist := filepath.Join(home, "Applications", "Lark Agent.app", "Contents", "Info.plist")
+	appIcon := filepath.Join(home, "Applications", "Lark Agent.app", "Contents", "Resources", "LarkAgent.icns")
+	statusIcon := filepath.Join(home, "Applications", "Lark Agent.app", "Contents", "Resources", "StatusIconTemplate.png")
 	for _, path := range []string{
 		plist,
 		infoPlist,
+		appIcon,
+		statusIcon,
 		configPath,
 		statePath,
 		filepath.Join(home, "Applications", "Lark Agent.app", "Contents", "MacOS", "LarkAgentStatus"),
@@ -418,6 +440,14 @@ esac
 		if output, err := lint.CombinedOutput(); err != nil {
 			t.Fatalf("plutil %s: %v\n%s", path, err, output)
 		}
+	}
+	infoData, err := os.ReadFile(infoPlist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(infoData), "<key>CFBundleIconFile</key>") ||
+		!strings.Contains(string(infoData), "<string>LarkAgent</string>") {
+		t.Fatalf("status app does not reference the branded icon:\n%s", infoData)
 	}
 	gotEnv, err := os.ReadFile(envPath)
 	if err != nil {
@@ -507,6 +537,8 @@ esac
 		filepath.Join(appSupport, "agent.conf"),
 		filepath.Join(appSupport, "env"),
 		infoPlist,
+		appIcon,
+		statusIcon,
 		filepath.Join(home, "Applications", "Lark Agent.app", "Contents", "MacOS", "LarkAgentStatus"),
 		plist,
 		configPath,

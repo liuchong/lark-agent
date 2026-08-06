@@ -1,4 +1,8 @@
-# lark-agent
+<p align="center">
+  <img src="assets/brand/lark-agent-mark.svg" width="156" alt="Lark Agent logo">
+</p>
+
+<h1 align="center">lark-agent</h1>
 
 `lark-agent` 是一个基于官方公开 Go SDK（official Go SDK）的个人 AI Agent。它在 macOS 本地运行，
 通过 `github.com/larksuite/oapi-sdk-go/v3` 读取消息、消费 WebSocket 实时事件并

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Lark Agent logo</title>
+  <desc id="desc">An abstract bird and chat bubble with an agent spark.</desc>
+  <defs>
+    <linearGradient id="mark" x1="88" y1="82" x2="431" y2="410" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3370FF"/>
+      <stop offset="0.62" stop-color="#176BEB"/>
+      <stop offset="1" stop-color="#00CDB8"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="369" y1="61" x2="434" y2="126" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8B73FF"/>
+      <stop offset="1" stop-color="#6547E8"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#mark)" d="M91 72c58 38 113 58 169 61 59 3 106 29 121 79 38-22 83-15 103 18-42 6-66 32-86 78-31 73-94 116-179 124 24-20 43-42 56-67-84 8-151-37-172-119 36 31 79 46 129 42-76-20-125-77-139-165-3-18-3-35-2-51Z"/>
+  <path fill="url(#spark)" d="M401 48c7 29 22 44 51 51-29 7-44 22-51 51-7-29-22-44-51-51 29-7 44-22 51-51Z"/>
+  <circle cx="450" cy="364" r="18" fill="#00CDB8"/>
+  <path d="M434 361c-29 29-59 39-94 31" fill="none" stroke="#00CDB8" stroke-width="13" stroke-linecap="round"/>
+</svg>
