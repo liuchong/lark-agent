@@ -41,6 +41,22 @@ type fakeConsumer struct {
 	err     error
 }
 
+type fakeResourceAwareConsumer struct {
+	signal lark.ResourceSignal
+}
+
+func (f fakeResourceAwareConsumer) Consume(context.Context, io.Writer) error {
+	return errors.New("resource-aware path was not used")
+}
+
+func (f fakeResourceAwareConsumer) ConsumeWithResources(
+	ctx context.Context,
+	_ io.Writer,
+	handle func(context.Context, lark.ResourceSignal) error,
+) error {
+	return handle(ctx, f.signal)
+}
+
 func (f fakeConsumer) Consume(_ context.Context, out io.Writer) error {
 	if f.payload != "" {
 		var compact bytes.Buffer
@@ -64,6 +80,25 @@ func (f *fakeStore) RecordWorkIntake(
 ) (domain.IntakeReceipt, error) {
 	f.items = append(f.items, item)
 	return domain.IntakeReceipt{Disposition: domain.IntakeAdmitted}, nil
+}
+
+func TestRealtimeSourceForwardsResourceSignalsOutsideMessageQueue(t *testing.T) {
+	store := &fakeStore{}
+	var got lark.ResourceSignal
+	source := NewSource(fakeResourceAwareConsumer{signal: lark.ResourceSignal{
+		Kind: lark.ResourceSignalComment, EventID: "evt_comment", FileToken: "bas_bug",
+	}}, store, Config{
+		HandleResourceSignal: func(_ context.Context, signal lark.ResourceSignal) error {
+			got = signal
+			return nil
+		},
+	})
+	if err := source.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got.EventID != "evt_comment" || len(store.items) != 0 {
+		t.Fatalf("signal=%+v items=%+v", got, store.items)
+	}
 }
 
 func ownerPrivatePayload(messageID string) string {

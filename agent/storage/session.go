@@ -262,11 +262,11 @@ func (s *Store) recordIntake(
 	if receipt.Disposition == domain.IntakeAdmitted {
 		result, insertErr := tx.ExecContext(ctx,
 			`INSERT OR IGNORE INTO work_items(
-				dedup_key, status, work_kind, priority, session_id, event_json,
-				next_attempt_at, created_at, updated_at
-			 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				dedup_key, status, work_kind, priority, session_id, resource_evidence_id,
+				event_json, next_attempt_at, created_at, updated_at
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			item.DedupKey, item.Status, item.WorkKind, item.Priority, s.session.ID,
-			string(eventJSON), nullableTime(item.NextAttemptAt),
+			nullInt64(item.ResourceEvidenceID), string(eventJSON), nullableTime(item.NextAttemptAt),
 			now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
 		if insertErr != nil {
 			return domain.IntakeReceipt{}, errs.NewInternalError(
@@ -346,11 +346,11 @@ func (s *Store) admitBackfillReceipt(
 	defer tx.Rollback() //nolint:errcheck
 	result, err := tx.ExecContext(ctx,
 		`INSERT OR IGNORE INTO work_items(
-			dedup_key, status, work_kind, priority, session_id, event_json,
-			next_attempt_at, created_at, updated_at
-		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			dedup_key, status, work_kind, priority, session_id, resource_evidence_id,
+			event_json, next_attempt_at, created_at, updated_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		item.DedupKey, item.Status, item.WorkKind, item.Priority, s.session.ID,
-		string(eventJSON), nullableTime(item.NextAttemptAt),
+		nullInt64(item.ResourceEvidenceID), string(eventJSON), nullableTime(item.NextAttemptAt),
 		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
 	if err != nil {
 		return domain.IntakeReceipt{}, errs.NewInternalError(

@@ -268,6 +268,36 @@ Owner 自己向智能助手发出的请求显示“助手答复草稿”。审�
 是发给机器人还是发给 Owner 的事实。升级前创建的旧审批会从工作项原始决策恢复该
 身份并消费旧审批键；如果两处都没有合法身份，恢复会明确失败而不是猜测发送者。
 
+## 文档、Wiki 与 Base 监控
+
+先登记要监控的资源，再执行真实远端订阅和首次对账：
+
+```bash
+lark-agent subscription add 'https://example.larksuite.com/wiki/RESOURCE?table=TABLE'
+lark-agent subscription sync
+lark-agent subscription list
+```
+
+`subscription sync` 会解析 Wiki 到实际文档或 Base 坐标、调用飞书云文档订阅接口、保存
+远端订阅号，并读取 Base 字段与记录完成首次冷启动基线。只有远端订阅成功的项目才标记
+为 `active`；缺少权限标记为 `forbidden`，其他读取或协议错误标记为 `degraded`。首次
+基线不会生成历史任务，后续变更和重连缺口通过定期对账补齐。
+
+运行中的 Agent 同时接收两类线索：用户身份轮询看到的飞书文档应用通知，以及官方
+WebSocket 的评论通知和 Base 记录变更事件。应用消息只用于提取资源位置，不会作为真人
+指令，也不会回复通知应用。当前 Agent 自己发送的应用消息会被排除，避免通知循环。
+
+当受监控的 Base 记录或评论明确提到 Owner 时，会生成 `resource_handoff` 工作。Agent
+必须先读取关联资源证据，再按工作区目录清单选择项目并调用
+`read_workspace_rules` 读取该项目适用的 `AGENTS.md` 与附属规则，然后核对实现、回归
+测试和 Git 历史。只有唯一记录、Owner 为经办人或明确被提及、实时状态字段和选项仍
+匹配、修复证据满足项目规则时，才能执行状态更新。
+
+Base 状态更新和评论回复都是持久化外部动作：`auto` 模式在全部硬门禁通过后执行一次
+并回读验证；`approval` 模式先产生精确动作号，可用 `/approval approve 动作号 confirm`
+批准；`paused` 模式不写入。进程在写入期间中断或结果不确定时不会自动重放，必须先核对
+Base 当前值再处理。
+
 ## 诊断
 
 只检查 SDK 配置和 Keychain 凭据：

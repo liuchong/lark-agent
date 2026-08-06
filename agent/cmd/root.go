@@ -35,6 +35,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/realtime"
 	"github.com/liuchong/lark-agent/agent/reply"
 	"github.com/liuchong/lark-agent/agent/replymatch"
+	agentresource "github.com/liuchong/lark-agent/agent/resource"
 	"github.com/liuchong/lark-agent/agent/router"
 	"github.com/liuchong/lark-agent/agent/rules"
 	agentruntime "github.com/liuchong/lark-agent/agent/runtime"
@@ -131,7 +132,7 @@ Modes:
 		newDaemonCommand(out, &configPath, &statePath),
 		newModeCommand(out, &configPath),
 		newQueueCommand(out, &configPath, &statePath),
-		newSubscriptionCommand(out, &statePath),
+		newSubscriptionCommand(out, &configPath, &statePath),
 		newApprovalCommand(out, &statePath),
 		newMemoryCommand(out, &statePath),
 		newRulesCommand(out, &configPath),
@@ -1770,6 +1771,26 @@ func buildLiveOptions(
 		return nil, nil, nil, info, err
 	}
 	imSvc := serviceim.NewService(apiClient, cfg.Owner.OpenID)
+	resourceSvc := serviceim.NewResourceService(apiClient)
+	resourceMonitor := agentresource.NewMonitor(
+		resourceSvc,
+		store,
+		agentresource.Config{OwnerOpenID: cfg.Owner.OpenID},
+	)
+	if err := bootstrapConfiguredResourceSubscriptions(ctx, cfg, store); err != nil {
+		return nil, nil, nil, info, err
+	}
+	resourceSync, err := resourceMonitor.SyncSubscriptions(ctx)
+	if err != nil {
+		return nil, nil, nil, info, err
+	}
+	resourceReconcile, err := resourceMonitor.Reconcile(ctx)
+	if err != nil {
+		info["resource_reconcile_error"] = err.Error()
+	} else {
+		info["resource_reconcile"] = resourceReconcile
+	}
+	info["resource_subscriptions"] = resourceSync
 	var realtimeSource realtime.Runner
 	var configuredAssistantChatIDs []string
 	if cfg.Assistant.ReplyScope == domain.ReplyScopeConfiguredGroups {
@@ -1792,6 +1813,10 @@ func buildLiveOptions(
 			AssistantReplyScope: cfg.Assistant.ReplyScope,
 			ConfiguredChatIDs:   configuredAssistantChatIDs,
 			Classify:            agentRouter.Route,
+			HandleResourceSignal: func(ctx context.Context, signal serviceim.ResourceSignal) error {
+				_, err := resourceMonitor.HandleResourceSignal(ctx, signal)
+				return err
+			},
 		})
 		info["realtime_owner_requests"] = true
 		info["realtime_requests"] = true
@@ -1865,6 +1890,7 @@ func buildLiveOptions(
 			chatQuery,
 			configuredAssistantChatIDs,
 			includePrivate,
+			resourceMonitor,
 		)
 		options = append(options, app.WithPoller(livePoller))
 		info["user_polling"] = true
@@ -1891,6 +1917,10 @@ func buildLiveOptions(
 		if githubClient != nil {
 			definitions = append(definitions, agenttools.GitHubContextDefinition(githubClient))
 		}
+		definitions = append(definitions, agenttools.ResourceDefinitions(agenttools.ResourceToolOptions{
+			Mode: cfg.Policy.Mode, Evidence: store, Actions: store,
+			Client: resourceToolClient{service: resourceSvc},
+		})...)
 		definitions = append(definitions,
 			agenttools.ShellDefinition(scope, agenttools.ShellOptions{
 				ApprovalRequired:     cfg.Agent.ShellApproval,
@@ -2129,7 +2159,14 @@ func newConfiguredLivePoller(
 	chatQuery string,
 	configuredAssistantChatIDs []string,
 	includePrivate bool,
+	resourceMonitor *agentresource.Monitor,
 ) *poll.Poller {
+	var reconcile func(context.Context)
+	if resourceMonitor != nil {
+		reconcile = func(ctx context.Context) {
+			_, _ = resourceMonitor.Reconcile(ctx)
+		}
+	}
 	return poll.New(im, store, poll.Config{
 		OwnerOpenID:                cfg.Owner.OpenID,
 		ChatQuery:                  chatQuery,
@@ -2141,7 +2178,56 @@ func newConfiguredLivePoller(
 		IndexLookback:              cfg.Scheduler.PollIndexLookback,
 		OwnerWait:                  cfg.Policy.OwnerWait,
 		Classify:                   agentRouter.Route,
+		NotificationSink:           resourceMonitor,
+		ReconcileResources:         reconcile,
 	})
+}
+
+func bootstrapConfiguredResourceSubscriptions(
+	ctx context.Context,
+	cfg config.Config,
+	store *storage.Store,
+) error {
+	for _, configured := range cfg.Lark.Subscriptions {
+		url := strings.TrimSpace(configured.URL)
+		if url == "" {
+			continue
+		}
+		ref, err := serviceim.ParseResourceURL(url)
+		if err != nil {
+			return err
+		}
+		modes := append([]string(nil), configured.MonitorModes...)
+		if len(modes) == 0 {
+			modes = []string{"document_comment", "cloud_docs_notice"}
+			if ref.ResourceType == serviceim.ResourceTypeBase {
+				modes = []string{"base_record", "base_field", "cloud_docs_notice"}
+			}
+		}
+		status := domain.ResourceSubscriptionStatus(configured.Status)
+		switch status {
+		case domain.ResourceSubscriptionActive, domain.ResourceSubscriptionDegraded:
+		default:
+			status = domain.ResourceSubscriptionPending
+		}
+		if _, err := store.UpsertResourceSubscription(ctx, domain.ResourceSubscription{
+			OriginalURL:          url,
+			ResourceType:         firstNonEmpty(configured.ResourceType, string(ref.ResourceType)),
+			FileToken:            firstNonEmpty(configured.FileToken, ref.FileToken),
+			AppToken:             firstNonEmpty(configured.AppToken, ref.AppToken),
+			WikiNodeToken:        firstNonEmpty(configured.WikiNodeToken, ref.WikiNodeToken),
+			TableID:              firstNonEmpty(configured.TableID, ref.TableID),
+			ViewID:               firstNonEmpty(configured.ViewID, ref.ViewID),
+			MonitorModes:         modes,
+			RemoteSubscriptionID: configured.RemoteSubscriptionID,
+			Status:               status,
+			Cursor:               configured.Cursor,
+			LastError:            configured.LastError,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func newAgentRouter(cfg config.Config, store *storage.Store) *router.Router {
@@ -2570,6 +2656,46 @@ func (r liveDelegatedReplyResolver) Resolve(
 
 type larkToolContext struct {
 	svc *serviceim.Service
+}
+
+type resourceToolClient struct {
+	service *serviceim.ResourceService
+}
+
+func (c resourceToolClient) ListBaseFields(
+	ctx context.Context,
+	appToken, tableID string,
+) ([]agenttools.ResourceField, error) {
+	fields, err := c.service.ListBaseFields(ctx, appToken, tableID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]agenttools.ResourceField, 0, len(fields))
+	for _, field := range fields {
+		item := agenttools.ResourceField{Name: field.Name, Type: field.Type}
+		for _, option := range field.Options {
+			item.Options = append(item.Options, option.Name)
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+func (c resourceToolClient) CompareAndUpdateBaseField(
+	ctx context.Context,
+	update agenttools.ResourceFieldUpdate,
+) (any, error) {
+	return c.service.CompareAndUpdateBaseField(ctx, serviceim.BaseFieldUpdate{
+		AppToken: update.AppToken, TableID: update.TableID, RecordID: update.RecordID,
+		FieldName: update.FieldName, Before: update.Before, After: update.After,
+	})
+}
+
+func (c resourceToolClient) ReplyToComment(
+	ctx context.Context,
+	fileToken, fileType, commentID, text string,
+) (any, error) {
+	return c.service.ReplyToComment(ctx, fileToken, fileType, commentID, text)
 }
 
 type liveOwnerNotifier struct {
@@ -3018,6 +3144,7 @@ func normalizeToolMessages(messages []serviceim.Message) []domain.NormalizedEven
 			SenderName:       message.SenderDisplayName,
 			SenderType:       message.SenderType,
 			Content:          message.Content,
+			ResourceURLs:     append([]string(nil), message.ResourceURLs...),
 			Attachments:      attachments,
 			Mentions:         message.Mentions,
 			CreatedAt:        normalizeServiceMessageTime(message.CreateTime),
@@ -3754,6 +3881,7 @@ func newQueueBackfillCommand(out io.Writer, configPath, statePath *string) *cobr
 				chatQuery,
 				nil,
 				includePrivate,
+				nil,
 			)
 			result, err := poller.Backfill(cmd.Context(), poll.BackfillRequest{
 				ChatQuery: chatQuery,
@@ -3912,8 +4040,9 @@ func newApprovalCommand(out io.Writer, statePath *string) *cobra.Command {
 	return cmd
 }
 
-func newSubscriptionCommand(out io.Writer, statePath *string) *cobra.Command {
+func newSubscriptionCommand(out io.Writer, configPath, statePath *string) *cobra.Command {
 	cmd := &cobra.Command{Use: "subscription", Short: "Manage document and Base monitoring subscriptions"}
+	var removeRemote bool
 	cmd.AddCommand(&cobra.Command{
 		Use:   "add URL",
 		Short: "Add a Wiki, document, or Base resource subscription",
@@ -3982,7 +4111,7 @@ func newSubscriptionCommand(out io.Writer, statePath *string) *cobra.Command {
 			return writeData(out, sub)
 		},
 	})
-	cmd.AddCommand(&cobra.Command{
+	removeCmd := &cobra.Command{
 		Use:   "remove URL",
 		Short: "Mark one resource subscription removed",
 		Args:  cobra.ExactArgs(1),
@@ -3992,28 +4121,107 @@ func newSubscriptionCommand(out io.Writer, statePath *string) *cobra.Command {
 				return err
 			}
 			defer store.Close() //nolint:errcheck
-			sub, err := store.RemoveResourceSubscription(cmd.Context(), args[0])
+			sub, err := store.GetResourceSubscription(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			if removeRemote && sub.Status != domain.ResourceSubscriptionRemoved {
+				cfg, err := config.Load(resolveConfigPath(*configPath))
+				if err != nil {
+					return err
+				}
+				credentials, err := serviceim.LoadCredentials(cmd.Context(), credentialRefs(cfg))
+				if err != nil {
+					return err
+				}
+				client, err := serviceim.NewClient(serviceim.ClientConfig{
+					AppID: cfg.Lark.AppID, AppSecret: credentials.AppSecret,
+					UserAccessToken: credentials.UserAccessToken,
+					RefreshToken:    credentials.RefreshToken,
+					UserTokenStore:  serviceim.NewKeychainUserTokenStore(credentialRefs(cfg)),
+					BaseURL:         cfg.Lark.BaseURL, Timeout: 30 * time.Second,
+				})
+				if err != nil {
+					return err
+				}
+				if _, err := serviceim.NewResourceService(client).SetCommentSubscription(
+					cmd.Context(),
+					serviceim.ResourceRef{
+						OriginalURL:  sub.OriginalURL,
+						ResourceType: serviceim.ResourceType(sub.ResourceType),
+						FileToken:    sub.FileToken, AppToken: sub.AppToken,
+						WikiNodeToken: sub.WikiNodeToken, TableID: sub.TableID, ViewID: sub.ViewID,
+					},
+					false,
+				); err != nil {
+					return err
+				}
+			}
+			sub, err = store.RemoveResourceSubscription(cmd.Context(), args[0])
 			if err != nil {
 				return err
 			}
 			return writeData(out, sub)
 		},
-	})
+	}
+	removeCmd.Flags().BoolVar(
+		&removeRemote,
+		"remote",
+		false,
+		"unsubscribe remotely before marking the local subscription removed",
+	)
+	cmd.AddCommand(removeCmd)
 	cmd.AddCommand(&cobra.Command{
 		Use:   "sync",
-		Short: "Report local resource subscription sync state",
+		Short: "Resolve resources and activate remote monitoring subscriptions",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			credentials, err := serviceim.LoadCredentials(cmd.Context(), credentialRefs(cfg))
+			if err != nil {
+				return err
+			}
+			client, err := serviceim.NewClient(serviceim.ClientConfig{
+				AppID: cfg.Lark.AppID, AppSecret: credentials.AppSecret,
+				UserAccessToken: credentials.UserAccessToken,
+				RefreshToken:    credentials.RefreshToken,
+				UserTokenStore:  serviceim.NewKeychainUserTokenStore(credentialRefs(cfg)),
+				BaseURL:         cfg.Lark.BaseURL, Timeout: 30 * time.Second,
+			})
+			if err != nil {
+				return err
+			}
 			store, err := storage.OpenInspection(resolveStatePath(*statePath))
 			if err != nil {
 				return err
 			}
 			defer store.Close() //nolint:errcheck
+			if err := bootstrapConfiguredResourceSubscriptions(cmd.Context(), cfg, store); err != nil {
+				return err
+			}
+			monitor := agentresource.NewMonitor(
+				serviceim.NewResourceService(client),
+				store,
+				agentresource.Config{OwnerOpenID: cfg.Owner.OpenID},
+			)
+			syncResult, err := monitor.SyncSubscriptions(cmd.Context())
+			if err != nil {
+				return err
+			}
+			reconcileResult, err := monitor.Reconcile(cmd.Context())
+			if err != nil {
+				return err
+			}
 			subs, err := store.ListResourceSubscriptions(cmd.Context())
 			if err != nil {
 				return err
 			}
 			return writeData(out, map[string]any{
 				"subscriptions": subs,
+				"sync":          syncResult,
+				"reconcile":     reconcileResult,
 				"remote_scope":  "base subscriptions are app/file scoped; table filtering is local and view is context only",
 			})
 		},

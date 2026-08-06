@@ -688,7 +688,7 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 		}
 	})
 
-	t.Run("group owner fix then status request stays direct mention", func(t *testing.T) {
+	t.Run("group owner fix then status request becomes resource handoff", func(t *testing.T) {
 		store := openSemanticIntegrationStore(t)
 		base := store.CurrentSession().StartedAt.Add(time.Second)
 		item := enqueueDueDelegatedItem(t, store, domain.NormalizedEvent{
@@ -746,7 +746,8 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 		if err != nil {
 			t.Fatal(err)
 		}
-		if builder.calls != 1 || builder.item.WorkKind == domain.WorkKindCodingQuestion ||
+		if builder.calls != 1 || builder.item.WorkKind != domain.WorkKindResourceHandoff ||
+			builder.item.TaskClass != domain.TaskClassResourceHandoff ||
 			builder.item.InvestigationActive ||
 			decider.calls != 1 || replier.calls != 1 {
 			t.Fatalf(

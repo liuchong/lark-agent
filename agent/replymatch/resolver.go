@@ -244,7 +244,10 @@ func validateResolution(req Request, ownerOpenID string, resolution Resolution) 
 			return invalidResolution("unanswered semantic result requires task_summary")
 		}
 		switch resolution.TaskClass {
-		case domain.TaskClassSimple, domain.TaskClassInvestigation, domain.TaskClassCoding:
+		case domain.TaskClassSimple,
+			domain.TaskClassInvestigation,
+			domain.TaskClassCoding,
+			domain.TaskClassResourceHandoff:
 		default:
 			return invalidResolution("unanswered semantic result requires a valid task_class")
 		}
@@ -351,8 +354,8 @@ func normalizeNoReplyNeeded(resolution Resolution, reason string) Resolution {
 }
 
 func normalizeStatusUpdateHandoff(resolution Resolution) Resolution {
-	resolution.TaskClass = domain.TaskClassSimple
-	resolution.RequiresProgress = false
+	resolution.TaskClass = domain.TaskClassResourceHandoff
+	resolution.RequiresProgress = true
 	if resolution.ClassificationConfidence < 0.85 {
 		resolution.ClassificationConfidence = 0.85
 	}
@@ -361,7 +364,7 @@ func normalizeStatusUpdateHandoff(resolution Resolution) Resolution {
 	if summary == "" ||
 		strings.Contains(lowerSummary, "investigate") ||
 		strings.Contains(summary, "调查") {
-		resolution.TaskSummary = "acknowledge the owner's fix and status update handoff"
+		resolution.TaskSummary = "locate the referenced issue, verify its fix evidence, and update its workflow status"
 	}
 	return resolution
 }

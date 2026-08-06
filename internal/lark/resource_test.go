@@ -40,3 +40,14 @@ func TestParseDocumentResourceURL(t *testing.T) {
 		t.Fatalf("ref=%+v", ref)
 	}
 }
+
+func TestParseBaseRecordShareURL(t *testing.T) {
+	ref, err := ParseResourceURL("https://example.larksuite.com/record/shrExampleRecordToken001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.ResourceType != ResourceTypeBaseRecord ||
+		ref.RecordShareToken != "shrExampleRecordToken001" {
+		t.Fatalf("ref=%+v", ref)
+	}
+}

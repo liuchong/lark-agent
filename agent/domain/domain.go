@@ -108,6 +108,7 @@ type NormalizedEvent struct {
 	SenderName       string       `json:"sender_name,omitempty" yaml:"sender_name,omitempty"`
 	SenderType       string       `json:"sender_type,omitempty" yaml:"sender_type,omitempty"`
 	Content          string       `json:"content,omitempty" yaml:"content,omitempty"`
+	ResourceURLs     []string     `json:"resource_urls,omitempty" yaml:"resource_urls,omitempty"`
 	Attachments      []Attachment `json:"attachments,omitempty" yaml:"attachments,omitempty"`
 	Mentions         []Mention    `json:"mentions,omitempty" yaml:"mentions,omitempty"`
 	CreatedAt        time.Time    `json:"created_at,omitempty" yaml:"created_at,omitempty"`
@@ -208,6 +209,51 @@ type ResourceSubscription struct {
 	LastError            string                     `json:"last_error,omitempty" yaml:"last_error,omitempty"`
 	CreatedAt            time.Time                  `json:"created_at" yaml:"created_at"`
 	UpdatedAt            time.Time                  `json:"updated_at" yaml:"updated_at"`
+}
+
+type ResourceEvidenceSource string
+
+const (
+	ResourceEvidenceNotification ResourceEvidenceSource = "notification"
+	ResourceEvidenceCommentEvent ResourceEvidenceSource = "comment_event"
+	ResourceEvidenceRecordEvent  ResourceEvidenceSource = "record_event"
+	ResourceEvidenceReconcile    ResourceEvidenceSource = "reconcile"
+)
+
+// ResourceEvidence is the privacy-bounded durable projection of a trusted
+// document or Base signal. Complete private threads and arbitrary record fields
+// never enter this shape.
+type ResourceEvidence struct {
+	ID              int64                  `json:"id" yaml:"id"`
+	DedupKey        string                 `json:"dedup_key" yaml:"dedup_key"`
+	SourceKind      ResourceEvidenceSource `json:"source_kind" yaml:"source_kind"`
+	SourceID        string                 `json:"source_id" yaml:"source_id"`
+	SubscriptionID  int64                  `json:"subscription_id,omitempty" yaml:"subscription_id,omitempty"`
+	ResourceType    string                 `json:"resource_type" yaml:"resource_type"`
+	OriginalURL     string                 `json:"url,omitempty" yaml:"url,omitempty"`
+	FileToken       string                 `json:"file_token,omitempty" yaml:"file_token,omitempty"`
+	AppToken        string                 `json:"app_token,omitempty" yaml:"app_token,omitempty"`
+	TableID         string                 `json:"table_id,omitempty" yaml:"table_id,omitempty"`
+	ViewID          string                 `json:"view_id,omitempty" yaml:"view_id,omitempty"`
+	RecordID        string                 `json:"record_id,omitempty" yaml:"record_id,omitempty"`
+	CommentID       string                 `json:"comment_id,omitempty" yaml:"comment_id,omitempty"`
+	Title           string                 `json:"title,omitempty" yaml:"title,omitempty"`
+	IssueKey        string                 `json:"issue_key,omitempty" yaml:"issue_key,omitempty"`
+	StatusFieldID   string                 `json:"status_field_id,omitempty" yaml:"status_field_id,omitempty"`
+	StatusFieldName string                 `json:"status_field_name,omitempty" yaml:"status_field_name,omitempty"`
+	StatusValue     string                 `json:"status_value,omitempty" yaml:"status_value,omitempty"`
+	AssigneeOpenIDs []string               `json:"assignee_open_ids,omitempty" yaml:"assignee_open_ids,omitempty"`
+	OwnerMentioned  bool                   `json:"owner_mentioned,omitempty" yaml:"owner_mentioned,omitempty"`
+	ContentDigest   string                 `json:"content_digest" yaml:"content_digest"`
+	ObservedAt      time.Time              `json:"observed_at" yaml:"observed_at"`
+}
+
+type ResourceEvidenceQuery struct {
+	Terms    []string `json:"terms,omitempty" yaml:"terms,omitempty"`
+	AppToken string   `json:"app_token,omitempty" yaml:"app_token,omitempty"`
+	TableID  string   `json:"table_id,omitempty" yaml:"table_id,omitempty"`
+	RecordID string   `json:"record_id,omitempty" yaml:"record_id,omitempty"`
+	Limit    int      `json:"limit,omitempty" yaml:"limit,omitempty"`
 }
 
 // GitHubReferenceKind identifies the trusted external object behind one Lark
@@ -347,22 +393,24 @@ const (
 type WorkKind string
 
 const (
-	WorkKindGeneric        WorkKind = "generic"
-	WorkKindFastPath       WorkKind = "fast_path"
-	WorkKindOwnerControl   WorkKind = "owner_control"
-	WorkKindSimpleQuestion WorkKind = "simple_question"
-	WorkKindDirectMention  WorkKind = "direct_mention"
-	WorkKindCodingQuestion WorkKind = "coding_question"
-	WorkKindCodingGoal     WorkKind = "coding_goal"
+	WorkKindGeneric         WorkKind = "generic"
+	WorkKindFastPath        WorkKind = "fast_path"
+	WorkKindOwnerControl    WorkKind = "owner_control"
+	WorkKindSimpleQuestion  WorkKind = "simple_question"
+	WorkKindDirectMention   WorkKind = "direct_mention"
+	WorkKindResourceHandoff WorkKind = "resource_handoff"
+	WorkKindCodingQuestion  WorkKind = "coding_question"
+	WorkKindCodingGoal      WorkKind = "coding_goal"
 )
 
 // TaskClass describes the work implied by bounded conversation context.
 type TaskClass string
 
 const (
-	TaskClassSimple        TaskClass = "simple"
-	TaskClassInvestigation TaskClass = "investigation"
-	TaskClassCoding        TaskClass = "coding"
+	TaskClassSimple          TaskClass = "simple"
+	TaskClassInvestigation   TaskClass = "investigation"
+	TaskClassCoding          TaskClass = "coding"
+	TaskClassResourceHandoff TaskClass = "resource_handoff"
 )
 
 // DelegatedInvestigationStatus tracks one resumable delegated investigation.
@@ -394,13 +442,14 @@ type DelegatedInvestigation struct {
 }
 
 const (
-	PriorityBackground     = 10
-	PriorityCodingQuestion = 40
-	PriorityDirectMention  = 60
-	PrioritySimpleQuestion = 70
-	PriorityOwnerControl   = 95
-	PriorityFastPath       = 90
-	PriorityPostReply      = 100
+	PriorityBackground      = 10
+	PriorityCodingQuestion  = 40
+	PriorityDirectMention   = 60
+	PriorityResourceHandoff = 65
+	PrioritySimpleQuestion  = 70
+	PriorityOwnerControl    = 95
+	PriorityFastPath        = 90
+	PriorityPostReply       = 100
 )
 
 // SchedulerLane separates latency-sensitive replies from durable background
@@ -436,6 +485,7 @@ type WorkItem struct {
 	ContextDigest       string            `json:"-" yaml:"-"`
 	ResolvedContext     []NormalizedEvent `json:"-" yaml:"-"`
 	InvestigationActive bool              `json:"-" yaml:"-"`
+	ResourceEvidenceID  int64             `json:"-" yaml:"-"`
 }
 
 // CodingWorkKind distinguishes one-shot answers from durable follow-up goals.

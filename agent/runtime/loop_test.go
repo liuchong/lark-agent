@@ -172,6 +172,59 @@ func TestAgentLoopDefaultToolChoiceAllowsModelChoice(t *testing.T) {
 	}
 }
 
+func TestResourceHandoffTerminalDecisionSeparatesNotificationsFromHumanRequests(t *testing.T) {
+	notification := agentcontext.Bundle{
+		WorkKind: domain.WorkKindResourceHandoff,
+		Event:    domain.NormalizedEvent{SenderType: "resource"},
+	}
+	if err := validateTerminalDecision(notification, domain.Decision{
+		Kind: domain.DecisionNotify,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateTerminalDecision(notification, domain.Decision{
+		Kind: domain.DecisionReply, Language: "zh-CN", ReplyText: "已处理。",
+	}); err == nil {
+		t.Fatal("notification-origin handoff must not reply")
+	}
+	human := agentcontext.Bundle{
+		WorkKind: domain.WorkKindResourceHandoff,
+		Event:    domain.NormalizedEvent{SenderType: "user", ChatID: "oc_group"},
+	}
+	if err := validateTerminalDecision(human, domain.Decision{
+		Kind: domain.DecisionReply, Language: "zh-CN", ReplyText: "已核对并更新状态。",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateTerminalDecision(human, domain.Decision{
+		Kind: domain.DecisionNotify,
+	}); err == nil {
+		t.Fatal("human handoff must receive a sender-facing result")
+	}
+}
+
+func TestResourceStatusMutationRequiresRulesCodeTestsGitAndSchema(t *testing.T) {
+	bundle := agentcontext.Bundle{WorkKind: domain.WorkKindResourceHandoff}
+	var progress resourceHandoffProgress
+	if err := progress.ValidateMutation(bundle, "update_base_status"); err == nil ||
+		!strings.Contains(err.Error(), "read_workspace_rules") {
+		t.Fatalf("initial gate error=%v", err)
+	}
+	source := []domain.SourceRef{{RelativePath: "evidence", Digest: "sha256:1"}}
+	progress.Observe(bundle, "get_resource_evidence", `{}`, `{"current":{}}`, source)
+	progress.Observe(bundle, "inspect_base_schema", `{}`, `[{"name":"状态"}]`, nil)
+	progress.Observe(bundle, "read_workspace_rules", `{"path":"sample-module/go"}`, `[{}]`, source)
+	progress.Observe(bundle, "read_workspace", `{"path":"sample-module/go/pkg/db/item_model.go"}`, "code", source)
+	progress.Observe(bundle, "read_workspace", `{"path":"sample-module/go/internal/item_flow/item_archive_flow_test.go"}`, "test", source)
+	progress.Observe(bundle, "inspect_git_history", `{"path":"sample-module"}`, "commit", source)
+	if err := progress.ValidateMutation(bundle, "update_base_status"); err != nil {
+		t.Fatal(err)
+	}
+	if err := progress.ValidateMutation(bundle, "reply_resource_comment"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestModelRunProgressPromptIsCodeMaintainedStatusBar(t *testing.T) {
 	prompt := modelRunProgressPrompt(runBudget{
 		Phase:           PhaseGenerate,

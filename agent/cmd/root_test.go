@@ -929,7 +929,7 @@ func TestConfiguredLivePollerPersistsRouterPriority(t *testing.T) {
 		SenderOpenID: "owner", Content: "@_user_1 ping",
 		Mentions:   []domain.Mention{{OpenID: "assistant", Name: "Agent"}},
 		CreateTime: time.Now().UTC().Format(time.RFC3339),
-	}}, store, r, cfg, "Test Group", nil, true)
+	}}, store, r, cfg, "Test Group", nil, true, nil)
 	if _, err := poller.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}

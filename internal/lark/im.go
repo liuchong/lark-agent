@@ -166,6 +166,7 @@ type Message struct {
 	SenderType        string
 	MsgType           string
 	Content           string
+	ResourceURLs      []string
 	Attachments       []MessageAttachment
 	Mentions          []domain.Mention
 	CreateTime        string
@@ -1444,6 +1445,7 @@ func parseMessage(raw any) Message {
 		SenderType:        firstString(sender, "sender_type", "type"),
 		MsgType:           firstString(item, "msg_type", "message_type"),
 		Content:           stringValue(item["content"]),
+		ResourceURLs:      resourceURLsFromContent(item["content"]),
 		Mentions:          parseMentions(item["mentions"]),
 		CreateTime:        firstString(item, "create_time", "createTime"),
 		UpdateTime:        firstString(item, "update_time", "updateTime"),
@@ -1458,9 +1460,11 @@ func parseMessage(raw any) Message {
 	}
 	if msg.Content == "" {
 		msg.Content = textFromContent(item["body"])
+		msg.ResourceURLs = append(msg.ResourceURLs, resourceURLsFromContent(item["body"])...)
 	} else {
 		msg.Content = textFromContent(msg.Content)
 	}
+	msg.ResourceURLs = uniqueResourceURLs(msg.ResourceURLs)
 	if msg.MsgType == "image" {
 		imageKey := contentString(item["content"], "image_key")
 		if imageKey == "" {
@@ -1474,6 +1478,60 @@ func parseMessage(raw any) Message {
 		}
 	}
 	return msg
+}
+
+func resourceURLsFromContent(raw any) []string {
+	value := raw
+	if encoded, ok := raw.(string); ok {
+		var decoded any
+		if json.Unmarshal([]byte(encoded), &decoded) == nil {
+			value = decoded
+		}
+	}
+	var out []string
+	var walk func(any)
+	walk = func(current any) {
+		switch typed := current.(type) {
+		case map[string]any:
+			for _, child := range typed {
+				walk(child)
+			}
+		case []any:
+			for _, child := range typed {
+				walk(child)
+			}
+		case string:
+			for _, candidate := range strings.Fields(typed) {
+				candidate = strings.Trim(candidate, `"'()[]{}<>,，。；;`)
+				parsed, err := url.Parse(candidate)
+				if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+					continue
+				}
+				parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+				if len(parts) >= 2 {
+					switch parts[0] {
+					case "wiki", "base", "record", "doc", "docs", "docx", "sheet", "sheets":
+						out = append(out, candidate)
+					}
+				}
+			}
+		}
+	}
+	walk(value)
+	return uniqueResourceURLs(out)
+}
+
+func uniqueResourceURLs(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func contentString(raw any, key string) string {

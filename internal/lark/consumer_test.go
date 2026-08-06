@@ -8,6 +8,7 @@ import (
 	"time"
 
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
+	larkdrive "github.com/larksuite/oapi-sdk-go/v3/service/drive/v1"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
@@ -32,6 +33,49 @@ func TestProjectMessageEventPreservesTypedFields(t *testing.T) {
 		envelope.SenderID != "ou_owner" ||
 		envelope.Content != "hello" {
 		t.Fatalf("envelope=%+v", envelope)
+	}
+}
+
+func TestProjectCommentNoticePreservesOwnerMentionAndResource(t *testing.T) {
+	signal, err := projectCommentNotice(&larkdrive.P2NoticeCommentAddV1{
+		EventV2Base: &larkevent.EventV2Base{Header: &larkevent.EventHeader{
+			EventID: "evt_comment", CreateTime: "1786000000000",
+		}},
+		Event: &larkdrive.P2NoticeCommentAddV1Data{
+			NoticeMeta: &larkdrive.Notice{
+				FileType: stringPtr("bitable"), FileToken: stringPtr("bas_bug"),
+				ToUserId: &larkdrive.UserId{OpenId: stringPtr("ou_owner")},
+			},
+			CommentId:   stringPtr("comment_bug"),
+			IsMentioned: boolPtr(true),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signal.Kind != ResourceSignalComment || signal.EventID != "evt_comment" ||
+		signal.FileToken != "bas_bug" || signal.CommentID != "comment_bug" ||
+		signal.ToOpenID != "ou_owner" || !signal.Mentioned {
+		t.Fatalf("signal=%+v", signal)
+	}
+}
+
+func TestProjectBaseRecordChangePreservesChangedRecordIDs(t *testing.T) {
+	signal, err := projectBaseRecordChange(&larkdrive.P2FileBitableRecordChangedV1{
+		EventV2Base: &larkevent.EventV2Base{Header: &larkevent.EventHeader{EventID: "evt_record"}},
+		Event: &larkdrive.P2FileBitableRecordChangedV1Data{
+			FileToken: stringPtr("bas_bug"), TableId: stringPtr("tbl_bug"),
+			ActionList: []*larkdrive.BitableTableRecordAction{
+				{RecordId: stringPtr("rec_a")}, {RecordId: stringPtr("rec_b")},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signal.Kind != ResourceSignalRecordChange || signal.TableID != "tbl_bug" ||
+		len(signal.RecordIDs) != 2 || signal.RecordIDs[0] != "rec_a" {
+		t.Fatalf("signal=%+v", signal)
 	}
 }
 
@@ -205,5 +249,9 @@ func sdkMessageEvent() *larkim.P2MessageReceiveV1 {
 }
 
 func stringPtr(value string) *string {
+	return &value
+}
+
+func boolPtr(value bool) *bool {
 	return &value
 }

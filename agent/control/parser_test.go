@@ -168,6 +168,9 @@ func TestCommandCatalogDrivesParserHelpAndSemanticPrompt(t *testing.T) {
 	if !strings.Contains(help, "lark-agent model doctor primary") {
 		t.Fatalf("help missing model doctor: %s", help)
 	}
+	if !strings.Contains(help, "lark-agent subscription sync") {
+		t.Fatalf("help missing resource subscription sync: %s", help)
+	}
 	for _, spec := range specs {
 		if spec.UsageZH == "" || spec.PurposeZH == "" {
 			t.Fatalf("incomplete localized command spec: %+v", spec)

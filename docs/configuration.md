@@ -28,7 +28,10 @@ lark-agent config show
   默认值；GitHub Action 必须显式传入，国际版使用
   `https://open.larksuite.com`。
 - `lark.subscriptions`：文档、Wiki、Base 监控订阅的非秘密配置投影；运行态状态仍以
-  SQLite 为准。
+  SQLite 为准。也可以用 `lark-agent subscription add URL` 登记本机订阅，再用
+  `lark-agent subscription sync` 解析 Wiki、建立远端文件订阅并完成首次 Base
+  基线对账。配置或本机记录中的 `active` 不能替代远端同步结果；同步失败会落为
+  `degraded` 或 `forbidden`。
 - `github.enabled`：是否启用可信 GitHub 证据桥。默认关闭。
 - `github.allowed_repositories`：允许通知和后续读取的精确 `owner/repository`
   列表；不支持通配符，也不能由模型或消息正文扩大。

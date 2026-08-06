@@ -11,4 +11,6 @@
   readiness tests.
 - Resource monitoring must state platform limits explicitly: Base remote
   subscription is app/file scoped, table filtering is local, view is context
-  only, and Base comment/@ events are not claimed.
+  only. Public comment notifications and Base record-change events are signals,
+  not record truth; re-read the typed comment, schema, and record before work or
+  mutation, and keep application-authored notification prose untrusted.

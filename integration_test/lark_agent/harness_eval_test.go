@@ -190,6 +190,129 @@ func TestHarnessEvalClarificationDoesNotRequireFakeCodeRead(t *testing.T) {
 	}
 }
 
+func TestHarnessEvalWork6210UsesResourceEvidenceRulesAndVerifiedStatusAction(t *testing.T) {
+	model := &responseQualityModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
+			"resource", "get_resource_evidence", `{"terms":["归档示例条目"],"limit":10}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
+			"rules", "read_workspace_rules", `{"path":"src/sample/sample-module/go"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
+			"production", "read_workspace", `{"path":"src/sample/sample-module/go/pkg/db/item_model.go"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
+			"test", "read_workspace", `{"path":"src/sample/sample-module/go/internal/item_flow/item_archive_flow_test.go"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
+			"git", "inspect_git_history", `{"path":"src/sample/sample-module","query":"archive item"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
+			"schema", "inspect_base_schema", `{"app_token":"bas_bug","table_id":"tbl_bug"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
+			"update", "update_base_status", `{
+				"app_token":"bas_bug","table_id":"tbl_bug","record_id":"rec_bug",
+				"field_name":"状态","expected_value":"待修改","desired_value":"已解决"
+			}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
+			"submit", "submit_decision", `{
+				"decision":"reply",
+				"relevance_confidence":0.99,
+				"reply_confidence":0.95,
+				"risk":"medium",
+				"evidence_status":"verified",
+				"reply_outcome":"complete",
+				"progress":{
+					"completed_checks":["资源记录","项目规则","修复代码","回归测试","提交历史","状态字段"],
+					"initial_finding":"归档示例条目后列表未刷新的问题已有修复和回归测试",
+					"unknowns":[],
+					"next_step":"无"
+				},
+				"reply_text":"已核对 示例模块 的实现、回归测试和修复提交，并将对应 Bug 状态从“待修改”更新为“已解决”。",
+				"reason":"verified resource handoff completed"
+			}`,
+		)}),
+	}}
+	updates := 0
+	source := func(path, digest string) []domain.SourceRef {
+		return []domain.SourceRef{{RelativePath: path, Digest: digest, Kind: "workspace"}}
+	}
+	definition := func(name string, execute func(json.RawMessage) agenttools.Execution) agenttools.Definition {
+		return agenttools.Definition{
+			Info: &schema.ToolInfo{Name: name}, ResourceHandoffOnly: true,
+			NonOwnerReadOnly: true,
+			Execute: func(_ context.Context, raw json.RawMessage) (agenttools.Execution, error) {
+				return execute(raw), nil
+			},
+		}
+	}
+	registry, err := agenttools.NewRegistry(
+		definition("get_resource_evidence", func(json.RawMessage) agenttools.Execution {
+			return agenttools.Execution{
+				Content: `{"related":[{"issue_key":"BUG-99999","app_token":"bas_bug","table_id":"tbl_bug","record_id":"rec_bug","status_value":"待修改"}]}`,
+				Sources: source("resource_evidence/320", "sha256:resource"),
+			}
+		}),
+		definition("read_workspace_rules", func(json.RawMessage) agenttools.Execution {
+			return agenttools.Execution{
+				Content: `sample-module requires Go regression tests and Lark bug workflow evidence`,
+				Sources: source("src/sample/sample-module/AGENTS.md", "sha256:rules"),
+			}
+		}),
+		definition("read_workspace", func(raw json.RawMessage) agenttools.Execution {
+			if strings.Contains(string(raw), "item_archive_flow_test.go") {
+				return agenttools.Execution{
+					Content: `released conversations without latest_msg stay visible`,
+					Sources: source("src/sample/sample-module/go/internal/item_flow/item_archive_flow_test.go", "sha256:test"),
+				}
+			}
+			return agenttools.Execution{
+				Content: `conversation list filters only is_excluded_from_list`,
+				Sources: source("src/sample/sample-module/go/pkg/db/item_model.go", "sha256:production"),
+			}
+		}),
+		definition("inspect_git_history", func(json.RawMessage) agenttools.Execution {
+			return agenttools.Execution{
+				Content: `3399c0a5 fix archive item remaining in list`,
+				Sources: source("src/sample/sample-module/.git/3399c0a5", "sha256:git"),
+			}
+		}),
+		definition("inspect_base_schema", func(json.RawMessage) agenttools.Execution {
+			return agenttools.Execution{Content: `[{"name":"状态","type":3,"options":["待修改","已解决"]}]`}
+		}),
+		definition("update_base_status", func(json.RawMessage) agenttools.Execution {
+			updates++
+			return agenttools.Execution{Content: `{"status":"completed","result":{"verified":true}}`}
+		}),
+		agentruntime.SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, _, err := (agentruntime.AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 20, MaxToolCalls: 12,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		User: agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_work_6210", ChatID: "oc_group", ChatType: "group",
+			SenderID: "ou_teammate", SenderType: "user",
+			Content:  "@测试负责人 这个问题修复后改下状态哈",
+			Mentions: []domain.Mention{{OpenID: "ou_owner"}},
+		},
+		TaskSummary: "核对“归档示例条目后列表未刷新”的修复并更新 Bug 状态",
+		TaskClass:   domain.TaskClassResourceHandoff,
+		WorkKind:    domain.WorkKindResourceHandoff,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.ReplyOutcome != domain.ReplyOutcomeComplete || updates != 1 || model.calls != 8 {
+		t.Fatalf("decision=%+v updates=%d calls=%d", decision, updates, model.calls)
+	}
+}
+
 func TestHarnessEvalRepeatedStableResultStopsMechanicalToolCalls(t *testing.T) {
 	model := &responseQualityModel{responses: []*schema.Message{
 		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall("probe_1", "probe", `{"query":"same"}`)}),

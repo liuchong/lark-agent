@@ -521,6 +521,42 @@ func (s *Store) migrate() error {
 			`ALTER TABLE agent_steps ADD COLUMN failure_category TEXT NOT NULL DEFAULT ''`,
 			`ALTER TABLE agent_steps ADD COLUMN recovery_action TEXT NOT NULL DEFAULT ''`,
 		}},
+		{version: 19, statements: []string{
+			`CREATE TABLE IF NOT EXISTS resource_evidence (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				dedup_key TEXT NOT NULL UNIQUE,
+				source_kind TEXT NOT NULL,
+				source_id TEXT NOT NULL,
+				subscription_id INTEGER REFERENCES resource_subscriptions(id),
+				resource_type TEXT NOT NULL,
+				original_url TEXT NOT NULL DEFAULT '',
+				file_token TEXT NOT NULL DEFAULT '',
+				app_token TEXT NOT NULL DEFAULT '',
+				table_id TEXT NOT NULL DEFAULT '',
+				view_id TEXT NOT NULL DEFAULT '',
+				record_id TEXT NOT NULL DEFAULT '',
+				comment_id TEXT NOT NULL DEFAULT '',
+				title TEXT NOT NULL DEFAULT '',
+				issue_key TEXT NOT NULL DEFAULT '',
+				status_field_id TEXT NOT NULL DEFAULT '',
+				status_field_name TEXT NOT NULL DEFAULT '',
+				status_value TEXT NOT NULL DEFAULT '',
+				assignee_open_ids_json TEXT NOT NULL DEFAULT '[]',
+				owner_mentioned INTEGER NOT NULL DEFAULT 0,
+				content_digest TEXT NOT NULL,
+				observed_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_resource_evidence_record
+			 ON resource_evidence(app_token, table_id, record_id, observed_at DESC)`,
+			`CREATE INDEX IF NOT EXISTS idx_resource_evidence_issue
+			 ON resource_evidence(issue_key, observed_at DESC)`,
+			`CREATE INDEX IF NOT EXISTS idx_resource_evidence_title
+			 ON resource_evidence(title, observed_at DESC)`,
+			`ALTER TABLE work_items ADD COLUMN resource_evidence_id INTEGER
+			 REFERENCES resource_evidence(id)`,
+			`CREATE INDEX IF NOT EXISTS idx_work_items_resource_evidence
+			 ON work_items(resource_evidence_id)`,
+		}},
 	}
 	for _, migration := range migrations {
 		if version >= migration.version {
@@ -532,6 +568,10 @@ func (s *Store) migrate() error {
 		}
 		for _, stmt := range migration.statements {
 			if _, err := tx.Exec(stmt); err != nil {
+				if strings.Contains(strings.ToUpper(stmt), " ADD COLUMN ") &&
+					strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+					continue
+				}
 				_ = tx.Rollback()
 				return errs.NewInternalError(errs.SubtypeStorage, "apply agent schema migration %d", migration.version).WithCause(err)
 			}
@@ -846,6 +886,224 @@ func (s *Store) RemoveResourceSubscription(ctx context.Context, originalURL stri
 		return domain.ResourceSubscription{}, errs.NewValidationError(errs.SubtypeFailedPrecondition, "resource subscription not found").WithParam("url")
 	}
 	return s.GetResourceSubscription(ctx, originalURL)
+}
+
+func (s *Store) RecordResourceEvidence(
+	ctx context.Context,
+	evidence domain.ResourceEvidence,
+) (domain.ResourceEvidence, bool, error) {
+	if strings.TrimSpace(evidence.DedupKey) == "" ||
+		strings.TrimSpace(string(evidence.SourceKind)) == "" ||
+		strings.TrimSpace(evidence.SourceID) == "" ||
+		strings.TrimSpace(evidence.ResourceType) == "" ||
+		strings.TrimSpace(evidence.ContentDigest) == "" {
+		return domain.ResourceEvidence{}, false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"resource evidence identity, source, type, and digest are required",
+		)
+	}
+	if evidence.ObservedAt.IsZero() {
+		evidence.ObservedAt = time.Now().UTC()
+	}
+	assignees, err := json.Marshal(uniqueNonEmptyStrings(evidence.AssigneeOpenIDs))
+	if err != nil {
+		return domain.ResourceEvidence{}, false, errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"encode resource evidence assignees",
+		).WithCause(err)
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO resource_evidence(
+			dedup_key, source_kind, source_id, subscription_id, resource_type, original_url,
+			file_token, app_token, table_id, view_id, record_id, comment_id, title, issue_key,
+			status_field_id, status_field_name, status_value, assignee_open_ids_json,
+			owner_mentioned, content_digest, observed_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		evidence.DedupKey, evidence.SourceKind, evidence.SourceID, nullInt64(evidence.SubscriptionID),
+		evidence.ResourceType, evidence.OriginalURL, evidence.FileToken, evidence.AppToken,
+		evidence.TableID, evidence.ViewID, evidence.RecordID, evidence.CommentID, evidence.Title,
+		evidence.IssueKey, evidence.StatusFieldID, evidence.StatusFieldName, evidence.StatusValue,
+		string(assignees), evidence.OwnerMentioned, evidence.ContentDigest,
+		evidence.ObservedAt.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return domain.ResourceEvidence{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"record resource evidence",
+		).WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.ResourceEvidence{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"count resource evidence insert",
+		).WithCause(err)
+	}
+	stored, err := s.getResourceEvidenceByDedup(ctx, evidence.DedupKey)
+	return stored, affected == 1, err
+}
+
+func (s *Store) FindResourceEvidence(
+	ctx context.Context,
+	query domain.ResourceEvidenceQuery,
+) ([]domain.ResourceEvidence, error) {
+	limit := query.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	clauses := []string{"1 = 1"}
+	var args []any
+	if query.AppToken != "" {
+		clauses = append(clauses, "app_token = ?")
+		args = append(args, query.AppToken)
+	}
+	if query.TableID != "" {
+		clauses = append(clauses, "table_id = ?")
+		args = append(args, query.TableID)
+	}
+	if query.RecordID != "" {
+		clauses = append(clauses, "record_id = ?")
+		args = append(args, query.RecordID)
+	}
+	terms := uniqueNonEmptyStrings(query.Terms)
+	if len(terms) > 0 {
+		var termClauses []string
+		for _, term := range terms {
+			termClauses = append(termClauses, "(title LIKE ? ESCAPE '\\' OR issue_key LIKE ? ESCAPE '\\' OR original_url LIKE ? ESCAPE '\\')")
+			pattern := "%" + escapeLikePattern(term) + "%"
+			args = append(args, pattern, pattern, pattern)
+		}
+		clauses = append(clauses, "("+strings.Join(termClauses, " OR ")+")")
+	}
+	orderBy := "owner_mentioned DESC, observed_at DESC, id DESC"
+	if query.AppToken != "" && query.TableID != "" && query.RecordID != "" {
+		orderBy = "observed_at DESC, id DESC"
+	}
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+resourceEvidenceColumns+`
+		FROM resource_evidence
+		WHERE `+strings.Join(clauses, " AND ")+`
+		ORDER BY `+orderBy+`
+		LIMIT ?`, args...)
+	if err != nil {
+		return nil, errs.NewInternalError(errs.SubtypeStorage, "find resource evidence").WithCause(err)
+	}
+	defer rows.Close() //nolint:errcheck
+	var out []domain.ResourceEvidence
+	for rows.Next() {
+		evidence, err := scanResourceEvidence(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, evidence)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errs.NewInternalError(errs.SubtypeStorage, "read resource evidence").WithCause(err)
+	}
+	return out, nil
+}
+
+func (s *Store) GetResourceEvidenceForWork(
+	ctx context.Context,
+	dedupKey string,
+) (domain.ResourceEvidence, error) {
+	var evidenceID int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(resource_evidence_id, 0) FROM work_items WHERE dedup_key = ?`,
+		dedupKey,
+	).Scan(&evidenceID); err != nil {
+		return domain.ResourceEvidence{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"locate resource evidence for work",
+		).WithCause(err)
+	}
+	if evidenceID == 0 {
+		return domain.ResourceEvidence{}, errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"work item has no linked resource evidence",
+		)
+	}
+	return scanResourceEvidence(s.db.QueryRowContext(ctx, `SELECT `+resourceEvidenceColumns+`
+		FROM resource_evidence WHERE id = ?`, evidenceID))
+}
+
+const resourceEvidenceColumns = `id, dedup_key, source_kind, source_id,
+	COALESCE(subscription_id, 0), resource_type, original_url, file_token, app_token,
+	table_id, view_id, record_id, comment_id, title, issue_key, status_field_id,
+	status_field_name, status_value, assignee_open_ids_json, owner_mentioned,
+	content_digest, observed_at`
+
+func (s *Store) getResourceEvidenceByDedup(
+	ctx context.Context,
+	dedupKey string,
+) (domain.ResourceEvidence, error) {
+	return scanResourceEvidence(s.db.QueryRowContext(ctx, `SELECT `+resourceEvidenceColumns+`
+		FROM resource_evidence WHERE dedup_key = ?`, dedupKey))
+}
+
+type resourceEvidenceScanner interface {
+	Scan(...any) error
+}
+
+func scanResourceEvidence(scanner resourceEvidenceScanner) (domain.ResourceEvidence, error) {
+	var evidence domain.ResourceEvidence
+	var assigneesJSON, observedAt string
+	if err := scanner.Scan(
+		&evidence.ID, &evidence.DedupKey, &evidence.SourceKind, &evidence.SourceID,
+		&evidence.SubscriptionID, &evidence.ResourceType, &evidence.OriginalURL,
+		&evidence.FileToken, &evidence.AppToken, &evidence.TableID, &evidence.ViewID,
+		&evidence.RecordID, &evidence.CommentID, &evidence.Title, &evidence.IssueKey,
+		&evidence.StatusFieldID, &evidence.StatusFieldName, &evidence.StatusValue,
+		&assigneesJSON, &evidence.OwnerMentioned, &evidence.ContentDigest, &observedAt,
+	); err != nil {
+		return domain.ResourceEvidence{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"scan resource evidence",
+		).WithCause(err)
+	}
+	if err := json.Unmarshal([]byte(assigneesJSON), &evidence.AssigneeOpenIDs); err != nil {
+		return domain.ResourceEvidence{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"decode resource evidence assignees",
+		).WithCause(err)
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, observedAt)
+	if err != nil {
+		return domain.ResourceEvidence{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"parse resource evidence observation time",
+		).WithCause(err)
+	}
+	evidence.ObservedAt = parsed
+	return evidence, nil
+}
+
+func uniqueNonEmptyStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func escapeLikePattern(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `%`, `\%`)
+	return strings.ReplaceAll(value, `_`, `\_`)
+}
+
+func nullInt64(value int64) any {
+	if value == 0 {
+		return nil
+	}
+	return value
 }
 
 // StartAgentRun creates a durable multi-step run for an already-enqueued event.
@@ -1700,6 +1958,131 @@ func (s *Store) CompleteShellApproval(ctx context.Context, actionID int64, respo
 		return errs.NewValidationError(errs.SubtypeFailedPrecondition, "action %d is not executing", actionID)
 	}
 	return nil
+}
+
+// RequestResourceAction creates or returns an approval for one exact external
+// resource mutation. The request JSON is part of the idempotency identity.
+func (s *Store) RequestResourceAction(
+	ctx context.Context,
+	dedupKey, kind, requestJSON string,
+) (int64, error) {
+	workItemID, key, err := s.resourceActionIdentity(ctx, dedupKey, kind, requestJSON)
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO action_attempts(
+			work_item_id, kind, idempotency_key, status, request_json, created_at, updated_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		workItemID, kind, key, domain.ActionAwaitingApproval, requestJSON, now, now); err != nil {
+		return 0, errs.NewInternalError(errs.SubtypeStorage, "request resource action approval").WithCause(err)
+	}
+	var actionID int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM action_attempts WHERE idempotency_key = ?`, key).Scan(&actionID); err != nil {
+		return 0, errs.NewInternalError(errs.SubtypeStorage, "read resource action approval").WithCause(err)
+	}
+	return actionID, nil
+}
+
+func (s *Store) ConsumeResourceAction(
+	ctx context.Context,
+	dedupKey, kind, requestJSON string,
+) (int64, bool, error) {
+	_, key, err := s.resourceActionIdentity(ctx, dedupKey, kind, requestJSON)
+	if err != nil {
+		return 0, false, err
+	}
+	var actionID int64
+	err = s.db.QueryRowContext(ctx,
+		`SELECT id FROM action_attempts WHERE idempotency_key = ? AND status = ?`,
+		key, domain.ActionReady).Scan(&actionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, errs.NewInternalError(errs.SubtypeStorage, "read approved resource action").WithCause(err)
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE action_attempts SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		domain.ActionExecuting, time.Now().UTC().Format(time.RFC3339Nano), actionID, domain.ActionReady)
+	if err != nil {
+		return 0, false, errs.NewInternalError(errs.SubtypeStorage, "consume approved resource action").WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	return actionID, err == nil && affected == 1, err
+}
+
+func (s *Store) BeginResourceAction(
+	ctx context.Context,
+	dedupKey, kind, requestJSON string,
+) (int64, string, bool, error) {
+	workItemID, key, err := s.resourceActionIdentity(ctx, dedupKey, kind, requestJSON)
+	if err != nil {
+		return 0, "", false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, "", false, errs.NewInternalError(errs.SubtypeStorage, "begin resource action").WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var actionID int64
+	var status domain.ActionStatus
+	var response string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id, status, COALESCE(response_json, '') FROM action_attempts WHERE idempotency_key = ?`,
+		key).Scan(&actionID, &status, &response)
+	if errors.Is(err, sql.ErrNoRows) {
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		result, insertErr := tx.ExecContext(ctx,
+			`INSERT INTO action_attempts(
+				work_item_id, kind, idempotency_key, status, request_json, created_at, updated_at
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			workItemID, kind, key, domain.ActionExecuting, requestJSON, now, now)
+		if insertErr != nil {
+			return 0, "", false, errs.NewInternalError(errs.SubtypeStorage, "start resource action").WithCause(insertErr)
+		}
+		actionID, err = result.LastInsertId()
+		if err != nil {
+			return 0, "", false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, "", false, err
+		}
+		return actionID, "", false, nil
+	}
+	if err != nil {
+		return 0, "", false, errs.NewInternalError(errs.SubtypeStorage, "read resource action").WithCause(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, "", false, err
+	}
+	if status == domain.ActionCompleted {
+		return actionID, response, false, nil
+	}
+	return actionID, "", true, nil
+}
+
+func (s *Store) CompleteResourceAction(
+	ctx context.Context,
+	actionID int64,
+	responseJSON, errorText string,
+) error {
+	return s.CompleteShellApproval(ctx, actionID, responseJSON, errorText)
+}
+
+func (s *Store) resourceActionIdentity(
+	ctx context.Context,
+	dedupKey, kind, requestJSON string,
+) (int64, string, error) {
+	var workItemID int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM work_items WHERE dedup_key = ?`, dedupKey).Scan(&workItemID); err != nil {
+		return 0, "", errs.NewInternalError(errs.SubtypeStorage, "locate resource action work item").WithCause(err)
+	}
+	sum := sha256.Sum256([]byte(strings.Join([]string{dedupKey, kind, requestJSON}, "\x00")))
+	return workItemID, fmt.Sprintf("resource:%x", sum[:]), nil
 }
 
 // BeginReplyAction starts or resumes one idempotent external reply.
@@ -2749,10 +3132,10 @@ func (s *Store) EnqueueWorkItem(item domain.WorkItem) (bool, error) {
 		res, err := s.db.ExecContext(context.Background(),
 			`INSERT OR IGNORE INTO work_items(
 				dedup_key, status, work_kind, priority, duplicate_of, session_id,
-				event_json, created_at, updated_at
-			 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				resource_evidence_id, event_json, created_at, updated_at
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			item.DedupKey, domain.StatusIgnored, domain.WorkKindGeneric, domain.PriorityBackground,
-			duplicateOf, s.session.ID, string(data), now, now)
+			duplicateOf, s.session.ID, nullInt64(item.ResourceEvidenceID), string(data), now, now)
 		if err != nil {
 			return false, errs.NewInternalError(errs.SubtypeStorage, "enqueue duplicate work item").WithCause(err)
 		}
@@ -2769,11 +3152,11 @@ func (s *Store) EnqueueWorkItem(item domain.WorkItem) (bool, error) {
 	}
 	res, err := s.db.ExecContext(context.Background(),
 		`INSERT OR IGNORE INTO work_items(
-			dedup_key, status, work_kind, priority, session_id, event_json,
+			dedup_key, status, work_kind, priority, session_id, resource_evidence_id, event_json,
 			created_at, updated_at
-		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		item.DedupKey, item.Status, item.WorkKind, item.Priority, s.session.ID,
-		string(data), now, now)
+		nullInt64(item.ResourceEvidenceID), string(data), now, now)
 	if err != nil {
 		return false, errs.NewInternalError(errs.SubtypeStorage, "enqueue work item").WithCause(err)
 	}
@@ -4817,7 +5200,7 @@ type rowScanner interface {
 }
 
 const workItemSelect = `SELECT id, dedup_key, status, work_kind, priority,
-		duplicate_of, session_id, event_json, lease_by, lease_time, retry_count,
+		duplicate_of, session_id, COALESCE(resource_evidence_id, 0), event_json, lease_by, lease_time, retry_count,
 		next_attempt_at, created_at, updated_at
 	FROM work_items`
 
@@ -4827,7 +5210,7 @@ func scanWorkItem(row rowScanner) (domain.WorkItem, error) {
 	var sessionID, leaseBy, leaseTime, nextAttemptAt sql.NullString
 	var duplicateOf sql.NullInt64
 	if err := row.Scan(&item.ID, &item.DedupKey, &status, &workKind,
-		&item.Priority, &duplicateOf, &sessionID, &eventJSON, &leaseBy,
+		&item.Priority, &duplicateOf, &sessionID, &item.ResourceEvidenceID, &eventJSON, &leaseBy,
 		&leaseTime, &item.RetryCount, &nextAttemptAt, &createdAt, &updatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.WorkItem{}, err

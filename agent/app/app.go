@@ -470,10 +470,32 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 			return d.resolveHeldReplyCandidate(ctx, item, candidate, candidates)
 		}
 	}
-	decision, err := d.router.Route(ctx, item)
-	if err != nil {
-		d.markRetry(item, err)
-		return Result{}, err
+	var decision domain.Decision
+	if item.WorkKind == domain.WorkKindResourceHandoff {
+		routed, routeErr := d.router.Route(ctx, item)
+		if routeErr != nil {
+			d.markRetry(item, routeErr)
+			return Result{}, routeErr
+		}
+		relevance := domain.RelevanceInferred
+		if item.Event.SenderType == "user" && item.Event.ChatID != "" {
+			relevance = routed.Relevance
+		}
+		decision = domain.Decision{
+			Kind: domain.DecisionNotify, Mode: routed.Mode,
+			Relevance:  relevance,
+			WorkKind:   domain.WorkKindResourceHandoff,
+			Priority:   domain.PriorityResourceHandoff,
+			Confidence: 1, Risk: domain.RiskMedium,
+			Reason: "trusted_resource_handoff",
+		}
+		item.TaskClass = domain.TaskClassResourceHandoff
+	} else {
+		decision, err = d.router.Route(ctx, item)
+		if err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
 	}
 	if scheduler, ok := d.queue.(schedulingStore); ok {
 		lease := leaseForWorkKind(decision.WorkKind, d.leaseMaxAge, d.workLeases)
@@ -493,7 +515,8 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 		defer stopHeartbeat()
 		ctx = runCtx
 	}
-	if isDelegatedReply(decision.Relevance) &&
+	if item.WorkKind != domain.WorkKindResourceHandoff &&
+		isDelegatedReply(decision.Relevance) &&
 		d.replyResolver != nil &&
 		!item.InvestigationActive {
 		resolution, resolveErr := d.replyResolver.Resolve(ctx, item)
@@ -557,6 +580,10 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 				item.WorkKind = domain.WorkKindCodingQuestion
 				decision.WorkKind = domain.WorkKindCodingQuestion
 				decision.Priority = domain.PriorityCodingQuestion
+			case domain.TaskClassResourceHandoff:
+				item.WorkKind = domain.WorkKindResourceHandoff
+				decision.WorkKind = domain.WorkKindResourceHandoff
+				decision.Priority = domain.PriorityResourceHandoff
 			case domain.TaskClassInvestigation, domain.TaskClassSimple:
 			default:
 				return d.deferDelegatedReply(

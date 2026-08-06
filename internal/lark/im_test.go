@@ -68,6 +68,22 @@ func TestParseMessagePreservesConversationRelations(t *testing.T) {
 	}
 }
 
+func TestParseMessageExtractsResourceURLsFromApplicationCard(t *testing.T) {
+	message := parseMessage(map[string]any{
+		"message_id": "om_docs_notice",
+		"msg_type":   "interactive",
+		"sender": map[string]any{
+			"sender_type": "app",
+			"sender_id":   map[string]any{"open_id": "cli_docs"},
+		},
+		"content": `{"header":{"title":{"content":"BUG-99999"}},"elements":[{"tag":"button","url":"https://example.larksuite.com/record/shrExampleRecordToken001","text":{"content":"查看记录"}}]}`,
+	})
+	if len(message.ResourceURLs) != 1 ||
+		message.ResourceURLs[0] != "https://example.larksuite.com/record/shrExampleRecordToken001" {
+		t.Fatalf("message=%+v", message)
+	}
+}
+
 func TestParseMessagePreservesImageContextMetadata(t *testing.T) {
 	message := parseMessage(map[string]any{
 		"message_id": "om_image",

@@ -84,5 +84,21 @@
       "finalizer_invoked",
       "validated_sources_preserved"
     ]
+  },
+  {
+    "name": "work_6210_bug_status_resource_handoff",
+    "source_work_id": 6210,
+    "failure_stage": "semantic_task_classification_and_cross_source_correlation",
+    "expected_terminal_state": "resource_handoff_with_verified_status_action_or_exact_blocker",
+    "expected_outcome": "complete",
+    "max_model_calls": 10,
+    "max_tool_calls": 9,
+    "metrics": [
+      "resource_handoff_classification",
+      "resource_evidence_correlation",
+      "project_rules_before_code",
+      "status_compare_before_write",
+      "status_readback_verified"
+    ]
   }
 ]

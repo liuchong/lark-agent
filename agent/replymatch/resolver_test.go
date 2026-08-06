@@ -558,7 +558,7 @@ func TestResolverClassifiesContextualCodingHandoff(t *testing.T) {
 	}
 }
 
-func TestResolverKeepsFixThenStatusRequestAsSimpleHandoff(t *testing.T) {
+func TestResolverClassifiesFixThenStatusRequestAsResourceHandoff(t *testing.T) {
 	base := time.Date(2026, 8, 6, 3, 59, 41, 0, time.UTC)
 	model := &scriptedModel{reply: `{
 		"target_message_id":"om_fix_status",
@@ -597,8 +597,8 @@ func TestResolverKeepsFixThenStatusRequestAsSimpleHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	if resolution.Result != ResultUnanswered ||
-		resolution.TaskClass != domain.TaskClassSimple ||
-		resolution.RequiresProgress ||
+		resolution.TaskClass != domain.TaskClassResourceHandoff ||
+		!resolution.RequiresProgress ||
 		resolution.TaskSummary == "investigate the group invite short code API and update the record status" {
 		t.Fatalf("resolution=%+v", resolution)
 	}

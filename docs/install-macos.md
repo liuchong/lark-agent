@@ -100,6 +100,14 @@ policy:
 Owner 发给其他真人的普通私聊消息不会进入代回复队列。
 非 Owner 私聊机器人或直接 `@机器人` 始终静默；这些范围配置不会互相代替。
 
+要启用文档、Wiki 和 Base 的 `@Owner` 监控，发布态应用还必须在飞书开放平台订阅
+WebSocket 事件 `drive.notice.comment_add_v1` 和
+`drive.file.bitable_record_changed_v1`、`drive.file.bitable_field_changed_v1`，并授予当前应用/用户读取云文档评论、订阅文件、
+读取 Base 字段与记录所需权限。若允许 Agent 更新状态或回复评论，还需分别授予 Base
+记录写入和云文档评论回复权限。不同飞书版本在控制台展示的权限名称可能不同，以
+`lark-agent subscription sync` 返回的缺失权限为准，不能在同步失败时把本地
+`pending` 记录当成已监控。
+
 安装后，Owner 可在智能助手私聊中发送 `/help`、`/status`、`/tasks` 和 `/memory`
 查询运行状态、待处理任务与持久记忆。任务详情会给出精确的恢复、取消、确认、核对
 或审批命令。私聊中紧跟唯一动作通知的“确认”“不用继续了”等自然语言可以映射到

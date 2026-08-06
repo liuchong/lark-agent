@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -131,6 +133,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		Owner:           bundle.User.OpenID != "" && bundle.Event.SenderID == bundle.User.OpenID,
 		ReadOnly:        bundle.User.OpenID == "" || bundle.Event.SenderID != bundle.User.OpenID,
 		ChatID:          bundle.Event.ChatID,
+		WorkKind:        bundle.WorkKind,
 		GitHubReference: bundle.GitHubReference,
 	}
 	requestedWorkspaceScope := requestedCodingWorkspaceScope(bundle)
@@ -180,6 +183,7 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 	codingEvidenceConvergencePrompted := false
 	codingEvidenceAvailable := false
 	var codingSearches codingSearchEvidence
+	var resourceProgress resourceHandoffProgress
 	investigationPlanSubmitted := false
 	noProgressLarkContext := false
 	toolCalls := 0
@@ -638,7 +642,10 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 					}
 				}
 			} else {
-				execution, toolErr = l.Tools.Execute(toolCtx, call.Function.Name, json.RawMessage(call.Function.Arguments))
+				toolErr = resourceProgress.ValidateMutation(bundle, call.Function.Name)
+				if toolErr == nil {
+					execution, toolErr = l.Tools.Execute(toolCtx, call.Function.Name, json.RawMessage(call.Function.Arguments))
+				}
 				if toolErr == nil && consumesInvestigationToolBudget(call.Function.Name) {
 					toolCalls++
 				}
@@ -742,6 +749,15 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			}
 			if toolErr == nil && call.Function.Name == "get_lark_context" && toolContentNoNewContext(execution.Content) {
 				noProgressLarkContext = true
+			}
+			if toolErr == nil && execution.Decision == nil {
+				resourceProgress.Observe(
+					bundle,
+					call.Function.Name,
+					executionArguments,
+					execution.Content,
+					execution.Sources,
+				)
 			}
 			if toolErr == nil && execution.Decision == nil && isRelevantEvidenceTool(call.Function.Name) {
 				content := strings.TrimSpace(execution.Content)
@@ -919,6 +935,10 @@ func (l AgentLoop) maxTurnsForWorkKind(kind domain.WorkKind) int {
 			return limit
 		}
 		return l.MaxTurns
+	case domain.WorkKindResourceHandoff:
+		if l.MaxTurns > 20 {
+			return 20
+		}
 	case domain.WorkKindCodingQuestion:
 		if l.CodingMaxTurns > 0 && l.MaxTurns > l.CodingMaxTurns {
 			return l.CodingMaxTurns
@@ -956,6 +976,121 @@ func modelTurnProgressPrompt(currentTurn, maxTurns int) string {
 		maxTurns,
 		remaining,
 	)
+}
+
+type resourceHandoffProgress struct {
+	resourceEvidence bool
+	baseSchema       bool
+	projectRules     bool
+	productionRead   bool
+	testRead         bool
+	gitHistory       bool
+}
+
+func (p resourceHandoffProgress) ValidateMutation(
+	bundle agentcontext.Bundle,
+	toolName string,
+) error {
+	if bundle.WorkKind != domain.WorkKindResourceHandoff {
+		return nil
+	}
+	if !p.projectRules && isResourceProjectEvidenceTool(toolName) {
+		return errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"resource handoff must call read_workspace_rules with the selected project path before %s",
+			toolName,
+		)
+	}
+	switch toolName {
+	case "update_base_status":
+		var missing []string
+		checks := []struct {
+			ok   bool
+			name string
+		}{
+			{p.resourceEvidence, "get_resource_evidence"},
+			{p.baseSchema, "inspect_base_schema"},
+			{p.projectRules, "read_workspace_rules for the selected project"},
+			{p.productionRead, "read_workspace on authoritative implementation"},
+			{p.testRead, "read_workspace on regression/integration tests"},
+			{p.gitHistory, "inspect_git_history for the fix"},
+		}
+		for _, check := range checks {
+			if !check.ok {
+				missing = append(missing, check.name)
+			}
+		}
+		sort.Strings(missing)
+		if len(missing) > 0 {
+			return errs.NewInternalError(
+				errs.SubtypeFailedPrecondition,
+				"resource status mutation is blocked until these verified reads complete: %s",
+				strings.Join(missing, ", "),
+			)
+		}
+	case "reply_resource_comment":
+		if !p.resourceEvidence || !p.projectRules || !p.productionRead ||
+			!p.testRead || !p.gitHistory {
+			return errs.NewInternalError(
+				errs.SubtypeFailedPrecondition,
+				"resource comment reply is blocked until linked evidence, project rules, implementation, regression tests, and Git evidence are verified",
+			)
+		}
+	}
+	return nil
+}
+
+func isResourceProjectEvidenceTool(name string) bool {
+	switch name {
+	case "explore_workspace",
+		"search_workspace",
+		"read_workspace",
+		"search_code_symbols",
+		"trace_code_path",
+		"inspect_git_history",
+		"shell":
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *resourceHandoffProgress) Observe(
+	bundle agentcontext.Bundle,
+	toolName, arguments, content string,
+	sources []domain.SourceRef,
+) {
+	if p == nil || bundle.WorkKind != domain.WorkKindResourceHandoff ||
+		strings.TrimSpace(content) == "" {
+		return
+	}
+	switch toolName {
+	case "get_resource_evidence":
+		p.resourceEvidence = len(sources) > 0
+	case "inspect_base_schema":
+		p.baseSchema = true
+	case "read_workspace_rules":
+		p.projectRules = len(sources) > 0
+	case "inspect_git_history":
+		p.gitHistory = len(sources) > 0
+	case "read_workspace":
+		var args struct {
+			Path string `json:"path"`
+		}
+		if json.Unmarshal([]byte(arguments), &args) != nil || len(sources) == 0 {
+			return
+		}
+		path := strings.ToLower(filepath.ToSlash(args.Path))
+		if strings.Contains(path, "integration_test") ||
+			strings.Contains(path, "/test") ||
+			strings.Contains(path, "_test.") ||
+			strings.Contains(path, "/spec") ||
+			strings.Contains(path, "fixture") {
+			p.testRead = true
+		} else if !strings.HasSuffix(path, ".md") {
+			p.productionRead = true
+		}
+	}
 }
 
 type runBudget struct {
@@ -1683,7 +1818,7 @@ func SubmitDecisionDefinition() agenttools.Definition {
 					Type:     schema.String,
 					Required: true,
 					Enum:     []string{"ignore", "record", "notify", "reply", "request_approval"},
-					Desc:     "ignore only irrelevant non-delegated content; record a non-delegated owner-relevant update that needs no response; delegated direct_mention or private_message work has already passed a semantic unanswered gate and must finish as a useful sender-facing reply or request_approval with exact reply_text; delegated assignments and coordination requests require completed bounded read work plus a concise initial finding, not an acknowledgement or restatement; assistant_request and owner_request cannot finish as notify only; coding questions must finish as reply and cannot use ignore, record, notify, or request_approval; request_approval is only for a non-coding risky response or personal commitment with an exact proposed reply_text",
+					Desc:     "ignore only irrelevant non-delegated content; record a non-delegated owner-relevant update that needs no response; notification-origin resource_handoff must finish as notify and must never reply to an app, while human conversational resource_handoff must finish as reply or request_approval after bounded evidence correlation; delegated direct_mention or private_message work has already passed a semantic unanswered gate and must finish as a useful sender-facing reply or request_approval with exact reply_text; delegated assignments and coordination requests require completed bounded read work plus a concise initial finding, not an acknowledgement or restatement; assistant_request and owner_request cannot finish as notify only; coding questions must finish as reply and cannot use ignore, record, notify, or request_approval; request_approval is only for a non-coding risky response or personal commitment with an exact proposed reply_text",
 				},
 				"relevance_confidence": {Type: schema.Number, Required: true},
 				"reply_confidence": {
@@ -1916,6 +2051,33 @@ func canonicalizeDecisionSources(
 }
 
 func validateTerminalDecision(bundle agentcontext.Bundle, decision domain.Decision) error {
+	if bundle.WorkKind == domain.WorkKindResourceHandoff {
+		if resourceHandoffIsNotification(bundle) {
+			if decision.Kind == domain.DecisionNotify {
+				return nil
+			}
+			return errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"notification-origin resource handoff work must finish as an owner notification; never reply to the notification app",
+			)
+		}
+		switch decision.Kind {
+		case domain.DecisionReply, domain.DecisionRequestApproval:
+			language := agentlocale.Language(decision.Language)
+			if language != agentlocale.LanguageChinese && language != agentlocale.LanguageEnglish {
+				return errs.NewInternalError(
+					errs.SubtypeInvalidResponse,
+					"resource handoff reply is missing a resolved output language",
+				)
+			}
+			return agentlocale.ValidateProse(decision.ReplyText, language)
+		default:
+			return errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"human conversational resource handoff work must finish with a useful sender-facing reply or request_approval",
+			)
+		}
+	}
 	delegated := isDelegatedInvocation(bundle)
 	if delegated &&
 		decision.Kind == domain.DecisionNotify &&
@@ -1955,6 +2117,15 @@ func validateTerminalDecision(bundle agentcontext.Bundle, decision domain.Decisi
 		errs.SubtypeInvalidResponse,
 		"assistant_request and owner_request cannot finish as notify only; submit a useful reply or request_approval with exact reply_text",
 	)
+}
+
+func resourceHandoffIsNotification(bundle agentcontext.Bundle) bool {
+	switch strings.ToLower(strings.TrimSpace(bundle.Event.SenderType)) {
+	case "app", "bot", "resource":
+		return true
+	default:
+		return strings.TrimSpace(bundle.Event.ChatID) == ""
+	}
 }
 
 func normalizeDecisionLanguage(bundle agentcontext.Bundle, decision domain.Decision) domain.Decision {
@@ -2167,6 +2338,8 @@ func isRelevantEvidenceTool(name string) bool {
 	switch name {
 	case "get_lark_context",
 		"search_lark_messages",
+		"search_related_lark_evidence",
+		"get_resource_evidence",
 		"get_github_context",
 		"explore_workspace",
 		"search_workspace",

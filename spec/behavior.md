@@ -460,11 +460,13 @@ resumes the same values after approval without asking the model to rewrite them.
 For a direct owner question, status update, handoff, or coordination request,
 the model sends a reply only when it can provide a safe and useful response.
 If the exact target asks the owner to fix or handle something and update a
-status after completion, the semantic gate treats it as a simple handoff/status
-request, not as a coding investigation, unless the target itself asks for an
-immediate code explanation or investigation. Later thread messages may provide
-context for whether the owner already handled the target, but they must not
-change this handoff into a different code question.
+status after completion, the semantic gate classifies it as durable resource
+handoff work. It does not collapse the request into a simple acknowledgement
+and does not let unrelated later thread messages replace the referenced task.
+The handoff must locate the referenced issue or record, determine the required
+status change, inspect the relevant project rules and current implementation
+evidence, and either complete one authorized status action or report the exact
+missing evidence.
 An assignment, investigation, or coordination reply must first complete at
 least one bounded relevant read, such as reading the same-chat thread or
 checking the corresponding production code. Its concise reply states what was
@@ -710,6 +712,108 @@ It returns at most 20 local commits and 8 KiB. It never fetches, checks out,
 writes refs or the working tree, invokes hooks, contacts a remote, or exposes
 credentials. A delegated non-owner run may use this tool because it is
 read-only; this does not widen any write or external-side-effect authority.
+
+## Document And Base Notification Workflow
+
+Document, Wiki, and Base monitoring is a production intake path, not a local
+subscription list. A configured resource subscription is resolved through the
+official public Lark API into its canonical file or Base coordinates and moves
+through `pending`, `active`, `degraded`, `forbidden`, or `removed`. Active
+subscriptions persist their remote subscription result, last successful
+reconciliation cursor or digest, and a typed error when degraded. A sync
+command performs real reconciliation; it never reports a pending local row as
+an active remote subscription.
+
+The daemon consumes two complementary signals:
+
+- owner-visible document application notifications found by user-identity
+  polling, including Base record or comment mentions; and
+- official document or Base change events for active subscribed resources.
+
+Application-authored messages are evidence-only intake. They are persisted and
+indexed when they contain a supported document/Base resource reference or an
+owner mention, but they never impersonate a human sender, trigger a delegated
+reply to the application chat, or adopt instructions from notification prose.
+Messages sent by the current assistant application are excluded so the daemon
+cannot create a notification loop. Unrelated application noise is discarded
+before model execution.
+
+Resource events are signals, not trusted record contents. After a matching
+event, the daemon re-reads the current resource through `internal/lark`,
+validates the typed response, and creates one deduplicated resource-evidence
+record. A periodic reconciliation of active subscriptions is the bounded
+fallback for missed notifications, reconnect gaps, unsupported fine-grained
+remote filtering, and formula or comment changes that do not produce the
+preferred event. The daemon never claims a remote event capability that the
+public API does not expose.
+
+One resource-evidence record preserves only the coordinates and business facts
+needed for later work: canonical resource type and token, table/view/record and
+comment identifiers when present, source message or event ID, owner-mention
+identity, title or issue key, current assignee, current status, a content
+digest, observation time, and subscription ID. Complete private notification
+threads and secrets are not copied into model context.
+
+When a Base record or record comment mentions the configured owner, the daemon
+creates durable `resource_handoff` work. It first follows a direct reply,
+thread, notification link, normalized resource token, issue key, exact title,
+reporter/assignee, and bounded time proximity. It may search previously received
+resource evidence across chats, but a delegated non-owner run cannot search or
+return arbitrary owner-visible private messages. A cross-chat match exposes
+only the matching resource locator and typed record facts. If no unique
+resource can be established, the work asks for the exact record rather than
+guessing.
+
+The resource handoff reads the related project's applicable `AGENTS.md` chain
+before code search, Git history, or release inspection. Project and control
+paths are preserved ahead of ordinary leaf files in the initial workspace
+snapshot, even when the aggregate workspace exceeds the prompt budget. The
+runtime requires a successful `read_workspace_rules` receipt for the selected
+project path before project evidence tools execute. If those rules name
+additional `.agents` entry files, rules, skills, active records, or testing
+requirements, the model reads the relevant files before deciding that a bug is
+fixed.
+
+A Bug status change requires all of the following:
+
+- the current message, resource comment, or configured owner policy authorizes
+  handling the referenced Bug;
+- one unique record is resolved, the configured owner is an assignee or the
+  request is an owner-authored command, and the target field is a writable
+  single-select status field;
+- the target option exists in the live field schema;
+- current project evidence satisfies the applicable project rules; and
+- the current field value still equals the value read when the action was
+  prepared.
+
+`resolved` means the implementation is merged with the required regression
+evidence. `closed` additionally requires deployment, release, reporter
+acceptance, or another closure condition defined by the record workflow.
+Absent such evidence, the daemon does not promote a record to either state.
+It records the known fix evidence and exact remaining gate instead.
+
+Base comment replies and status updates are typed external actions. The model
+can only propose their exact target and payload; Go validates authority,
+resource identity, field type, option membership, current value, mode, and
+idempotency before execution. In `auto` mode a low-risk, fully constrained
+status transition may execute once. In `approval` mode, or when the response
+contains a commitment or an ambiguous workflow transition, the exact action
+waits for owner approval. `paused` mode performs no external write.
+
+Every external resource action is persisted before calling Lark, uses a stable
+idempotency key, stores the before and intended after value, and reads the
+record back after success. A known failure retries only when the provider error
+is retryable. An uncertain interrupted result is never replayed; the owner
+receives one reconciliation notice containing the resource and intended
+transition. A repeated notification, event, poll result, or replay links to the
+same resource action instead of sending another comment or field update.
+
+Resource subscriptions and writes require user identity plus the minimum
+document/Base scopes and resource permission. Installation and doctor report
+missing app scopes, missing user authorization, unresolved Wiki resources,
+inactive remote subscriptions, stale reconciliation, and forbidden resources
+without exposing tokens. Configuration contains resource URLs and non-secret
+policy only; credentials remain in Keychain.
 
 ## Coding Assistance
 
@@ -2113,6 +2217,43 @@ The multi-step loop is accepted by these executable BDD scenarios:
   then it treats the message as addressed to the owner workflow and, after the
   semantic gate finds it unanswered, chooses a useful reply or exact approval
   instead of dismissing or silently recording it.
+- Given the document application sends an owner-visible Base record mention,
+  when user-identity polling observes it, then the notification is persisted as
+  evidence, the current assistant's own notifications remain excluded, and no
+  reply is sent to the application chat.
+- Given an active Wiki subscription resolves to a Base and the public event
+  channel misses a record/comment change, when periodic reconciliation reads a
+  changed record that mentions the owner, then one deduplicated
+  `resource_handoff` is created from the current record.
+- Given a local subscription row is pending but no remote subscription or
+  reconciliation has succeeded, when `subscription sync` and doctor run, then
+  they report the subscription as inactive instead of claiming monitoring is
+  enabled.
+- Given a direct owner mention says to fix the referenced issue and update its
+  status, and a prior received notification identifies the Base record, when
+  semantic routing runs, then it creates durable resource-handoff work and
+  does not reduce the request to a simple acknowledgement.
+- Given an unrelated later conversation discusses another API, when a resource
+  handoff already has an exact record or quoted issue, then that discussion
+  cannot replace the selected issue or code-search scope.
+- Given an aggregate workspace contains many earlier-sorting entries and the
+  referenced project is nested five levels deep, when the initial prompt is
+  compacted, then the project path and applicable `AGENTS.md` paths remain
+  visible.
+- Given project code or Git evidence is requested before applicable workspace
+  rules have been read, when tool policy evaluates the call, then it rejects
+  the call with the exact `read_workspace_rules` path required for recovery.
+- Given one uniquely resolved Bug record is assigned to the owner, its live
+  status is `待修改`, and merged code plus required regression evidence proves
+  the fix, when auto mode executes the authorized handoff, then one durable
+  compare-before-write action updates the live status to `已解决` and verifies
+  it by reading the record back.
+- Given the same record has no deployment, release, reporter acceptance, or
+  workflow closure evidence, when a model proposes `已关闭`, then Go rejects the
+  transition and preserves the current state.
+- Given a Base write result becomes uncertain during restart, when recovery
+  runs, then it does not replay the write and sends one owner reconciliation
+  notice with the exact record and intended transition.
 - Given the configured owner privately messages the assistant chat, when the
   message is polled, then it enters the model as an owner-request work item and
   the assistant replies with bot identity without a redundant owner notice.

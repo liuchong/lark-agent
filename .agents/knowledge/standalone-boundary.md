@@ -13,7 +13,9 @@ Production invariants:
 - SDK HTTP and WebSocket events are projected into typed Agent DTOs at the boundary;
 - an unknown successful response is an error, not permission to guess;
 - no import of `github.com/larksuite/cli` is allowed;
-- document/Base subscriptions are bounded by official public API capability and do not claim Base comment/@ or view-level remote filtering.
+- document/Base subscriptions use only public SDK-backed APIs; comment
+  notifications and Base record-change events are accepted as signals, while
+  table/view filtering and current record verification remain local and typed.
 
 Standalone local ownership:
 

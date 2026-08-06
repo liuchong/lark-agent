@@ -164,6 +164,14 @@ lark-agent doctor
 登录 JSON 只有 `token` 字段。该令牌只用于读取已验证引用所指向的仓库、PR、
 workflow run、检查结果和审查信息，不提供评论、合并、重跑、取消或其他写能力。
 
+## 文档与 Base 监控
+
+`lark-agent subscription add URL` 登记 Wiki、文档或 Base，随后运行
+`lark-agent subscription sync` 建立远端订阅并完成首次对账。Agent 会接收云文档
+应用通知、评论 `@Owner` 和 Base 记录变更，但不会回复通知应用或把通知正文当成指令。
+状态写入前必须关联唯一记录、读取项目 `AGENTS.md` 规则、核对实现/回归测试/Git 证据、
+检查实时字段选项并比较当前值；`approval` 模式先生成可审计动作号，`paused` 模式不写。
+
 ## 文档
 
 - [macOS 安装](docs/install-macos.md)
