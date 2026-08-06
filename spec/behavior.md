@@ -1125,6 +1125,11 @@ when the owner explicitly resumes the work, then neither completed action may
 short-circuit the new claim. The semantic resolver runs again, and any new
 sender reply, owner notification, or staged investigation message receives a
 generation-specific idempotency identity.
+Given a generation greater than one has a validated automatic reply but no
+approved reply action for that exact current-generation draft, when approval
+consumption checks run, then the absence is a normal `not found` result and the
+automatic reply continues. It must not be reported as a storage failure or
+reuse an approved action from another generation.
 The CLI `queue resume` path and the Owner-private `/task resume` path use the
 same generation transaction. Given an unresolved interruption whose external
 action result is uncertain, either path refuses resume until reconciliation.

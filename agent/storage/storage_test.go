@@ -2097,6 +2097,21 @@ func TestExplicitResumeDoesNotReusePriorApprovedReply(t *testing.T) {
 	if approved, found, err := store.ReadyApprovedReply(item.ID); err != nil || found {
 		t.Fatalf("stale approved=%+v found=%v err=%v", approved, found, err)
 	}
+	if actionID, consumed, err := store.ConsumeReplyApproval(
+		context.Background(),
+		item.DedupKey,
+		"当前代自动回复",
+		"当前代证据",
+		"",
+		domain.RelevanceDirectMention,
+	); err != nil || consumed || actionID != 0 {
+		t.Fatalf(
+			"missing current-generation approval actionID=%d consumed=%v err=%v",
+			actionID,
+			consumed,
+			err,
+		)
+	}
 	newActionID, err := store.RequestReplyApproval(
 		context.Background(),
 		item.DedupKey,

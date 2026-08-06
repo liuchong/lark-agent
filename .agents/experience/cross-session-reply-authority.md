@@ -16,6 +16,10 @@ For delegated conversation work:
   remain immutable audit evidence for their original communication generation,
   but cannot short-circuit or provide idempotency identity to an explicitly
   resumed generation;
+- absence of a current-generation approval action means "not pre-approved",
+  not a storage failure; automatic low-risk replies must continue through the
+  normal policy gate, while approval-required replies still create and await a
+  new generation-scoped approval;
 - mutating resource/tool actions keep independent idempotency fences so a new
   communication generation never implies replaying side effects;
 - CLI and Owner-private resume commands must share one write-first transaction

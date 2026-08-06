@@ -2526,6 +2526,9 @@ func (s *Store) ConsumeReplyApproval(
 			return 0, false, nil
 		}
 	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
 	if err != nil {
 		return 0, false, errs.NewInternalError(errs.SubtypeStorage, "read approved reply action").WithCause(err)
 	}
