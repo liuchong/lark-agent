@@ -624,6 +624,70 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 		}
 	})
 
+	t.Run("group owner fix then status request cannot be swallowed as no reply", func(t *testing.T) {
+		store := openSemanticIntegrationStore(t)
+		base := store.CurrentSession().StartedAt.Add(time.Second)
+		item := enqueueDueDelegatedItem(t, store, domain.NormalizedEvent{
+			Source:    domain.SourcePoll,
+			EventID:   "poll:om_group_fix_status",
+			MessageID: "om_group_fix_status",
+			ChatID:    "oc_any_group",
+			ChatType:  "group",
+			SenderID:  "ou_teammate",
+			Content:   "@测试负责人 这个问题修复后改下状态哈",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+			CreatedAt: base,
+		})
+		semanticModel := &semanticIntegrationModel{response: `{
+			"target_message_id":"om_group_fix_status",
+			"result":"no_reply_needed",
+			"confidence":0.90,
+			"reason":"The target asks the owner to fix the linked issue and update its status.",
+			"target_intent":"Request to fix the problem in the linked record and update its status after the fix."
+		}`}
+		builder := &semanticIntegrationBuilder{}
+		decider := &semanticIntegrationDecider{}
+		replier := &semanticIntegrationReplyHandler{}
+		daemon := app.NewDaemon(
+			store,
+			router.New(router.Config{
+				OwnerOpenID: "ou_owner",
+				Mode:        domain.ModeAuto,
+				ReplyScope:  domain.ReplyScopeAllGroups,
+			}),
+			app.WithContextBuilder(builder),
+			app.WithDecider(decider),
+			app.WithReplyHandler(replier),
+			app.WithDelegatedReplyResolver(semanticIntegrationResolver{
+				store:    store,
+				matcher:  replymatch.New(semanticModel, "ou_owner"),
+				messages: []domain.NormalizedEvent{item.Event},
+			}, 0.85, 30*time.Second),
+		)
+
+		result, err := daemon.RunOnce(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		items, err := store.ListWorkItems()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Decision.Reason != "owner_reply_resolution_failed" ||
+			len(items) != 1 || items[0].Status != domain.StatusWaitingUser ||
+			!items[0].NextAttemptAt.After(time.Now().UTC()) ||
+			builder.calls != 0 || decider.calls != 0 || replier.calls != 0 {
+			t.Fatalf(
+				"result=%+v items=%+v builder=%d decider=%d replier=%d",
+				result,
+				items,
+				builder.calls,
+				decider.calls,
+				replier.calls,
+			)
+		}
+	})
+
 	t.Run("malformed semantic result fails closed and retries later", func(t *testing.T) {
 		store := openSemanticIntegrationStore(t)
 		base := store.CurrentSession().StartedAt.Add(time.Second)

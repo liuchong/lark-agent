@@ -291,7 +291,7 @@ func validateResolution(req Request, ownerOpenID string, resolution Resolution) 
 		return invalidResolution("unanswered result cannot contain matched owner messages")
 	}
 	if resolution.Result == ResultNoReplyNeeded &&
-		hasExplicitResponseObligation(target, Resolution{}) {
+		hasExplicitResponseObligation(target, resolution) {
 		return invalidResolution(
 			"no_reply_needed is invalid when the target contains an explicit owner action obligation",
 		)
@@ -376,11 +376,11 @@ func noReplyIntent(values ...string) bool {
 }
 
 func hasExplicitResponseObligation(target domain.NormalizedEvent, resolution Resolution) bool {
-	text := strings.TrimSpace(target.Content)
-	quote := strings.TrimSpace(resolution.ResponseObligationQuote)
-	if quote != "" {
-		text += "\n" + quote
-	}
+	text := strings.Join([]string{
+		strings.TrimSpace(target.Content),
+		strings.TrimSpace(resolution.ResponseObligationQuote),
+		strings.TrimSpace(resolution.TargetIntent),
+	}, "\n")
 	text = strings.ToLower(text)
 	for _, marker := range []string{
 		"?",
@@ -399,17 +399,21 @@ func hasExplicitResponseObligation(target domain.NormalizedEvent, resolution Res
 		"排查下",
 		"查一下",
 		"确认一下",
+		"改下",
+		"改状态",
 		"帮忙确认",
 		"帮我确认",
 		"处理一下",
 		"跟进",
 		"跟进一下",
 		"修一下",
+		"修复后",
 		"改一下",
 		"做一下",
 		"回复",
 		"发一下",
 		"同步一下",
+		"更新状态",
 		"please",
 		"can you",
 		"could you",
@@ -423,6 +427,8 @@ func hasExplicitResponseObligation(target domain.NormalizedEvent, resolution Res
 		"reply",
 		"send",
 		"look into",
+		"update status",
+		"change status",
 	} {
 		if strings.Contains(text, marker) {
 			return true

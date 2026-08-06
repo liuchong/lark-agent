@@ -376,6 +376,30 @@ func TestResolverRejectsNoReplyNeededForChineseGroupInvestigationRequest(t *test
 	}
 }
 
+func TestResolverRejectsNoReplyNeededForFixThenUpdateStatusRequest(t *testing.T) {
+	base := time.Date(2026, 8, 6, 3, 59, 41, 0, time.UTC)
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_group_fix_status",
+		"result":"no_reply_needed",
+		"confidence":0.90,
+		"reason":"The target asks the owner to fix the linked issue and update its status.",
+		"target_intent":"Request to fix the problem in the linked record and update its status after the fix."
+	}`}
+	_, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_group_fix_status", ChatID: "oc_group",
+			ChatType: "group", SenderID: "ou_teammate",
+			Content:   "@测试负责人 这个问题修复后改下状态哈",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+			CreatedAt: base,
+		}),
+		ContextCutoff: base.Add(3 * time.Minute),
+	})
+	if err == nil {
+		t.Fatal("fix then update status request accepted no_reply_needed")
+	}
+}
+
 func TestResolverAllowsNoReplyNeededForCompletedStatusStatement(t *testing.T) {
 	base := time.Date(2026, 8, 4, 1, 21, 0, 0, time.UTC)
 	model := &scriptedModel{reply: `{
