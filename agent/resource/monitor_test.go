@@ -2,6 +2,7 @@ package resource
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -189,7 +190,9 @@ func TestMonitorSyncResolvesWikiAndActivatesRemoteSubscription(t *testing.T) {
 	if result.Active != 1 || len(store.subscriptions) != 1 ||
 		store.subscriptions[0].Status != domain.ResourceSubscriptionActive ||
 		store.subscriptions[0].RemoteSubscriptionID != "sub_bug" ||
-		store.subscriptions[0].AppToken != "bas_bug" {
+		store.subscriptions[0].AppToken != "bas_bug" ||
+		!reflect.DeepEqual(store.subscriptions[0].MonitorModes,
+			[]string{"base_record", "base_field", "cloud_docs_notice"}) {
 		t.Fatalf("result=%+v subscriptions=%+v", result, store.subscriptions)
 	}
 }

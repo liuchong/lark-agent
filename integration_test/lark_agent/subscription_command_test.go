@@ -15,7 +15,8 @@ func TestSubscriptionCommandsPersistBaseURL(t *testing.T) {
 		t.Fatalf("add exit=%d stderr=%s", code, stderr)
 	}
 	if !strings.Contains(stdout, `"app_token":"basExampleAppToken001"`) ||
-		!strings.Contains(stdout, `"view_id":"vewExampleView001"`) {
+		!strings.Contains(stdout, `"view_id":"vewExampleView001"`) ||
+		!strings.Contains(stdout, `"monitor_modes":["base_record","base_field","cloud_docs_notice"]`) {
 		t.Fatalf("add stdout=%s", stdout)
 	}
 	code, stdout, stderr = runAgent(t, bin, "--state", state, "subscription", "list")

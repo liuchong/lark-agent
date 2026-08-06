@@ -2199,10 +2199,7 @@ func bootstrapConfiguredResourceSubscriptions(
 		}
 		modes := append([]string(nil), configured.MonitorModes...)
 		if len(modes) == 0 {
-			modes = []string{"document_comment", "cloud_docs_notice"}
-			if ref.ResourceType == serviceim.ResourceTypeBase {
-				modes = []string{"base_record", "base_field", "cloud_docs_notice"}
-			}
+			modes = agentresource.MonitorModesForResource(ref.ResourceType)
 		}
 		status := domain.ResourceSubscriptionStatus(configured.Status)
 		switch status {
@@ -4057,10 +4054,7 @@ func newSubscriptionCommand(out io.Writer, configPath, statePath *string) *cobra
 				return err
 			}
 			defer store.Close() //nolint:errcheck
-			modes := []string{"document_comment", "cloud_docs_notice"}
-			if ref.ResourceType == serviceim.ResourceTypeBase {
-				modes = []string{"base_record", "base_field", "cloud_docs_notice"}
-			}
+			modes := agentresource.MonitorModesForResource(ref.ResourceType)
 			sub, err := store.UpsertResourceSubscription(cmd.Context(), domain.ResourceSubscription{
 				OriginalURL:   ref.OriginalURL,
 				ResourceType:  string(ref.ResourceType),

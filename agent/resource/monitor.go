@@ -174,6 +174,7 @@ func (m *Monitor) SyncSubscriptions(ctx context.Context) (SyncResult, error) {
 				sub.AppToken = resolved.AppToken
 				sub.TableID = resolved.TableID
 				sub.ViewID = resolved.ViewID
+				sub.MonitorModes = MonitorModesForResource(resolved.ResourceType)
 				sub.RemoteSubscriptionID = remote.ID
 				sub.Status = domain.ResourceSubscriptionActive
 				sub.LastError = ""
@@ -191,6 +192,13 @@ func (m *Monitor) SyncSubscriptions(ctx context.Context) (SyncResult, error) {
 		}
 	}
 	return result, nil
+}
+
+func MonitorModesForResource(resourceType servicelark.ResourceType) []string {
+	if resourceType == servicelark.ResourceTypeBase {
+		return []string{"base_record", "base_field", "cloud_docs_notice"}
+	}
+	return []string{"document_comment", "cloud_docs_notice"}
 }
 
 func (m *Monitor) Reconcile(ctx context.Context) (ReconcileResult, error) {
