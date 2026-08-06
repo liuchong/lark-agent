@@ -3,10 +3,12 @@ package resource
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/liuchong/lark-agent/agent/domain"
+	errs "github.com/liuchong/lark-agent/internal/apperr"
 	servicelark "github.com/liuchong/lark-agent/internal/lark"
 )
 
@@ -194,6 +196,23 @@ func TestMonitorSyncResolvesWikiAndActivatesRemoteSubscription(t *testing.T) {
 		!reflect.DeepEqual(store.subscriptions[0].MonitorModes,
 			[]string{"base_record", "base_field", "cloud_docs_notice"}) {
 		t.Fatalf("result=%+v subscriptions=%+v", result, store.subscriptions)
+	}
+}
+
+func TestResourceErrorSummaryPreservesSafeProviderDiagnostics(t *testing.T) {
+	summary := resourceErrorSummary(
+		errs.NewAPIError(errs.SubtypeServerError, "field validation failed").
+			WithCode(131002).
+			WithIdentity("user").
+			WithHint("check token type"),
+	)
+	for _, want := range []string{
+		"field validation failed", "code=131002", "category=api",
+		"identity=user", "hint=check token type",
+	} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("summary missing %q: %s", want, summary)
+		}
 	}
 }
 

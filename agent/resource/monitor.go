@@ -182,7 +182,7 @@ func (m *Monitor) SyncSubscriptions(ctx context.Context) (SyncResult, error) {
 		}
 		if resolveErr != nil {
 			sub.Status = subscriptionFailureStatus(resolveErr)
-			sub.LastError = resolveErr.Error()
+			sub.LastError = resourceErrorSummary(resolveErr)
 			result.Degraded++
 		} else {
 			result.Active++
@@ -498,7 +498,7 @@ func (m *Monitor) degradeSubscription(
 	cause error,
 ) error {
 	sub.Status = subscriptionFailureStatus(cause)
-	sub.LastError = cause.Error()
+	sub.LastError = resourceErrorSummary(cause)
 	if _, err := m.store.UpsertResourceSubscription(ctx, sub); err != nil {
 		return err
 	}
@@ -510,6 +510,33 @@ func subscriptionFailureStatus(err error) domain.ResourceSubscriptionStatus {
 		return domain.ResourceSubscriptionForbidden
 	}
 	return domain.ResourceSubscriptionDegraded
+}
+
+func resourceErrorSummary(err error) string {
+	if err == nil {
+		return ""
+	}
+	problem, ok := errs.ProblemOf(err)
+	if !ok {
+		return err.Error()
+	}
+	parts := []string{problem.Message}
+	if problem.Code != 0 {
+		parts = append(parts, fmt.Sprintf("code=%d", problem.Code))
+	}
+	if problem.Category != "" {
+		parts = append(parts, "category="+string(problem.Category))
+	}
+	if problem.Identity != "" {
+		parts = append(parts, "identity="+problem.Identity)
+	}
+	if len(problem.MissingScopes) > 0 {
+		parts = append(parts, "missing_scopes="+strings.Join(problem.MissingScopes, ","))
+	}
+	if problem.Hint != "" {
+		parts = append(parts, "hint="+problem.Hint)
+	}
+	return strings.Join(parts, "; ")
 }
 
 func subscriptionRef(sub domain.ResourceSubscription) servicelark.ResourceRef {
