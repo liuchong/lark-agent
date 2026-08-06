@@ -13,7 +13,9 @@ Production invariants:
 - SDK HTTP and WebSocket events are projected into typed Agent DTOs at the boundary;
 - an unknown successful response is an error, not permission to guess;
 - no import of `github.com/larksuite/cli` is allowed;
-- document/Base subscriptions are bounded by official public API capability and do not claim Base comment/@ or view-level remote filtering.
+- document/Base subscriptions use only public SDK-backed APIs; comment
+  notifications and Base record-change events are accepted as signals, while
+  table/view filtering and current record verification remain local and typed.
 
 Standalone local ownership:
 
@@ -22,7 +24,13 @@ Standalone local ownership:
 - logs: `~/Library/Logs/lark-agent`;
 - LaunchAgent: `com.liuchong.lark-agent`;
 - no old command-line tool directory is read or migrated;
-- cross-session work is inspected and resumed explicitly, never auto-replayed.
+- cross-session stateless read-only work is automatically readmitted only after
+  a ready session classifies it as safe to recompute; delegated conversation
+  context and unsent reply candidates require explicit owner resume and new
+  classification;
+- executing or result-uncertain external actions are never auto-replayed; they
+  are terminalized with one durable owner reconciliation notice;
+- terminal history is only replayed through an explicit owner command.
 
 Repository rewrite and runtime transport changes must preserve these invariants
 in specifications, tests, help, documentation, installation, and live evidence.

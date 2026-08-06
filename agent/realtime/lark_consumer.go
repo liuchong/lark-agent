@@ -30,6 +30,14 @@ func NewLarkConsumer(caller lark.Caller, cfg LarkConsumerConfig) *LarkConsumer {
 }
 
 func (c *LarkConsumer) Consume(ctx context.Context, out io.Writer) error {
+	return c.ConsumeWithResources(ctx, out, nil)
+}
+
+func (c *LarkConsumer) ConsumeWithResources(
+	ctx context.Context,
+	out io.Writer,
+	handleResource func(context.Context, lark.ResourceSignal) error,
+) error {
 	if _, err := lark.CheckPublishedApp(ctx, c.caller, c.cfg.AppID); err != nil {
 		return err
 	}
@@ -39,8 +47,16 @@ func (c *LarkConsumer) Consume(ctx context.Context, out io.Writer) error {
 		BaseURL:   c.cfg.BaseURL,
 	}
 	encoder := json.NewEncoder(out)
-	return consumer.Consume(ctx, func(event lark.EventEnvelope) error {
-		return encoder.Encode(event)
+	return consumer.ConsumeWithHandlers(ctx, lark.ConsumerHandlers{
+		Message: func(event lark.EventEnvelope) error {
+			return encoder.Encode(event)
+		},
+		Resource: func(signal lark.ResourceSignal) error {
+			if handleResource == nil {
+				return nil
+			}
+			return handleResource(ctx, signal)
+		},
 	})
 }
 

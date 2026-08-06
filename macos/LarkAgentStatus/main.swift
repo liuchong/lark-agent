@@ -15,7 +15,7 @@ final class AgentMenuApp: NSObject, NSApplicationDelegate {
 
     override init() {
         super.init()
-        statusItem.button?.title = "LA"
+        configureStatusIcon()
         statusItem.button?.toolTip = "Lark Agent"
         statusItem.menu = menu
         rebuildMenu()
@@ -23,6 +23,34 @@ final class AgentMenuApp: NSObject, NSApplicationDelegate {
             self?.refreshStatus()
         }
         refreshStatus()
+    }
+
+    private func configureStatusIcon() {
+        guard let iconURL = Bundle.main.url(
+            forResource: "StatusIconTemplate",
+            withExtension: "png"
+        ), let image = NSImage(contentsOf: iconURL) else {
+            statusItem.button?.title = "LA"
+            return
+        }
+        image.isTemplate = true
+        image.size = NSSize(width: 18, height: 18)
+        statusItem.button?.image = image
+        statusItem.button?.imagePosition = .imageOnly
+        statusItem.button?.title = ""
+        statusItem.button?.setAccessibilityLabel("Lark Agent")
+    }
+
+    private func setStatusIndicator(_ suffix: String) {
+        guard let button = statusItem.button else {
+            return
+        }
+        if button.image == nil {
+            button.title = suffix.isEmpty ? "LA" : "LA \(suffix)"
+            return
+        }
+        button.imagePosition = suffix.isEmpty ? .imageOnly : .imageLeading
+        button.title = suffix
     }
 
     private func rebuildMenu(status: String = "Checking...") {
@@ -52,14 +80,14 @@ final class AgentMenuApp: NSObject, NSApplicationDelegate {
         if result.output.contains("\"running\":true") {
             let details = statusDetails(pending: pending, interrupted: interrupted)
             status = details.isEmpty ? "Running" : "Running · \(details)"
-            statusItem.button?.title = interrupted > 0 ? "LA ⏸\(interrupted)" : (pending > 0 ? "LA \(pending)" : "LA ●")
+            setStatusIndicator(interrupted > 0 ? "⏸\(interrupted)" : (pending > 0 ? "\(pending)" : ""))
         } else if result.output.contains("\"installed\":true") {
             let details = statusDetails(pending: pending, interrupted: interrupted)
             status = details.isEmpty ? "Stopped" : "Stopped · \(details)"
-            statusItem.button?.title = interrupted > 0 ? "LA ⏸\(interrupted)" : (pending > 0 ? "LA \(pending)" : "LA ○")
+            setStatusIndicator(interrupted > 0 ? "⏸\(interrupted)" : (pending > 0 ? "\(pending)" : "○"))
         } else {
             status = result.ok ? "Not Installed" : "Error"
-            statusItem.button?.title = "LA !"
+            setStatusIndicator("!")
         }
         rebuildMenu(status: status)
     }

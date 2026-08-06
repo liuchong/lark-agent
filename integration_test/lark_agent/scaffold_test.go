@@ -609,19 +609,47 @@ func TestPrivateOwnerAutoReplyWithDurableStoreDoesNotRequireApprovalHistory(t *t
 }
 
 func TestApprovedAssistantReplyResumesWithBotIdentity(t *testing.T) {
-	testApprovedReplyOutcome(t, domain.RelevanceAssistantRequest, false, "ou_owner", false)
+	testApprovedReplyOutcome(
+		t,
+		domain.RelevanceAssistantRequest,
+		false,
+		"ou_owner",
+		false,
+		domain.ModeAuto,
+	)
 }
 
 func TestLegacyApprovedAssistantReplyResumesWithBotIdentity(t *testing.T) {
-	testApprovedReplyOutcome(t, domain.RelevanceAssistantRequest, true, "ou_owner", false)
+	testApprovedReplyOutcome(
+		t,
+		domain.RelevanceAssistantRequest,
+		true,
+		"ou_owner",
+		false,
+		domain.ModeAuto,
+	)
 }
 
-func TestApprovedDelegatedReplyResumesWithUserIdentityThenNotifiesOwner(t *testing.T) {
-	testApprovedReplyOutcome(t, domain.RelevanceDirectMention, false, "ou_requester", false)
+func TestApprovedDelegatedReplyNotifiesOwnerThenResumesWithUserIdentity(t *testing.T) {
+	testApprovedReplyOutcome(
+		t,
+		domain.RelevanceDirectMention,
+		false,
+		"ou_requester",
+		false,
+		domain.ModeApproval,
+	)
 }
 
 func TestApprovedNonOwnerAssistantReplyIsBlockedAfterAuthorizationChange(t *testing.T) {
-	testApprovedReplyOutcome(t, domain.RelevanceAssistantRequest, false, "ou_requester", true)
+	testApprovedReplyOutcome(
+		t,
+		domain.RelevanceAssistantRequest,
+		false,
+		"ou_requester",
+		true,
+		domain.ModeAuto,
+	)
 }
 
 func testApprovedReplyOutcome(
@@ -630,6 +658,7 @@ func testApprovedReplyOutcome(
 	legacy bool,
 	senderID string,
 	wantBlocked bool,
+	gateMode domain.Mode,
 ) {
 	t.Helper()
 	statePath := filepath.Join(t.TempDir(), "state.db")
@@ -638,6 +667,9 @@ func testApprovedReplyOutcome(
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
+	if _, err := store.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	mentions := []domain.Mention{{OpenID: "ou_owner", Name: "测试负责人"}}
 	if relevance == domain.RelevanceAssistantRequest {
 		mentions = []domain.Mention{{OpenID: "ou_bot", Name: "Lark Agent"}}
@@ -705,7 +737,7 @@ func testApprovedReplyOutcome(
 		}),
 		app.WithReplyHandler(reply.NewController(
 			policy.NewReplyGate(policy.Config{
-				Mode:        domain.ModeAuto,
+				Mode:        gateMode,
 				OwnerOpenID: "ou_owner",
 			}, privateReplyThreadState{}),
 			messenger,
@@ -746,7 +778,7 @@ func testApprovedReplyOutcome(
 		wantMessageID = "om_user_reply"
 		if messenger.userReplies != 1 || messenger.botReplies != 0 ||
 			notifier.calls != 1 || !strings.HasPrefix(messenger.replyText, "🤖") ||
-			strings.Join(messenger.events, ",") != "user_reply,notify" {
+			strings.Join(messenger.events, ",") != "notify,user_reply" {
 			t.Fatalf("delegated result=%+v messenger=%+v notifier=%+v", result, messenger, notifier)
 		}
 	}
@@ -1010,6 +1042,7 @@ func TestHelpContract(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit=%d stderr=%s", code, stderr)
 	}
+	normalizedStdout := strings.Join(strings.Fields(stdout), " ")
 	for _, want := range []string{
 		"lark-agent",
 		"daemon",
@@ -1018,7 +1051,9 @@ func TestHelpContract(t *testing.T) {
 		"model",
 		"Only the configured owner can mention the assistant bot",
 		"assistant bot",
-		"independent all-groups or configured-groups scopes",
+		"Assistant mentions and owner mentions have independent all-groups or",
+		"Private delegated messages have an independent",
+		"all-private or disabled scope",
 		"keyboard working reaction",
 		"coding investigation",
 		"fast path",
@@ -1027,12 +1062,15 @@ func TestHelpContract(t *testing.T) {
 		"16 tool calls",
 		"interactive",
 		"queue summary",
+		"queue tasks",
+		"configured owner can use /help",
+		"Group commands disclose no queue details",
 		"approval",
 		"auto",
 		"approval",
 		"paused",
 	} {
-		if !strings.Contains(stdout, want) {
+		if !strings.Contains(normalizedStdout, strings.Join(strings.Fields(want), " ")) {
 			t.Fatalf("help output missing %q\nstdout:\n%s", want, stdout)
 		}
 	}
@@ -1082,6 +1120,12 @@ func TestBehaviorSpecDocumentsCodingAssistanceContract(t *testing.T) {
 		"`interrupted`",
 		"`queue inspect --work-id <id>`",
 		"`queue resume`",
+		"`queue cancel`",
+		"`/tasks`",
+		"`/task acknowledge",
+		"`/task reconcile",
+		"`operator_cancel`",
+		"three terminal-only model attempts",
 		"never blindly repeated",
 		"private offline notice",
 		"private online notice",
@@ -1141,6 +1185,9 @@ func TestApprovalCommandRoundTrip(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "state.db")
 	store, err := storage.Open(state)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkCurrentSessionReady(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	event := domain.NormalizedEvent{MessageID: "om_integration_approval", Content: "run formatter"}
@@ -1295,7 +1342,7 @@ func TestDaemonInstallAppPreviewDoesNotWrite(t *testing.T) {
 	cfg := filepath.Join(t.TempDir(), "config.yaml")
 	state := filepath.Join(t.TempDir(), "state.db")
 	root := t.TempDir()
-	code, _, stderr := runAgentWithEnv(t, []string{"HOME=" + home}, bin, "--config", cfg, "init", "--workspace", root, "--app-id", "cli_test", "--owner-open-id", "ou_owner")
+	code, _, stderr := runAgentWithEnv(t, []string{"HOME=" + home}, bin, "--config", cfg, "init", "--workspace", root, "--app-id", "cli_test", "--owner-open-id", "ou_owner", "--owner-name", "测试负责人")
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
 	}
@@ -1322,7 +1369,7 @@ func TestDaemonRunRejectsNonPositivePollInterval(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.db")
 	code, _, stderr := runAgent(t, bin,
 		"--config", cfgPath,
-		"init", "--workspace", root, "--app-id", "cli_test", "--owner-open-id", "ou_owner")
+		"init", "--workspace", root, "--app-id", "cli_test", "--owner-open-id", "ou_owner", "--owner-name", "测试负责人")
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
 	}
@@ -1343,7 +1390,7 @@ func TestInitWritesDeepAgentTurnBudget(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "agent.yaml")
 	code, _, stderr := runAgent(t, bin,
 		"--config", cfgPath,
-		"init", "--workspace", t.TempDir(), "--app-id", "cli_test", "--owner-open-id", "ou_owner")
+		"init", "--workspace", t.TempDir(), "--app-id", "cli_test", "--owner-open-id", "ou_owner", "--owner-name", "测试负责人")
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
 	}
@@ -1391,7 +1438,9 @@ func TestOwnerAssistantContractIsSharedByPromptAndDecisionTool(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"ignore only irrelevant content",
+		"ignore only irrelevant non-delegated content",
+		"passed a semantic unanswered gate",
+		"must finish as a useful sender-facing reply or request_approval",
 		"completed bounded read work",
 		"assistant_request",
 		"owner_request",
@@ -1499,7 +1548,7 @@ func TestInvalidAssistantReplyScopeFailsAtConfigLoad(t *testing.T) {
 		"init",
 		"--workspace", workspace,
 		"--app-id", "cli_test",
-		"--owner-open-id", "ou_owner",
+		"--owner-open-id", "ou_owner", "--owner-name", "测试负责人",
 	)
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
@@ -1536,7 +1585,7 @@ func TestInvalidDelegatedReplyScopeFailsAtConfigLoad(t *testing.T) {
 		"init",
 		"--workspace", workspace,
 		"--app-id", "cli_test",
-		"--owner-open-id", "ou_owner",
+		"--owner-open-id", "ou_owner", "--owner-name", "测试负责人",
 	)
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
@@ -1578,7 +1627,7 @@ func TestConfiguredGroupsScopeWithoutChatQueryFailsLiveStartup(t *testing.T) {
 		"init",
 		"--workspace", workspace,
 		"--app-id", "cli_test",
-		"--owner-open-id", "ou_owner",
+		"--owner-open-id", "ou_owner", "--owner-name", "测试负责人",
 	)
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
@@ -1619,7 +1668,7 @@ func TestConfiguredAssistantScopeWithoutChatQueryFailsLiveStartup(t *testing.T) 
 		"init",
 		"--workspace", workspace,
 		"--app-id", "cli_test",
-		"--owner-open-id", "ou_owner",
+		"--owner-open-id", "ou_owner", "--owner-name", "测试负责人",
 	)
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
@@ -1655,7 +1704,7 @@ func TestDoctorReportsAssistantOwnerDirect(t *testing.T) {
 	if err := os.Mkdir(workspace, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	code, _, stderr := runAgent(t, bin, "--config", configPath, "init", "--workspace", workspace, "--app-id", "cli_test", "--owner-open-id", "ou_owner")
+	code, _, stderr := runAgent(t, bin, "--config", configPath, "init", "--workspace", workspace, "--app-id", "cli_test", "--owner-open-id", "ou_owner", "--owner-name", "测试负责人")
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
 	}
@@ -1691,7 +1740,15 @@ func TestDoctorReportsAssistantOwnerDirect(t *testing.T) {
 
 func TestInitRequiresAbsoluteWorkspace(t *testing.T) {
 	bin := buildAgentBinary(t)
-	code, _, stderr := runAgent(t, bin, "init", "--workspace", "relative/path")
+	code, _, stderr := runAgent(
+		t,
+		bin,
+		"init",
+		"--workspace",
+		"relative/path",
+		"--owner-name",
+		"测试负责人",
+	)
 	if code != 2 {
 		t.Fatalf("exit=%d stderr=%s", code, stderr)
 	}
@@ -1739,7 +1796,7 @@ func TestDaemonRunUsesExplicitStatePath(t *testing.T) {
 	cfg := filepath.Join(t.TempDir(), "config.yaml")
 	state := filepath.Join(t.TempDir(), "agent-state.db")
 
-	code, stdout, stderr := runAgent(t, bin, "--config", cfg, "init", "--workspace", root, "--app-id", "cli_test", "--owner-open-id", "ou_owner")
+	code, stdout, stderr := runAgent(t, bin, "--config", cfg, "init", "--workspace", root, "--app-id", "cli_test", "--owner-open-id", "ou_owner", "--owner-name", "测试负责人")
 	if code != 0 {
 		t.Fatalf("init exit=%d stdout=%s stderr=%s", code, stdout, stderr)
 	}

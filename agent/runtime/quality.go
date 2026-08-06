@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -8,11 +9,36 @@ import (
 
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
+	agentlocale "github.com/liuchong/lark-agent/agent/locale"
 	"github.com/liuchong/lark-agent/internal/apperr"
 )
 
 type responseEvidence struct {
 	SuccessfulReads int
+	digests         map[string]struct{}
+}
+
+func (e *responseEvidence) RecordRelevantRead(digest string, nonEmpty bool) {
+	if e == nil || !nonEmpty {
+		return
+	}
+	digest = strings.TrimSpace(digest)
+	if digest == "" {
+		return
+	}
+	if e.digests == nil {
+		e.digests = make(map[string]struct{})
+	}
+	if _, exists := e.digests[digest]; exists {
+		return
+	}
+	e.digests[digest] = struct{}{}
+	e.SuccessfulReads++
+}
+
+func evidenceDigest(toolName, content string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(content)))
+	return fmt.Sprintf("%s:sha256:%x", strings.TrimSpace(toolName), sum[:])
 }
 
 func guardedRequestDecision(bundle agentcontext.Bundle) (domain.Decision, bool) {
@@ -27,6 +53,13 @@ func guardedRequestDecision(bundle agentcontext.Bundle) (domain.Decision, bool) 
 	case bundle.User.OpenID != "" && bundle.Event.SenderID == bundle.User.OpenID:
 		relevance = domain.RelevanceOwnerRequest
 	}
+	language := resolvedBundleLanguage(bundle)
+	replyText := "这个请求涉及工作环境或工作目录之外的信息，我不能处理。请改成具体业务问题，并把范围限定在已配置的工作目录内。"
+	reason := "request asks for out-of-workspace or descriptive environment reconnaissance"
+	if language == agentlocale.LanguageEnglish {
+		replyText = "I cannot handle requests for work-environment details or paths outside the configured workspace. Please ask a concrete business question scoped to the configured workspace."
+		reason = "request is outside the configured business workspace boundary"
+	}
 	return domain.Decision{
 		Kind:       domain.DecisionReply,
 		Relevance:  relevance,
@@ -34,8 +67,9 @@ func guardedRequestDecision(bundle agentcontext.Bundle) (domain.Decision, bool) 
 		Priority:   bundle.Priority,
 		Confidence: 1,
 		Risk:       domain.RiskLow,
-		Reason:     "request asks for out-of-workspace or descriptive environment reconnaissance",
-		ReplyText:  "这个请求涉及工作环境或工作目录之外的信息，我不能处理。请改成具体业务问题，并把范围限定在已配置的工作目录内。",
+		Reason:     reason,
+		ReplyText:  replyText,
+		Language:   string(language),
 	}, true
 }
 
@@ -117,7 +151,24 @@ func validateResponseQuality(bundle agentcontext.Bundle, decision domain.Decisio
 	if decision.Kind == domain.DecisionReply && containsFutureCommitment(decision.ReplyText) {
 		return qualityError("delegated automatic reply contains an unapproved future commitment")
 	}
-	if !requiresRelevantWork(bundle.Event.Content) {
+	if decision.Kind == domain.DecisionReply &&
+		decision.ReplyOutcome == domain.ReplyOutcomeClarification {
+		if len(decision.Progress.Unknowns) == 0 || strings.TrimSpace(decision.Progress.NextStep) == "" {
+			return qualityError("clarification reply requires structured progress with exact unknowns and next_step")
+		}
+		if isAcknowledgementOnly(decision.ReplyText) {
+			return qualityError("clarification reply is acknowledgement-only; ask for the exact missing input")
+		}
+		requestText := strings.TrimSpace(bundle.TaskSummary)
+		if requestText == "" {
+			requestText = bundle.Event.Content
+		}
+		if highRestatementSimilarity(requestText, decision.ReplyText) {
+			return qualityError("clarification reply mostly restates the request without asking for exact missing input")
+		}
+		return nil
+	}
+	if !bundleRequiresRelevantWork(bundle) {
 		return nil
 	}
 	if decision.Kind != domain.DecisionReply && decision.Kind != domain.DecisionNotify && decision.Kind != domain.DecisionRecord {
@@ -129,11 +180,24 @@ func validateResponseQuality(bundle agentcontext.Bundle, decision domain.Decisio
 	if decision.Kind != domain.DecisionReply {
 		return nil
 	}
-	if isAcknowledgementOnly(decision.ReplyText) {
+	structuredProgress := hasUsefulStructuredProgress(decision.Progress)
+	if decision.ReplyOutcome == domain.ReplyOutcomePartial && !structuredProgress {
+		return qualityError("partial reply requires structured progress with completed checks, a finding or unknown, and next_step")
+	}
+	if isAcknowledgementOnly(decision.ReplyText) && !structuredProgress {
 		return qualityError("delegated reply is acknowledgement-only; state completed work and an initial finding or explicit unknown")
 	}
-	if highRestatementSimilarity(bundle.Event.Content, decision.ReplyText) && !containsCompletedWorkSignal(decision.ReplyText) {
+	requestText := strings.TrimSpace(bundle.TaskSummary)
+	if requestText == "" {
+		requestText = bundle.Event.Content
+	}
+	if highRestatementSimilarity(requestText, decision.ReplyText) &&
+		!structuredProgress &&
+		!containsCompletedWorkSignal(decision.ReplyText) {
 		return qualityError("delegated reply mostly restates the request without completed relevant work")
+	}
+	if structuredProgress {
+		return nil
 	}
 	if !containsCompletedWorkSignal(decision.ReplyText) {
 		return qualityError("delegated reply must state completed relevant work and an initial finding or explicit unknown")
@@ -141,11 +205,31 @@ func validateResponseQuality(bundle agentcontext.Bundle, decision domain.Decisio
 	return nil
 }
 
+func hasUsefulStructuredProgress(progress domain.DecisionProgress) bool {
+	return len(progress.CompletedChecks) > 0 &&
+		(strings.TrimSpace(progress.InitialFinding) != "" || len(progress.Unknowns) > 0) &&
+		strings.TrimSpace(progress.NextStep) != ""
+}
+
+func bundleRequiresRelevantWork(bundle agentcontext.Bundle) bool {
+	if bundle.TaskClass == domain.TaskClassInvestigation ||
+		bundle.TaskClass == domain.TaskClassCoding ||
+		bundle.WorkKind == domain.WorkKindCodingQuestion {
+		return true
+	}
+	return requiresRelevantWork(bundle.TaskSummary) ||
+		requiresRelevantWork(bundle.Event.Content)
+}
+
 func isDelegatedInvocation(bundle agentcontext.Bundle) bool {
-	if !bundle.Event.MentionsUser(bundle.User.OpenID) {
+	if bundle.User.OpenID != "" && bundle.Event.SenderID == bundle.User.OpenID {
 		return false
 	}
-	return bundle.User.OpenID == "" || bundle.Event.SenderID != bundle.User.OpenID
+	if bundle.Event.MentionsUser(bundle.User.OpenID) {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(bundle.Event.ChatType), "p2p") &&
+		strings.TrimSpace(bundle.Event.SenderID) != ""
 }
 
 func requiresRelevantWork(content string) bool {
@@ -160,7 +244,8 @@ func containsFutureCommitment(reply string) bool {
 	lower := strings.ToLower(reply)
 	return containsAny(lower,
 		"我会", "我们会", "将会", "稍后", "后续会", "之后会", "忙完后", "尽快",
-		"马上安排", "对齐后同步", "确认后同步", "完成后同步", "will follow up",
+		"马上安排", "对齐后同步", "确认后同步", "完成后同步", "之后同步", "后续同步",
+		"稍后同步", "我来确认", "我来调查", "有结果再", "有结果会", "will follow up",
 		"will deliver", "will coordinate",
 	)
 }

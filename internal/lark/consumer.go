@@ -11,6 +11,7 @@ import (
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	larkdrive "github.com/larksuite/oapi-sdk-go/v3/service/drive/v1"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	"github.com/larksuite/oapi-sdk-go/v3/ws"
 
@@ -23,22 +24,55 @@ type Consumer struct {
 	BaseURL   string
 }
 
+type ResourceSignalKind string
+
+const (
+	ResourceSignalComment      ResourceSignalKind = "comment"
+	ResourceSignalRecordChange ResourceSignalKind = "record_change"
+	ResourceSignalFieldChange  ResourceSignalKind = "field_change"
+)
+
+type ResourceSignal struct {
+	Kind       ResourceSignalKind `json:"kind"`
+	EventID    string             `json:"event_id"`
+	FileToken  string             `json:"file_token"`
+	FileType   string             `json:"file_type,omitempty"`
+	TableID    string             `json:"table_id,omitempty"`
+	RecordIDs  []string           `json:"record_ids,omitempty"`
+	CommentID  string             `json:"comment_id,omitempty"`
+	ReplyID    string             `json:"reply_id,omitempty"`
+	ToOpenID   string             `json:"to_open_id,omitempty"`
+	Mentioned  bool               `json:"mentioned,omitempty"`
+	ObservedAt time.Time          `json:"observed_at"`
+}
+
+type ConsumerHandlers struct {
+	Message  func(EventEnvelope) error
+	Resource func(ResourceSignal) error
+}
+
 var realtimeNow = func() time.Time {
 	return time.Now().UTC()
 }
 
 func (c Consumer) Consume(ctx context.Context, handle func(EventEnvelope) error) error {
+	return c.ConsumeWithHandlers(ctx, ConsumerHandlers{Message: handle})
+}
+
+func (c Consumer) ConsumeWithHandlers(ctx context.Context, handlers ConsumerHandlers) error {
 	if c.AppID == "" || c.AppSecret == "" {
 		return errs.NewConfigError(errs.SubtypeNotConfigured, "lark app credentials are not configured")
 	}
-	if handle == nil {
+	if handlers.Message == nil && handlers.Resource == nil {
 		return errs.NewValidationError(errs.SubtypeInvalidArgument, "event handler is required")
 	}
 	eventErr := make(chan error, 1)
 	handleEvent := func(envelope EventEnvelope, err error) error {
 		if err == nil {
 			envelope = prepareRealtimeEnvelope(envelope)
-			err = handle(envelope)
+			if handlers.Message != nil {
+				err = handlers.Message(envelope)
+			}
 		}
 		if err != nil {
 			select {
@@ -49,17 +83,55 @@ func (c Consumer) Consume(ctx context.Context, handle func(EventEnvelope) error)
 		}
 		return nil
 	}
-	handler := dispatcher.NewEventDispatcher("", "").
-		OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
-			return handleEvent(projectMessageEvent(event))
-		})
+	sdkLogger := newCredentialSafeSDKLogger()
+	handler := dispatcher.NewEventDispatcher("", "")
+	handler.Config.Logger = sdkLogger
+	handler.OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
+		return handleEvent(projectMessageEvent(event))
+	})
 	registerSDKEventHandler(handler, "message", legacyMessageHandler{handle: func(event *legacyMessageEvent) error {
 		return handleEvent(projectLegacyMessageEvent(event))
 	}})
+	handleResource := func(signal ResourceSignal, err error) error {
+		if err == nil && handlers.Resource != nil {
+			if signal.ObservedAt.IsZero() {
+				signal.ObservedAt = realtimeNow()
+			}
+			err = handlers.Resource(signal)
+		}
+		if err != nil {
+			select {
+			case eventErr <- err:
+			default:
+			}
+		}
+		return err
+	}
+	handler.OnP2NoticeCommentAddV1(func(
+		ctx context.Context,
+		event *larkdrive.P2NoticeCommentAddV1,
+	) error {
+		return handleResource(projectCommentNotice(event))
+	})
+	handler.OnP2FileBitableRecordChangedV1(func(
+		ctx context.Context,
+		event *larkdrive.P2FileBitableRecordChangedV1,
+	) error {
+		return handleResource(projectBaseRecordChange(event))
+	})
+	handler.OnP2FileBitableFieldChangedV1(func(
+		ctx context.Context,
+		event *larkdrive.P2FileBitableFieldChangedV1,
+	) error {
+		return handleResource(projectBaseFieldChange(event))
+	})
 	for _, eventType := range ignoredRealtimeEventTypes {
 		registerSDKEventHandler(handler, eventType, ignoredEventHandler{})
 	}
-	options := []ws.ClientOption{ws.WithEventHandler(handler)}
+	options := []ws.ClientOption{
+		ws.WithEventHandler(handler),
+		ws.WithLogger(sdkLogger),
+	}
 	if c.BaseURL != "" {
 		options = append(options, ws.WithDomain(c.BaseURL))
 	}
@@ -77,6 +149,105 @@ func (c Consumer) Consume(ctx context.Context, handle func(EventEnvelope) error)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func projectCommentNotice(event *larkdrive.P2NoticeCommentAddV1) (ResourceSignal, error) {
+	if event == nil || event.Event == nil || event.Event.NoticeMeta == nil {
+		return ResourceSignal{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"Lark comment notice event is empty",
+		)
+	}
+	notice := event.Event.NoticeMeta
+	signal := ResourceSignal{
+		Kind:      ResourceSignalComment,
+		FileToken: larkcore.StringValue(notice.FileToken),
+		FileType:  larkcore.StringValue(notice.FileType),
+		CommentID: larkcore.StringValue(event.Event.CommentId),
+		ReplyID:   larkcore.StringValue(event.Event.ReplyId),
+		Mentioned: event.Event.IsMentioned != nil && *event.Event.IsMentioned,
+	}
+	if notice.ToUserId != nil {
+		signal.ToOpenID = larkcore.StringValue(notice.ToUserId.OpenId)
+	}
+	if event.EventV2Base != nil && event.EventV2Base.Header != nil {
+		signal.EventID = event.EventV2Base.Header.EventID
+		signal.ObservedAt = parseMessageTime(event.EventV2Base.Header.CreateTime)
+	}
+	if signal.EventID == "" || signal.FileToken == "" || signal.CommentID == "" {
+		return ResourceSignal{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"Lark comment notice is missing event_id, file_token, or comment_id",
+		)
+	}
+	return signal, nil
+}
+
+func projectBaseRecordChange(
+	event *larkdrive.P2FileBitableRecordChangedV1,
+) (ResourceSignal, error) {
+	if event == nil || event.Event == nil {
+		return ResourceSignal{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"Lark Base record event is empty",
+		)
+	}
+	signal := ResourceSignal{
+		Kind:      ResourceSignalRecordChange,
+		FileToken: larkcore.StringValue(event.Event.FileToken),
+		FileType:  larkcore.StringValue(event.Event.FileType),
+		TableID:   larkcore.StringValue(event.Event.TableId),
+	}
+	if event.EventV2Base != nil && event.EventV2Base.Header != nil {
+		signal.EventID = event.EventV2Base.Header.EventID
+		signal.ObservedAt = parseMessageTime(event.EventV2Base.Header.CreateTime)
+	}
+	seen := map[string]bool{}
+	for _, action := range event.Event.ActionList {
+		if action == nil {
+			continue
+		}
+		recordID := larkcore.StringValue(action.RecordId)
+		if recordID != "" && !seen[recordID] {
+			seen[recordID] = true
+			signal.RecordIDs = append(signal.RecordIDs, recordID)
+		}
+	}
+	if signal.EventID == "" || signal.FileToken == "" || signal.TableID == "" {
+		return ResourceSignal{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"Lark Base record event is missing event_id, file_token, or table_id",
+		)
+	}
+	return signal, nil
+}
+
+func projectBaseFieldChange(
+	event *larkdrive.P2FileBitableFieldChangedV1,
+) (ResourceSignal, error) {
+	if event == nil || event.Event == nil {
+		return ResourceSignal{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"Lark Base field event is empty",
+		)
+	}
+	signal := ResourceSignal{
+		Kind:      ResourceSignalFieldChange,
+		FileToken: larkcore.StringValue(event.Event.FileToken),
+		FileType:  larkcore.StringValue(event.Event.FileType),
+		TableID:   larkcore.StringValue(event.Event.TableId),
+	}
+	if event.EventV2Base != nil && event.EventV2Base.Header != nil {
+		signal.EventID = event.EventV2Base.Header.EventID
+		signal.ObservedAt = parseMessageTime(event.EventV2Base.Header.CreateTime)
+	}
+	if signal.EventID == "" || signal.FileToken == "" || signal.TableID == "" {
+		return ResourceSignal{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"Lark Base field event is missing event_id, file_token, or table_id",
+		)
+	}
+	return signal, nil
 }
 
 func prepareRealtimeEnvelope(envelope EventEnvelope) EventEnvelope {

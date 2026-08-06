@@ -12,7 +12,9 @@ boundary is `internal/lark`, which calls the official public Go SDK
   conversations, coding tools, scheduler lanes, reactions, and lifecycle notices.
 - Durably distinguish live, duplicate, offline-backlog, interrupted, completed,
   and uncertain work.
-- Never replay cross-restart work without exact owner resumption.
+- After a ready-session gate, only stateless work may be recomputed
+  automatically. Delegated context, drafts, and uncertain side effects are
+  never replayed across restarts without exact owner authority.
 - Install from the current independent config and state only; historical data is
   not imported.
 - Build, verify, commit, and push before installing live service changes.

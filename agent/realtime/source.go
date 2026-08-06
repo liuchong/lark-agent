@@ -11,6 +11,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/domain"
 	"github.com/liuchong/lark-agent/agent/ingest"
 	"github.com/liuchong/lark-agent/internal/apperr"
+	servicelark "github.com/liuchong/lark-agent/internal/lark"
 )
 
 const maxEventBytes = 1024 * 1024
@@ -22,6 +23,14 @@ var sourceNow = func() time.Time {
 // Consumer streams one processed JSON event per line until the context ends.
 type Consumer interface {
 	Consume(context.Context, io.Writer) error
+}
+
+type resourceAwareConsumer interface {
+	ConsumeWithResources(
+		context.Context,
+		io.Writer,
+		func(context.Context, servicelark.ResourceSignal) error,
+	) error
 }
 
 // Runner is one restartable real-time intake session.
@@ -36,12 +45,13 @@ type Store interface {
 
 // Config defines the bot-visible real-time intake boundary.
 type Config struct {
-	OwnerOpenID         string
-	AssistantOpenIDs    []string
-	AssistantNames      []string
-	AssistantReplyScope domain.ReplyScope
-	ConfiguredChatIDs   []string
-	Classify            func(context.Context, domain.WorkItem) (domain.Decision, error)
+	OwnerOpenID          string
+	AssistantOpenIDs     []string
+	AssistantNames       []string
+	AssistantReplyScope  domain.ReplyScope
+	ConfiguredChatIDs    []string
+	Classify             func(context.Context, domain.WorkItem) (domain.Decision, error)
+	HandleResourceSignal func(context.Context, servicelark.ResourceSignal) error
 }
 
 // Source converts bot events to the same durable work shape as polling.
@@ -116,7 +126,12 @@ func (s *Source) Run(ctx context.Context) error {
 	reader, writer := io.Pipe()
 	consumeErr := make(chan error, 1)
 	go func() {
-		err := s.consumer.Consume(streamCtx, writer)
+		var err error
+		if consumer, ok := s.consumer.(resourceAwareConsumer); ok && s.cfg.HandleResourceSignal != nil {
+			err = consumer.ConsumeWithResources(streamCtx, writer, s.cfg.HandleResourceSignal)
+		} else {
+			err = s.consumer.Consume(streamCtx, writer)
+		}
 		_ = writer.CloseWithError(err)
 		consumeErr <- err
 	}()

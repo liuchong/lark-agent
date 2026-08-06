@@ -27,6 +27,46 @@ func TestMentionedOwnerAlwaysRoutes(t *testing.T) {
 	}
 }
 
+func TestInboundHumanPrivateMessageRoutesAsDelegatedReply(t *testing.T) {
+	r := New(Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:     "om_private_human",
+		ChatID:        "oc_private_human",
+		ChatType:      "p2p",
+		ChatPartnerID: "ou_sender",
+		SenderID:      "ou_sender",
+		SenderType:    "user",
+		Content:       "这个方案今天能确认吗？",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionNotify ||
+		decision.Relevance != domain.RelevancePrivateMessage ||
+		decision.WorkKind != domain.WorkKindDirectMention ||
+		decision.Priority != domain.PriorityDirectMention {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestBotPrivateMessageDoesNotBecomeDelegatedReply(t *testing.T) {
+	r := New(Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:  "om_private_bot",
+		ChatID:     "oc_private_bot",
+		ChatType:   "p2p",
+		SenderID:   "cli_bot",
+		SenderType: "app",
+		Content:    "automated notification",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionIgnore {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
 func TestOwnerMentioningAssistantInGroupRoutesAsAssistantRequest(t *testing.T) {
 	r := New(Config{
 		OwnerOpenID:      "ou_owner",
@@ -176,7 +216,7 @@ func TestOwnerFastPathCoversDateStatusDoctorQueueAndHelp(t *testing.T) {
 	}
 	for content, want := range cases {
 		decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
-			SenderID: "owner", Content: content,
+			ChatType: "p2p", SenderID: "owner", Content: content,
 		}))
 		if err != nil {
 			t.Fatal(err)
@@ -211,6 +251,156 @@ func TestOwnerFastPathCoversResponseStatusQuestions(t *testing.T) {
 			!strings.Contains(decision.ReplyText, "队列可检查") {
 			t.Fatalf("content=%q decision=%+v", content, decision)
 		}
+	}
+}
+
+func TestOwnerPrivateSlashCommandRoutesToControlPlane(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:      "ou_owner",
+		AssistantOpenIDs: []string{"ou_bot"},
+		Mode:             domain.ModeAuto,
+	})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:     "om_control_private",
+		ChatID:        "oc_private",
+		ChatType:      "p2p",
+		ChatPartnerID: "ou_bot",
+		SenderID:      "ou_owner",
+		Content:       "/tasks",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionNotify ||
+		decision.WorkKind != domain.WorkKindOwnerControl ||
+		decision.Relevance != domain.RelevanceOwnerRequest ||
+		decision.Reason != "owner_private_control_command" {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestOwnerGroupSlashCommandRedirectsWithoutQueueDetails(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantReplyScope: domain.ReplyScopeAllGroups,
+		Mode:                domain.ModeAuto,
+	})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_control_group",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_owner",
+		Content:   "@_user_1 /tasks",
+		Mentions:  []domain.Mention{{OpenID: "ou_bot", Name: "Assistant"}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		decision.WorkKind != domain.WorkKindFastPath ||
+		!strings.Contains(decision.ReplyText, "私聊") ||
+		strings.Contains(decision.ReplyText, "队列") {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestOwnerGroupControlFastPathRedirectsWithoutQueueDetails(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantNames:      []string{"Assistant"},
+		AssistantReplyScope: domain.ReplyScopeAllGroups,
+		Mode:                domain.ModeAuto,
+		StatusText: func() string {
+			return "需要你处理 9 条；正在执行或自动等待 8 条。发送 `/tasks` 查看详情。"
+		},
+		DoctorText:       func() string { return "需要你处理 7 条；疑似长时间处理中的任务 6 条。" },
+		QueueSummaryText: func() string { return "任务（共 5 条，第 1 页）：#42 secret task" },
+		HelpText:         "智能助手私聊命令：\n- `/tasks`：查看任务。",
+	})
+	for _, content := range []string{
+		"@_user_1 status",
+		"@_user_1 doctor",
+		"@_user_1 queue summary",
+		"@_user_1 help",
+		"@_user_1 为什么不回答",
+		"@_user_1 why didn't you reply",
+	} {
+		decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_control_group_fast_path",
+			ChatID:    "oc_group",
+			ChatType:  "group",
+			SenderID:  "ou_owner",
+			Content:   content,
+			Mentions:  []domain.Mention{{OpenID: "ou_bot", Name: "Assistant"}},
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision.Kind != domain.DecisionReply ||
+			decision.WorkKind != domain.WorkKindFastPath ||
+			!strings.Contains(decision.ReplyText, "私聊") ||
+			strings.Contains(decision.ReplyText, "需要你处理") ||
+			strings.Contains(decision.ReplyText, "任务（共") ||
+			strings.Contains(decision.ReplyText, "#42") ||
+			strings.Contains(decision.ReplyText, "/tasks") {
+			t.Fatalf("content=%q decision=%+v", content, decision)
+		}
+	}
+}
+
+func TestOwnerGroupControlFastPathUsesNativeMentionForNormalization(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantReplyScope: domain.ReplyScopeAllGroups,
+		Mode:                domain.ModeAuto,
+		StatusText:          func() string { return "Needs your action: 9. Use `/tasks` for details." },
+	})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_control_group_native_mention",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_owner",
+		Content:   "@Assistant status",
+		Mentions:  []domain.Mention{{Key: "@Assistant", OpenID: "ou_bot", Name: "Assistant"}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		decision.WorkKind != domain.WorkKindFastPath ||
+		!strings.Contains(decision.ReplyText, "私聊") ||
+		strings.Contains(decision.ReplyText, "Needs your action") ||
+		strings.Contains(decision.ReplyText, "/tasks") {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestOwnerGroupSlashCommandRedirectUsesConfiguredEnglish(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:         "ou_owner",
+		AssistantOpenIDs:    []string{"ou_bot"},
+		AssistantReplyScope: domain.ReplyScopeAllGroups,
+		Mode:                domain.ModeAuto,
+		Language:            "en-US",
+	})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_control_group_en",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_owner",
+		Content:   "@_user_1 /tasks",
+		Mentions:  []domain.Mention{{OpenID: "ou_bot", Name: "Assistant"}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		!strings.Contains(decision.ReplyText, "private chat") ||
+		strings.Contains(decision.ReplyText, "私聊") {
+		t.Fatalf("decision=%+v", decision)
 	}
 }
 
@@ -375,6 +565,33 @@ func TestOwnerPrivateAssistantChatRoutesAsOwnerRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	if decision.Kind != domain.DecisionNotify || decision.Relevance != domain.RelevanceOwnerRequest || decision.Reason != "owner_assistant_private_chat" {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestOwnerHumanPrivateMessageDoesNotFallThroughToInferredRelevance(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:       "ou_owner",
+		AssistantOpenIDs:  []string{"ou_assistant"},
+		Mode:              domain.ModeAuto,
+		PrivateReplyScope: domain.PrivateReplyScopeAll,
+	})
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:     "om_owner_question",
+		ChatID:        "oc_human_private",
+		ChatType:      "p2p",
+		ChatPartnerID: "ou_teammate",
+		SenderID:      "ou_owner",
+		SenderType:    "user",
+		Content:       "感觉你要不要给这个项目配一个 UI，客户端什么的？",
+	})
+
+	decision, err := r.Route(context.Background(), item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionIgnore ||
+		decision.Reason != "owner_message_without_assistant_invocation" {
 		t.Fatalf("decision=%+v", decision)
 	}
 }

@@ -42,7 +42,7 @@ func TestGitHubNotifyDryRunEmitsStructuredPostWithoutSecrets(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
 	code, _, stderr := runAgent(t, bin,
 		"--config", cfgPath,
-		"init", "--workspace", root, "--app-id", "cli_synthetic", "--owner-open-id", "ou_owner")
+		"init", "--workspace", root, "--app-id", "cli_synthetic", "--owner-open-id", "ou_owner", "--owner-name", "测试负责人")
 	if code != 0 {
 		t.Fatalf("init exit=%d stderr=%s", code, stderr)
 	}

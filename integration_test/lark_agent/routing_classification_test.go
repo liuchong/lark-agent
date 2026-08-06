@@ -62,6 +62,33 @@ func TestWorkspaceProductionEntryInvestigationRoutesAsCodingQuestion(t *testing.
 	}
 }
 
+func TestWorkspaceImplementationEvidenceRequestRoutesAsCodingQuestion(t *testing.T) {
+	const (
+		ownerID = "ou_owner"
+		botID   = "ou_assistant"
+	)
+	r := router.New(router.Config{
+		OwnerOpenID:      ownerID,
+		AssistantOpenIDs: []string{botID},
+		AssistantNames:   []string{"Owner Assistant"},
+	})
+	decision, err := r.Route(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_group_evidence",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  ownerID,
+		Mentions:  []domain.Mention{{OpenID: botID, Name: "Owner Assistant"}},
+		Content:   "@_user_1 结合上一条消息，核对仓库里的一个相关测试或实现文件作为证据；不要只复述上一条。",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.WorkKind != domain.WorkKindCodingQuestion ||
+		decision.Priority != domain.PriorityCodingQuestion {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
 func TestWorkspaceBusinessInvestigationStaysSimpleQuestion(t *testing.T) {
 	const (
 		ownerID = "ou_owner"

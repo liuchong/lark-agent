@@ -32,6 +32,7 @@ func TestDefaultConfigUsesSDKKeychainBoundary(t *testing.T) {
 	}
 	cfg.Lark.AppID = "cli_test"
 	cfg.Owner.OpenID = "ou_owner"
+	cfg.Owner.Name = "测试负责人"
 	cfg.Workspace.Root = t.TempDir()
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)

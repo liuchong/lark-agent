@@ -26,6 +26,13 @@ var codingQuestionMarkers = []string{
 	"源代码",
 	"生产入口",
 	"代码入口",
+	"实现文件",
+	"测试文件",
+	"相关测试",
+	"单元测试",
+	"集成测试",
+	"代码仓库",
+	"仓库代码",
 }
 
 // IsCodingQuestion reports whether a request explicitly needs source-code

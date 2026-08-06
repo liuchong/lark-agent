@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -20,6 +21,18 @@ type fakeCaller struct {
 type routingCaller struct {
 	requests []APIRequest
 	call     func(APIRequest) (interface{}, error)
+}
+
+type resourceCaller struct {
+	routingCaller
+	resources map[string]MessageResource
+}
+
+func (f *resourceCaller) GetMessageResource(
+	_ context.Context,
+	req MessageResourceRequest,
+) (MessageResource, error) {
+	return f.resources[req.MessageID+":"+req.FileKey], nil
 }
 
 func (f *routingCaller) CallAPI(_ context.Context, req APIRequest) (interface{}, error) {
@@ -52,6 +65,130 @@ func TestParseMessagePreservesConversationRelations(t *testing.T) {
 		message.ReplyToMessageID != "om_parent" ||
 		message.ThreadID != "omt_thread" {
 		t.Fatalf("message=%+v", message)
+	}
+}
+
+func TestParseMessageExtractsResourceURLsFromApplicationCard(t *testing.T) {
+	message := parseMessage(map[string]any{
+		"message_id": "om_docs_notice",
+		"msg_type":   "interactive",
+		"sender": map[string]any{
+			"sender_type": "app",
+			"sender_id":   map[string]any{"open_id": "cli_docs"},
+		},
+		"content": `{"header":{"title":{"content":"BUG-99999"}},"elements":[{"tag":"button","url":"https://example.larksuite.com/record/shrExampleRecordToken001","text":{"content":"查看记录"}}]}`,
+	})
+	if len(message.ResourceURLs) != 1 ||
+		message.ResourceURLs[0] != "https://example.larksuite.com/record/shrExampleRecordToken001" {
+		t.Fatalf("message=%+v", message)
+	}
+}
+
+func TestParseMessagePreservesImageContextMetadata(t *testing.T) {
+	message := parseMessage(map[string]any{
+		"message_id": "om_image",
+		"chat_id":    "oc_group",
+		"msg_type":   "image",
+		"sender": map[string]any{
+			"id":          map[string]any{"open_id": "ou_sender"},
+			"name":        "Ada",
+			"sender_type": "user",
+		},
+		"content": `{"image_key":"img_v2_evidence"}`,
+	})
+
+	t.Run("sender display name", func(t *testing.T) {
+		field := reflect.ValueOf(message).FieldByName("SenderDisplayName")
+		if !field.IsValid() || field.Kind() != reflect.String || field.String() != "Ada" {
+			t.Fatalf("sender display name was not preserved: message=%+v", message)
+		}
+	})
+
+	t.Run("non-empty text placeholder", func(t *testing.T) {
+		if strings.TrimSpace(message.Content) == "" {
+			t.Fatalf("image message must retain a non-empty text placeholder: message=%+v", message)
+		}
+	})
+
+	t.Run("typed image attachment", func(t *testing.T) {
+		attachments := reflect.ValueOf(message).FieldByName("Attachments")
+		if !attachments.IsValid() || attachments.Kind() != reflect.Slice || attachments.Len() != 1 {
+			t.Fatalf("image message must retain one typed attachment: message=%+v", message)
+		}
+		attachment := attachments.Index(0)
+		if attachment.Kind() == reflect.Pointer {
+			attachment = attachment.Elem()
+		}
+		if !attachment.IsValid() || attachment.Kind() != reflect.Struct {
+			t.Fatalf("attachment must be a typed struct: attachment=%v", attachments.Index(0))
+		}
+		typeField := attachment.FieldByName("Type")
+		if !typeField.IsValid() {
+			typeField = attachment.FieldByName("Kind")
+		}
+		keyField := attachment.FieldByName("Key")
+		if !keyField.IsValid() {
+			keyField = attachment.FieldByName("ImageKey")
+		}
+		if !typeField.IsValid() || typeField.Kind() != reflect.String || typeField.String() != "image" ||
+			!keyField.IsValid() || keyField.Kind() != reflect.String ||
+			keyField.String() != "img_v2_evidence" {
+			t.Fatalf("attachment lost image type or key: attachment=%+v", attachment.Interface())
+		}
+	})
+}
+
+func TestHydrateContextImagesIsBoundedAndMarksUnreadableEvidence(t *testing.T) {
+	caller := &resourceCaller{resources: map[string]MessageResource{
+		"om_one:img_one": {
+			Data:     []byte("\x89PNG\r\n\x1a\nsmall"),
+			FileName: "one.png",
+		},
+		"om_two:img_two": {
+			Data:     []byte(strings.Repeat("x", 33)),
+			FileName: "two.png",
+		},
+	}}
+	service := NewService(caller, "ou_owner")
+	messages := []Message{
+		{
+			MessageID: "om_one",
+			Attachments: []MessageAttachment{{
+				Type: "image", Key: "img_one",
+			}},
+		},
+		{
+			MessageID: "om_two",
+			Attachments: []MessageAttachment{{
+				Type: "image", Key: "img_two",
+			}},
+		},
+		{
+			MessageID: "om_three",
+			Attachments: []MessageAttachment{{
+				Type: "image", Key: "img_three",
+			}},
+		},
+	}
+
+	got := service.HydrateContextImages(
+		context.Background(),
+		messages,
+		ImageHydrationLimits{MaxImages: 2, MaxImageBytes: 32, MaxTotalBytes: 64},
+	)
+	if attachment := got[0].Attachments[0]; !attachment.Readable ||
+		attachment.MediaType != "image/png" ||
+		len(attachment.Data) == 0 {
+		t.Fatalf("first attachment=%+v", attachment)
+	}
+	if attachment := got[1].Attachments[0]; attachment.Readable ||
+		attachment.UnreadableReason != "image_exceeds_size_limit" ||
+		len(attachment.Data) != 0 {
+		t.Fatalf("second attachment=%+v", attachment)
+	}
+	if attachment := got[2].Attachments[0]; attachment.Readable ||
+		attachment.UnreadableReason != "image_count_limit_reached" {
+		t.Fatalf("third attachment=%+v", attachment)
 	}
 }
 
@@ -183,6 +320,109 @@ func TestDeleteTypingReactionUsesBotIdentity(t *testing.T) {
 		caller.req.Method != http.MethodDelete ||
 		caller.req.Path != "/open-apis/im/v1/messages/om_private/reactions/reaction_typing" {
 		t.Fatalf("request=%+v", caller.req)
+	}
+}
+
+func TestListMessageReactionsUsesUserIdentityAndOpenIDPagination(t *testing.T) {
+	caller := &routingCaller{
+		call: func(req APIRequest) (interface{}, error) {
+			switch req.Params["page_token"] {
+			case nil:
+				return map[string]any{"data": map[string]any{
+					"has_more":   true,
+					"page_token": "next-page",
+					"items": []any{map[string]any{
+						"reaction_id": "r_other",
+						"operator": map[string]any{
+							"operator_type": "user",
+							"operator_id":   map[string]any{"open_id": "ou_other"},
+						},
+						"reaction_type": map[string]any{"emoji_type": "Get"},
+					}},
+				}}, nil
+			case "next-page":
+				return map[string]any{"data": map[string]any{
+					"items": []any{map[string]any{
+						"reaction_id": "r_owner",
+						"operator": map[string]any{
+							"operator_type": "user",
+							"operator_id":   map[string]any{"open_id": "ou_owner"},
+						},
+						"reaction_type": map[string]any{"emoji_type": "Get"},
+					}},
+				}}, nil
+			default:
+				t.Fatalf("unexpected page token: %+v", req.Params)
+				return nil, nil
+			}
+		},
+	}
+	svc := NewService(caller, "ou_owner")
+	result, err := svc.FindOwnerAckReaction(context.Background(), OwnerAckReactionRequest{
+		MessageID:   "om_private",
+		OwnerOpenID: "ou_owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Found ||
+		result.Reaction.ReactionID != "r_owner" ||
+		result.Reaction.EmojiType != "Get" ||
+		result.Reaction.OperatorOpenID != "ou_owner" {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(caller.requests) != 2 {
+		t.Fatalf("requests=%d", len(caller.requests))
+	}
+	for _, req := range caller.requests {
+		if req.As != IdentityUser ||
+			req.Method != http.MethodGet ||
+			req.Path != "/open-apis/im/v1/messages/om_private/reactions" ||
+			req.Params["user_id_type"] != "open_id" {
+			t.Fatalf("request=%+v", req)
+		}
+	}
+}
+
+func TestFindOwnerAckReactionIgnoresOtherUsersBotsAndUnsupportedEmoji(t *testing.T) {
+	caller := &fakeCaller{response: map[string]any{"data": map[string]any{
+		"items": []any{
+			map[string]any{
+				"reaction_id": "r_other",
+				"operator": map[string]any{
+					"operator_type": "user",
+					"operator_id":   map[string]any{"open_id": "ou_other"},
+				},
+				"reaction_type": map[string]any{"emoji_type": "Get"},
+			},
+			map[string]any{
+				"reaction_id": "r_bot",
+				"operator": map[string]any{
+					"operator_type": "bot",
+					"operator_id":   map[string]any{"open_id": "ou_owner"},
+				},
+				"reaction_type": map[string]any{"emoji_type": "Get"},
+			},
+			map[string]any{
+				"reaction_id": "r_owner_typing",
+				"operator": map[string]any{
+					"operator_type": "user",
+					"operator_id":   map[string]any{"open_id": "ou_owner"},
+				},
+				"reaction_type": map[string]any{"emoji_type": "Typing"},
+			},
+		},
+	}}}
+	svc := NewService(caller, "ou_owner")
+	result, err := svc.FindOwnerAckReaction(context.Background(), OwnerAckReactionRequest{
+		MessageID:   "om_private",
+		OwnerOpenID: "ou_owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Found {
+		t.Fatalf("unsupported reaction counted: %+v", result)
 	}
 }
 
@@ -527,6 +767,263 @@ func TestListRecentMessagesUsesUserIdentity(t *testing.T) {
 	}
 	if len(messages.Items) != 1 || messages.Items[0].MessageID != "om_recent" {
 		t.Fatalf("messages=%+v", messages)
+	}
+}
+
+func TestGetSemanticReplyContextPaginatesThroughTargetAndLaterDiscussion(t *testing.T) {
+	base := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
+	caller := &routingCaller{call: func(req APIRequest) (interface{}, error) {
+		switch req.Path {
+		case "/open-apis/im/v1/messages/mget":
+			return map[string]any{"data": map[string]any{"items": []any{
+				map[string]any{
+					"message_id": "om_target", "chat_id": "oc_group",
+					"content":     `{"text":"发布日期是哪天？"}`,
+					"create_time": base.Format(time.RFC3339),
+				},
+			}}}, nil
+		case "/open-apis/im/v1/messages":
+			if req.Params["page_token"] == "page_2" {
+				return map[string]any{"data": map[string]any{"items": []any{
+					map[string]any{
+						"message_id": "om_target", "chat_id": "oc_group",
+						"content":     `{"text":"发布日期是哪天？"}`,
+						"create_time": base.Format(time.RFC3339),
+					},
+				}}}, nil
+			}
+			return map[string]any{"data": map[string]any{
+				"has_more": true, "page_token": "page_2",
+				"items": []any{
+					map[string]any{
+						"message_id": "om_owner", "chat_id": "oc_group",
+						"sender":      map[string]any{"id": map[string]any{"open_id": "ou_owner"}},
+						"content":     `{"text":"我先确认一下发布计划。"}`,
+						"create_time": base.Add(time.Minute).Format(time.RFC3339),
+					},
+				},
+			}}, nil
+		default:
+			t.Fatalf("unexpected request=%s %s", req.Method, req.Path)
+			return nil, nil
+		}
+	}}
+
+	result, err := NewService(caller, "ou_owner").GetSemanticReplyContext(
+		context.Background(),
+		SemanticReplyContextRequest{
+			ChatID:          "oc_group",
+			TargetMessageID: "om_target",
+			Since:           base,
+			MaxMessages:     10,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Withdrawn || result.Incomplete || len(result.Messages) != 2 ||
+		result.Messages[0].MessageID != "om_target" ||
+		result.Messages[1].MessageID != "om_owner" {
+		t.Fatalf("result=%+v", result)
+	}
+	if result.ContextCutoff.Before(base.Add(time.Minute)) {
+		t.Fatalf("context cutoff=%s", result.ContextCutoff)
+	}
+}
+
+func TestGetSemanticReplyContextIncludesPreTargetWindowTargetAndLaterClarification(t *testing.T) {
+	targetTime := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
+	caller := &routingCaller{call: func(req APIRequest) (interface{}, error) {
+		switch req.Path {
+		case "/open-apis/im/v1/messages/mget":
+			return map[string]any{"data": map[string]any{"items": []any{
+				map[string]any{
+					"message_id": "om_target", "chat_id": "oc_group",
+					"content":     `{"text":"Please investigate this."}`,
+					"create_time": targetTime.Format(time.RFC3339),
+				},
+			}}}, nil
+		case "/open-apis/im/v1/messages":
+			if req.Params["page_token"] == "older" {
+				return map[string]any{"data": map[string]any{"items": []any{
+					map[string]any{
+						"message_id": "om_context", "chat_id": "oc_group",
+						"content":     `{"text":"Production message edits return 1408."}`,
+						"create_time": targetTime.Add(-2*time.Minute - 30*time.Second).Format(time.RFC3339),
+					},
+					map[string]any{
+						"message_id": "om_too_old", "chat_id": "oc_group",
+						"content":     `{"text":"Unrelated older discussion."}`,
+						"create_time": targetTime.Add(-3*time.Minute - time.Second).Format(time.RFC3339),
+					},
+				}}}, nil
+			}
+			return map[string]any{"data": map[string]any{
+				"has_more": true, "page_token": "older",
+				"items": []any{
+					map[string]any{
+						"message_id": "om_clarification", "chat_id": "oc_group",
+						"content":     `{"text":"Clarification: production is not deployed."}`,
+						"create_time": targetTime.Add(2 * time.Minute).Format(time.RFC3339),
+					},
+					map[string]any{
+						"message_id": "om_target", "chat_id": "oc_group",
+						"content":     `{"text":"Please investigate this."}`,
+						"create_time": targetTime.Format(time.RFC3339),
+					},
+				},
+			}}, nil
+		default:
+			t.Fatalf("unexpected request=%s %s", req.Method, req.Path)
+			return nil, nil
+		}
+	}}
+
+	result, err := NewService(caller, "ou_owner").GetSemanticReplyContext(
+		context.Background(),
+		SemanticReplyContextRequest{
+			ChatID:          "oc_group",
+			TargetMessageID: "om_target",
+			Since:           targetTime.Add(-3 * time.Minute),
+			MaxMessages:     20,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(messageIDs(result.Messages), ","); got != "om_context,om_target,om_clarification" {
+		t.Fatalf("shared context message IDs=%s, want pre-target,target,clarification", got)
+	}
+	if result.ContextCutoff.Before(targetTime.Add(2 * time.Minute)) {
+		t.Fatalf("context cutoff=%s does not cover clarification", result.ContextCutoff)
+	}
+}
+
+func TestGetSemanticReplyContextIncludesRootOutsideAdjacentWindow(t *testing.T) {
+	targetTime := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
+	mgetCalls := 0
+	caller := &routingCaller{call: func(req APIRequest) (interface{}, error) {
+		switch req.Path {
+		case "/open-apis/im/v1/messages/mget":
+			mgetCalls++
+			if mgetCalls == 1 {
+				return map[string]any{"data": map[string]any{"items": []any{
+					map[string]any{
+						"message_id": "om_target", "chat_id": "oc_group",
+						"root_id":     "om_root",
+						"content":     `{"text":"@测试负责人 你看一下"}`,
+						"create_time": targetTime.Format(time.RFC3339),
+					},
+				}}}, nil
+			}
+			return map[string]any{"data": map[string]any{"items": []any{
+				map[string]any{
+					"message_id": "om_root", "chat_id": "oc_group",
+					"content":     `{"text":"生产示例事件返回 1408 SampleEventDisabled"}`,
+					"create_time": targetTime.Add(-20 * time.Minute).Format(time.RFC3339),
+				},
+				map[string]any{
+					"message_id": "om_target", "chat_id": "oc_group",
+					"root_id":     "om_root",
+					"content":     `{"text":"@测试负责人 你看一下"}`,
+					"create_time": targetTime.Format(time.RFC3339),
+				},
+			}}}, nil
+		case "/open-apis/im/v1/messages":
+			return map[string]any{"data": map[string]any{"items": []any{
+				map[string]any{
+					"message_id": "om_target", "chat_id": "oc_group",
+					"root_id":     "om_root",
+					"content":     `{"text":"@测试负责人 你看一下"}`,
+					"create_time": targetTime.Format(time.RFC3339),
+				},
+			}}}, nil
+		default:
+			t.Fatalf("unexpected request=%s %s", req.Method, req.Path)
+			return nil, nil
+		}
+	}}
+
+	result, err := NewService(caller, "ou_owner").GetSemanticReplyContext(
+		context.Background(),
+		SemanticReplyContextRequest{
+			ChatID:          "oc_group",
+			TargetMessageID: "om_target",
+			Since:           targetTime.Add(-3 * time.Minute),
+			MaxMessages:     20,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Incomplete ||
+		strings.Join(messageIDs(result.Messages), ",") != "om_root,om_target" {
+		t.Fatalf("result=%+v", result)
+	}
+	if mgetCalls != 2 {
+		t.Fatalf("mget calls=%d, want target plus relation lookup", mgetCalls)
+	}
+}
+
+func TestGetSemanticReplyContextMarksBoundedWindowIncomplete(t *testing.T) {
+	base := time.Date(2026, 7, 29, 2, 0, 0, 0, time.UTC)
+	caller := &routingCaller{call: func(req APIRequest) (interface{}, error) {
+		if req.Path == "/open-apis/im/v1/messages/mget" {
+			return map[string]any{"data": map[string]any{"items": []any{
+				map[string]any{
+					"message_id": "om_target", "chat_id": "oc_group",
+					"create_time": base.Format(time.RFC3339),
+				},
+			}}}, nil
+		}
+		return map[string]any{"data": map[string]any{
+			"has_more": true, "page_token": "more",
+			"items": []any{
+				map[string]any{
+					"message_id": "om_new", "chat_id": "oc_group",
+					"create_time": base.Add(time.Minute).Format(time.RFC3339),
+				},
+			},
+		}}, nil
+	}}
+
+	result, err := NewService(caller, "ou_owner").GetSemanticReplyContext(
+		context.Background(),
+		SemanticReplyContextRequest{
+			ChatID:          "oc_group",
+			TargetMessageID: "om_target",
+			Since:           base,
+			MaxMessages:     1,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Incomplete || result.Withdrawn {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestGetSemanticReplyContextTreatsMissingExactTargetAsWithdrawn(t *testing.T) {
+	caller := &routingCaller{call: func(req APIRequest) (interface{}, error) {
+		if req.Path != "/open-apis/im/v1/messages/mget" {
+			t.Fatalf("unexpected request=%s %s", req.Method, req.Path)
+		}
+		return map[string]any{"data": map[string]any{"items": []any{}}}, nil
+	}}
+
+	result, err := NewService(caller, "ou_owner").GetSemanticReplyContext(
+		context.Background(),
+		SemanticReplyContextRequest{
+			ChatID:          "oc_group",
+			TargetMessageID: "om_missing",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Withdrawn || result.Incomplete || len(result.Messages) != 0 {
+		t.Fatalf("result=%+v", result)
 	}
 }
 
@@ -1035,6 +1532,26 @@ func TestCompactMessagesDropsUnreferencedAppNoise(t *testing.T) {
 		t.Fatalf("unreferenced app noise remained: %v", messageIDs(compacted))
 	}
 	for _, want := range []string{"om_human_1", "om_parent", "om_target"} {
+		if !containsMessage(compacted, want) {
+			t.Fatalf("wanted message %s missing: %v", want, messageIDs(compacted))
+		}
+	}
+}
+
+func TestCompactMessagesKeepsCurrentAssistantPrivateContextWhenRequested(t *testing.T) {
+	messages := []Message{
+		{MessageID: "om_owner_1", SenderType: "user", Content: "前一个问题", CreateTime: "2026-07-31T00:50:00Z"},
+		{MessageID: "om_assistant_notice", SenderType: "app", Content: "审批 #453，批准命令如下", CreateTime: "2026-07-31T00:51:00Z"},
+		{MessageID: "om_owner_confirm", SenderType: "user", Content: "确认", CreateTime: "2026-07-31T00:52:00Z"},
+	}
+	compacted, truncated := compactMessages(messages, MessageContextRequest{
+		MessageID:          "om_owner_confirm",
+		IncludeAppMessages: true,
+	}, 30)
+	if truncated {
+		t.Fatalf("trusted private context should not be marked truncated: %v", messageIDs(compacted))
+	}
+	for _, want := range []string{"om_owner_1", "om_assistant_notice", "om_owner_confirm"} {
 		if !containsMessage(compacted, want) {
 			t.Fatalf("wanted message %s missing: %v", want, messageIDs(compacted))
 		}

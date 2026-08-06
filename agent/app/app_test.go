@@ -12,20 +12,33 @@ import (
 	"github.com/liuchong/lark-agent/agent/policy"
 	"github.com/liuchong/lark-agent/agent/poll"
 	"github.com/liuchong/lark-agent/agent/reply"
+	"github.com/liuchong/lark-agent/agent/replymatch"
 	"github.com/liuchong/lark-agent/agent/router"
 	"github.com/liuchong/lark-agent/agent/tools"
+	errs "github.com/liuchong/lark-agent/internal/apperr"
 )
 
 type fakeQueue struct {
-	item      domain.WorkItem
-	ok        bool
-	done      bool
-	retried   bool
-	completed domain.Decision
-	approved  *domain.Decision
-	goal      *domain.CodingGoal
-	goalUsed  int
-	leaseErr  error
+	item            domain.WorkItem
+	ok              bool
+	done            bool
+	retried         bool
+	completed       domain.Decision
+	approved        *domain.Decision
+	goal            *domain.CodingGoal
+	goalUsed        int
+	leaseErr        error
+	deferred        bool
+	deferFor        time.Duration
+	deadLetter      bool
+	deadReason      string
+	candidate       *domain.WorkReplyCandidate
+	saved           *domain.Decision
+	held            bool
+	consumed        bool
+	cancelled       bool
+	cancelReason    string
+	approvalBlocked bool
 }
 
 func (f *fakeQueue) UpdateWorkItemSchedulingClaim(
@@ -61,8 +74,66 @@ func (f *fakeQueue) ReadyApprovedReply(int64) (domain.Decision, bool, error) {
 	return *f.approved, true, nil
 }
 
+func (f *fakeQueue) BlockReadyReplyApprovalClaim(
+	context.Context,
+	int64,
+	string,
+	string,
+) error {
+	f.approvalBlocked = true
+	f.approved = nil
+	return nil
+}
+
+func (f *fakeQueue) ReadyWorkReplyCandidate(int64) (domain.WorkReplyCandidate, bool, error) {
+	if f.candidate == nil {
+		return domain.WorkReplyCandidate{}, false, nil
+	}
+	return *f.candidate, true, nil
+}
+
+func (f *fakeQueue) SaveWorkReplyCandidate(_ int64, _ string, decision domain.Decision) error {
+	f.saved = &decision
+	f.candidate = &domain.WorkReplyCandidate{
+		WorkItemID: f.item.ID,
+		Status:     domain.ReplyCandidatePending,
+		Decision:   decision,
+	}
+	return nil
+}
+
+func (f *fakeQueue) HoldWorkReplyCandidate(_ int64, _ string, reason string) error {
+	f.held = true
+	if f.candidate != nil {
+		f.candidate.Status = domain.ReplyCandidateHeld
+		f.candidate.HoldReason = reason
+	}
+	return nil
+}
+
+func (f *fakeQueue) ConsumeWorkReplyCandidate(int64, string) error {
+	f.consumed = true
+	f.candidate = nil
+	return nil
+}
+
+func (f *fakeQueue) CancelWorkReplyCandidate(_ int64, _, reason string) error {
+	f.cancelled = true
+	f.cancelReason = reason
+	f.candidate = nil
+	return nil
+}
+
 func (f *fakeQueue) ClaimNext(string) (domain.WorkItem, bool, error) {
 	return f.item, f.ok, nil
+}
+
+func (f *fakeQueue) GetWorkItem(context.Context, int64) (domain.WorkItem, error) {
+	item := f.item
+	if f.deadLetter {
+		item.Status = domain.StatusDeadLetter
+	}
+	return item, nil
 }
 
 func (f *fakeQueue) Complete(_ int64, decision domain.Decision) error {
@@ -74,6 +145,209 @@ func (f *fakeQueue) Complete(_ int64, decision domain.Decision) error {
 func (f *fakeQueue) MarkRetry(int64, string) error {
 	f.retried = true
 	return nil
+}
+
+func (f *fakeQueue) MarkDeadLetter(_ int64, reason string) error {
+	f.deadLetter = true
+	f.deadReason = reason
+	return nil
+}
+
+func (f *fakeQueue) DeferWaitingUserClaim(_ int64, _ string, _ string, delay time.Duration) error {
+	f.deferred = true
+	f.deferFor = delay
+	return nil
+}
+
+type fakeReplyResolver struct {
+	resolution  replymatch.Resolution
+	resolutions []replymatch.Resolution
+	err         error
+	calls       int
+}
+
+type fakeInvestigationProgress struct {
+	events *[]string
+}
+
+func (f *fakeInvestigationProgress) Begin(
+	_ context.Context,
+	_ domain.WorkItem,
+	_ replymatch.Resolution,
+) error {
+	*f.events = append(*f.events, "progress")
+	return nil
+}
+
+func (f *fakeInvestigationProgress) Finalizing(
+	_ context.Context,
+	_ domain.WorkItem,
+) error {
+	*f.events = append(*f.events, "finalizing")
+	return nil
+}
+
+func (f *fakeInvestigationProgress) Complete(
+	_ context.Context,
+	_ domain.WorkItem,
+) error {
+	*f.events = append(*f.events, "complete")
+	return nil
+}
+
+func (f *fakeInvestigationProgress) Block(
+	_ context.Context,
+	_ domain.WorkItem,
+	_ error,
+) error {
+	*f.events = append(*f.events, "blocked")
+	return nil
+}
+
+type fakeControlHandler struct {
+	called   bool
+	command  domain.OwnerControlCommand
+	decision domain.Decision
+	err      error
+}
+
+func (h *fakeControlHandler) Handle(
+	_ context.Context,
+	_ domain.WorkItem,
+	command domain.OwnerControlCommand,
+) (domain.Decision, error) {
+	h.called = true
+	h.command = command
+	return h.decision, h.err
+}
+
+type fakeSemanticControlResolver struct {
+	called     bool
+	resolution SemanticControlResolution
+	bundle     agentcontext.Bundle
+}
+
+func (r *fakeSemanticControlResolver) Resolve(
+	_ context.Context,
+	_ domain.WorkItem,
+	bundle agentcontext.Bundle,
+) (SemanticControlResolution, error) {
+	r.called = true
+	r.bundle = bundle
+	return r.resolution, nil
+}
+
+func TestDaemonExecutesOwnerControlBeforeModel(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:     "om_owner_control",
+		ChatID:        "oc_private",
+		ChatType:      "p2p",
+		ChatPartnerID: "ou_bot",
+		SenderID:      "ou_owner",
+		Content:       "/help",
+	})}
+	handler := &fakeControlHandler{decision: domain.Decision{
+		Kind:       domain.DecisionReply,
+		Confidence: 1,
+		Risk:       domain.RiskLow,
+		Reason:     "owner_control_help",
+		ReplyText:  "命令帮助",
+	}}
+	decider := &fakeDecider{}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{
+			OwnerOpenID:      "ou_owner",
+			AssistantOpenIDs: []string{"ou_bot"},
+			Mode:             domain.ModeAuto,
+		}),
+		WithControlHandler(handler),
+		WithDecider(decider),
+		WithReplyHandler(replier),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || !handler.called || decider.called || !replier.called {
+		t.Fatalf(
+			"result=%+v handler=%+v decider=%+v replier=%+v",
+			result, handler, decider, replier,
+		)
+	}
+	if result.Decision.Relevance != domain.RelevanceOwnerRequest ||
+		result.Decision.WorkKind != domain.WorkKindOwnerControl {
+		t.Fatalf("route identity was not preserved: %+v", result.Decision)
+	}
+}
+
+func TestDaemonExecutesContextualSemanticOwnerCommandBeforeGeneralModel(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:     "om_owner_confirm",
+		ChatID:        "oc_private",
+		ChatType:      "p2p",
+		ChatPartnerID: "ou_bot",
+		SenderID:      "ou_owner",
+		Content:       "确认",
+	})}
+	builder := &fakeBuilder{}
+	semantic := &fakeSemanticControlResolver{resolution: SemanticControlResolution{
+		Kind: SemanticControlCommand,
+		Command: &domain.OwnerControlCommand{
+			Name:     domain.OwnerControlApprovalApprove,
+			ActionID: 453,
+			Confirm:  true,
+		},
+	}}
+	handler := &fakeControlHandler{decision: domain.Decision{
+		Kind:       domain.DecisionReply,
+		Confidence: 1,
+		Risk:       domain.RiskLow,
+		Reason:     "owner_control_approval_approve",
+		ReplyText:  "已批准动作 #453",
+	}}
+	decider := &fakeDecider{}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{
+			OwnerOpenID:      "ou_owner",
+			AssistantOpenIDs: []string{"ou_bot"},
+			Mode:             domain.ModeAuto,
+		}),
+		WithContextBuilder(builder),
+		WithSemanticControlResolver(semantic),
+		WithControlHandler(handler),
+		WithDecider(decider),
+		WithReplyHandler(replier),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || !semantic.called || !builder.called ||
+		!handler.called || decider.called || !replier.called {
+		t.Fatalf(
+			"result=%+v semantic=%+v builder=%+v handler=%+v decider=%+v replier=%+v",
+			result, semantic, builder, handler, decider, replier,
+		)
+	}
+	if handler.command.Name != domain.OwnerControlApprovalApprove ||
+		handler.command.ActionID != 453 {
+		t.Fatalf("command=%+v", handler.command)
+	}
+}
+
+func (r *fakeReplyResolver) Resolve(context.Context, domain.WorkItem) (replymatch.Resolution, error) {
+	r.calls++
+	if len(r.resolutions) > 0 {
+		index := min(r.calls-1, len(r.resolutions)-1)
+		return r.resolutions[index], r.err
+	}
+	return r.resolution, r.err
 }
 
 func TestDaemonRunOnceRoutesItem(t *testing.T) {
@@ -88,6 +362,588 @@ func TestDaemonRunOnceRoutesItem(t *testing.T) {
 	}
 	if !result.Processed || !q.done || result.Decision.Relevance != domain.RelevanceDirectMention {
 		t.Fatalf("result=%+v queue=%+v", result, q)
+	}
+}
+
+func TestDaemonSemanticOwnerAnswerSkipsMainReplyModel(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_target",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID:        "om_target",
+		Result:                 replymatch.ResultAnswered,
+		MatchedOwnerMessageIDs: []string{"om_owner_answer"},
+		Confidence:             0.98,
+	}}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolver.calls != 1 || decider.called || !q.done ||
+		result.Decision.Kind != domain.DecisionIgnore ||
+		result.Decision.Reason != "owner_semantically_replied" {
+		t.Fatalf("result=%+v queue=%+v resolver=%+v decider=%+v", result, q, resolver, decider)
+	}
+}
+
+func TestDaemonNoReplyNeededSkipsMainReplyModel(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID:  "om_private_answer",
+		ChatID:     "oc_private",
+		ChatType:   "p2p",
+		SenderID:   "ou_sender",
+		SenderType: "user",
+		Content:    "有 UI 和客户端",
+	})}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_private_answer",
+		Result:          replymatch.ResultNoReplyNeeded,
+		Confidence:      0.98,
+		Reason:          "the message answers an owner-led question and adds no request",
+	}}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{
+			OwnerOpenID:       "ou_owner",
+			Mode:              domain.ModeAuto,
+			PrivateReplyScope: domain.PrivateReplyScopeAll,
+		}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolver.calls != 1 || decider.called || !q.done ||
+		result.Decision.Kind != domain.DecisionIgnore ||
+		result.Decision.Reason != "delegated_reply_not_needed" {
+		t.Fatalf("result=%+v queue=%+v resolver=%+v decider=%+v", result, q, resolver, decider)
+	}
+}
+
+func TestDaemonAmbiguousOwnerReplyDefersWithoutMainModel(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_target",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_target",
+		Result:          replymatch.ResultAmbiguous,
+		Confidence:      0.7,
+		Reason:          "owner discussion is ambiguous",
+	}}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithDelegatedReplyResolver(resolver, 0.85, 45*time.Second),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || resolver.calls != 1 || decider.called ||
+		!q.deferred || q.deferFor != 45*time.Second || q.done {
+		t.Fatalf("result=%+v queue=%+v resolver=%+v decider=%+v", result, q, resolver, decider)
+	}
+}
+
+func TestSemanticSuppressionConfidenceFloorDoesNotFollowLowerConfig(t *testing.T) {
+	resolution := replymatch.Resolution{
+		Result:                 replymatch.ResultAnswered,
+		Confidence:             0.65,
+		MatchedOwnerMessageIDs: []string{"om_owner_answer"},
+	}
+	if semanticSuppressesDelegatedReply(resolution, 0.60) {
+		t.Fatal("semantic suppression accepted below the 0.70 safety floor")
+	}
+	resolution.Confidence = 0.70
+	if !semanticSuppressesDelegatedReply(resolution, 0.60) {
+		t.Fatal("semantic suppression rejected the 0.70 safety floor")
+	}
+}
+
+func TestDaemonResolvesHeldCandidateWithoutCallingMainModel(t *testing.T) {
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_held_candidate",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})
+	item.ID = 901
+	decision := domain.Decision{
+		Kind:         domain.DecisionReply,
+		Relevance:    domain.RelevanceDirectMention,
+		Risk:         domain.RiskLow,
+		ReplyOutcome: domain.ReplyOutcomePartial,
+		ReplyText:    "已核对入口；生产配置仍未知。",
+	}
+	q := &fakeQueue{
+		ok:   true,
+		item: item,
+		candidate: &domain.WorkReplyCandidate{
+			WorkItemID: item.ID,
+			Status:     domain.ReplyCandidateHeld,
+			Decision:   decision,
+		},
+	}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: item.Event.MessageID,
+		Result:          replymatch.ResultUnanswered,
+		Confidence:      0.99,
+		Reason:          "still unanswered",
+	}}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithReplyHandler(replier),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decider.called || resolver.calls != 1 || !replier.called ||
+		!q.consumed || !q.done || result.Decision.ReplyText != decision.ReplyText {
+		t.Fatalf("result=%+v queue=%+v resolver=%+v decider=%+v replier=%+v",
+			result, q, resolver, decider, replier)
+	}
+}
+
+func TestDaemonCancelsHeldCandidateForModerateConfidenceOwnerAnswer(t *testing.T) {
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_held_candidate_answered",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})
+	item.ID = 902
+	decision := domain.Decision{
+		Kind:         domain.DecisionReply,
+		Relevance:    domain.RelevanceDirectMention,
+		Risk:         domain.RiskLow,
+		ReplyOutcome: domain.ReplyOutcomePartial,
+		ReplyText:    "已核对入口；生产配置仍未知。",
+	}
+	q := &fakeQueue{
+		ok:   true,
+		item: item,
+		candidate: &domain.WorkReplyCandidate{
+			WorkItemID: item.ID,
+			Status:     domain.ReplyCandidateHeld,
+			Decision:   decision,
+		},
+	}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID:        item.Event.MessageID,
+		Result:                 replymatch.ResultAnswered,
+		Confidence:             0.82,
+		Reason:                 "owner answered while candidate was held",
+		MatchedOwnerMessageIDs: []string{"om_owner_answer"},
+	}}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithReplyHandler(replier),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decider.called || resolver.calls != 1 || replier.called ||
+		!q.cancelled || q.consumed || !q.done ||
+		result.Decision.Kind != domain.DecisionIgnore ||
+		result.Decision.Reason != "held_candidate_answered" {
+		t.Fatalf("result=%+v queue=%+v resolver=%+v decider=%+v replier=%+v",
+			result, q, resolver, decider, replier)
+	}
+}
+
+func TestHeldCandidateReappliesCurrentRoutingPolicyBeforeSend(t *testing.T) {
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_held_candidate_paused",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})
+	item.ID = 902
+	q := &fakeQueue{
+		ok:   true,
+		item: item,
+		candidate: &domain.WorkReplyCandidate{
+			WorkItemID: item.ID,
+			Status:     domain.ReplyCandidateHeld,
+			Decision: domain.Decision{
+				Kind:         domain.DecisionReply,
+				Relevance:    domain.RelevanceDirectMention,
+				ReplyOutcome: domain.ReplyOutcomePartial,
+				ReplyText:    "stale validated candidate",
+			},
+		},
+	}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{
+			OwnerOpenID: "ou_owner",
+			Mode:        domain.ModePaused,
+		}),
+		WithReplyHandler(replier),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replier.called || !q.cancelled || !q.done ||
+		result.Decision.Kind != domain.DecisionIgnore ||
+		result.Decision.Reason != "agent_paused" {
+		t.Fatalf("result=%+v queue=%+v replier=%+v", result, q, replier)
+	}
+}
+
+func TestHeldCandidateCannotOutliveMissingOwnerMention(t *testing.T) {
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_held_candidate_without_owner_mention",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_sender",
+		Content:   "这个任务后续应该就完整了",
+		Mentions:  []domain.Mention{{OpenID: "ou_someone_else"}},
+	})
+	item.ID = 903
+	q := &fakeQueue{
+		ok:   true,
+		item: item,
+		candidate: &domain.WorkReplyCandidate{
+			WorkItemID: item.ID,
+			Status:     domain.ReplyCandidateHeld,
+			Decision: domain.Decision{
+				Kind:         domain.DecisionReply,
+				Relevance:    domain.RelevanceDirectMention,
+				ReplyOutcome: domain.ReplyOutcomePartial,
+				ReplyText:    "stale validated candidate",
+			},
+		},
+	}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithReplyHandler(replier),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replier.called || !q.cancelled || !q.done ||
+		result.Decision.Kind != domain.DecisionRecord ||
+		result.Decision.Relevance != domain.RelevanceInferred {
+		t.Fatalf("result=%+v queue=%+v replier=%+v", result, q, replier)
+	}
+}
+
+func TestHeldCandidateWithoutResolverDeadLettersInsteadOfRetrying(t *testing.T) {
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_candidate_without_resolver",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})
+	item.ID = 44
+	decision := domain.Decision{
+		Kind:      domain.DecisionReply,
+		ReplyText: "validated candidate",
+	}
+	q := &fakeQueue{
+		ok:   true,
+		item: item,
+		candidate: &domain.WorkReplyCandidate{
+			WorkItemID: item.ID,
+			Status:     domain.ReplyCandidateHeld,
+			Decision:   decision,
+		},
+	}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithReplyHandler(&fakeReplyHandler{}),
+	)
+	if _, err := daemon.RunOnce(context.Background()); err == nil {
+		t.Fatal("missing candidate resolver unexpectedly succeeded")
+	}
+	if !q.deadLetter || q.retried {
+		t.Fatalf("queue=%+v", q)
+	}
+}
+
+func TestDaemonWithdrawnDelegatedTargetCancelsWithoutMainModel(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_target",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_target",
+		Result:          replymatch.ResultWithdrawn,
+		Confidence:      1,
+		Reason:          "target message was withdrawn",
+	}}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decider.called || !q.done || result.Decision.Kind != domain.DecisionIgnore ||
+		result.Decision.Reason != "message_withdrawn" {
+		t.Fatalf("result=%+v queue=%+v decider=%+v", result, q, decider)
+	}
+}
+
+func TestDaemonDurablyStartsAndClosesContextualInvestigation(t *testing.T) {
+	events := []string{}
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_contextual",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Content:   "@Owner 你看看吧，我电脑断线了",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	q.item.ID = 77
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID:          "om_contextual",
+		Result:                   replymatch.ResultUnanswered,
+		Confidence:               0.97,
+		Reason:                   "bounded context identifies production message editing",
+		TaskSummary:              "核查生产环境示例事件返回 1408",
+		TaskClass:                domain.TaskClassCoding,
+		ClassificationConfidence: 0.98,
+		RequiresProgress:         true,
+		ContextCutoff:            time.Now().UTC(),
+		ContextDigest:            "sha256:context",
+	}}
+	builder := &fakeBuilder{}
+	decider := &fakeDecider{decision: domain.Decision{
+		Kind:       domain.DecisionReply,
+		ReplyText:  "已核对当前源码，旧接口会直接返回 1408，当前代码已转发 RPC；仍需核对生产版本。",
+		Confidence: 0.95,
+	}}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted, events: &events}
+	progress := &fakeInvestigationProgress{events: &events}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(builder),
+		WithDecider(decider),
+		WithReplyHandler(replier),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+		WithInvestigationProgressHandler(progress),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || !q.done {
+		t.Fatalf("result=%+v queue=%+v", result, q)
+	}
+	if got := strings.Join(events, ","); got != "progress,finalizing,reply,complete" {
+		t.Fatalf("events=%s", got)
+	}
+	if !builder.called ||
+		builder.item.TaskSummary != resolver.resolution.TaskSummary ||
+		builder.item.WorkKind != domain.WorkKindCodingQuestion {
+		t.Fatalf("builder item=%+v", builder.item)
+	}
+}
+
+func TestDaemonRechecksOwnerHandlingBeforeInvestigationFinalReply(t *testing.T) {
+	events := []string{}
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_contextual",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Content:   "@Owner 帮忙核查生产示例事件",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	q.item.ID = 78
+	resolver := &fakeReplyResolver{resolutions: []replymatch.Resolution{
+		{
+			TargetMessageID:          "om_contextual",
+			Result:                   replymatch.ResultUnanswered,
+			Confidence:               0.97,
+			Reason:                   "unanswered",
+			TaskSummary:              "核查生产示例事件",
+			TaskClass:                domain.TaskClassCoding,
+			ClassificationConfidence: 0.98,
+			RequiresProgress:         true,
+			ContextCutoff:            time.Now().UTC(),
+			ContextDigest:            "sha256:before",
+		},
+		{
+			TargetMessageID:        "om_contextual",
+			Result:                 replymatch.ResultAnswered,
+			Confidence:             0.82,
+			Reason:                 "owner answered while investigation was running",
+			MatchedOwnerMessageIDs: []string{"om_owner_answer"},
+		},
+	}}
+	replier := &fakeReplyHandler{status: domain.ActionCompleted, events: &events}
+	progress := &fakeInvestigationProgress{events: &events}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(&fakeDecider{decision: domain.Decision{
+			Kind:      domain.DecisionReply,
+			ReplyText: "调查结论",
+		}}),
+		WithReplyHandler(replier),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+		WithInvestigationProgressHandler(progress),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolver.calls != 2 || replier.called ||
+		result.Decision.Kind != domain.DecisionIgnore ||
+		result.Decision.Reason != "owner_semantically_replied_during_investigation" {
+		t.Fatalf("result=%+v resolver=%+v replier=%+v", result, resolver, replier)
+	}
+	if got := strings.Join(events, ","); got != "progress,finalizing,complete" {
+		t.Fatalf("events=%s", got)
+	}
+}
+
+func TestDaemonResumedInvestigationSkipsInitialReclassification(t *testing.T) {
+	events := []string{}
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_resumed_contextual",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Content:   "@Owner 你看一下",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})
+	item.ID = 79
+	item.TaskSummary = "核查生产示例事件"
+	item.TaskClass = domain.TaskClassCoding
+	item.ContextCutoff = time.Now().UTC().Add(-time.Minute)
+	item.ContextDigest = "sha256:persisted"
+	item.ResolvedContext = []domain.NormalizedEvent{{
+		MessageID: "om_root",
+		ChatID:    "oc_group",
+		Content:   "生产示例事件返回 1408 SampleEventDisabled",
+	}}
+	item.InvestigationActive = true
+	q := &fakeQueue{ok: true, item: item}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_resumed_contextual",
+		Result:          replymatch.ResultUnanswered,
+		Confidence:      0.99,
+		Reason:          "owner still has not answered",
+	}}
+	builder := &fakeBuilder{}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(builder),
+		WithDecider(&fakeDecider{decision: domain.Decision{
+			Kind:       domain.DecisionReply,
+			ReplyText:  "已核查生产示例事件。",
+			Confidence: 0.95,
+		}}),
+		WithReplyHandler(&fakeReplyHandler{
+			status: domain.ActionCompleted,
+			events: &events,
+		}),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+		WithInvestigationProgressHandler(&fakeInvestigationProgress{
+			events: &events,
+		}),
+	)
+
+	if _, err := daemon.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if resolver.calls != 1 {
+		t.Fatalf("resolver calls=%d, want only final owner-handled check", resolver.calls)
+	}
+	if !builder.called ||
+		builder.item.ContextDigest != item.ContextDigest ||
+		len(builder.item.ResolvedContext) != 1 {
+		t.Fatalf("builder item=%+v", builder.item)
+	}
+	if got := strings.Join(events, ","); got != "finalizing,reply,complete" {
+		t.Fatalf("events=%s", got)
+	}
+}
+
+func TestDaemonHonorsLongerSemanticRetryDeadline(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_target",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_target",
+		Result:          replymatch.ResultAmbiguous,
+		Confidence:      0,
+		Reason:          "target was edited inside the owner wait window",
+		RetryAfter:      2 * time.Minute,
+	}}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+
+	if _, err := daemon.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !q.deferred || q.deferFor != 2*time.Minute {
+		t.Fatalf("queue=%+v", q)
 	}
 }
 
@@ -148,8 +1004,12 @@ func (b *fakeBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, error) {
 	b.called = true
 	b.item = item
 	return agentcontext.Bundle{
-		Event: item.Event, WorkKind: item.WorkKind, Priority: item.Priority,
-		User: agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event:       item.Event,
+		WorkKind:    item.WorkKind,
+		TaskSummary: item.TaskSummary,
+		TaskClass:   item.TaskClass,
+		Priority:    item.Priority,
+		User:        agentcontext.UserProfile{OpenID: "ou_owner"},
 	}, nil
 }
 
@@ -157,19 +1017,108 @@ type fakeDecider struct {
 	called   bool
 	decision domain.Decision
 	bundle   agentcontext.Bundle
+	err      error
 }
 
 func (d *fakeDecider) Decide(_ context.Context, bundle agentcontext.Bundle) (domain.Decision, error) {
 	d.called = true
 	d.bundle = bundle
-	return d.decision, nil
+	return d.decision, d.err
+}
+
+func TestDaemonDeadLettersModelNonConvergenceWithoutRetry(t *testing.T) {
+	events := []string{}
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_non_convergent",
+		Content:   "@Owner 看看删号报 10005",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	q.item.ID = 42
+	q.item.InvestigationActive = true
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(&fakeDecider{err: errs.NewInternalError(
+			errs.SubtypeModelNonConvergence,
+			"model did not submit a terminal decision after 3 attempts",
+		)}),
+		WithInvestigationProgressHandler(&fakeInvestigationProgress{events: &events}),
+	)
+	_, err := daemon.RunOnce(context.Background())
+	if err == nil {
+		t.Fatal("non-convergent model run unexpectedly succeeded")
+	}
+	if !q.deadLetter || q.retried ||
+		!strings.Contains(q.deadReason, "terminal decision after 3 attempts") {
+		t.Fatalf("queue=%+v", q)
+	}
+	if got := strings.Join(events, ","); got != "blocked" {
+		t.Fatalf("events=%s", got)
+	}
+}
+
+func TestDaemonDeadLettersDeterministicProviderErrorWithoutRetry(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_provider_400",
+		Content:   "@Owner 看看为什么工具调用失败",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	q.item.ID = 43
+	err400 := errs.NewAPIError(
+		errs.SubtypeServerError,
+		"OpenAI-compatible model returned HTTP 400: tool_choice 'required' is incompatible with thinking enabled",
+	).WithCode(400)
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(&fakeDecider{err: err400}),
+	)
+	_, err := daemon.RunOnce(context.Background())
+	if err == nil {
+		t.Fatal("deterministic provider error unexpectedly succeeded")
+	}
+	if !q.deadLetter || q.retried ||
+		!strings.Contains(q.deadReason, "HTTP 400") {
+		t.Fatalf("queue=%+v", q)
+	}
+}
+
+func TestDaemonRetriesTransientProviderError(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_provider_503",
+		Content:   "@Owner 看看为什么工具调用失败",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	q.item.ID = 44
+	err503 := errs.NewAPIError(
+		errs.SubtypeServerError,
+		"OpenAI-compatible model returned HTTP 503: overloaded",
+	).WithCode(503)
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(&fakeDecider{err: err503}),
+	)
+	_, err := daemon.RunOnce(context.Background())
+	if err == nil {
+		t.Fatal("transient provider error unexpectedly succeeded")
+	}
+	if !q.retried || q.deadLetter {
+		t.Fatalf("queue=%+v", q)
+	}
 }
 
 type fakeReplyHandler struct {
-	called bool
-	text   string
-	status domain.ActionStatus
-	events *[]string
+	called           bool
+	text             string
+	status           domain.ActionStatus
+	actionID         int64
+	idempotency      string
+	events           *[]string
+	approvalExpected bool
 }
 
 func (h *fakeReplyHandler) Handle(_ context.Context, _ domain.WorkItem, decision domain.Decision) (reply.Result, error) {
@@ -182,7 +1131,27 @@ func (h *fakeReplyHandler) Handle(_ context.Context, _ domain.WorkItem, decision
 	if status == "" {
 		status = domain.ActionCompleted
 	}
-	return reply.Result{Action: domain.Action{Status: status}}, nil
+	return reply.Result{Action: domain.Action{
+		ID:          h.actionID,
+		Status:      status,
+		Idempotency: h.idempotency,
+	}}, nil
+}
+
+func (h *fakeReplyHandler) RequiresApproval(domain.Decision) bool {
+	return h.approvalExpected || h.status == domain.ActionAwaitingApproval
+}
+
+type blockedPreflightCompletedReplyHandler struct {
+	fakeReplyHandler
+}
+
+func (h *blockedPreflightCompletedReplyHandler) Preflight(
+	context.Context,
+	domain.WorkItem,
+	domain.Decision,
+) (domain.Action, error) {
+	return domain.Action{Status: domain.ActionBlocked}, nil
 }
 
 type fakeOwnerActivity struct {
@@ -256,8 +1225,13 @@ func TestDelegatedOwnerMentionDoesNotShowAssistantWorkingReaction(t *testing.T) 
 
 func TestReplyDecisionWithoutHandlerRetriesInsteadOfCompleting(t *testing.T) {
 	q := &fakeQueue{}
-	item := domain.NewWorkItem(domain.NormalizedEvent{MessageID: "om_reply"})
-	daemon := NewDaemon(q, router.New(router.Config{}))
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_reply",
+		ChatType:  "group",
+		SenderID:  "ou_teammate",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})
+	daemon := NewDaemon(q, router.New(router.Config{OwnerOpenID: "ou_owner"}))
 	_, err := daemon.finishDecision(context.Background(), item, domain.Decision{
 		Kind: domain.DecisionReply, Confidence: 1, Risk: domain.RiskLow, ReplyText: "hello",
 	})
@@ -327,14 +1301,22 @@ func TestDaemonResumesPersistedApprovedReplyWithoutModel(t *testing.T) {
 		ReplyText:  "persisted exact draft",
 	}
 	q := &fakeQueue{
-		ok:       true,
-		item:     domain.NewWorkItem(domain.NormalizedEvent{MessageID: "om_resume"}),
+		ok: true,
+		item: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_resume",
+			ChatType:  "group",
+			SenderID:  "ou_teammate",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		}),
 		approved: &approved,
 	}
 	builder := &fakeBuilder{}
 	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply, ReplyText: "different model draft"}}
 	replier := &fakeReplyHandler{}
-	daemon := NewDaemon(q, router.New(router.Config{Mode: domain.ModeApproval}),
+	daemon := NewDaemon(q, router.New(router.Config{
+		OwnerOpenID: "ou_owner",
+		Mode:        domain.ModeApproval,
+	}),
 		WithContextBuilder(builder),
 		WithDecider(decider),
 		WithReplyHandler(replier),
@@ -348,6 +1330,50 @@ func TestDaemonResumesPersistedApprovedReplyWithoutModel(t *testing.T) {
 	}
 	if replier.text != "persisted exact draft" || result.Decision.ReplyText != "persisted exact draft" {
 		t.Fatalf("result=%+v replier=%+v", result, replier)
+	}
+}
+
+func TestDaemonBlocksPersistedApprovalWithoutCurrentOwnerMention(t *testing.T) {
+	approved := domain.Decision{
+		Kind:       domain.DecisionReply,
+		Mode:       domain.ModeApproval,
+		Relevance:  domain.RelevanceDirectMention,
+		Confidence: 1,
+		Risk:       domain.RiskLow,
+		ReplyText:  "stale approved draft",
+	}
+	q := &fakeQueue{
+		ok: true,
+		item: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_stale_approval_without_owner_mention",
+			ChatID:    "oc_group",
+			ChatType:  "group",
+			SenderID:  "ou_teammate",
+			Content:   "这个任务后续应该就完整了",
+			Mentions:  []domain.Mention{{OpenID: "ou_someone_else"}},
+		}),
+		approved: &approved,
+	}
+	builder := &fakeBuilder{}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	replier := &fakeReplyHandler{}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeApproval}),
+		WithContextBuilder(builder),
+		WithDecider(decider),
+		WithReplyHandler(replier),
+	)
+
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if builder.called || decider.called || replier.called || !q.approvalBlocked ||
+		result.Decision.Kind != domain.DecisionRecord ||
+		result.Decision.Relevance != domain.RelevanceInferred {
+		t.Fatalf("result=%+v builder=%+v decider=%+v replier=%+v",
+			result, builder, decider, replier)
 	}
 }
 
@@ -448,10 +1474,26 @@ type fakePoller struct {
 }
 
 type fakeNotifier struct {
-	called   bool
-	decision domain.Decision
-	key      string
-	events   *[]string
+	called         bool
+	approvalCalled bool
+	decision       domain.Decision
+	approvalAction domain.Action
+	key            string
+	events         *[]string
+}
+
+type genericOnlyNotifier struct {
+	called bool
+}
+
+func (n *genericOnlyNotifier) HandleNotification(
+	context.Context,
+	domain.WorkItem,
+	domain.Decision,
+	string,
+) error {
+	n.called = true
+	return nil
 }
 
 func (n *fakeNotifier) HandleNotification(
@@ -465,6 +1507,21 @@ func (n *fakeNotifier) HandleNotification(
 	n.key = key
 	if n.events != nil {
 		*n.events = append(*n.events, "notify")
+	}
+	return nil
+}
+
+func (n *fakeNotifier) HandleApprovalNotification(
+	_ context.Context,
+	_ domain.WorkItem,
+	decision domain.Decision,
+	action domain.Action,
+) error {
+	n.approvalCalled = true
+	n.decision = decision
+	n.approvalAction = action
+	if n.events != nil {
+		*n.events = append(*n.events, "approval_notify")
 	}
 	return nil
 }
@@ -617,7 +1674,7 @@ func TestDaemonExecutesNotifyDecision(t *testing.T) {
 	}
 }
 
-func TestDaemonRepliesBeforeNotifyingOwnerOfRemainingAction(t *testing.T) {
+func TestDaemonNotifiesOwnerBeforeDelegatedReply(t *testing.T) {
 	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID: "om_reply_then_notify",
 		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
@@ -643,11 +1700,124 @@ func TestDaemonRepliesBeforeNotifyingOwnerOfRemainingAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 2 || events[0] != "reply" || events[1] != "notify" {
+	if len(events) != 2 || events[0] != "notify" || events[1] != "reply" {
 		t.Fatalf("action order=%v", events)
 	}
 	if !result.Processed || notifier.decision.OwnerAction != decision.OwnerAction {
 		t.Fatalf("result=%+v notifier=%+v", result, notifier)
+	}
+}
+
+func TestDaemonNotifiesOwnerWithExactActionWhenDelegatedReplyAwaitsApproval(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_low_confidence",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	var events []string
+	replier := &fakeReplyHandler{
+		status:      domain.ActionAwaitingApproval,
+		actionID:    355,
+		idempotency: "approval:355",
+		events:      &events,
+	}
+	notifier := &fakeNotifier{events: &events}
+	daemon := NewDaemon(q, router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(&fakeDecider{decision: domain.Decision{
+			Kind:        domain.DecisionReply,
+			Relevance:   domain.RelevanceDirectMention,
+			Confidence:  0.72,
+			Risk:        domain.RiskLow,
+			ReplyText:   "我已核对上下文，但还不能确认具体组织。",
+			OwnerAction: "确认具体 OpenAI 组织",
+		}}),
+		WithReplyHandler(replier),
+		WithNotificationHandler(notifier),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || result.Decision.Kind != domain.DecisionRequestApproval {
+		t.Fatalf("result=%+v", result)
+	}
+	if !notifier.approvalCalled || notifier.approvalAction.ID != 355 {
+		t.Fatalf("notifier=%+v", notifier)
+	}
+	if got, want := strings.Join(events, ","), "reply,approval_notify"; got != want {
+		t.Fatalf("action order=%q want %q", got, want)
+	}
+}
+
+func TestDaemonRejectsNonActionableApprovalNotifier(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_non_actionable_approval",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	replier := &fakeReplyHandler{
+		status:      domain.ActionAwaitingApproval,
+		actionID:    357,
+		idempotency: "approval:357",
+	}
+	notifier := &genericOnlyNotifier{}
+	daemon := NewDaemon(q, router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(&fakeDecider{decision: domain.Decision{
+			Kind:       domain.DecisionReply,
+			Relevance:  domain.RelevanceDirectMention,
+			Confidence: 0.72,
+			Risk:       domain.RiskLow,
+			ReplyText:  "待审批的精确草稿",
+		}}),
+		WithReplyHandler(replier),
+		WithNotificationHandler(notifier),
+	)
+	if _, err := daemon.RunOnce(context.Background()); err == nil {
+		t.Fatal("non-actionable approval notifier was accepted")
+	}
+	if notifier.called {
+		t.Fatal("approval silently degraded to a generic notification")
+	}
+}
+
+func TestDaemonApprovedDelegatedReplyStillNotifiesBeforeSending(t *testing.T) {
+	approved := domain.Decision{
+		Kind:        domain.DecisionReply,
+		Mode:        domain.ModeApproval,
+		Relevance:   domain.RelevanceDirectMention,
+		Confidence:  1,
+		Risk:        domain.RiskLow,
+		ReplyText:   "已批准的精确答复",
+		OwnerAction: "核对后续处理",
+	}
+	q := &fakeQueue{
+		ok: true,
+		item: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_approved",
+			ChatType:  "group",
+			SenderID:  "ou_teammate",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		}),
+		approved: &approved,
+	}
+	var events []string
+	replier := &fakeReplyHandler{events: &events, approvalExpected: true}
+	notifier := &fakeNotifier{events: &events}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeApproval}),
+		WithReplyHandler(replier),
+		WithNotificationHandler(notifier),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || result.Decision.Kind != domain.DecisionReply {
+		t.Fatalf("result=%+v", result)
+	}
+	if got, want := strings.Join(events, ","), "notify,reply"; got != want {
+		t.Fatalf("approved action order=%q want %q", got, want)
 	}
 }
 
@@ -766,6 +1936,100 @@ func TestDaemonCompletesWorkForCompletedPostReplyNotification(t *testing.T) {
 	}
 	if replier.called || notifier.called || !result.Processed || q.completed == false {
 		t.Fatalf("result=%+v replier=%+v notifier=%+v queue=%+v", result, replier, notifier, q)
+	}
+}
+
+func TestCandidateIsConsumedAfterPostReplyNotificationCompletes(t *testing.T) {
+	decision := domain.Decision{
+		Kind:        domain.DecisionReply,
+		Relevance:   domain.RelevanceDirectMention,
+		ReplyText:   "validated candidate",
+		OwnerAction: "owner follow-up",
+	}
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_candidate_post_notice",
+		ChatType:  "group",
+		SenderID:  "ou_teammate",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})
+	item.ID = 42
+	q := &fakePostReplyQueue{
+		fakeQueue: &fakeQueue{
+			item: item,
+			candidate: &domain.WorkReplyCandidate{
+				WorkItemID: item.ID,
+				Status:     domain.ReplyCandidatePending,
+				Decision:   decision,
+			},
+		},
+		actionID:  93,
+		key:       "owner-notification:candidate",
+		completed: true,
+	}
+	daemon := NewDaemon(q, router.New(router.Config{
+		OwnerOpenID: "ou_owner",
+		Mode:        domain.ModeAuto,
+	}),
+		WithReplyHandler(&blockedPreflightCompletedReplyHandler{}),
+		WithNotificationHandler(&fakeNotifier{}),
+	)
+	result, err := daemon.finishCandidateDecision(
+		context.Background(),
+		item,
+		decision,
+		q,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Processed || !q.consumed || !q.done || q.candidate != nil {
+		t.Fatalf("result=%+v queue=%+v", result, q)
+	}
+}
+
+func TestFinalRouteGateRecordsAccurateCandidateCancellationReason(t *testing.T) {
+	decision := domain.Decision{
+		Kind:      domain.DecisionReply,
+		Relevance: domain.RelevanceDirectMention,
+		ReplyText: "stale candidate",
+	}
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_candidate_without_owner_mention",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_teammate",
+		Content:   "这个任务后续应该就完整了",
+		Mentions:  []domain.Mention{{OpenID: "ou_someone_else"}},
+	})
+	item.ID = 43
+	q := &fakeQueue{
+		item: item,
+		candidate: &domain.WorkReplyCandidate{
+			WorkItemID: item.ID,
+			Status:     domain.ReplyCandidatePending,
+			Decision:   decision,
+		},
+	}
+	replier := &fakeReplyHandler{}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithReplyHandler(replier),
+	)
+
+	result, err := daemon.finishCandidateDecision(
+		context.Background(),
+		item,
+		decision,
+		q,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replier.called || !q.cancelled || !q.done ||
+		q.cancelReason != "sender_facing_reply_blocked_by_current_route" ||
+		result.Decision.Kind != domain.DecisionRecord {
+		t.Fatalf("result=%+v queue=%+v replier=%+v", result, q, replier)
 	}
 }
 

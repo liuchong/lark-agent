@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/liuchong/lark-agent/agent/domain"
@@ -121,12 +122,83 @@ func TestLegacyPromptIncludesRulesConversationAndJSONContract(t *testing.T) {
 	}
 }
 
+func TestPromptIncludesAuthoritativeRuntimePolicy(t *testing.T) {
+	policy := RuntimePolicySnapshot{
+		Authoritative:           true,
+		MustNotInferFromRules:   true,
+		Mode:                    domain.ModeAuto,
+		AssistantReplyScope:     domain.ReplyScopeAllGroups,
+		DelegatedReplyScope:     domain.ReplyScopeAllGroups,
+		PrivateReplyScope:       domain.PrivateReplyScopeAll,
+		OwnerWait:               (3 * time.Minute).String(),
+		OwnerReplyConfidenceMin: 0.85,
+		OwnerReplyRetry:         (5 * time.Minute).String(),
+		ReplyConfidenceMin:      0.70,
+		InvestigationProgress:   "enabled",
+	}
+	bundle, err := (Builder{RuntimePolicy: policy}).Build(domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_policy",
+		Content:   "确认一下当前高置信度自动发送的具体阈值是多少？",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundle.RuntimePolicy != policy {
+		t.Fatalf("runtime policy=%+v", bundle.RuntimePolicy)
+	}
+	for name, prompt := range map[string]string{
+		"legacy": Prompt(bundle),
+		"agent":  AgentUserPrompt(bundle),
+	} {
+		for _, want := range []string{
+			"runtime_policy",
+			"owner_reply_confidence_min",
+			"0.85",
+			"reply_confidence_min",
+			"0.7",
+			"authoritative",
+			"must not be inferred from workspace rules",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("%s prompt missing %q:\n%s", name, want, prompt)
+			}
+		}
+	}
+}
+
+func TestAgentPromptSectionsKeepStablePrefixHash(t *testing.T) {
+	bundleA := Bundle{
+		Event: domain.NormalizedEvent{MessageID: "om_a", Content: "查一下 A"},
+		User:  UserProfile{OpenID: "ou_owner", Name: "Owner"},
+	}
+	bundleB := bundleA
+	bundleB.Event = domain.NormalizedEvent{MessageID: "om_b", Content: "查一下 B，时间不同"}
+
+	sectionsA := AgentPromptSections(bundleA)
+	sectionsB := AgentPromptSections(bundleB)
+	hashA := StablePromptHash(sectionsA)
+	hashB := StablePromptHash(sectionsB)
+	if hashA == "" {
+		t.Fatalf("stable prompt hash is empty")
+	}
+	if hashA != hashB {
+		t.Fatalf("stable prefix hash changed with current input: %s != %s", hashA, hashB)
+	}
+	if !sectionContains(sectionsA, PromptSectionCurrentInput, "om_a") ||
+		!sectionContains(sectionsB, PromptSectionCurrentInput, "om_b") {
+		t.Fatalf("current input sections missing: %+v %+v", sectionsA, sectionsB)
+	}
+}
+
 func TestBuilderIncludesBoundedEnvironmentContext(t *testing.T) {
 	root := t.TempDir()
 	mustWriteFile(t, filepath.Join(root, "AGENTS.md"), "reply briefly")
 	mustWriteFile(t, filepath.Join(root, "service", "router.go"), "package service")
 	mustWriteFile(t, filepath.Join(root, "service", "internal", "repo.go"), "package internal")
-	mustWriteFile(t, filepath.Join(root, "service", "internal", "deep", "skip.go"), "package deep")
+	mustWriteFile(t, filepath.Join(root, "service", "internal", "deep", "project", "go.mod"), "module example.com/deep")
+	mustWriteFile(t, filepath.Join(root, "service", "internal", "deep", "project", "src", "skip.go"), "package deep")
+	mustWriteFile(t, filepath.Join(root, "bare-repository", ".git", "HEAD"), "ref: refs/heads/main")
+	mustWriteFile(t, filepath.Join(root, "bare-repository", "README.md"), "repository without a language manifest")
 	mustWriteFile(t, filepath.Join(root, ".agents", "skills", "intent", "SKILL.md"), "intent skill")
 	mustWriteFile(t, filepath.Join(root, "service", "AGENTS.md"), "service rules")
 	mustWriteFile(t, filepath.Join(root, "service", ".agents", "skills", "backend", "SKILL.md"), "backend skill")
@@ -163,11 +235,20 @@ func TestBuilderIncludesBoundedEnvironmentContext(t *testing.T) {
 	if !containsDirEntry(bundle.Environment.Directory, "service/internal", "dir") {
 		t.Fatalf("directory=%+v", bundle.Environment.Directory)
 	}
-	if containsDirEntry(bundle.Environment.Directory, "service/internal/deep/skip.go", "file") {
-		t.Fatalf("directory should be depth bounded: %+v", bundle.Environment.Directory)
+	if !containsDirEntry(bundle.Environment.Directory, "service/internal/deep/project/go.mod", "file") {
+		t.Fatalf("directory should include five levels: %+v", bundle.Environment.Directory)
+	}
+	if !containsProject(bundle.Environment.Projects, "service/internal/deep/project", "go") {
+		t.Fatalf("project catalog=%+v", bundle.Environment.Projects)
+	}
+	if !containsProject(bundle.Environment.Projects, "bare-repository", "git") {
+		t.Fatalf("bare Git repository missing from catalog=%+v", bundle.Environment.Projects)
+	}
+	if containsDirEntry(bundle.Environment.Directory, "service/internal/deep/project/src/skip.go", "file") {
+		t.Fatalf("directory should remain bounded after five levels: %+v", bundle.Environment.Directory)
 	}
 	prompt := Prompt(bundle)
-	for _, want := range []string{"Environment:", "Available tools:", "Directory overview:", "search_code_symbols", "search_workspace", ".agents/skills/intent/SKILL.md"} {
+	for _, want := range []string{"Environment:", "Available tools:", "Project catalog:", "Directory overview:", "search_code_symbols", "search_workspace", ".agents/skills/intent/SKILL.md"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
@@ -216,6 +297,11 @@ func TestAgentSystemPromptDefinesAssistantAndDelegatedOwnerRoles(t *testing.T) {
 	prompt := AgentSystemPrompt()
 	for _, want := range []string{
 		"two explicit Lark roles",
+		"runtime_policy object",
+		"authoritative for questions about this assistant's current behavior",
+		"Never infer current runtime policy from workspace rules",
+		"owner_reply_confidence_min is the semantic threshold",
+		"reply_confidence_min is the final automatic-send threshold",
 		"assistant_request",
 		"answer the configured owner as the assistant bot",
 		"directly mentions the owner",
@@ -233,18 +319,64 @@ func TestAgentSystemPromptDefinesAssistantAndDelegatedOwnerRoles(t *testing.T) {
 		"initial finding or explicit unknown",
 		"never pad a reply by restating the request",
 		"Never invent an owner or team commitment",
-		"delegated direct_mention work",
+		"Delegated direct_mention and private_message work",
+		"never finish delegated work as ignore, record, or notify",
+		"first privately notifies the owner",
 		"assistant_request and owner_request replies do not create that owner notice",
 		"put a concise concrete private task in owner_action",
 		"never use an internal label such as direct_mention",
 		"matching successful tool receipt",
 		"read_workspace",
+		"preserve its exact spelling and case",
+		"similarly named sibling",
 		"concrete business questions",
 		"run is read-only",
 		"runtime chooses bot identity for assistant_request and owner_request",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("system prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestAgentTaskProcessPromptSeparatesCodingFlowAndTypedOutcomes(t *testing.T) {
+	prompt := AgentTaskProcessPrompt(Bundle{
+		WorkKind:  domain.WorkKindCodingQuestion,
+		TaskClass: domain.TaskClassCoding,
+		Event:     domain.NormalizedEvent{Content: "请核对接口返回结构"},
+	})
+	for _, want := range []string{
+		"coding_question",
+		"submit_investigation_plan",
+		"minimum sufficient evidence",
+		"complete",
+		"partial",
+		"clarification",
+		"structured progress",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("task process prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestAgentTaskProcessPromptForbidsUnclassifiedSenderFacingReply(t *testing.T) {
+	prompt := AgentTaskProcessPrompt(Bundle{
+		WorkKind: domain.WorkKindGeneric,
+		Event: domain.NormalizedEvent{
+			ChatType: "group",
+			SenderID: "ou_teammate",
+			Content:  "这个任务后续应该就完整了",
+		},
+		User: UserProfile{OpenID: "ou_owner"},
+	})
+	for _, want := range []string{
+		"not a sender-facing invocation",
+		"ignore, record, or notify",
+		"never reply or request_approval",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("unclassified task prompt missing %q:\n%s", want, prompt)
 		}
 	}
 }
@@ -277,9 +409,27 @@ func containsString(values []string, want string) bool {
 	return false
 }
 
+func sectionContains(sections []PromptSection, kind PromptSectionKind, want string) bool {
+	for _, section := range sections {
+		if section.Kind == kind && strings.Contains(section.Content, want) {
+			return true
+		}
+	}
+	return false
+}
+
 func containsDirEntry(entries []DirectoryEntry, path, kind string) bool {
 	for _, entry := range entries {
 		if entry.Path == path && entry.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func containsProject(projects []ProjectEntry, path, kind string) bool {
+	for _, project := range projects {
+		if project.Path == path && project.Kind == kind {
 			return true
 		}
 	}

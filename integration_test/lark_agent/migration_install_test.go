@@ -16,6 +16,42 @@ import (
 	"github.com/liuchong/lark-agent/agent/storage"
 )
 
+func TestStatusAppUsesMacOSTemplateIcon(t *testing.T) {
+	sourcePath := filepath.Join(repoRoot(t), "macos", "LarkAgentStatus", "main.swift")
+	source, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	for _, expected := range []string{
+		`forResource: "StatusIconTemplate"`,
+		"image.isTemplate = true",
+		"statusItem.button?.imagePosition = .imageOnly",
+	} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("status app does not enable macOS template rendering; missing %q", expected)
+		}
+	}
+}
+
+func TestBrandVariantsExposeAgentVisualLanguage(t *testing.T) {
+	for _, name := range []string{
+		"lark-agent-mark.svg",
+		"lark-agent-app-icon.svg",
+		"lark-agent-status-template.svg",
+	} {
+		source, err := os.ReadFile(filepath.Join(repoRoot(t), "assets", "brand", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, expected := range []string{`id="agent-antenna"`, `id="tool-loop"`} {
+			if !strings.Contains(string(source), expected) {
+				t.Errorf("%s does not expose the Agent visual element %s", name, expected)
+			}
+		}
+	}
+}
+
 func TestQueueRetryCannotBypassExplicitPriorSessionResume(t *testing.T) {
 	bin := buildAgentBinary(t)
 	statePath := filepath.Join(t.TempDir(), "state.db")
@@ -65,6 +101,116 @@ func TestQueueRetryCannotBypassExplicitPriorSessionResume(t *testing.T) {
 	}
 }
 
+func TestMacOSPrivateEnvUpdaterPreservesUnsetValues(t *testing.T) {
+	appSupport := filepath.Join(t.TempDir(), "Library", "Application Support", "lark-agent")
+	if err := os.MkdirAll(appSupport, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	envPath := filepath.Join(appSupport, "env")
+	original := strings.Join([]string{
+		"OPENAI_API_KEY=existing-key",
+		"OPENAI_BASE_URL=https://existing.example.test/v1",
+		"OPENAI_MODEL=existing-model",
+		"CUSTOM_PRIVATE_SETTING=preserved",
+		"",
+	}, "\n")
+	if err := os.WriteFile(envPath, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	updater := filepath.Join(repoRoot(t), "scripts", "macos", "update-private-env.sh")
+	run := func(extra ...string) []byte {
+		t.Helper()
+		command := exec.Command("bash", updater, envPath)
+		command.Env = append(withoutEnvironmentKeys(
+			os.Environ(),
+			"OPENAI_API_KEY",
+			"OPENAI_BASE_URL",
+			"OPENAI_MODEL",
+		), extra...)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("private env updater failed: %v\n%s", err, output)
+		}
+		if len(output) != 0 {
+			t.Fatalf("private env updater printed data: %q", output)
+		}
+		data, err := os.ReadFile(envPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(envPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("private env mode=%#o, want 0600", info.Mode().Perm())
+		}
+		return data
+	}
+
+	if got := run(); string(got) != original {
+		t.Fatalf("unset variables changed private env:\n%s", got)
+	}
+
+	updated := string(run("OPENAI_MODEL=updated-model"))
+	for _, want := range []string{
+		"OPENAI_API_KEY=existing-key",
+		"OPENAI_BASE_URL=https://existing.example.test/v1",
+		"OPENAI_MODEL=updated-model",
+		"CUSTOM_PRIVATE_SETTING=preserved",
+	} {
+		if !strings.Contains(updated, want) {
+			t.Fatalf("partial update missing %q:\n%s", want, updated)
+		}
+	}
+	if strings.Contains(updated, "OPENAI_MODEL=existing-model") {
+		t.Fatalf("partial update retained old model:\n%s", updated)
+	}
+
+	cleared := string(run("OPENAI_API_KEY="))
+	if strings.Contains(cleared, "OPENAI_API_KEY=") {
+		t.Fatalf("explicit empty value did not remove API key:\n%s", cleared)
+	}
+	for _, want := range []string{
+		"OPENAI_BASE_URL=https://existing.example.test/v1",
+		"OPENAI_MODEL=updated-model",
+		"CUSTOM_PRIVATE_SETTING=preserved",
+	} {
+		if !strings.Contains(cleared, want) {
+			t.Fatalf("explicit removal lost %q:\n%s", want, cleared)
+		}
+	}
+
+	newPath := filepath.Join(appSupport, "new-env")
+	command := exec.Command("bash", updater, newPath)
+	command.Env = withoutEnvironmentKeys(
+		os.Environ(),
+		"OPENAI_API_KEY",
+		"OPENAI_BASE_URL",
+		"OPENAI_MODEL",
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("new private env update failed: %v\n%s", err, output)
+	} else if len(output) != 0 {
+		t.Fatalf("new private env updater printed data: %q", output)
+	}
+	data, err := os.ReadFile(newPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("new private env is not empty: %q", data)
+	}
+	info, err := os.Stat(newPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("new private env mode=%#o, want 0600", info.Mode().Perm())
+	}
+}
+
 func TestMacOSInstallerInstallsCleanHomeWithoutLoading(t *testing.T) {
 	home := t.TempDir()
 	appSupport := filepath.Join(home, "Library", "Application Support", "lark-agent")
@@ -80,6 +226,7 @@ func TestMacOSInstallerInstallsCleanHomeWithoutLoading(t *testing.T) {
 	fakeStoppedState := filepath.Join(home, "fake-stopped-state")
 	fakeRollbackState := filepath.Join(home, "fake-rollback-state")
 	fakeLaunchctl := filepath.Join(fakeBinDir, "launchctl")
+	fakeSecurity := filepath.Join(fakeBinDir, "security")
 	if err := os.WriteFile(fakeLaunchctl, []byte(`#!/bin/sh
 state=${FAKE_LAUNCHCTL_STATE:?}
 pid_file=${FAKE_LAUNCHCTL_PID:?}
@@ -146,11 +293,76 @@ esac
 `), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(fakeSecurity, []byte(`#!/bin/sh
+set -eu
+store="$HOME/fake-keychain"
+mkdir -p "$store"
+service=""
+account=""
+password=""
+want_password=0
+cmd=$1
+shift
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -s) service=$2; shift 2 ;;
+    -a) account=$2; shift 2 ;;
+    -w)
+      if [ "$#" -ge 2 ] && [ "${2#-}" = "$2" ]; then
+        password=$2
+        shift 2
+      else
+        want_password=1
+        shift
+      fi
+      ;;
+    -U) shift ;;
+    *) shift ;;
+  esac
+done
+key="$store/${service}__${account}"
+case "$cmd" in
+  find-generic-password)
+    [ "$want_password" -eq 1 ] || exit 2
+    [ -f "$key" ] || exit 44
+    cat "$key"
+    ;;
+  add-generic-password)
+    [ -n "$service" ] && [ -n "$account" ] || exit 2
+    mkdir -p "$(dirname "$key")"
+    printf '%s' "$password" > "$key"
+    chmod 600 "$key"
+    ;;
+  delete-generic-password)
+    rm -f "$key"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	cfg := config.Default()
 	cfg.Lark.AppID = "cli_test"
 	cfg.Owner.OpenID = "ou_owner"
+	cfg.Owner.Name = "测试负责人"
 	cfg.Workspace.Root = t.TempDir()
 	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	envPath := filepath.Join(appSupport, "env")
+	initialModelEnv := []byte(strings.Join([]string{
+		"OPENAI_API_KEY=upgrade-key",
+		"OPENAI_BASE_URL=https://upgrade.example.test/v1",
+		"OPENAI_MODEL=upgrade-model",
+		"CUSTOM_PRIVATE_SETTING=preserved",
+		"",
+	}, "\n"))
+	if err := os.MkdirAll(appSupport, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(envPath, initialModelEnv, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -165,7 +377,12 @@ esac
 	}
 	command := exec.Command("bash", script)
 	command.Dir = repoRoot(t)
-	installerEnv := append(os.Environ(),
+	installerEnv := append(withoutEnvironmentKeys(
+		os.Environ(),
+		"OPENAI_API_KEY",
+		"OPENAI_BASE_URL",
+		"OPENAI_MODEL",
+	),
 		"HOME="+home,
 		"PATH="+fakeBinDir+":"+os.Getenv("PATH"),
 		"FAKE_LAUNCHCTL_STATE="+fakeLaunchctlState,
@@ -177,6 +394,7 @@ esac
 		"LARK_AGENT_APP_SECRET=redacted-test-value-one",
 		"LARK_AGENT_USER_ACCESS_TOKEN=redacted-test-value-two",
 		"LARK_AGENT_OFFLINE_LIVE_TEST=1",
+		"MODEL_MIGRATION_DOCTOR=0",
 		"GOMODCACHE="+goCaches[0],
 		"GOCACHE="+goCaches[1],
 	)
@@ -212,9 +430,13 @@ esac
 		"com.liuchong.lark-agent.plist",
 	)
 	infoPlist := filepath.Join(home, "Applications", "Lark Agent.app", "Contents", "Info.plist")
+	appIcon := filepath.Join(home, "Applications", "Lark Agent.app", "Contents", "Resources", "LarkAgent.icns")
+	statusIcon := filepath.Join(home, "Applications", "Lark Agent.app", "Contents", "Resources", "StatusIconTemplate.png")
 	for _, path := range []string{
 		plist,
 		infoPlist,
+		appIcon,
+		statusIcon,
 		configPath,
 		statePath,
 		filepath.Join(home, "Applications", "Lark Agent.app", "Contents", "MacOS", "LarkAgentStatus"),
@@ -236,6 +458,35 @@ esac
 		if output, err := lint.CombinedOutput(); err != nil {
 			t.Fatalf("plutil %s: %v\n%s", path, err, output)
 		}
+	}
+	infoData, err := os.ReadFile(infoPlist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(infoData), "<key>CFBundleIconFile</key>") ||
+		!strings.Contains(string(infoData), "<string>LarkAgent</string>") {
+		t.Fatalf("status app does not reference the branded icon:\n%s", infoData)
+	}
+	gotEnv, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(gotEnv), "OPENAI_") ||
+		!strings.Contains(string(gotEnv), "CUSTOM_PRIVATE_SETTING=preserved") {
+		t.Fatalf("installer did not migrate model env safely:\n%s", gotEnv)
+	}
+	keyPath := filepath.Join(home, "fake-keychain", "lark-agent__model/primary/api-key")
+	keyData, err := os.ReadFile(keyPath)
+	if err != nil || string(keyData) != "upgrade-key" {
+		t.Fatalf("model key was not migrated to fake Keychain: %v %q", err, keyData)
+	}
+	loadedConfig, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := loadedConfig.Model.Profiles["primary"]
+	if primary.BaseURL != "https://upgrade.example.test/v1" || primary.Name != "upgrade-model" {
+		t.Fatalf("primary profile was not migrated: %+v", primary)
 	}
 
 	wrapper := filepath.Join(
@@ -304,6 +555,8 @@ esac
 		filepath.Join(appSupport, "agent.conf"),
 		filepath.Join(appSupport, "env"),
 		infoPlist,
+		appIcon,
+		statusIcon,
 		filepath.Join(home, "Applications", "Lark Agent.app", "Contents", "MacOS", "LarkAgentStatus"),
 		plist,
 		configPath,
@@ -415,4 +668,28 @@ esac
 		strings.Contains(string(actions), "duplicate-bootstrap") {
 		t.Fatalf("unexpected reinstall launchctl order:\n%s\n%s", actions, reinstallOutput)
 	}
+	envInfo, err := os.Stat(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("reinstalled model environment mode=%#o, want 0600", envInfo.Mode().Perm())
+	}
+}
+
+func withoutEnvironmentKeys(environment []string, keys ...string) []string {
+	filtered := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		remove := false
+		for _, key := range keys {
+			if strings.HasPrefix(entry, key+"=") {
+				remove = true
+				break
+			}
+		}
+		if !remove {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }

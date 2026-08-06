@@ -63,7 +63,9 @@ func (m *OpenAICompatibleModel) Generate(ctx context.Context, input []*schema.Me
 			return nil, err
 		}
 		body["tools"] = tools
-		body["tool_choice"] = openAIToolChoice(cfg.ToolChoice)
+		if choice, ok := openAIToolChoice(cfg.ToolChoice); ok {
+			body["tool_choice"] = choice
+		}
 	} else {
 		body["response_format"] = map[string]string{"type": "json_object"}
 	}
@@ -178,9 +180,34 @@ func toOpenAIMessages(input []*schema.Message) []map[string]any {
 		if msg == nil {
 			continue
 		}
+		content := any(msg.Content)
+		if len(msg.UserInputMultiContent) > 0 {
+			parts := make([]map[string]any, 0, len(msg.UserInputMultiContent))
+			for _, part := range msg.UserInputMultiContent {
+				switch part.Type {
+				case schema.ChatMessagePartTypeText:
+					parts = append(parts, map[string]any{
+						"type": "text",
+						"text": part.Text,
+					})
+				case schema.ChatMessagePartTypeImageURL:
+					if part.Image == nil || part.Image.URL == nil {
+						continue
+					}
+					parts = append(parts, map[string]any{
+						"type": "image_url",
+						"image_url": map[string]any{
+							"url":    *part.Image.URL,
+							"detail": string(part.Image.Detail),
+						},
+					})
+				}
+			}
+			content = parts
+		}
 		wire := map[string]any{
 			"role":    string(msg.Role),
-			"content": msg.Content,
+			"content": content,
 		}
 		if msg.Name != "" {
 			wire["name"] = msg.Name
@@ -225,16 +252,16 @@ func toOpenAITools(tools []*schema.ToolInfo) ([]map[string]any, error) {
 	return out, nil
 }
 
-func openAIToolChoice(choice *schema.ToolChoice) string {
+func openAIToolChoice(choice *schema.ToolChoice) (string, bool) {
 	if choice == nil {
-		return "auto"
+		return "", false
 	}
 	switch *choice {
 	case schema.ToolChoiceForbidden:
-		return "none"
+		return "none", true
 	case schema.ToolChoiceForced:
-		return "required"
+		return "required", true
 	default:
-		return "auto"
+		return "", false
 	}
 }

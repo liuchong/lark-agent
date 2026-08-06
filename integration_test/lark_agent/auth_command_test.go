@@ -13,6 +13,7 @@ func TestAuthStatusUsesConfiguredSDKCredentialBoundary(t *testing.T) {
 	cfg := config.Default()
 	cfg.Lark.AppID = "cli_test"
 	cfg.Owner.OpenID = "ou_owner"
+	cfg.Owner.Name = "测试负责人"
 	cfg.Workspace.Root = t.TempDir()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	if err := config.Save(configPath, cfg); err != nil {
@@ -37,6 +38,7 @@ func TestAuthStatusAllowsBotOnlyCredentialBoundary(t *testing.T) {
 	cfg := config.Default()
 	cfg.Lark.AppID = "cli_test"
 	cfg.Owner.OpenID = "ou_owner"
+	cfg.Owner.Name = "测试负责人"
 	cfg.Workspace.Root = t.TempDir()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	if err := config.Save(configPath, cfg); err != nil {

@@ -3,7 +3,6 @@ package policy
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/liuchong/lark-agent/agent/domain"
 )
@@ -29,6 +28,28 @@ func TestAutoReplyCancelsWhenOwnerAlreadyReplied(t *testing.T) {
 		Kind:       domain.DecisionReply,
 		Confidence: 0.98,
 		Risk:       domain.RiskLow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Status != domain.ActionCancelled || action.CancelReason != "owner_already_replied" {
+		t.Fatalf("action=%+v", action)
+	}
+}
+
+func TestOwnerHandledStateWinsBeforeLowConfidenceApproval(t *testing.T) {
+	gate := NewReplyGate(Config{
+		Mode:               domain.ModeAuto,
+		ReplyConfidenceMin: 0.85,
+	}, fakeThreadState{ownerReplied: true})
+	action, err := gate.Prepare(context.Background(), domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_handled_low_confidence",
+	}), domain.Decision{
+		Kind:       domain.DecisionReply,
+		Relevance:  domain.RelevanceDirectMention,
+		Confidence: 0.20,
+		Risk:       domain.RiskLow,
+		ReplyText:  "不应发送",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -90,6 +111,69 @@ func TestLowRiskDirectMentionReplyUsesConfiguredConfidenceFloor(t *testing.T) {
 	}
 }
 
+func TestDefaultGateSendsVerifiedLowRiskReplyAtSeventyPercent(t *testing.T) {
+	gate := NewReplyGate(Config{Mode: domain.ModeAuto}, fakeThreadState{})
+	action, err := gate.Prepare(context.Background(), domain.WorkItem{}, domain.Decision{
+		Kind:       domain.DecisionReply,
+		Relevance:  domain.RelevanceDirectMention,
+		Confidence: 0.70,
+		Risk:       domain.RiskLow,
+		ReplyText:  "已完成只读核对，结论如下。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Status != domain.ActionReady {
+		t.Fatalf("action=%+v", action)
+	}
+}
+
+func TestMediumAndHighRiskRepliesRequireApprovalEvenAtHighConfidence(t *testing.T) {
+	for _, risk := range []domain.Risk{domain.RiskMedium, domain.RiskHigh} {
+		gate := NewReplyGate(Config{
+			Mode:               domain.ModeAuto,
+			ReplyConfidenceMin: 0.70,
+		}, fakeThreadState{})
+		action, err := gate.Prepare(context.Background(), domain.WorkItem{}, domain.Decision{
+			Kind:       domain.DecisionReply,
+			Relevance:  domain.RelevanceDirectMention,
+			Confidence: 0.99,
+			Risk:       risk,
+			ReplyText:  "需要代表负责人作出承诺。",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if action.Status != domain.ActionAwaitingApproval ||
+			action.CancelReason != "risk_requires_approval" {
+			t.Fatalf("risk=%s action=%+v", risk, action)
+		}
+	}
+}
+
+func TestRequiresApprovalPredictsOnlyConfidenceAndModeHolds(t *testing.T) {
+	auto := NewReplyGate(Config{
+		Mode:               domain.ModeAuto,
+		ReplyConfidenceMin: 0.85,
+	}, fakeThreadState{})
+	if auto.RequiresApproval(domain.Decision{
+		Kind: domain.DecisionReply, Confidence: 0.92,
+	}) {
+		t.Fatal("high-confidence auto reply unexpectedly requires approval")
+	}
+	if !auto.RequiresApproval(domain.Decision{
+		Kind: domain.DecisionReply, Confidence: 0.72,
+	}) {
+		t.Fatal("low-confidence reply did not require approval")
+	}
+	approval := NewReplyGate(Config{Mode: domain.ModeApproval}, fakeThreadState{})
+	if !approval.RequiresApproval(domain.Decision{
+		Kind: domain.DecisionReply, Confidence: 0.99,
+	}) {
+		t.Fatal("approval mode did not require approval")
+	}
+}
+
 func TestMediumRiskDirectMentionStillRequiresApprovalBelowConfidenceFloor(t *testing.T) {
 	gate := NewReplyGate(Config{Mode: domain.ModeAuto, ReplyConfidenceMin: 0.85}, fakeThreadState{})
 	action, err := gate.Prepare(context.Background(), domain.WorkItem{}, domain.Decision{
@@ -102,7 +186,7 @@ func TestMediumRiskDirectMentionStillRequiresApprovalBelowConfidenceFloor(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if action.Status != domain.ActionAwaitingApproval || action.CancelReason != "low_confidence" {
+	if action.Status != domain.ActionAwaitingApproval || action.CancelReason != "risk_requires_approval" {
 		t.Fatalf("action=%+v", action)
 	}
 }
@@ -303,61 +387,5 @@ func TestOwnerRequestBypassesConfiguredGroupsReplyLimit(t *testing.T) {
 	}
 	if action.Status != domain.ActionReady {
 		t.Fatalf("action=%+v", action)
-	}
-}
-
-func TestOwnerWaitRunsBeforeFinalStateCheck(t *testing.T) {
-	waited := false
-	state := &fakeThreadState{}
-	gate := NewReplyGate(Config{
-		Mode:      domain.ModeAuto,
-		OwnerWait: time.Second,
-		Sleeper: func(context.Context, time.Duration) error {
-			waited = true
-			state.ownerReplied = true
-			return nil
-		},
-	}, state)
-	action, err := gate.Prepare(context.Background(), domain.WorkItem{}, domain.Decision{
-		Kind:       domain.DecisionReply,
-		Confidence: 0.99,
-		Risk:       domain.RiskLow,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !waited || action.Status != domain.ActionCancelled || action.CancelReason != "owner_already_replied" {
-		t.Fatalf("waited=%v action=%+v", waited, action)
-	}
-}
-
-func TestInteractiveOwnerRequestsDoNotWait(t *testing.T) {
-	for _, kind := range []domain.WorkKind{domain.WorkKindFastPath, domain.WorkKindSimpleQuestion} {
-		waited := false
-		gate := NewReplyGate(Config{
-			Mode:        domain.ModeAuto,
-			OwnerOpenID: "ou_owner",
-			OwnerWait:   time.Minute,
-			Sleeper: func(context.Context, time.Duration) error {
-				waited = true
-				return nil
-			},
-		}, fakeThreadState{})
-		action, err := gate.Prepare(context.Background(), domain.WorkItem{
-			Event: domain.NormalizedEvent{SenderID: "ou_owner"},
-		}, domain.Decision{
-			Kind:       domain.DecisionReply,
-			Relevance:  domain.RelevanceOwnerRequest,
-			WorkKind:   kind,
-			Confidence: 1,
-			Risk:       domain.RiskLow,
-			ReplyText:  "reply",
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if waited || action.Status != domain.ActionReady {
-			t.Fatalf("kind=%s waited=%v action=%+v", kind, waited, action)
-		}
 	}
 }

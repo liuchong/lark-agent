@@ -65,6 +65,18 @@ type fakeStore struct {
 	items     []domain.WorkItem
 }
 
+type recordingResourceNotificationSink struct {
+	events []domain.NormalizedEvent
+}
+
+func (s *recordingResourceNotificationSink) IngestResourceNotification(
+	_ context.Context,
+	event domain.NormalizedEvent,
+) (bool, error) {
+	s.events = append(s.events, event)
+	return true, nil
+}
+
 type scopedFakeStore struct {
 	cursors map[string]time.Time
 	items   []domain.WorkItem
@@ -175,6 +187,61 @@ func TestPollerColdStartOnlySetsCursor(t *testing.T) {
 	}
 	if len(store.events) != 0 {
 		t.Fatalf("cold start enqueued events: %+v", store.events)
+	}
+}
+
+func TestPollerStoresApplicationResourceNotificationWithoutCreatingWork(t *testing.T) {
+	now := time.Date(2026, 8, 6, 2, 0, 0, 0, time.UTC)
+	store := &fakeStore{cursorSet: true, cursor: now.Add(-time.Minute)}
+	sink := &recordingResourceNotificationSink{}
+	im := &fakeIM{generalMessages: serviceim.SearchMessagesResult{Items: []serviceim.Message{{
+		MessageID:    "om_docs_notice",
+		ChatID:       "oc_docs",
+		ChatType:     "p2p",
+		SenderOpenID: "cli_docs",
+		SenderType:   "app",
+		Content:      "BUG-99999 提到了你",
+		ResourceURLs: []string{"https://example.larksuite.com/record/shr_bug"},
+		CreateTime:   now.Add(-30 * time.Second).Format(time.RFC3339),
+	}}}}
+	result, err := New(im, store, Config{
+		OwnerOpenID: "ou_owner", IncludePrivate: true, NotificationSink: sink,
+		Now: func() time.Time { return now },
+	}).Poll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.events) != 1 || len(store.items) != 0 || result.ResourceEvidence != 1 {
+		t.Fatalf("sink=%+v items=%+v result=%+v", sink.events, store.items, result)
+	}
+	if len(im.searchCalls) != 2 || im.searchCalls[0].ExcludeBotSend || im.searchCalls[1].ExcludeBotSend {
+		t.Fatalf("search calls=%+v", im.searchCalls)
+	}
+	if len(sink.events[0].ResourceURLs) != 1 || sink.events[0].SenderType != "app" {
+		t.Fatalf("event=%+v", sink.events[0])
+	}
+}
+
+func TestPollerExcludesCurrentAssistantApplicationFromResourceNotifications(t *testing.T) {
+	now := time.Date(2026, 8, 6, 2, 0, 0, 0, time.UTC)
+	store := &fakeStore{cursorSet: true, cursor: now.Add(-time.Minute)}
+	sink := &recordingResourceNotificationSink{}
+	im := &fakeIM{generalMessages: serviceim.SearchMessagesResult{Items: []serviceim.Message{{
+		MessageID:    "om_self_notice",
+		ChatID:       "oc_assistant",
+		SenderOpenID: "ou_assistant",
+		SenderType:   "app",
+		Content:      "https://example.larksuite.com/record/shr_bug",
+		CreateTime:   now.Add(-30 * time.Second).Format(time.RFC3339),
+	}}}}
+	if _, err := New(im, store, Config{
+		OwnerOpenID: "ou_owner", AssistantOpenIDs: []string{"ou_assistant"},
+		NotificationSink: sink, Now: func() time.Time { return now },
+	}).Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.events) != 0 || len(store.items) != 0 {
+		t.Fatalf("sink=%+v items=%+v", sink.events, store.items)
 	}
 }
 

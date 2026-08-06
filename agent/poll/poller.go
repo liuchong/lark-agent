@@ -46,6 +46,10 @@ type Store interface {
 	RecordBackfillWorkIntake(context.Context, domain.WorkItem) (domain.IntakeReceipt, error)
 }
 
+type ResourceNotificationSink interface {
+	IngestResourceNotification(context.Context, domain.NormalizedEvent) (bool, error)
+}
+
 // Config controls user-message polling.
 type Config struct {
 	OwnerOpenID                string
@@ -56,16 +60,21 @@ type Config struct {
 	IncludePrivate             bool
 	PageSize                   int
 	IndexLookback              time.Duration
+	OwnerWait                  time.Duration
 	Now                        func() time.Time
 	Classify                   func(context.Context, domain.WorkItem) (domain.Decision, error)
+	NotificationSink           ResourceNotificationSink
+	ReconcileResources         func(context.Context)
 }
 
 // Result summarizes a poll cycle.
 type Result struct {
-	ColdStart   bool     `json:"cold_start" yaml:"cold_start"`
-	Seen        int      `json:"seen" yaml:"seen"`
-	Inserted    int      `json:"inserted" yaml:"inserted"`
-	TestChatIDs []string `json:"test_chat_ids,omitempty" yaml:"test_chat_ids,omitempty"`
+	ColdStart        bool     `json:"cold_start" yaml:"cold_start"`
+	Seen             int      `json:"seen" yaml:"seen"`
+	Inserted         int      `json:"inserted" yaml:"inserted"`
+	ResourceEvidence int      `json:"resource_evidence" yaml:"resource_evidence"`
+	ResourceErrors   []string `json:"resource_errors,omitempty" yaml:"resource_errors,omitempty"`
+	TestChatIDs      []string `json:"test_chat_ids,omitempty" yaml:"test_chat_ids,omitempty"`
 }
 
 // BackfillRequest explicitly recovers owner mentions that were never captured
@@ -80,11 +89,13 @@ type BackfillRequest struct {
 
 // BackfillResult summarizes an explicit historical intake operation.
 type BackfillResult struct {
-	Seen     int      `json:"seen" yaml:"seen"`
-	Inserted int      `json:"inserted" yaml:"inserted"`
-	ChatIDs  []string `json:"chat_ids" yaml:"chat_ids"`
-	StartISO string   `json:"start" yaml:"start"`
-	EndISO   string   `json:"end" yaml:"end"`
+	Seen             int      `json:"seen" yaml:"seen"`
+	Inserted         int      `json:"inserted" yaml:"inserted"`
+	ResourceEvidence int      `json:"resource_evidence" yaml:"resource_evidence"`
+	ResourceErrors   []string `json:"resource_errors,omitempty" yaml:"resource_errors,omitempty"`
+	ChatIDs          []string `json:"chat_ids" yaml:"chat_ids"`
+	StartISO         string   `json:"start" yaml:"start"`
+	EndISO           string   `json:"end" yaml:"end"`
 }
 
 // Poller discovers visible conversations and ingests new messages.
@@ -180,7 +191,7 @@ func (p *Poller) Backfill(ctx context.Context, req BackfillRequest) (BackfillRes
 		PageSize:       pageSize,
 		IncludeAtMe:    true,
 		AtChatterIDs:   []string{p.cfg.OwnerOpenID},
-		ExcludeBotSend: true,
+		ExcludeBotSend: false,
 		ChatType:       p.chatTypeFilter(),
 	})
 	if err != nil {
@@ -204,14 +215,29 @@ func (p *Poller) Backfill(ctx context.Context, req BackfillRequest) (BackfillRes
 	result.Seen = len(seen)
 	for _, msg := range seen {
 		event := p.eventFromMessage(msg, true)
+		if p.isApplicationMessage(event) {
+			accepted, err := p.ingestResourceNotification(ctx, event)
+			if err != nil {
+				result.ResourceErrors = append(result.ResourceErrors, err.Error())
+				continue
+			}
+			if accepted {
+				result.ResourceEvidence++
+			}
+			continue
+		}
 		item := domain.NewWorkItem(event)
 		if p.cfg.Classify != nil {
 			decision, err := p.cfg.Classify(ctx, item)
 			if err != nil {
 				return result, err
 			}
+			if discardBeforeIntake(decision) {
+				continue
+			}
 			item.WorkKind = decision.WorkKind
 			item.Priority = decision.Priority
+			p.applyDelegatedWait(&item, decision)
 		}
 		receipt, err := p.store.RecordBackfillWorkIntake(ctx, item)
 		if err != nil {
@@ -297,6 +323,9 @@ func (p *Poller) Poll(ctx context.Context) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
+	if p.cfg.ReconcileResources != nil {
+		p.cfg.ReconcileResources(ctx)
+	}
 	now := p.currentTime().UTC()
 	if err := p.discoverTestChats(ctx); err != nil {
 		return Result{}, err
@@ -335,7 +364,7 @@ func (p *Poller) Poll(ctx context.Context) (Result, error) {
 		StartISO:       queryStart.Format(time.RFC3339),
 		EndISO:         now.Format(time.RFC3339),
 		PageSize:       p.pageSize,
-		ExcludeBotSend: true,
+		ExcludeBotSend: false,
 		ChatType:       p.chatTypeFilter(),
 	})
 	if err != nil {
@@ -347,7 +376,7 @@ func (p *Poller) Poll(ctx context.Context) (Result, error) {
 		PageSize:       p.pageSize,
 		IncludeAtMe:    true,
 		AtChatterIDs:   []string{p.cfg.OwnerOpenID},
-		ExcludeBotSend: true,
+		ExcludeBotSend: false,
 		ChatType:       p.chatTypeFilter(),
 	})
 	if err != nil {
@@ -382,6 +411,17 @@ func (p *Poller) Poll(ctx context.Context) (Result, error) {
 	result.Seen = len(seen)
 	for _, msg := range seen {
 		event := p.eventFromMessage(msg, mentioned[msg.MessageID])
+		if p.isApplicationMessage(event) {
+			accepted, err := p.ingestResourceNotification(ctx, event)
+			if err != nil {
+				result.ResourceErrors = append(result.ResourceErrors, err.Error())
+				continue
+			}
+			if accepted {
+				result.ResourceEvidence++
+			}
+			continue
+		}
 		if p.nonOwnerAssistantMention(event) {
 			continue
 		}
@@ -391,8 +431,12 @@ func (p *Poller) Poll(ctx context.Context) (Result, error) {
 			if err != nil {
 				return result, err
 			}
+			if discardBeforeIntake(decision) {
+				continue
+			}
 			item.WorkKind = decision.WorkKind
 			item.Priority = decision.Priority
+			p.applyDelegatedWait(&item, decision)
 		}
 		receipt, err := p.store.RecordWorkIntake(ctx, item)
 		if err != nil {
@@ -406,6 +450,57 @@ func (p *Poller) Poll(ctx context.Context) (Result, error) {
 		return result, err
 	}
 	return result, nil
+}
+
+func (p *Poller) isApplicationMessage(event domain.NormalizedEvent) bool {
+	switch strings.ToLower(strings.TrimSpace(event.SenderType)) {
+	case "app", "bot":
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *Poller) ingestResourceNotification(
+	ctx context.Context,
+	event domain.NormalizedEvent,
+) (bool, error) {
+	for _, assistantOpenID := range p.cfg.AssistantOpenIDs {
+		if assistantOpenID != "" && event.SenderID == assistantOpenID {
+			return false, nil
+		}
+	}
+	if p.cfg.NotificationSink == nil ||
+		(len(event.ResourceURLs) == 0 && !event.MentionsUser(p.cfg.OwnerOpenID)) {
+		return false, nil
+	}
+	return p.cfg.NotificationSink.IngestResourceNotification(ctx, event)
+}
+
+func discardBeforeIntake(decision domain.Decision) bool {
+	return decision.Kind == domain.DecisionIgnore &&
+		decision.Reason == "owner_message_without_assistant_invocation"
+}
+
+func (p *Poller) applyDelegatedWait(item *domain.WorkItem, decision domain.Decision) {
+	if item == nil ||
+		(decision.Relevance != domain.RelevanceDirectMention &&
+			decision.Relevance != domain.RelevancePrivateMessage) {
+		return
+	}
+	wait := p.cfg.OwnerWait
+	if wait <= 0 {
+		wait = 3 * time.Minute
+	}
+	start := item.Event.CreatedAt
+	if item.Event.UpdatedAt.After(start) {
+		start = item.Event.UpdatedAt
+	}
+	if start.IsZero() {
+		start = p.currentTime().UTC()
+	}
+	item.Status = domain.StatusWaitingUser
+	item.NextAttemptAt = start.Add(wait)
 }
 
 func (p *Poller) nonOwnerAssistantMention(event domain.NormalizedEvent) bool {
@@ -541,6 +636,9 @@ func mergeMessage(base, overlay serviceim.Message) serviceim.Message {
 	}
 	if len(out.Mentions) == 0 {
 		out.Mentions = append([]domain.Mention(nil), overlay.Mentions...)
+	}
+	if len(out.ResourceURLs) == 0 {
+		out.ResourceURLs = append([]string(nil), overlay.ResourceURLs...)
 	}
 	if out.CreateTime == "" {
 		out.CreateTime = overlay.CreateTime
@@ -692,8 +790,10 @@ func (p *Poller) eventFromMessage(msg serviceim.Message, mentionedOwner bool) do
 		SenderID:         msg.SenderOpenID,
 		SenderType:       msg.SenderType,
 		Content:          msg.Content,
+		ResourceURLs:     append([]string(nil), msg.ResourceURLs...),
 		Mentions:         mentions,
 		CreatedAt:        parseMessageTime(msg.CreateTime),
+		UpdatedAt:        parseMessageTime(msg.UpdateTime),
 		RawDigest:        digestMessage(msg),
 		InTestScope:      chat.ChatID != "",
 		InAssistantScope: p.assistantChatIDs[msg.ChatID],
@@ -732,6 +832,7 @@ func digestMessage(msg serviceim.Message) string {
 		msg.ReplyToMessageID,
 		msg.ThreadID,
 		msg.Content,
+		strings.Join(msg.ResourceURLs, "\n"),
 	}, "\x00")))
 	return "sha256:" + hex.EncodeToString(sum[:8])
 }

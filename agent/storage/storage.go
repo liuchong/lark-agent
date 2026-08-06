@@ -16,18 +16,20 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/liuchong/lark-agent/agent/domain"
+	"github.com/liuchong/lark-agent/agent/replymatch"
 	"github.com/liuchong/lark-agent/internal/apperr"
 	vfs "github.com/liuchong/lark-agent/internal/fsx"
 )
 
 // Store is a SQLite-backed durable queue.
 type Store struct {
-	db              *sql.DB
-	maxRetries      int
-	duplicateWindow time.Duration
-	maxActiveGoals  int
-	session         domain.OnlineSession
-	ownsSession     bool
+	db                   *sql.DB
+	maxRetries           int
+	ownerReplyMaxRetries int
+	duplicateWindow      time.Duration
+	maxActiveGoals       int
+	session              domain.OnlineSession
+	ownsSession          bool
 }
 
 // Open opens the state database for one daemon runtime, creates a new online
@@ -53,7 +55,13 @@ func open(path string, createSession bool) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	store := &Store{db: db, maxRetries: 20, duplicateWindow: 2 * time.Minute, maxActiveGoals: 3}
+	store := &Store{
+		db:                   db,
+		maxRetries:           20,
+		ownerReplyMaxRetries: 3,
+		duplicateWindow:      2 * time.Minute,
+		maxActiveGoals:       3,
+	}
 	if err := store.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -83,6 +91,14 @@ func open(path string, createSession bool) (*Store, error) {
 func (s *Store) ConfigureRecovery(maxRetries int) {
 	if maxRetries > 0 {
 		s.maxRetries = maxRetries
+	}
+}
+
+// ConfigureOwnerReplyRecovery sets the semantic context-only retry ceiling
+// independently from transient provider retries.
+func (s *Store) ConfigureOwnerReplyRecovery(maxRetries int) {
+	if maxRetries > 0 {
+		s.ownerReplyMaxRetries = maxRetries
 	}
 }
 
@@ -354,6 +370,214 @@ func (s *Store) migrate() error {
 			)`,
 			`CREATE INDEX IF NOT EXISTS idx_external_references_key
 			 ON external_references(provider, external_key)`,
+		}},
+		{version: 10, statements: []string{
+			`CREATE TABLE IF NOT EXISTS owner_reply_resolutions (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				work_item_id INTEGER NOT NULL REFERENCES work_items(id),
+				target_message_id TEXT NOT NULL,
+				result TEXT NOT NULL,
+				matched_owner_message_ids_json TEXT NOT NULL,
+				confidence REAL NOT NULL,
+				reason TEXT NOT NULL,
+				context_cutoff TEXT NOT NULL,
+				evaluated_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_owner_reply_resolutions_work_item
+			 ON owner_reply_resolutions(work_item_id, evaluated_at DESC, id DESC)`,
+		}},
+		{version: 11, statements: []string{
+			`CREATE TABLE IF NOT EXISTS owner_control_commands (
+				message_id TEXT PRIMARY KEY,
+				command_json TEXT NOT NULL,
+				status TEXT NOT NULL,
+				result_json TEXT,
+				error TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_owner_control_commands_status
+			 ON owner_control_commands(status, updated_at)`,
+			`CREATE TABLE IF NOT EXISTS owner_work_resolutions (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				work_item_id INTEGER NOT NULL REFERENCES work_items(id),
+				action_id INTEGER REFERENCES action_attempts(id),
+				command_message_id TEXT NOT NULL UNIQUE,
+				disposition TEXT NOT NULL,
+				reason TEXT NOT NULL,
+				resolved_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_owner_work_resolutions_work_item
+			 ON owner_work_resolutions(work_item_id, resolved_at DESC, id DESC)`,
+			`CREATE INDEX IF NOT EXISTS idx_action_attempts_pending
+			 ON action_attempts(status, updated_at DESC, id DESC)`,
+		}},
+		{version: 12, statements: []string{
+			`ALTER TABLE owner_work_resolutions ADD COLUMN work_updated_at TEXT`,
+			`CREATE INDEX IF NOT EXISTS idx_owner_work_resolutions_work_epoch
+			 ON owner_work_resolutions(work_item_id, work_updated_at, id DESC)`,
+		}},
+		{version: 13, statements: []string{
+			`ALTER TABLE owner_reply_resolutions ADD COLUMN task_summary TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE owner_reply_resolutions ADD COLUMN task_class TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE owner_reply_resolutions ADD COLUMN classification_confidence REAL NOT NULL DEFAULT 0`,
+			`ALTER TABLE owner_reply_resolutions ADD COLUMN requires_progress INTEGER NOT NULL DEFAULT 0`,
+			`CREATE TABLE IF NOT EXISTS delegated_investigations (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				work_item_id INTEGER NOT NULL UNIQUE REFERENCES work_items(id),
+				task_summary TEXT NOT NULL,
+				task_class TEXT NOT NULL,
+				context_cutoff TEXT NOT NULL,
+				context_digest TEXT NOT NULL,
+				status TEXT NOT NULL,
+				progress_action_id INTEGER REFERENCES action_attempts(id),
+				final_action_id INTEGER REFERENCES action_attempts(id),
+				last_error TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_delegated_investigations_status
+			 ON delegated_investigations(status, updated_at)`,
+		}},
+		{version: 14, statements: []string{
+			`ALTER TABLE delegated_investigations
+			 ADD COLUMN context_messages_json TEXT NOT NULL DEFAULT '[]'`,
+		}},
+		{version: 15, statements: []string{
+			`CREATE TABLE IF NOT EXISTS memory_entries (
+				id TEXT PRIMARY KEY,
+				kind TEXT NOT NULL CHECK (
+					kind IN ('fact', 'preference', 'project', 'response_feedback')
+				),
+				scope TEXT NOT NULL,
+				content TEXT NOT NULL,
+				status TEXT NOT NULL CHECK (status IN ('candidate', 'confirmed')),
+				source_work_item_id INTEGER REFERENCES work_items(id),
+				source_message_id TEXT,
+				confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				deleted_at TEXT
+			)`,
+			`CREATE TABLE IF NOT EXISTS memory_feedback (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				memory_entry_id TEXT NOT NULL REFERENCES memory_entries(id),
+				verdict TEXT NOT NULL CHECK (
+					verdict IN ('confirm', 'reject', 'helpful', 'unhelpful')
+				),
+				note TEXT NOT NULL DEFAULT '',
+				source_message_id TEXT,
+				created_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_memory_entries_retrieval
+			 ON memory_entries(status, scope, deleted_at, updated_at DESC)`,
+			`CREATE INDEX IF NOT EXISTS idx_memory_entries_source
+			 ON memory_entries(source_work_item_id, source_message_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_memory_feedback_entry
+			 ON memory_feedback(memory_entry_id, created_at DESC)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_feedback_message
+			 ON memory_feedback(memory_entry_id, source_message_id)
+			 WHERE source_message_id IS NOT NULL AND source_message_id <> ''`,
+		}},
+		{version: 16, statements: []string{
+			`ALTER TABLE work_items
+			 ADD COLUMN owner_reply_retry_count INTEGER NOT NULL DEFAULT 0`,
+			`UPDATE work_items
+			 SET owner_reply_retry_count = retry_count,
+			     retry_count = 0
+			 WHERE status = 'waiting_user' AND retry_count > 0`,
+			`CREATE TABLE IF NOT EXISTS work_reply_candidates (
+				work_item_id INTEGER PRIMARY KEY REFERENCES work_items(id),
+				decision_json TEXT NOT NULL,
+				digest TEXT NOT NULL,
+				status TEXT NOT NULL CHECK (
+					status IN ('pending', 'held', 'consumed', 'cancelled')
+				),
+				hold_reason TEXT NOT NULL DEFAULT '',
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_work_reply_candidates_status
+			 ON work_reply_candidates(status, updated_at)`,
+		}},
+		{version: 17, statements: []string{
+			`ALTER TABLE owner_reply_resolutions
+			 ADD COLUMN target_intent TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE owner_reply_resolutions
+			 ADD COLUMN response_obligation_quote TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE owner_reply_resolutions
+			 ADD COLUMN owner_ack_reaction_json TEXT NOT NULL DEFAULT ''`,
+		}},
+		{version: 18, statements: []string{
+			`ALTER TABLE agent_runs ADD COLUMN role TEXT NOT NULL DEFAULT 'agent'`,
+			`ALTER TABLE agent_runs ADD COLUMN profile TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_runs ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_runs ADD COLUMN protocol TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_runs ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_steps ADD COLUMN phase TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_steps ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE agent_steps ADD COLUMN finish_reason TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_steps ADD COLUMN http_status INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE agent_steps ADD COLUMN failure_category TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_steps ADD COLUMN recovery_action TEXT NOT NULL DEFAULT ''`,
+		}},
+		{version: 19, statements: []string{
+			`CREATE TABLE IF NOT EXISTS resource_evidence (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				dedup_key TEXT NOT NULL UNIQUE,
+				source_kind TEXT NOT NULL,
+				source_id TEXT NOT NULL,
+				subscription_id INTEGER REFERENCES resource_subscriptions(id),
+				resource_type TEXT NOT NULL,
+				original_url TEXT NOT NULL DEFAULT '',
+				file_token TEXT NOT NULL DEFAULT '',
+				app_token TEXT NOT NULL DEFAULT '',
+				table_id TEXT NOT NULL DEFAULT '',
+				view_id TEXT NOT NULL DEFAULT '',
+				record_id TEXT NOT NULL DEFAULT '',
+				comment_id TEXT NOT NULL DEFAULT '',
+				title TEXT NOT NULL DEFAULT '',
+				issue_key TEXT NOT NULL DEFAULT '',
+				status_field_id TEXT NOT NULL DEFAULT '',
+				status_field_name TEXT NOT NULL DEFAULT '',
+				status_value TEXT NOT NULL DEFAULT '',
+				assignee_open_ids_json TEXT NOT NULL DEFAULT '[]',
+				owner_mentioned INTEGER NOT NULL DEFAULT 0,
+				content_digest TEXT NOT NULL,
+				observed_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_resource_evidence_record
+			 ON resource_evidence(app_token, table_id, record_id, observed_at DESC)`,
+			`CREATE INDEX IF NOT EXISTS idx_resource_evidence_issue
+			 ON resource_evidence(issue_key, observed_at DESC)`,
+			`CREATE INDEX IF NOT EXISTS idx_resource_evidence_title
+			 ON resource_evidence(title, observed_at DESC)`,
+			`ALTER TABLE work_items ADD COLUMN resource_evidence_id INTEGER
+			 REFERENCES resource_evidence(id)`,
+			`CREATE INDEX IF NOT EXISTS idx_work_items_resource_evidence
+			 ON work_items(resource_evidence_id)`,
+		}},
+		{version: 20, statements: []string{
+			`CREATE TABLE IF NOT EXISTS delegated_investigation_history (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				investigation_id INTEGER NOT NULL,
+				work_item_id INTEGER NOT NULL REFERENCES work_items(id),
+				task_summary TEXT NOT NULL,
+				task_class TEXT NOT NULL,
+				context_cutoff TEXT NOT NULL,
+				context_digest TEXT NOT NULL,
+				status TEXT NOT NULL,
+				progress_action_id INTEGER,
+				final_action_id INTEGER,
+				last_error TEXT,
+				context_messages_json TEXT NOT NULL DEFAULT '[]',
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				archived_reason TEXT NOT NULL,
+				archived_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_delegated_investigation_history_work
+			 ON delegated_investigation_history(work_item_id, archived_at DESC, id DESC)`,
 		}},
 	}
 	for _, migration := range migrations {
@@ -682,6 +906,224 @@ func (s *Store) RemoveResourceSubscription(ctx context.Context, originalURL stri
 	return s.GetResourceSubscription(ctx, originalURL)
 }
 
+func (s *Store) RecordResourceEvidence(
+	ctx context.Context,
+	evidence domain.ResourceEvidence,
+) (domain.ResourceEvidence, bool, error) {
+	if strings.TrimSpace(evidence.DedupKey) == "" ||
+		strings.TrimSpace(string(evidence.SourceKind)) == "" ||
+		strings.TrimSpace(evidence.SourceID) == "" ||
+		strings.TrimSpace(evidence.ResourceType) == "" ||
+		strings.TrimSpace(evidence.ContentDigest) == "" {
+		return domain.ResourceEvidence{}, false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"resource evidence identity, source, type, and digest are required",
+		)
+	}
+	if evidence.ObservedAt.IsZero() {
+		evidence.ObservedAt = time.Now().UTC()
+	}
+	assignees, err := json.Marshal(uniqueNonEmptyStrings(evidence.AssigneeOpenIDs))
+	if err != nil {
+		return domain.ResourceEvidence{}, false, errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"encode resource evidence assignees",
+		).WithCause(err)
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO resource_evidence(
+			dedup_key, source_kind, source_id, subscription_id, resource_type, original_url,
+			file_token, app_token, table_id, view_id, record_id, comment_id, title, issue_key,
+			status_field_id, status_field_name, status_value, assignee_open_ids_json,
+			owner_mentioned, content_digest, observed_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		evidence.DedupKey, evidence.SourceKind, evidence.SourceID, nullInt64(evidence.SubscriptionID),
+		evidence.ResourceType, evidence.OriginalURL, evidence.FileToken, evidence.AppToken,
+		evidence.TableID, evidence.ViewID, evidence.RecordID, evidence.CommentID, evidence.Title,
+		evidence.IssueKey, evidence.StatusFieldID, evidence.StatusFieldName, evidence.StatusValue,
+		string(assignees), evidence.OwnerMentioned, evidence.ContentDigest,
+		evidence.ObservedAt.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return domain.ResourceEvidence{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"record resource evidence",
+		).WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.ResourceEvidence{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"count resource evidence insert",
+		).WithCause(err)
+	}
+	stored, err := s.getResourceEvidenceByDedup(ctx, evidence.DedupKey)
+	return stored, affected == 1, err
+}
+
+func (s *Store) FindResourceEvidence(
+	ctx context.Context,
+	query domain.ResourceEvidenceQuery,
+) ([]domain.ResourceEvidence, error) {
+	limit := query.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	clauses := []string{"1 = 1"}
+	var args []any
+	if query.AppToken != "" {
+		clauses = append(clauses, "app_token = ?")
+		args = append(args, query.AppToken)
+	}
+	if query.TableID != "" {
+		clauses = append(clauses, "table_id = ?")
+		args = append(args, query.TableID)
+	}
+	if query.RecordID != "" {
+		clauses = append(clauses, "record_id = ?")
+		args = append(args, query.RecordID)
+	}
+	terms := uniqueNonEmptyStrings(query.Terms)
+	if len(terms) > 0 {
+		var termClauses []string
+		for _, term := range terms {
+			termClauses = append(termClauses, "(title LIKE ? ESCAPE '\\' OR issue_key LIKE ? ESCAPE '\\' OR original_url LIKE ? ESCAPE '\\')")
+			pattern := "%" + escapeLikePattern(term) + "%"
+			args = append(args, pattern, pattern, pattern)
+		}
+		clauses = append(clauses, "("+strings.Join(termClauses, " OR ")+")")
+	}
+	orderBy := "owner_mentioned DESC, observed_at DESC, id DESC"
+	if query.AppToken != "" && query.TableID != "" && query.RecordID != "" {
+		orderBy = "observed_at DESC, id DESC"
+	}
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+resourceEvidenceColumns+`
+		FROM resource_evidence
+		WHERE `+strings.Join(clauses, " AND ")+`
+		ORDER BY `+orderBy+`
+		LIMIT ?`, args...)
+	if err != nil {
+		return nil, errs.NewInternalError(errs.SubtypeStorage, "find resource evidence").WithCause(err)
+	}
+	defer rows.Close() //nolint:errcheck
+	var out []domain.ResourceEvidence
+	for rows.Next() {
+		evidence, err := scanResourceEvidence(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, evidence)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errs.NewInternalError(errs.SubtypeStorage, "read resource evidence").WithCause(err)
+	}
+	return out, nil
+}
+
+func (s *Store) GetResourceEvidenceForWork(
+	ctx context.Context,
+	dedupKey string,
+) (domain.ResourceEvidence, error) {
+	var evidenceID int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(resource_evidence_id, 0) FROM work_items WHERE dedup_key = ?`,
+		dedupKey,
+	).Scan(&evidenceID); err != nil {
+		return domain.ResourceEvidence{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"locate resource evidence for work",
+		).WithCause(err)
+	}
+	if evidenceID == 0 {
+		return domain.ResourceEvidence{}, errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"work item has no linked resource evidence",
+		)
+	}
+	return scanResourceEvidence(s.db.QueryRowContext(ctx, `SELECT `+resourceEvidenceColumns+`
+		FROM resource_evidence WHERE id = ?`, evidenceID))
+}
+
+const resourceEvidenceColumns = `id, dedup_key, source_kind, source_id,
+	COALESCE(subscription_id, 0), resource_type, original_url, file_token, app_token,
+	table_id, view_id, record_id, comment_id, title, issue_key, status_field_id,
+	status_field_name, status_value, assignee_open_ids_json, owner_mentioned,
+	content_digest, observed_at`
+
+func (s *Store) getResourceEvidenceByDedup(
+	ctx context.Context,
+	dedupKey string,
+) (domain.ResourceEvidence, error) {
+	return scanResourceEvidence(s.db.QueryRowContext(ctx, `SELECT `+resourceEvidenceColumns+`
+		FROM resource_evidence WHERE dedup_key = ?`, dedupKey))
+}
+
+type resourceEvidenceScanner interface {
+	Scan(...any) error
+}
+
+func scanResourceEvidence(scanner resourceEvidenceScanner) (domain.ResourceEvidence, error) {
+	var evidence domain.ResourceEvidence
+	var assigneesJSON, observedAt string
+	if err := scanner.Scan(
+		&evidence.ID, &evidence.DedupKey, &evidence.SourceKind, &evidence.SourceID,
+		&evidence.SubscriptionID, &evidence.ResourceType, &evidence.OriginalURL,
+		&evidence.FileToken, &evidence.AppToken, &evidence.TableID, &evidence.ViewID,
+		&evidence.RecordID, &evidence.CommentID, &evidence.Title, &evidence.IssueKey,
+		&evidence.StatusFieldID, &evidence.StatusFieldName, &evidence.StatusValue,
+		&assigneesJSON, &evidence.OwnerMentioned, &evidence.ContentDigest, &observedAt,
+	); err != nil {
+		return domain.ResourceEvidence{}, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"scan resource evidence",
+		).WithCause(err)
+	}
+	if err := json.Unmarshal([]byte(assigneesJSON), &evidence.AssigneeOpenIDs); err != nil {
+		return domain.ResourceEvidence{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"decode resource evidence assignees",
+		).WithCause(err)
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, observedAt)
+	if err != nil {
+		return domain.ResourceEvidence{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"parse resource evidence observation time",
+		).WithCause(err)
+	}
+	evidence.ObservedAt = parsed
+	return evidence, nil
+}
+
+func uniqueNonEmptyStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func escapeLikePattern(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `%`, `\%`)
+	return strings.ReplaceAll(value, `_`, `\_`)
+}
+
+func nullInt64(value int64) any {
+	if value == 0 {
+		return nil
+	}
+	return value
+}
+
 // StartAgentRun creates a durable multi-step run for an already-enqueued event.
 func (s *Store) StartAgentRun(ctx context.Context, event domain.NormalizedEvent, modelFingerprint, configFingerprint string) (domain.AgentRun, error) {
 	dedupKey := domain.DedupKey(event)
@@ -703,14 +1145,40 @@ func (s *Store) StartAgentRun(ctx context.Context, event domain.NormalizedEvent,
 		ConfigFingerprint: configFingerprint,
 		StartedAt:         now,
 	}
+	run.Role, run.Profile, run.Provider, run.Protocol, run.Model = agentRunAuditFromFingerprint(modelFingerprint)
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO agent_runs(id, work_item_id, dedup_key, status, model_fingerprint, config_fingerprint, started_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		run.ID, run.WorkItemID, run.DedupKey, run.Status, run.ModelFingerprint, run.ConfigFingerprint, now.Format(time.RFC3339Nano))
+		`INSERT INTO agent_runs(
+			id, work_item_id, dedup_key, status, role, profile, provider, protocol, model,
+			model_fingerprint, config_fingerprint, started_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		run.ID, run.WorkItemID, run.DedupKey, run.Status, run.Role, run.Profile,
+		run.Provider, run.Protocol, run.Model, run.ModelFingerprint,
+		run.ConfigFingerprint, now.Format(time.RFC3339Nano))
 	if err != nil {
 		return domain.AgentRun{}, errs.NewInternalError(errs.SubtypeStorage, "start agent run").WithCause(err)
 	}
 	return run, nil
+}
+
+func agentRunAuditFromFingerprint(fingerprint string) (role, profile, provider, protocol, modelName string) {
+	role = "agent"
+	left := fingerprint
+	if at := strings.Index(left, "@"); at >= 0 {
+		left = left[:at]
+	}
+	if colon := strings.Index(left, ":"); colon >= 0 {
+		profile = left[:colon]
+		left = left[colon+1:]
+	}
+	parts := strings.Split(left, "/")
+	if len(parts) >= 3 {
+		provider = parts[0]
+		protocol = parts[1]
+		modelName = strings.Join(parts[2:], "/")
+		return role, profile, provider, protocol, modelName
+	}
+	modelName = left
+	return role, profile, provider, protocol, modelName
 }
 
 // AppendAgentStep persists one model response or tool result.
@@ -725,12 +1193,15 @@ func (s *Store) AppendAgentStep(ctx context.Context, step domain.AgentStep) erro
 	defer tx.Rollback() //nolint:errcheck // commit path below closes the transaction
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO agent_steps(
-			run_id, sequence, kind, tool_call_id, tool_name, input_json, output_json,
-			request_id, prompt_tokens, completion_tokens, error, created_at
-		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		step.RunID, step.Sequence, step.Kind, step.ToolCallID, step.ToolName,
-		step.InputJSON, step.OutputJSON, step.RequestID, step.PromptTokens,
-		step.CompletionTokens, step.Error, step.CreatedAt.Format(time.RFC3339Nano))
+			run_id, sequence, kind, phase, attempt, tool_call_id, tool_name, input_json,
+			output_json, request_id, finish_reason, http_status, failure_category,
+			recovery_action, prompt_tokens, completion_tokens, error, created_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		step.RunID, step.Sequence, step.Kind, step.Phase, step.Attempt,
+		step.ToolCallID, step.ToolName, step.InputJSON, step.OutputJSON,
+		step.RequestID, step.FinishReason, step.HTTPStatus, step.FailureCategory,
+		step.RecoveryAction, step.PromptTokens, step.CompletionTokens, step.Error,
+		step.CreatedAt.Format(time.RFC3339Nano))
 	if err != nil {
 		return errs.NewInternalError(errs.SubtypeStorage, "append agent step").WithCause(err)
 	}
@@ -879,10 +1350,19 @@ func (s *Store) RequeueAbandonedRuns(maxAge time.Duration) (int64, error) {
 // model or agent configuration upgrade.
 func (s *Store) RequeueChangedRuntimeFailures(modelFingerprint, configFingerprint string) (int64, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	result, err := s.db.Exec(
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return 0, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin runtime upgrade requeue",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	result, err := tx.Exec(
 		`UPDATE work_items
 		 SET status = ?, decision_json = NULL, lease_by = NULL, lease_time = NULL,
-		     retry_count = 0, next_attempt_at = NULL, updated_at = ?
+		     retry_count = 0, owner_reply_retry_count = 0,
+		     next_attempt_at = NULL, updated_at = ?
 		 WHERE status IN (?, ?)
 		   AND EXISTS (
 			SELECT 1 FROM agent_runs r
@@ -905,12 +1385,38 @@ func (s *Store) RequeueChangedRuntimeFailures(modelFingerprint, configFingerprin
 		return 0, errs.NewInternalError(errs.SubtypeStorage, "read runtime upgrade requeue result").WithCause(err)
 	}
 	if changed > 0 {
-		if _, err := s.db.Exec(
+		if _, err := tx.Exec(
+			`UPDATE work_reply_candidates
+			 SET status = ?, hold_reason = ?, updated_at = ?
+			 WHERE status IN (?, ?)
+			   AND work_item_id IN (
+				SELECT id FROM work_items WHERE status = ? AND updated_at = ?
+			   )`,
+			domain.ReplyCandidateCancelled,
+			"runtime contract changed; candidate requires regeneration",
+			now,
+			domain.ReplyCandidatePending,
+			domain.ReplyCandidateHeld,
+			domain.StatusReceived,
+			now,
+		); err != nil {
+			return 0, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"cancel stale reply candidates after runtime upgrade",
+			).WithCause(err)
+		}
+		if _, err := tx.Exec(
 			`DELETE FROM dead_letters WHERE work_item_id IN (
 				SELECT id FROM work_items WHERE status = ? AND updated_at = ?
 			)`, domain.StatusReceived, now); err != nil {
 			return 0, errs.NewInternalError(errs.SubtypeStorage, "clear upgraded dead letters").WithCause(err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit runtime upgrade requeue",
+		).WithCause(err)
 	}
 	return changed, nil
 }
@@ -988,7 +1494,8 @@ func (s *Store) RequeueChangedRuntimeDirectMentions(ownerOpenID, modelFingerprin
 	for _, id := range ids {
 		result, err := tx.Exec(
 			`UPDATE work_items SET status = ?, decision_json = NULL, lease_by = NULL,
-			        lease_time = NULL, retry_count = 0, next_attempt_at = NULL, updated_at = ?
+			        lease_time = NULL, retry_count = 0, owner_reply_retry_count = 0,
+			        next_attempt_at = NULL, updated_at = ?
 			 WHERE id = ? AND status IN (?, ?)`,
 			domain.StatusReceived, now, id, domain.StatusIgnored, domain.StatusCompleted)
 		if err != nil {
@@ -1107,7 +1614,8 @@ func (s *Store) RequeueLowRiskDirectMentionApprovals(ownerOpenID string) (int64,
 		}
 		result, err = tx.Exec(
 			`UPDATE work_items SET status = ?, decision_json = NULL, lease_by = NULL,
-			        lease_time = NULL, retry_count = 0, next_attempt_at = NULL, updated_at = ?
+			        lease_time = NULL, retry_count = 0, owner_reply_retry_count = 0,
+			        next_attempt_at = NULL, updated_at = ?
 			 WHERE id = ?`,
 			domain.StatusReceived, now, id)
 		if err != nil {
@@ -1180,7 +1688,8 @@ func (s *Store) RequeueLegacyCompletedMentions(ownerOpenID string) (int64, error
 	for _, id := range ids {
 		result, err := tx.Exec(
 			`UPDATE work_items SET status = ?, decision_json = NULL, lease_by = NULL,
-			        lease_time = NULL, retry_count = 0, next_attempt_at = NULL, updated_at = ?
+			        lease_time = NULL, retry_count = 0, owner_reply_retry_count = 0,
+			        next_attempt_at = NULL, updated_at = ?
 			 WHERE id = ? AND status = ?`,
 			domain.StatusReceived, now, id, domain.StatusCompleted)
 		if err != nil {
@@ -1202,7 +1711,9 @@ func (s *Store) RequeueLegacyCompletedMentions(ownerOpenID string) (int64, error
 func (s *Store) ListAgentRuns() ([]domain.AgentRun, error) {
 	rows, err := s.db.Query(
 		`SELECT id, work_item_id, dedup_key, status, COALESCE(model_fingerprint, ''),
-		        COALESCE(config_fingerprint, ''), COALESCE(last_error, ''), started_at, completed_at
+		        COALESCE(config_fingerprint, ''), COALESCE(last_error, ''),
+		        COALESCE(role, ''), COALESCE(profile, ''), COALESCE(provider, ''),
+		        COALESCE(protocol, ''), COALESCE(model, ''), started_at, completed_at
 		 FROM agent_runs ORDER BY started_at, id`)
 	if err != nil {
 		return nil, errs.NewInternalError(errs.SubtypeStorage, "list agent runs").WithCause(err)
@@ -1217,7 +1728,8 @@ func (s *Store) ListAgentRuns() ([]domain.AgentRun, error) {
 		var started string
 		var completed sql.NullString
 		if err := rows.Scan(&run.ID, &run.WorkItemID, &run.DedupKey, &status, &run.ModelFingerprint,
-			&run.ConfigFingerprint, &run.LastError, &started, &completed); err != nil {
+			&run.ConfigFingerprint, &run.LastError, &run.Role, &run.Profile,
+			&run.Provider, &run.Protocol, &run.Model, &started, &completed); err != nil {
 			return nil, errs.NewInternalError(errs.SubtypeStorage, "scan agent run").WithCause(err)
 		}
 		run.Status = domain.AgentRunStatus(status)
@@ -1233,8 +1745,11 @@ func (s *Store) ListAgentRuns() ([]domain.AgentRun, error) {
 // ListAgentSteps returns one run's durable trajectory.
 func (s *Store) ListAgentSteps(runID string) ([]domain.AgentStep, error) {
 	rows, err := s.db.Query(
-		`SELECT run_id, sequence, kind, tool_call_id, tool_name, input_json, output_json,
-		        request_id, prompt_tokens, completion_tokens, error, created_at
+		`SELECT run_id, sequence, kind, COALESCE(phase, ''), COALESCE(attempt, 0),
+		        tool_call_id, tool_name, input_json, output_json, request_id,
+		        COALESCE(finish_reason, ''), COALESCE(http_status, 0),
+		        COALESCE(failure_category, ''), COALESCE(recovery_action, ''),
+		        prompt_tokens, completion_tokens, error, created_at
 		 FROM agent_steps WHERE run_id = ? ORDER BY sequence`, runID)
 	if err != nil {
 		return nil, errs.NewInternalError(errs.SubtypeStorage, "list agent steps").WithCause(err)
@@ -1246,8 +1761,10 @@ func (s *Store) ListAgentSteps(runID string) ([]domain.AgentStep, error) {
 	for rows.Next() {
 		var step domain.AgentStep
 		var created string
-		if err := rows.Scan(&step.RunID, &step.Sequence, &step.Kind, &step.ToolCallID, &step.ToolName,
-			&step.InputJSON, &step.OutputJSON, &step.RequestID, &step.PromptTokens,
+		if err := rows.Scan(&step.RunID, &step.Sequence, &step.Kind, &step.Phase,
+			&step.Attempt, &step.ToolCallID, &step.ToolName, &step.InputJSON,
+			&step.OutputJSON, &step.RequestID, &step.FinishReason, &step.HTTPStatus,
+			&step.FailureCategory, &step.RecoveryAction, &step.PromptTokens,
 			&step.CompletionTokens, &step.Error, &created); err != nil {
 			return nil, errs.NewInternalError(errs.SubtypeStorage, "scan agent step").WithCause(err)
 		}
@@ -1282,14 +1799,17 @@ func (s *Store) ExportAgentRunTranscript(runID string) (string, error) {
 func (s *Store) getAgentRun(runID string) (domain.AgentRun, error) {
 	row := s.db.QueryRow(
 		`SELECT id, work_item_id, dedup_key, status, COALESCE(model_fingerprint, ''),
-		        COALESCE(config_fingerprint, ''), COALESCE(last_error, ''), started_at, completed_at
+		        COALESCE(config_fingerprint, ''), COALESCE(last_error, ''),
+		        COALESCE(role, ''), COALESCE(profile, ''), COALESCE(provider, ''),
+		        COALESCE(protocol, ''), COALESCE(model, ''), started_at, completed_at
 		 FROM agent_runs WHERE id = ?`, runID)
 	var run domain.AgentRun
 	var status string
 	var started string
 	var completed sql.NullString
 	if err := row.Scan(&run.ID, &run.WorkItemID, &run.DedupKey, &status, &run.ModelFingerprint,
-		&run.ConfigFingerprint, &run.LastError, &started, &completed); err != nil {
+		&run.ConfigFingerprint, &run.LastError, &run.Role, &run.Profile,
+		&run.Provider, &run.Protocol, &run.Model, &started, &completed); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.AgentRun{}, errs.NewValidationError(errs.SubtypeInvalidArgument, "agent run not found: %s", runID)
 		}
@@ -1456,6 +1976,131 @@ func (s *Store) CompleteShellApproval(ctx context.Context, actionID int64, respo
 		return errs.NewValidationError(errs.SubtypeFailedPrecondition, "action %d is not executing", actionID)
 	}
 	return nil
+}
+
+// RequestResourceAction creates or returns an approval for one exact external
+// resource mutation. The request JSON is part of the idempotency identity.
+func (s *Store) RequestResourceAction(
+	ctx context.Context,
+	dedupKey, kind, requestJSON string,
+) (int64, error) {
+	workItemID, key, err := s.resourceActionIdentity(ctx, dedupKey, kind, requestJSON)
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO action_attempts(
+			work_item_id, kind, idempotency_key, status, request_json, created_at, updated_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		workItemID, kind, key, domain.ActionAwaitingApproval, requestJSON, now, now); err != nil {
+		return 0, errs.NewInternalError(errs.SubtypeStorage, "request resource action approval").WithCause(err)
+	}
+	var actionID int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM action_attempts WHERE idempotency_key = ?`, key).Scan(&actionID); err != nil {
+		return 0, errs.NewInternalError(errs.SubtypeStorage, "read resource action approval").WithCause(err)
+	}
+	return actionID, nil
+}
+
+func (s *Store) ConsumeResourceAction(
+	ctx context.Context,
+	dedupKey, kind, requestJSON string,
+) (int64, bool, error) {
+	_, key, err := s.resourceActionIdentity(ctx, dedupKey, kind, requestJSON)
+	if err != nil {
+		return 0, false, err
+	}
+	var actionID int64
+	err = s.db.QueryRowContext(ctx,
+		`SELECT id FROM action_attempts WHERE idempotency_key = ? AND status = ?`,
+		key, domain.ActionReady).Scan(&actionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, errs.NewInternalError(errs.SubtypeStorage, "read approved resource action").WithCause(err)
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE action_attempts SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		domain.ActionExecuting, time.Now().UTC().Format(time.RFC3339Nano), actionID, domain.ActionReady)
+	if err != nil {
+		return 0, false, errs.NewInternalError(errs.SubtypeStorage, "consume approved resource action").WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	return actionID, err == nil && affected == 1, err
+}
+
+func (s *Store) BeginResourceAction(
+	ctx context.Context,
+	dedupKey, kind, requestJSON string,
+) (int64, string, bool, error) {
+	workItemID, key, err := s.resourceActionIdentity(ctx, dedupKey, kind, requestJSON)
+	if err != nil {
+		return 0, "", false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, "", false, errs.NewInternalError(errs.SubtypeStorage, "begin resource action").WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var actionID int64
+	var status domain.ActionStatus
+	var response string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id, status, COALESCE(response_json, '') FROM action_attempts WHERE idempotency_key = ?`,
+		key).Scan(&actionID, &status, &response)
+	if errors.Is(err, sql.ErrNoRows) {
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		result, insertErr := tx.ExecContext(ctx,
+			`INSERT INTO action_attempts(
+				work_item_id, kind, idempotency_key, status, request_json, created_at, updated_at
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			workItemID, kind, key, domain.ActionExecuting, requestJSON, now, now)
+		if insertErr != nil {
+			return 0, "", false, errs.NewInternalError(errs.SubtypeStorage, "start resource action").WithCause(insertErr)
+		}
+		actionID, err = result.LastInsertId()
+		if err != nil {
+			return 0, "", false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, "", false, err
+		}
+		return actionID, "", false, nil
+	}
+	if err != nil {
+		return 0, "", false, errs.NewInternalError(errs.SubtypeStorage, "read resource action").WithCause(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, "", false, err
+	}
+	if status == domain.ActionCompleted {
+		return actionID, response, false, nil
+	}
+	return actionID, "", true, nil
+}
+
+func (s *Store) CompleteResourceAction(
+	ctx context.Context,
+	actionID int64,
+	responseJSON, errorText string,
+) error {
+	return s.CompleteShellApproval(ctx, actionID, responseJSON, errorText)
+}
+
+func (s *Store) resourceActionIdentity(
+	ctx context.Context,
+	dedupKey, kind, requestJSON string,
+) (int64, string, error) {
+	var workItemID int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM work_items WHERE dedup_key = ?`, dedupKey).Scan(&workItemID); err != nil {
+		return 0, "", errs.NewInternalError(errs.SubtypeStorage, "locate resource action work item").WithCause(err)
+	}
+	sum := sha256.Sum256([]byte(strings.Join([]string{dedupKey, kind, requestJSON}, "\x00")))
+	return workItemID, fmt.Sprintf("resource:%x", sum[:]), nil
 }
 
 // BeginReplyAction starts or resumes one idempotent external reply.
@@ -1815,8 +2460,9 @@ func (s *Store) CompleteReplyApproval(ctx context.Context, actionID int64, messa
 	return s.CompleteShellApproval(ctx, actionID, string(response), errorText)
 }
 
-// BeginPostReplyNotification starts or resumes the durable owner notification
-// that follows a successful sender-facing reply.
+// BeginPostReplyNotification starts or resumes the durable owner notification.
+// New delegated replies complete this notice before the sender-facing send;
+// rows created by older versions may still represent a post-reply notice.
 func (s *Store) BeginPostReplyNotification(
 	ctx context.Context,
 	dedupKey string,
@@ -1888,8 +2534,10 @@ func (s *Store) BeginPostReplyNotification(
 	return actionID, key, false, nil
 }
 
-// ReadyPostReplyNotification returns a post-reply owner notification that can
-// finish the work item without rerunning the model or sender-facing reply.
+// ReadyPostReplyNotification returns an owner notification that can finish the
+// work item without rerunning the model or sender-facing reply. A completed
+// reply action is required so a pre-reply notice cannot accidentally skip the
+// sender-facing send after restart.
 func (s *Store) ReadyPostReplyNotification(workItemID int64) (int64, string, domain.Decision, bool, error) {
 	var actionID int64
 	var key string
@@ -1898,8 +2546,17 @@ func (s *Store) ReadyPostReplyNotification(workItemID int64) (int64, string, dom
 		`SELECT id, idempotency_key, COALESCE(request_json, '')
 		 FROM action_attempts
 		 WHERE work_item_id = ? AND kind = 'owner_notification' AND status IN (?, ?, ?)
+		   AND EXISTS(
+				SELECT 1 FROM action_attempts reply
+				WHERE reply.work_item_id = action_attempts.work_item_id
+				  AND reply.kind = 'reply' AND reply.status = ?
+		   )
 		 ORDER BY id LIMIT 1`,
-		workItemID, domain.ActionExecuting, domain.ActionBlocked, domain.ActionCompleted,
+		workItemID,
+		domain.ActionExecuting,
+		domain.ActionBlocked,
+		domain.ActionCompleted,
+		domain.ActionCompleted,
 	).Scan(&actionID, &key, &requestJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, "", domain.Decision{}, false, nil
@@ -1965,10 +2622,8 @@ func (s *Store) DecideAction(id int64, approve bool) error {
 	}
 	defer tx.Rollback() //nolint:errcheck
 	actionStatus := domain.ActionReady
-	workStatus := domain.StatusReceived
 	if !approve {
 		actionStatus = domain.ActionCancelled
-		workStatus = domain.StatusCancelled
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	var workItemID int64
@@ -1984,11 +2639,55 @@ func (s *Store) DecideAction(id int64, approve bool) error {
 		}
 		return errs.NewInternalError(errs.SubtypeStorage, "update approval decision").WithCause(err)
 	}
-	if _, err := tx.Exec(
-		`UPDATE work_items SET status = ?, lease_by = NULL, lease_time = NULL,
-		        next_attempt_at = NULL, updated_at = ? WHERE id = ?`,
-		workStatus, now, workItemID); err != nil {
-		return errs.NewInternalError(errs.SubtypeStorage, "update approved work item").WithCause(err)
+	if approve {
+		var sessionID, sessionStatus string
+		sessionErr := tx.QueryRow(
+			`SELECT id, status FROM online_sessions
+			 WHERE status IN (?, ?)
+			 ORDER BY started_at DESC, id DESC LIMIT 1`,
+			domain.OnlineSessionStarting,
+			domain.OnlineSessionReady,
+		).Scan(&sessionID, &sessionStatus)
+		switch {
+		case sessionErr == nil && domain.OnlineSessionStatus(sessionStatus) == domain.OnlineSessionReady:
+			if _, err := tx.Exec(
+				`UPDATE work_items
+				 SET status = ?, session_id = ?, lease_by = NULL, lease_time = NULL,
+				     next_attempt_at = NULL, updated_at = ?
+				 WHERE id = ?`,
+				domain.StatusReceived, sessionID, now, workItemID,
+			); err != nil {
+				return errs.NewInternalError(errs.SubtypeStorage, "assign approved work to ready session").WithCause(err)
+			}
+			if _, err := tx.Exec(
+				`UPDATE work_interruptions SET resumed_at = ?
+				 WHERE work_item_id = ? AND resumed_at IS NULL`,
+				now, workItemID,
+			); err != nil {
+				return errs.NewInternalError(errs.SubtypeStorage, "close approved work interruption").WithCause(err)
+			}
+		case errors.Is(sessionErr, sql.ErrNoRows),
+			sessionErr == nil && domain.OnlineSessionStatus(sessionStatus) == domain.OnlineSessionStarting:
+			if _, err := tx.Exec(
+				`UPDATE work_items
+				 SET status = ?, lease_by = NULL, lease_time = NULL,
+				     next_attempt_at = NULL, updated_at = ?
+				 WHERE id = ?`,
+				domain.StatusInterrupted, now, workItemID,
+			); err != nil {
+				return errs.NewInternalError(errs.SubtypeStorage, "pause approved work without ready session").WithCause(err)
+			}
+		default:
+			return errs.NewInternalError(errs.SubtypeStorage, "locate ready session for approval").WithCause(sessionErr)
+		}
+	} else {
+		if _, err := tx.Exec(
+			`UPDATE work_items SET status = ?, lease_by = NULL, lease_time = NULL,
+			        next_attempt_at = NULL, updated_at = ? WHERE id = ?`,
+			domain.StatusCancelled, now, workItemID,
+		); err != nil {
+			return errs.NewInternalError(errs.SubtypeStorage, "cancel rejected work item").WithCause(err)
+		}
 	}
 	goalStatus := domain.CodingGoalActive
 	if !approve {
@@ -2069,6 +2768,256 @@ func (s *Store) ReadyApprovedReply(workItemID int64) (domain.Decision, bool, err
 		ReplyText:   request.Text,
 		OwnerAction: request.OwnerAction,
 	}, true, nil
+}
+
+// BlockReadyReplyApprovalClaim terminalizes one approved draft when current
+// deterministic routing no longer permits a sender-facing reply.
+func (s *Store) BlockReadyReplyApprovalClaim(
+	ctx context.Context,
+	workItemID int64,
+	leaseToken string,
+	reason string,
+) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(
+		ctx,
+		`UPDATE action_attempts
+		 SET status = ?, error = ?, updated_at = ?
+		 WHERE id = (
+			SELECT a.id
+			FROM action_attempts a
+			JOIN work_items w ON w.id = a.work_item_id
+			WHERE a.work_item_id = ?
+			  AND a.kind = 'reply'
+			  AND a.status = ?
+			  AND COALESCE(w.lease_by, '') = ?
+			ORDER BY a.id
+			LIMIT 1
+		 )`,
+		domain.ActionBlocked,
+		strings.TrimSpace(reason),
+		now,
+		workItemID,
+		domain.ActionReady,
+		leaseToken,
+	)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"block approved reply after routing change",
+		).WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read blocked approved reply result",
+		).WithCause(err)
+	}
+	if affected == 1 {
+		return nil
+	}
+	if err := s.ValidateLease(workItemID, leaseToken); err != nil {
+		return err
+	}
+	return errs.NewValidationError(
+		errs.SubtypeFailedPrecondition,
+		"work item %d has no ready approved reply to block",
+		workItemID,
+	)
+}
+
+// SaveWorkReplyCandidate durably preserves one already validated reply before
+// the final owner-handled semantic check.
+func (s *Store) SaveWorkReplyCandidate(
+	workItemID int64,
+	leaseToken string,
+	decision domain.Decision,
+) error {
+	if workItemID <= 0 {
+		return errs.NewValidationError(errs.SubtypeInvalidArgument, "reply candidate requires work_item_id")
+	}
+	if strings.TrimSpace(leaseToken) == "" {
+		return errs.NewValidationError(errs.SubtypeInvalidArgument, "reply candidate requires lease_token")
+	}
+	if decision.Kind != domain.DecisionReply || strings.TrimSpace(decision.ReplyText) == "" {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"reply candidate requires an exact validated reply decision",
+		)
+	}
+	data, err := json.Marshal(decision)
+	if err != nil {
+		return errs.NewInternalError(errs.SubtypeStorage, "encode work reply candidate").WithCause(err)
+	}
+	sum := sha256.Sum256(data)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.Exec(
+		`INSERT INTO work_reply_candidates(
+			work_item_id, decision_json, digest, status, hold_reason, created_at, updated_at
+		)
+		SELECT id, ?, ?, ?, '', ?, ?
+		FROM work_items
+		WHERE id = ? AND status = ? AND lease_by = ?
+		ON CONFLICT(work_item_id) DO UPDATE SET
+			decision_json = excluded.decision_json,
+			digest = excluded.digest,
+			status = excluded.status,
+			hold_reason = '',
+			updated_at = excluded.updated_at`,
+		string(data),
+		fmt.Sprintf("sha256:%x", sum[:]),
+		domain.ReplyCandidatePending,
+		now,
+		now,
+		workItemID,
+		domain.StatusProcessing,
+		leaseToken,
+	)
+	if err != nil {
+		return errs.NewInternalError(errs.SubtypeStorage, "save work reply candidate").WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return errs.NewInternalError(errs.SubtypeStorage, "read reply candidate save result").WithCause(err)
+	}
+	if affected != 1 {
+		return errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"reply candidate lease is no longer current",
+		)
+	}
+	return nil
+}
+
+// ReadyWorkReplyCandidate returns one pending or held unsent reply.
+func (s *Store) ReadyWorkReplyCandidate(workItemID int64) (domain.WorkReplyCandidate, bool, error) {
+	var candidate domain.WorkReplyCandidate
+	var decisionJSON, status, createdAt, updatedAt string
+	err := s.db.QueryRow(
+		`SELECT work_item_id, decision_json, digest, status, hold_reason, created_at, updated_at
+		 FROM work_reply_candidates
+		 WHERE work_item_id = ? AND status IN (?, ?)`,
+		workItemID,
+		domain.ReplyCandidatePending,
+		domain.ReplyCandidateHeld,
+	).Scan(
+		&candidate.WorkItemID,
+		&decisionJSON,
+		&candidate.Digest,
+		&status,
+		&candidate.HoldReason,
+		&createdAt,
+		&updatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.WorkReplyCandidate{}, false, nil
+	}
+	if err != nil {
+		return domain.WorkReplyCandidate{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read work reply candidate",
+		).WithCause(err)
+	}
+	sum := sha256.Sum256([]byte(decisionJSON))
+	if expected := fmt.Sprintf("sha256:%x", sum[:]); candidate.Digest != expected {
+		return domain.WorkReplyCandidate{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"work reply candidate digest mismatch",
+		)
+	}
+	if err := json.Unmarshal([]byte(decisionJSON), &candidate.Decision); err != nil {
+		return domain.WorkReplyCandidate{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"decode work reply candidate",
+		).WithCause(err)
+	}
+	candidate.Status = domain.ReplyCandidateStatus(status)
+	candidate.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	candidate.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	return candidate, true, nil
+}
+
+// HoldWorkReplyCandidate marks an unsent reply as waiting for semantic context.
+func (s *Store) HoldWorkReplyCandidate(workItemID int64, leaseToken, reason string) error {
+	return s.transitionWorkReplyCandidate(
+		workItemID,
+		leaseToken,
+		domain.ReplyCandidateHeld,
+		strings.TrimSpace(reason),
+		[]domain.ReplyCandidateStatus{domain.ReplyCandidatePending, domain.ReplyCandidateHeld},
+	)
+}
+
+// ConsumeWorkReplyCandidate closes a candidate after its idempotent reply path
+// has completed.
+func (s *Store) ConsumeWorkReplyCandidate(workItemID int64, leaseToken string) error {
+	return s.transitionWorkReplyCandidate(
+		workItemID,
+		leaseToken,
+		domain.ReplyCandidateConsumed,
+		"",
+		[]domain.ReplyCandidateStatus{domain.ReplyCandidatePending, domain.ReplyCandidateHeld},
+	)
+}
+
+// CancelWorkReplyCandidate closes a candidate that is no longer safe or needed.
+func (s *Store) CancelWorkReplyCandidate(workItemID int64, leaseToken, reason string) error {
+	return s.transitionWorkReplyCandidate(
+		workItemID,
+		leaseToken,
+		domain.ReplyCandidateCancelled,
+		strings.TrimSpace(reason),
+		[]domain.ReplyCandidateStatus{domain.ReplyCandidatePending, domain.ReplyCandidateHeld},
+	)
+}
+
+func (s *Store) transitionWorkReplyCandidate(
+	workItemID int64,
+	leaseToken string,
+	status domain.ReplyCandidateStatus,
+	reason string,
+	from []domain.ReplyCandidateStatus,
+) error {
+	if len(from) == 0 {
+		return errs.NewValidationError(errs.SubtypeInvalidArgument, "reply candidate transition requires source status")
+	}
+	if strings.TrimSpace(leaseToken) == "" {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"reply candidate transition requires lease_token",
+		).WithParam("lease_token")
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(from)), ",")
+	args := []any{status, reason, time.Now().UTC().Format(time.RFC3339Nano), workItemID}
+	for _, value := range from {
+		args = append(args, value)
+	}
+	args = append(args, workItemID, domain.StatusProcessing, leaseToken)
+	result, err := s.db.Exec(
+		`UPDATE work_reply_candidates
+		 SET status = ?, hold_reason = ?, updated_at = ?
+		 WHERE work_item_id = ? AND status IN (`+placeholders+`)
+		   AND EXISTS (
+		       SELECT 1 FROM work_items
+		       WHERE id = ? AND status = ? AND lease_by = ?
+		   )`,
+		args...,
+	)
+	if err != nil {
+		return errs.NewInternalError(errs.SubtypeStorage, "transition work reply candidate").WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return errs.NewInternalError(errs.SubtypeStorage, "read reply candidate transition result").WithCause(err)
+	}
+	if affected != 1 {
+		return errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"work reply candidate is no longer active",
+		)
+	}
+	return nil
 }
 
 func shellActionKey(dedupKey, command, cwd string) string {
@@ -2201,10 +3150,10 @@ func (s *Store) EnqueueWorkItem(item domain.WorkItem) (bool, error) {
 		res, err := s.db.ExecContext(context.Background(),
 			`INSERT OR IGNORE INTO work_items(
 				dedup_key, status, work_kind, priority, duplicate_of, session_id,
-				event_json, created_at, updated_at
-			 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				resource_evidence_id, event_json, created_at, updated_at
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			item.DedupKey, domain.StatusIgnored, domain.WorkKindGeneric, domain.PriorityBackground,
-			duplicateOf, s.session.ID, string(data), now, now)
+			duplicateOf, s.session.ID, nullInt64(item.ResourceEvidenceID), string(data), now, now)
 		if err != nil {
 			return false, errs.NewInternalError(errs.SubtypeStorage, "enqueue duplicate work item").WithCause(err)
 		}
@@ -2221,11 +3170,11 @@ func (s *Store) EnqueueWorkItem(item domain.WorkItem) (bool, error) {
 	}
 	res, err := s.db.ExecContext(context.Background(),
 		`INSERT OR IGNORE INTO work_items(
-			dedup_key, status, work_kind, priority, session_id, event_json,
+			dedup_key, status, work_kind, priority, session_id, resource_evidence_id, event_json,
 			created_at, updated_at
-		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		item.DedupKey, item.Status, item.WorkKind, item.Priority, s.session.ID,
-		string(data), now, now)
+		nullInt64(item.ResourceEvidenceID), string(data), now, now)
 	if err != nil {
 		return false, errs.NewInternalError(errs.SubtypeStorage, "enqueue work item").WithCause(err)
 	}
@@ -2386,11 +3335,22 @@ func (s *Store) ClaimNextForLane(worker string, lane domain.SchedulerLane) (doma
 	now := time.Now().UTC()
 	nowRaw := now.Format(time.RFC3339Nano)
 	laneClause := ""
-	args := []any{domain.StatusReceived, domain.StatusReady, domain.StatusRetryWait, nowRaw}
+	args := []any{
+		domain.StatusReceived,
+		domain.StatusReady,
+		domain.StatusRetryWait,
+		domain.StatusWaitingUser,
+		nowRaw,
+	}
 	switch lane {
 	case domain.SchedulerLaneInteractive:
-		laneClause = ` AND work_kind IN (?, ?)`
-		args = append(args, domain.WorkKindFastPath, domain.WorkKindSimpleQuestion)
+		laneClause = ` AND work_kind IN (?, ?, ?)`
+		args = append(
+			args,
+			domain.WorkKindFastPath,
+			domain.WorkKindOwnerControl,
+			domain.WorkKindSimpleQuestion,
+		)
 	case domain.SchedulerLaneForeground:
 		laneClause = ` AND work_kind <> ?`
 		args = append(args, domain.WorkKindCodingGoal)
@@ -2399,10 +3359,8 @@ func (s *Store) ClaimNextForLane(worker string, lane domain.SchedulerLane) (doma
 		args = append(args, domain.WorkKindCodingGoal)
 	}
 	query := workItemSelect + `
-		 WHERE (
-			status IN (?, ?)
-		    OR (status = ? AND (next_attempt_at IS NULL OR next_attempt_at = '' OR next_attempt_at <= ?))
-		 )` + laneClause + `
+		 WHERE status IN (?, ?, ?, ?)
+		   AND (next_attempt_at IS NULL OR next_attempt_at = '' OR next_attempt_at <= ?)` + laneClause + `
 		 ORDER BY priority DESC, id
 		 LIMIT 1`
 	row := tx.QueryRowContext(context.Background(),
@@ -2416,8 +3374,9 @@ func (s *Store) ClaimNextForLane(worker string, lane domain.SchedulerLane) (doma
 	}
 	res, err := tx.ExecContext(context.Background(),
 		`UPDATE work_items SET status = ?, lease_by = ?, lease_time = ?, updated_at = ?
-		 WHERE id = ? AND status IN (?, ?, ?)`,
-		domain.StatusProcessing, leaseToken, nowRaw, nowRaw, item.ID, domain.StatusReceived, domain.StatusReady, domain.StatusRetryWait)
+		 WHERE id = ? AND status IN (?, ?, ?, ?)`,
+		domain.StatusProcessing, leaseToken, nowRaw, nowRaw, item.ID,
+		domain.StatusReceived, domain.StatusReady, domain.StatusRetryWait, domain.StatusWaitingUser)
 	if err != nil {
 		return domain.WorkItem{}, false, errs.NewInternalError(errs.SubtypeStorage, "lease work item").WithCause(err)
 	}
@@ -2434,7 +3393,37 @@ func (s *Store) ClaimNextForLane(worker string, lane domain.SchedulerLane) (doma
 	item.Status = domain.StatusProcessing
 	item.LeaseBy = leaseToken
 	item.LeaseTime = now
+	if err := s.hydrateDelegatedInvestigationWorkItem(&item); err != nil {
+		_ = s.MarkRetryClaim(item.ID, item.LeaseBy, err.Error(), time.Second)
+		return domain.WorkItem{}, false, err
+	}
 	return item, true, nil
+}
+
+func (s *Store) hydrateDelegatedInvestigationWorkItem(
+	item *domain.WorkItem,
+) error {
+	investigation, ok, err := s.GetDelegatedInvestigation(item.ID)
+	if err != nil || !ok {
+		return err
+	}
+	switch investigation.Status {
+	case domain.InvestigationPendingProgress,
+		domain.InvestigationInvestigating,
+		domain.InvestigationFinalizing:
+	default:
+		return nil
+	}
+	item.TaskSummary = investigation.TaskSummary
+	item.TaskClass = investigation.TaskClass
+	item.ContextCutoff = investigation.ContextCutoff
+	item.ContextDigest = investigation.ContextDigest
+	item.ResolvedContext = append(
+		[]domain.NormalizedEvent(nil),
+		investigation.ContextMessages...,
+	)
+	item.InvestigationActive = true
+	return nil
 }
 
 // RequeueExpiredLeases moves expired processing items back to received.
@@ -2870,19 +3859,815 @@ func (s *Store) ListWorkItems() ([]domain.WorkItem, error) {
 	return out, nil
 }
 
+// ListPendingDelegatedWork returns only active direct/private delegated targets
+// from one exact chat for multi-target semantic matching.
+func (s *Store) ListPendingDelegatedWork(chatID string) ([]domain.WorkItem, error) {
+	if strings.TrimSpace(chatID) == "" {
+		return nil, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"chat_id is required",
+		).WithParam("chat_id")
+	}
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		workItemSelect+` WHERE status IN (?, ?) AND work_kind = ? ORDER BY id`,
+		domain.StatusWaitingUser,
+		domain.StatusProcessing,
+		domain.WorkKindDirectMention,
+	)
+	if err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"list pending delegated work",
+		).WithCause(err)
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+	var out []domain.WorkItem
+	for rows.Next() {
+		item, scanErr := scanWorkItem(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if item.Event.ChatID == chatID {
+			out = append(out, item)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"iterate pending delegated work",
+		).WithCause(err)
+	}
+	return out, nil
+}
+
+// RecordOwnerReplyResolution appends one immutable semantic-resolution audit.
+func (s *Store) RecordOwnerReplyResolution(
+	workItemID int64,
+	resolution replymatch.Resolution,
+) error {
+	matchedJSON, err := json.Marshal(resolution.MatchedOwnerMessageIDs)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"encode matched owner messages",
+		).WithCause(err)
+	}
+	ownerAckReactionJSON := ""
+	if resolution.OwnerAckReaction != nil {
+		encoded, err := json.Marshal(resolution.OwnerAckReaction)
+		if err != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"encode owner ack reaction",
+			).WithCause(err)
+		}
+		ownerAckReactionJSON = string(encoded)
+	}
+	if resolution.ContextCutoff.IsZero() {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"semantic resolution context cutoff is required",
+		).WithParam("context_cutoff")
+	}
+	_, err = s.db.ExecContext(
+		context.Background(),
+		`INSERT INTO owner_reply_resolutions(
+			work_item_id, target_message_id, result,
+			matched_owner_message_ids_json, confidence, reason,
+			target_intent, response_obligation_quote, owner_ack_reaction_json,
+			task_summary, task_class, classification_confidence,
+			requires_progress, context_cutoff, evaluated_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		workItemID,
+		resolution.TargetMessageID,
+		resolution.Result,
+		string(matchedJSON),
+		resolution.Confidence,
+		resolution.Reason,
+		resolution.TargetIntent,
+		resolution.ResponseObligationQuote,
+		ownerAckReactionJSON,
+		resolution.TaskSummary,
+		resolution.TaskClass,
+		resolution.ClassificationConfidence,
+		resolution.RequiresProgress,
+		resolution.ContextCutoff.UTC().Format(time.RFC3339Nano),
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"record semantic owner-reply resolution",
+		).WithCause(err)
+	}
+	return nil
+}
+
+// ListOwnerReplyResolutions returns immutable semantic audits oldest first.
+func (s *Store) ListOwnerReplyResolutions(
+	workItemID int64,
+) ([]replymatch.Resolution, error) {
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		`SELECT target_message_id, result, matched_owner_message_ids_json,
+		        confidence, reason, target_intent, response_obligation_quote,
+		        owner_ack_reaction_json, task_summary, task_class,
+		        classification_confidence, requires_progress, context_cutoff
+		 FROM owner_reply_resolutions
+		 WHERE work_item_id = ?
+		 ORDER BY evaluated_at, id`,
+		workItemID,
+	)
+	if err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"list semantic owner-reply resolutions",
+		).WithCause(err)
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+	var out []replymatch.Resolution
+	for rows.Next() {
+		var resolution replymatch.Resolution
+		var resultRaw, matchedRaw, ownerAckReactionRaw, taskClassRaw, cutoffRaw string
+		if err := rows.Scan(
+			&resolution.TargetMessageID,
+			&resultRaw,
+			&matchedRaw,
+			&resolution.Confidence,
+			&resolution.Reason,
+			&resolution.TargetIntent,
+			&resolution.ResponseObligationQuote,
+			&ownerAckReactionRaw,
+			&resolution.TaskSummary,
+			&taskClassRaw,
+			&resolution.ClassificationConfidence,
+			&resolution.RequiresProgress,
+			&cutoffRaw,
+		); err != nil {
+			return nil, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"scan semantic owner-reply resolution",
+			).WithCause(err)
+		}
+		resolution.Result = replymatch.Result(resultRaw)
+		resolution.TaskClass = domain.TaskClass(taskClassRaw)
+		if err := json.Unmarshal(
+			[]byte(matchedRaw),
+			&resolution.MatchedOwnerMessageIDs,
+		); err != nil {
+			return nil, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"decode matched owner messages",
+			).WithCause(err)
+		}
+		if strings.TrimSpace(ownerAckReactionRaw) != "" {
+			var reaction replymatch.OwnerAckReaction
+			if err := json.Unmarshal(
+				[]byte(ownerAckReactionRaw),
+				&reaction,
+			); err != nil {
+				return nil, errs.NewInternalError(
+					errs.SubtypeStorage,
+					"decode owner ack reaction",
+				).WithCause(err)
+			}
+			resolution.OwnerAckReaction = &reaction
+		}
+		resolution.ContextCutoff, _ = time.Parse(time.RFC3339Nano, cutoffRaw)
+		out = append(out, resolution)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"iterate semantic owner-reply resolutions",
+		).WithCause(err)
+	}
+	return out, nil
+}
+
+// BeginDelegatedInvestigation creates one idempotent resumable investigation.
+func (s *Store) BeginDelegatedInvestigation(
+	plan domain.DelegatedInvestigation,
+) (domain.DelegatedInvestigation, bool, error) {
+	if plan.WorkItemID <= 0 {
+		return domain.DelegatedInvestigation{}, false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"delegated investigation requires work_item_id",
+		).WithParam("work_item_id")
+	}
+	if strings.TrimSpace(plan.TaskSummary) == "" {
+		return domain.DelegatedInvestigation{}, false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"delegated investigation requires task_summary",
+		).WithParam("task_summary")
+	}
+	switch plan.TaskClass {
+	case domain.TaskClassInvestigation, domain.TaskClassCoding:
+	default:
+		return domain.DelegatedInvestigation{}, false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"delegated investigation requires investigation or coding task_class",
+		).WithParam("task_class")
+	}
+	if plan.ContextCutoff.IsZero() || strings.TrimSpace(plan.ContextDigest) == "" {
+		return domain.DelegatedInvestigation{}, false, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"delegated investigation requires context cutoff and digest",
+		)
+	}
+	if plan.Status == "" {
+		plan.Status = domain.InvestigationPendingProgress
+	}
+	contextJSON, err := json.Marshal(plan.ContextMessages)
+	if err != nil {
+		return domain.DelegatedInvestigation{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"encode delegated investigation context",
+		).WithCause(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(
+		context.Background(),
+		`INSERT OR IGNORE INTO delegated_investigations(
+			work_item_id, task_summary, task_class, context_cutoff,
+			context_digest, status, context_messages_json, created_at, updated_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		plan.WorkItemID,
+		strings.TrimSpace(plan.TaskSummary),
+		plan.TaskClass,
+		plan.ContextCutoff.UTC().Format(time.RFC3339Nano),
+		strings.TrimSpace(plan.ContextDigest),
+		plan.Status,
+		string(contextJSON),
+		now,
+		now,
+	)
+	if err != nil {
+		return domain.DelegatedInvestigation{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin delegated investigation",
+		).WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.DelegatedInvestigation{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read delegated investigation insert result",
+		).WithCause(err)
+	}
+	investigation, ok, err := s.GetDelegatedInvestigation(plan.WorkItemID)
+	if err == nil && ok &&
+		(investigation.TaskSummary != strings.TrimSpace(plan.TaskSummary) ||
+			investigation.TaskClass != plan.TaskClass ||
+			!investigation.ContextCutoff.Equal(plan.ContextCutoff.UTC()) ||
+			investigation.ContextDigest != strings.TrimSpace(plan.ContextDigest)) {
+		return domain.DelegatedInvestigation{}, false, errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"delegated investigation context changed after it was persisted",
+		)
+	}
+	return investigation, affected == 1 && ok, err
+}
+
+// BeginInvestigationMessageAction creates or reads one staged-message action.
+// Existing executing actions are returned without being replayed because their
+// external result is uncertain.
+func (s *Store) BeginInvestigationMessageAction(
+	ctx context.Context,
+	workItemID int64,
+	stage string,
+	text string,
+) (domain.Action, bool, string, error) {
+	if workItemID <= 0 || strings.TrimSpace(text) == "" {
+		return domain.Action{}, false, "", errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"investigation message action requires work item and text",
+		)
+	}
+	var suffix, kind string
+	switch stage {
+	case "owner_notice":
+		suffix = "investigation-owner-notice"
+		kind = "investigation_owner_notice"
+	case "progress":
+		suffix = "investigation-progress"
+		kind = "investigation_progress"
+	default:
+		return domain.Action{}, false, "", errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"unsupported investigation message stage %q",
+			stage,
+		).WithParam("stage")
+	}
+	var dedupKey string
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT dedup_key FROM work_items WHERE id = ?`,
+		workItemID,
+	).Scan(&dedupKey); err != nil {
+		return domain.Action{}, false, "", errs.NewInternalError(
+			errs.SubtypeStorage,
+			"locate investigation work item",
+		).WithCause(err)
+	}
+	key := dedupKey + ":" + suffix
+	requestJSON, err := json.Marshal(map[string]string{"text": text})
+	if err != nil {
+		return domain.Action{}, false, "", errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"encode investigation message action",
+		).WithCause(err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.Action{}, false, "", errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin investigation message action",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	action := domain.Action{Kind: kind, Idempotency: key}
+	var responseJSON string
+	err = tx.QueryRowContext(
+		ctx,
+		`SELECT id, status, COALESCE(response_json, '')
+		 FROM action_attempts WHERE idempotency_key = ?`,
+		key,
+	).Scan(&action.ID, &action.Status, &responseJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		result, insertErr := tx.ExecContext(
+			ctx,
+			`INSERT INTO action_attempts(
+				work_item_id, kind, idempotency_key, status, request_json,
+				created_at, updated_at
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			workItemID,
+			kind,
+			key,
+			domain.ActionExecuting,
+			string(requestJSON),
+			now,
+			now,
+		)
+		if insertErr != nil {
+			return domain.Action{}, false, "", errs.NewInternalError(
+				errs.SubtypeStorage,
+				"insert investigation message action",
+			).WithCause(insertErr)
+		}
+		action.ID, err = result.LastInsertId()
+		if err != nil {
+			return domain.Action{}, false, "", errs.NewInternalError(
+				errs.SubtypeStorage,
+				"read investigation message action id",
+			).WithCause(err)
+		}
+		action.Status = domain.ActionExecuting
+		if stage == "progress" {
+			if _, err := tx.ExecContext(
+				ctx,
+				`UPDATE delegated_investigations
+				 SET progress_action_id = ?, updated_at = ?
+				 WHERE work_item_id = ?`,
+				action.ID,
+				now,
+				workItemID,
+			); err != nil {
+				return domain.Action{}, false, "", errs.NewInternalError(
+					errs.SubtypeStorage,
+					"link investigation progress action",
+				).WithCause(err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return domain.Action{}, false, "", errs.NewInternalError(
+				errs.SubtypeStorage,
+				"commit investigation message action",
+			).WithCause(err)
+		}
+		return action, true, "", nil
+	}
+	if err != nil {
+		return domain.Action{}, false, "", errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read investigation message action",
+		).WithCause(err)
+	}
+	var response map[string]string
+	if responseJSON != "" {
+		if err := json.Unmarshal([]byte(responseJSON), &response); err != nil {
+			return domain.Action{}, false, "", errs.NewInternalError(
+				errs.SubtypeStorage,
+				"decode investigation message action response",
+			).WithCause(err)
+		}
+	}
+	if action.Status == domain.ActionBlocked {
+		if _, err := tx.ExecContext(
+			ctx,
+			`UPDATE action_attempts
+			 SET status = ?, request_json = ?, error = NULL, updated_at = ?
+			 WHERE id = ?`,
+			domain.ActionExecuting,
+			string(requestJSON),
+			time.Now().UTC().Format(time.RFC3339Nano),
+			action.ID,
+		); err != nil {
+			return domain.Action{}, false, "", errs.NewInternalError(
+				errs.SubtypeStorage,
+				"resume known-failed investigation message action",
+			).WithCause(err)
+		}
+		action.Status = domain.ActionExecuting
+		if err := tx.Commit(); err != nil {
+			return domain.Action{}, false, "", errs.NewInternalError(
+				errs.SubtypeStorage,
+				"commit resumed investigation message action",
+			).WithCause(err)
+		}
+		return action, true, "", nil
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Action{}, false, "", errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit existing investigation message action",
+		).WithCause(err)
+	}
+	return action, false, response["message_id"], nil
+}
+
+// CompleteInvestigationMessageAction records a staged message result.
+func (s *Store) CompleteInvestigationMessageAction(
+	ctx context.Context,
+	actionID int64,
+	messageID string,
+	actionErr string,
+) error {
+	return s.CompleteReplyAction(ctx, actionID, messageID, actionErr)
+}
+
+// GetDelegatedInvestigation returns one investigation by work item.
+func (s *Store) GetDelegatedInvestigation(
+	workItemID int64,
+) (domain.DelegatedInvestigation, bool, error) {
+	var investigation domain.DelegatedInvestigation
+	var taskClass, status, cutoffRaw, contextRaw, createdRaw, updatedRaw string
+	var progressActionID, finalActionID sql.NullInt64
+	var lastError sql.NullString
+	err := s.db.QueryRowContext(
+		context.Background(),
+		`SELECT id, work_item_id, task_summary, task_class, context_cutoff,
+		        context_digest, status, progress_action_id, final_action_id,
+		        last_error, context_messages_json, created_at, updated_at
+		 FROM delegated_investigations WHERE work_item_id = ?`,
+		workItemID,
+	).Scan(
+		&investigation.ID,
+		&investigation.WorkItemID,
+		&investigation.TaskSummary,
+		&taskClass,
+		&cutoffRaw,
+		&investigation.ContextDigest,
+		&status,
+		&progressActionID,
+		&finalActionID,
+		&lastError,
+		&contextRaw,
+		&createdRaw,
+		&updatedRaw,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.DelegatedInvestigation{}, false, nil
+	}
+	if err != nil {
+		return domain.DelegatedInvestigation{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"get delegated investigation",
+		).WithCause(err)
+	}
+	investigation.TaskClass = domain.TaskClass(taskClass)
+	investigation.Status = domain.DelegatedInvestigationStatus(status)
+	investigation.ContextCutoff, _ = time.Parse(time.RFC3339Nano, cutoffRaw)
+	investigation.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdRaw)
+	investigation.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedRaw)
+	if progressActionID.Valid {
+		investigation.ProgressActionID = progressActionID.Int64
+	}
+	if finalActionID.Valid {
+		investigation.FinalActionID = finalActionID.Int64
+	}
+	if lastError.Valid {
+		investigation.LastError = lastError.String
+	}
+	if err := json.Unmarshal(
+		[]byte(contextRaw),
+		&investigation.ContextMessages,
+	); err != nil {
+		return domain.DelegatedInvestigation{}, false, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"decode delegated investigation context",
+		).WithCause(err)
+	}
+	markExpiredInvestigationImages(investigation.ContextMessages)
+	return investigation, true, nil
+}
+
+func (s *Store) ListDelegatedInvestigationHistory(
+	ctx context.Context,
+	workItemID int64,
+) ([]domain.ArchivedDelegatedInvestigation, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT investigation_id, work_item_id, task_summary, task_class,
+		        context_cutoff, context_digest, status, progress_action_id,
+		        final_action_id, last_error, context_messages_json,
+		        created_at, updated_at, archived_reason, archived_at
+		 FROM delegated_investigation_history
+		 WHERE work_item_id = ?
+		 ORDER BY archived_at DESC, id DESC`,
+		workItemID,
+	)
+	if err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"list delegated investigation history",
+		).WithCause(err)
+	}
+	defer rows.Close() //nolint:errcheck
+	var history []domain.ArchivedDelegatedInvestigation
+	for rows.Next() {
+		var archived domain.ArchivedDelegatedInvestigation
+		var taskClass, status, cutoffRaw, contextRaw, createdRaw, updatedRaw, archivedRaw string
+		var progressActionID, finalActionID sql.NullInt64
+		var lastError sql.NullString
+		if err := rows.Scan(
+			&archived.ID,
+			&archived.WorkItemID,
+			&archived.TaskSummary,
+			&taskClass,
+			&cutoffRaw,
+			&archived.ContextDigest,
+			&status,
+			&progressActionID,
+			&finalActionID,
+			&lastError,
+			&contextRaw,
+			&createdRaw,
+			&updatedRaw,
+			&archived.ArchivedReason,
+			&archivedRaw,
+		); err != nil {
+			return nil, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"scan delegated investigation history",
+			).WithCause(err)
+		}
+		archived.TaskClass = domain.TaskClass(taskClass)
+		archived.Status = domain.DelegatedInvestigationStatus(status)
+		archived.ContextCutoff, _ = time.Parse(time.RFC3339Nano, cutoffRaw)
+		archived.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdRaw)
+		archived.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedRaw)
+		archived.ArchivedAt, _ = time.Parse(time.RFC3339Nano, archivedRaw)
+		if progressActionID.Valid {
+			archived.ProgressActionID = progressActionID.Int64
+		}
+		if finalActionID.Valid {
+			archived.FinalActionID = finalActionID.Int64
+		}
+		if lastError.Valid {
+			archived.LastError = lastError.String
+		}
+		if err := json.Unmarshal([]byte(contextRaw), &archived.ContextMessages); err != nil {
+			return nil, errs.NewInternalError(
+				errs.SubtypeStorage,
+				"decode delegated investigation history context",
+			).WithCause(err)
+		}
+		markExpiredInvestigationImages(archived.ContextMessages)
+		history = append(history, archived)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errs.NewInternalError(
+			errs.SubtypeStorage,
+			"iterate delegated investigation history",
+		).WithCause(err)
+	}
+	return history, nil
+}
+
+func markExpiredInvestigationImages(messages []domain.NormalizedEvent) {
+	for messageIndex := range messages {
+		for attachmentIndex := range messages[messageIndex].Attachments {
+			attachment := &messages[messageIndex].Attachments[attachmentIndex]
+			if attachment.Type != "image" || attachment.DataURL != "" {
+				continue
+			}
+			if attachment.Readable {
+				attachment.Readable = false
+				attachment.UnreadableReason = "image_bytes_not_persisted"
+			}
+		}
+	}
+}
+
+// TransitionDelegatedInvestigation applies one checked state transition.
+func (s *Store) TransitionDelegatedInvestigation(
+	workItemID int64,
+	from domain.DelegatedInvestigationStatus,
+	to domain.DelegatedInvestigationStatus,
+	lastError string,
+) error {
+	if !validInvestigationTransition(from, to) {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"invalid delegated investigation transition %s -> %s",
+			from,
+			to,
+		)
+	}
+	result, err := s.db.ExecContext(
+		context.Background(),
+		`UPDATE delegated_investigations
+		 SET status = ?, last_error = ?, updated_at = ?
+		 WHERE work_item_id = ? AND status = ?`,
+		to,
+		strings.TrimSpace(lastError),
+		time.Now().UTC().Format(time.RFC3339Nano),
+		workItemID,
+		from,
+	)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"transition delegated investigation",
+		).WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read delegated investigation transition result",
+		).WithCause(err)
+	}
+	if affected != 1 {
+		return errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"delegated investigation state is no longer %s",
+			from,
+		)
+	}
+	return nil
+}
+
+// MarkDelegatedInvestigationFinalizing idempotently enters finalization.
+func (s *Store) MarkDelegatedInvestigationFinalizing(workItemID int64) error {
+	investigation, ok, err := s.GetDelegatedInvestigation(workItemID)
+	if err != nil || !ok {
+		return err
+	}
+	switch investigation.Status {
+	case domain.InvestigationFinalizing, domain.InvestigationCompleted:
+		return nil
+	case domain.InvestigationInvestigating:
+		return s.TransitionDelegatedInvestigation(
+			workItemID,
+			domain.InvestigationInvestigating,
+			domain.InvestigationFinalizing,
+			"",
+		)
+	default:
+		return errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"delegated investigation cannot finalize from %s",
+			investigation.Status,
+		)
+	}
+}
+
+// CompleteDelegatedInvestigation links a completed final reply when present
+// and terminalizes the durable investigation before the work item is closed.
+func (s *Store) CompleteDelegatedInvestigation(workItemID int64) error {
+	investigation, ok, err := s.GetDelegatedInvestigation(workItemID)
+	if err != nil || !ok {
+		return err
+	}
+	if investigation.Status == domain.InvestigationCompleted {
+		return nil
+	}
+	if investigation.Status != domain.InvestigationFinalizing {
+		return errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"delegated investigation cannot complete from %s",
+			investigation.Status,
+		)
+	}
+	var finalActionID sql.NullInt64
+	err = s.db.QueryRowContext(
+		context.Background(),
+		`SELECT a.id
+		 FROM action_attempts a
+		 JOIN work_items w ON w.id = a.work_item_id
+		 WHERE w.id = ?
+		   AND a.idempotency_key = w.dedup_key || ':reply'
+		   AND a.status = ?
+		 ORDER BY a.id DESC
+		 LIMIT 1`,
+		workItemID,
+		domain.ActionCompleted,
+	).Scan(&finalActionID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"locate delegated investigation final action",
+		).WithCause(err)
+	}
+	result, err := s.db.ExecContext(
+		context.Background(),
+		`UPDATE delegated_investigations
+		 SET status = ?, final_action_id = ?, last_error = '', updated_at = ?
+		 WHERE work_item_id = ? AND status = ?`,
+		domain.InvestigationCompleted,
+		finalActionID,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		workItemID,
+		domain.InvestigationFinalizing,
+	)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"complete delegated investigation",
+		).WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read delegated investigation completion result",
+		).WithCause(err)
+	}
+	if affected != 1 {
+		return errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"delegated investigation finalization changed concurrently",
+		)
+	}
+	return nil
+}
+
+func validInvestigationTransition(
+	from domain.DelegatedInvestigationStatus,
+	to domain.DelegatedInvestigationStatus,
+) bool {
+	switch from {
+	case domain.InvestigationPendingProgress:
+		return to == domain.InvestigationInvestigating ||
+			to == domain.InvestigationBlocked
+	case domain.InvestigationInvestigating:
+		return to == domain.InvestigationFinalizing ||
+			to == domain.InvestigationBlocked
+	case domain.InvestigationFinalizing:
+		return to == domain.InvestigationCompleted ||
+			to == domain.InvestigationBlocked
+	default:
+		return false
+	}
+}
+
 // Complete marks a work item completed, ignored, or cancelled according to its
 // decision and persists the decision snapshot.
 func (s *Store) Complete(id int64, decision domain.Decision) error {
-	return s.completeClaim(id, "", decision)
+	return s.completeClaim(id, "", decision, false)
 }
 
 // CompleteClaim atomically completes work and its CodingGoal only if the exact
 // lease token still owns the item.
 func (s *Store) CompleteClaim(id int64, leaseToken string, decision domain.Decision) error {
-	return s.completeClaim(id, leaseToken, decision)
+	return s.completeClaim(id, leaseToken, decision, false)
 }
 
-func (s *Store) completeClaim(id int64, leaseToken string, decision domain.Decision) error {
+// CompleteReplyCandidateClaim atomically completes the exact leased work and
+// consumes its validated reply candidate after the external reply path has
+// returned a durable completed result.
+func (s *Store) CompleteReplyCandidateClaim(
+	id int64,
+	leaseToken string,
+	decision domain.Decision,
+) error {
+	return s.completeClaim(id, leaseToken, decision, true)
+}
+
+func (s *Store) completeClaim(
+	id int64,
+	leaseToken string,
+	decision domain.Decision,
+	consumeCandidate bool,
+) error {
 	status := domain.StatusCompleted
 	switch decision.Kind {
 	case domain.DecisionIgnore:
@@ -2928,6 +4713,38 @@ func (s *Store) completeClaim(id int64, leaseToken string, decision domain.Decis
 	if affected == 0 {
 		return errs.NewValidationError(errs.SubtypeFailedPrecondition, "work item %d was not found", id)
 	}
+	if consumeCandidate {
+		candidateResult, err := tx.ExecContext(
+			context.Background(),
+			`UPDATE work_reply_candidates
+			 SET status = ?, hold_reason = '', updated_at = ?
+			 WHERE work_item_id = ? AND status IN (?, ?)`,
+			domain.ReplyCandidateConsumed,
+			time.Now().UTC().Format(time.RFC3339Nano),
+			id,
+			domain.ReplyCandidatePending,
+			domain.ReplyCandidateHeld,
+		)
+		if err != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"consume reply candidate while completing work",
+			).WithCause(err)
+		}
+		candidateAffected, err := candidateResult.RowsAffected()
+		if err != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"read reply candidate completion result",
+			).WithCause(err)
+		}
+		if candidateAffected != 1 {
+			return errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"work reply candidate is no longer active",
+			)
+		}
+	}
 	goalStatus := domain.CodingGoalCompleted
 	switch status {
 	case domain.StatusIgnored:
@@ -2958,6 +4775,311 @@ func (s *Store) MarkRetry(id int64, reason string) error {
 // MarkRetryClaim releases work only if the exact lease token still owns it.
 func (s *Store) MarkRetryClaim(id int64, leaseToken, reason string, minimumDelay time.Duration) error {
 	return s.markRetryAfter(id, leaseToken, reason, minimumDelay)
+}
+
+// MarkDeadLetter records a deterministic permanent failure without retrying.
+func (s *Store) MarkDeadLetter(id int64, reason string) error {
+	return s.markDeadLetter(id, "", reason)
+}
+
+// MarkDeadLetterClaim records a permanent failure only for the exact lease.
+func (s *Store) MarkDeadLetterClaim(id int64, leaseToken, reason string) error {
+	if strings.TrimSpace(leaseToken) == "" {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"dead-letter lease token is required",
+		).WithParam("lease_token")
+	}
+	return s.markDeadLetter(id, leaseToken, reason)
+}
+
+func (s *Store) markDeadLetter(id int64, leaseToken, reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"dead-letter reason is required",
+		).WithParam("reason")
+	}
+	data, err := json.Marshal(domain.Decision{
+		Kind:   domain.DecisionRecord,
+		Reason: reason,
+	})
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"marshal dead-letter decision",
+		).WithCause(err)
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin permanent dead-letter transition",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	query := `SELECT retry_count FROM work_items WHERE id = ?`
+	args := []any{id}
+	if leaseToken != "" {
+		query += ` AND status = ? AND lease_by = ?`
+		args = append(args, domain.StatusProcessing, leaseToken)
+	}
+	var retryCount int
+	if err := tx.QueryRow(query, args...).Scan(&retryCount); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"work item lease was lost",
+			)
+		}
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read permanent dead-letter work",
+		).WithCause(err)
+	}
+	retryCount++
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	update := `UPDATE work_items
+		SET status = ?, decision_json = ?, lease_by = NULL, lease_time = NULL,
+		    retry_count = ?, next_attempt_at = NULL, updated_at = ?
+		WHERE id = ?`
+	updateArgs := []any{
+		domain.StatusDeadLetter,
+		string(data),
+		retryCount,
+		now,
+		id,
+	}
+	if leaseToken != "" {
+		update += ` AND status = ? AND lease_by = ?`
+		updateArgs = append(updateArgs, domain.StatusProcessing, leaseToken)
+	}
+	result, err := tx.Exec(update, updateArgs...)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"move permanent failure to dead letter",
+		).WithCause(err)
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"work item lease was lost",
+		)
+	}
+	metadata, err := json.Marshal(map[string]any{
+		"retry_count": retryCount,
+		"permanent":   true,
+	})
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"marshal permanent dead-letter metadata",
+		).WithCause(err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO dead_letters(work_item_id, reason, metadata_json, created_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(work_item_id) DO UPDATE SET reason = excluded.reason,
+		 metadata_json = excluded.metadata_json, created_at = excluded.created_at`,
+		id,
+		reason,
+		string(metadata),
+		now,
+	); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"record permanent dead-letter reason",
+		).WithCause(err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE coding_goals SET status = ?, updated_at = ? WHERE work_item_id = ?`,
+		domain.CodingGoalBlocked,
+		now,
+		id,
+	); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"block permanent dead-letter coding goal",
+		).WithCause(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit permanent dead-letter transition",
+		).WithCause(err)
+	}
+	return nil
+}
+
+// DeferWaitingUserClaim releases an exact processing lease back to the
+// semantic owner-reply waiting state.
+func (s *Store) DeferWaitingUserClaim(
+	id int64,
+	leaseToken string,
+	reason string,
+	delay time.Duration,
+) error {
+	if delay <= 0 {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"delegated reply retry delay must be positive",
+		).WithParam("delay")
+	}
+	now := time.Now().UTC()
+	decisionJSON, err := json.Marshal(domain.Decision{
+		Kind:   domain.DecisionRecord,
+		Reason: reason,
+	})
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"encode delegated reply defer reason",
+		).WithCause(err)
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"begin delegated reply defer",
+		).WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var ownerReplyRetryCount int
+	if err := tx.QueryRow(
+		`SELECT owner_reply_retry_count
+		 FROM work_items
+		 WHERE id = ? AND status = ? AND lease_by = ?`,
+		id,
+		domain.StatusProcessing,
+		leaseToken,
+	).Scan(&ownerReplyRetryCount); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"delegated reply lease is no longer current",
+			)
+		}
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read delegated reply retry count",
+		).WithCause(err)
+	}
+	ownerReplyRetryCount++
+	nowRaw := now.Format(time.RFC3339Nano)
+	if s.ownerReplyMaxRetries > 0 && ownerReplyRetryCount >= s.ownerReplyMaxRetries {
+		result, err := tx.Exec(
+			`UPDATE work_items
+			 SET status = ?, decision_json = ?, lease_by = NULL, lease_time = NULL,
+			     owner_reply_retry_count = ?, next_attempt_at = NULL, updated_at = ?
+			 WHERE id = ? AND status = ? AND lease_by = ?`,
+			domain.StatusDeadLetter,
+			string(decisionJSON),
+			ownerReplyRetryCount,
+			nowRaw,
+			id,
+			domain.StatusProcessing,
+			leaseToken,
+		)
+		if err != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"move deferred delegated reply to dead letter",
+			).WithCause(err)
+		}
+		if affected, _ := result.RowsAffected(); affected != 1 {
+			return errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"delegated reply lease is no longer current",
+			)
+		}
+		metadata, _ := json.Marshal(map[string]any{
+			"owner_reply_retry_count": ownerReplyRetryCount,
+			"source":                  "semantic_waiting_user",
+		})
+		if _, err := tx.Exec(
+			`INSERT INTO dead_letters(work_item_id, reason, metadata_json, created_at)
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT(work_item_id) DO UPDATE SET reason = excluded.reason,
+				metadata_json = excluded.metadata_json, created_at = excluded.created_at`,
+			id,
+			reason,
+			string(metadata),
+			nowRaw,
+		); err != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"record delegated reply dead-letter reason",
+			).WithCause(err)
+		}
+		if _, err := tx.Exec(
+			`UPDATE coding_goals SET status = ?, updated_at = ? WHERE work_item_id = ?`,
+			domain.CodingGoalBlocked,
+			nowRaw,
+			id,
+		); err != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"block deferred delegated coding goal",
+			).WithCause(err)
+		}
+		if err := requireOwnerResolutionNotificationTx(
+			tx,
+			id,
+			reason,
+			nowRaw,
+		); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"commit delegated reply dead-letter transition",
+			).WithCause(err)
+		}
+		return nil
+	}
+	result, err := tx.Exec(
+		`UPDATE work_items
+		 SET status = ?, decision_json = ?, lease_by = NULL, lease_time = NULL,
+		     owner_reply_retry_count = ?, next_attempt_at = ?, updated_at = ?
+		 WHERE id = ? AND status = ? AND lease_by = ?`,
+		domain.StatusWaitingUser,
+		string(decisionJSON),
+		ownerReplyRetryCount,
+		now.Add(delay).Format(time.RFC3339Nano),
+		nowRaw,
+		id,
+		domain.StatusProcessing,
+		leaseToken,
+	)
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"defer delegated reply",
+		).WithCause(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"read delegated reply defer result",
+		).WithCause(err)
+	}
+	if affected != 1 {
+		return errs.NewValidationError(
+			errs.SubtypeFailedPrecondition,
+			"delegated reply lease is no longer current",
+		)
+	}
+	if err := tx.Commit(); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"commit delegated reply defer",
+		).WithCause(err)
+	}
+	return nil
 }
 
 // MarkRetryAfter honors a provider retry window while preserving the bounded
@@ -3179,7 +5301,7 @@ type rowScanner interface {
 }
 
 const workItemSelect = `SELECT id, dedup_key, status, work_kind, priority,
-		duplicate_of, session_id, event_json, lease_by, lease_time, retry_count,
+		duplicate_of, session_id, COALESCE(resource_evidence_id, 0), event_json, lease_by, lease_time, retry_count,
 		next_attempt_at, created_at, updated_at
 	FROM work_items`
 
@@ -3189,7 +5311,7 @@ func scanWorkItem(row rowScanner) (domain.WorkItem, error) {
 	var sessionID, leaseBy, leaseTime, nextAttemptAt sql.NullString
 	var duplicateOf sql.NullInt64
 	if err := row.Scan(&item.ID, &item.DedupKey, &status, &workKind,
-		&item.Priority, &duplicateOf, &sessionID, &eventJSON, &leaseBy,
+		&item.Priority, &duplicateOf, &sessionID, &item.ResourceEvidenceID, &eventJSON, &leaseBy,
 		&leaseTime, &item.RetryCount, &nextAttemptAt, &createdAt, &updatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.WorkItem{}, err

@@ -128,15 +128,17 @@ func (a DecisionAgent) Decide(ctx context.Context, bundle agentcontext.Bundle) (
 // drive side effects.
 func ParseDecision(raw string) (domain.Decision, error) {
 	var payload struct {
-		Decision            string             `json:"decision"`
-		RelevanceConfidence float64            `json:"relevance_confidence"`
-		ReplyConfidence     *float64           `json:"reply_confidence"`
-		Risk                string             `json:"risk"`
-		EvidenceStatus      string             `json:"evidence_status"`
-		ReplyText           string             `json:"reply_text"`
-		OwnerAction         string             `json:"owner_action"`
-		Reason              string             `json:"reason"`
-		SourceRefs          []domain.SourceRef `json:"source_refs"`
+		Decision            string                  `json:"decision"`
+		RelevanceConfidence float64                 `json:"relevance_confidence"`
+		ReplyConfidence     *float64                `json:"reply_confidence"`
+		Risk                string                  `json:"risk"`
+		EvidenceStatus      string                  `json:"evidence_status"`
+		ReplyOutcome        string                  `json:"reply_outcome"`
+		Progress            domain.DecisionProgress `json:"progress"`
+		ReplyText           string                  `json:"reply_text"`
+		OwnerAction         string                  `json:"owner_action"`
+		Reason              string                  `json:"reason"`
+		SourceRefs          []domain.SourceRef      `json:"source_refs"`
 	}
 	rawJSON, err := extractFirstJSONObject(raw)
 	if err != nil {
@@ -170,6 +172,26 @@ func ParseDecision(raw string) (domain.Decision, error) {
 			payload.EvidenceStatus,
 		)
 	}
+	replyOutcome := domain.ReplyOutcome(payload.ReplyOutcome)
+	if replyOutcome == "" && (kind == domain.DecisionReply || kind == domain.DecisionRequestApproval) {
+		replyOutcome = domain.ReplyOutcomeComplete
+	}
+	switch replyOutcome {
+	case "":
+	case domain.ReplyOutcomeComplete, domain.ReplyOutcomePartial, domain.ReplyOutcomeClarification:
+	default:
+		return domain.Decision{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"invalid reply_outcome: %s",
+			payload.ReplyOutcome,
+		)
+	}
+	if replyOutcome != "" && kind != domain.DecisionReply && kind != domain.DecisionRequestApproval {
+		return domain.Decision{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"reply_outcome is only valid for reply or request_approval decisions",
+		)
+	}
 	if kind == domain.DecisionReply && payload.ReplyConfidence == nil {
 		return domain.Decision{}, errs.NewInternalError(
 			errs.SubtypeInvalidResponse,
@@ -200,11 +222,31 @@ func ParseDecision(raw string) (domain.Decision, error) {
 		Confidence:     confidence,
 		Risk:           risk,
 		EvidenceStatus: evidenceStatus,
+		ReplyOutcome:   replyOutcome,
+		Progress:       normalizeDecisionProgress(payload.Progress),
 		Reason:         payload.Reason,
 		ReplyText:      strings.TrimSpace(payload.ReplyText),
 		OwnerAction:    strings.TrimSpace(payload.OwnerAction),
 		Sources:        payload.SourceRefs,
 	}, nil
+}
+
+func normalizeDecisionProgress(progress domain.DecisionProgress) domain.DecisionProgress {
+	progress.CompletedChecks = nonEmptyTrimmedStrings(progress.CompletedChecks)
+	progress.InitialFinding = strings.TrimSpace(progress.InitialFinding)
+	progress.Unknowns = nonEmptyTrimmedStrings(progress.Unknowns)
+	progress.NextStep = strings.TrimSpace(progress.NextStep)
+	return progress
+}
+
+func nonEmptyTrimmedStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func extractFirstJSONObject(raw string) ([]byte, error) {

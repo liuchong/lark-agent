@@ -101,6 +101,24 @@ type ListRecentMessagesResult struct {
 	PageToken string
 }
 
+// SemanticReplyContextRequest asks for one bounded same-chat window that
+// includes the exact delegated target and messages observed after it.
+type SemanticReplyContextRequest struct {
+	ChatID          string
+	TargetMessageID string
+	Since           time.Time
+	MaxMessages     int
+}
+
+// SemanticReplyContext is the conservative input to semantic owner-answer
+// matching. Incomplete or withdrawn contexts must not authorize a reply.
+type SemanticReplyContext struct {
+	Messages      []Message
+	ContextCutoff time.Time
+	Incomplete    bool
+	Withdrawn     bool
+}
+
 // ContextMode describes how messages were selected around the target.
 type ContextMode = domain.ContextMode
 
@@ -112,15 +130,16 @@ const (
 
 // MessageContextRequest asks for the latest context around a message.
 type MessageContextRequest struct {
-	Mode             ContextMode
-	ChatID           string
-	MessageID        string
-	RootMessageID    string
-	ReplyToMessageID string
-	ThreadID         string
-	CreatedAt        time.Time
-	Limit            int
-	After            time.Time
+	Mode               ContextMode
+	ChatID             string
+	MessageID          string
+	RootMessageID      string
+	ReplyToMessageID   string
+	ThreadID           string
+	CreatedAt          time.Time
+	Limit              int
+	After              time.Time
+	IncludeAppMessages bool
 }
 
 // ContextSelection records the bounded relation-aware context decision.
@@ -143,17 +162,156 @@ type Message struct {
 	ReplyToMessageID  string
 	ThreadID          string
 	SenderOpenID      string
+	SenderDisplayName string
 	SenderType        string
 	MsgType           string
 	Content           string
+	ResourceURLs      []string
+	Attachments       []MessageAttachment
 	Mentions          []domain.Mention
 	CreateTime        string
 	UpdateTime        string
 }
 
+// MessageReaction is the typed subset of Lark reaction data used by the agent.
+type MessageReaction struct {
+	ReactionID     string
+	EmojiType      string
+	OperatorType   string
+	OperatorOpenID string
+}
+
+type OwnerAckReactionRequest struct {
+	MessageID   string
+	OwnerOpenID string
+	PageSize    int
+	MaxPages    int
+}
+
+type OwnerAckReactionResult struct {
+	Found    bool
+	Reaction MessageReaction
+}
+
+// MessageAttachment is a typed reference to message evidence that can be
+// fetched through the Lark resource API when the model needs it.
+type MessageAttachment struct {
+	Type             string
+	Key              string
+	MediaType        string
+	Data             []byte
+	Readable         bool
+	UnreadableReason string
+}
+
+type messageResourceCaller interface {
+	GetMessageResource(context.Context, MessageResourceRequest) (MessageResource, error)
+}
+
+// ImageHydrationLimits bounds ephemeral image evidence for one model request.
+type ImageHydrationLimits struct {
+	MaxImages     int
+	MaxImageBytes int64
+	MaxTotalBytes int64
+	As            Identity
+}
+
 // NewService creates an IM service.
 func NewService(caller Caller, ownerOpenID string) *Service {
 	return &Service{caller: caller, ownerOpenID: ownerOpenID}
+}
+
+// HydrateContextImages fetches image evidence serially and records an explicit
+// unreadable reason for every image that cannot be supplied to the model.
+func (s *Service) HydrateContextImages(
+	ctx context.Context,
+	messages []Message,
+	limits ImageHydrationLimits,
+) []Message {
+	out := append([]Message(nil), messages...)
+	if limits.MaxImages <= 0 || limits.MaxImages > 2 {
+		limits.MaxImages = 2
+	}
+	if limits.MaxImageBytes <= 0 || limits.MaxImageBytes > 1<<20 {
+		limits.MaxImageBytes = 1 << 20
+	}
+	if limits.MaxTotalBytes <= 0 || limits.MaxTotalBytes > 2<<20 {
+		limits.MaxTotalBytes = 2 << 20
+	}
+	reader, available := s.caller.(messageResourceCaller)
+	seen := 0
+	var total int64
+	for messageIndex := range out {
+		out[messageIndex].Attachments = append(
+			[]MessageAttachment(nil),
+			out[messageIndex].Attachments...,
+		)
+		for attachmentIndex := range out[messageIndex].Attachments {
+			attachment := &out[messageIndex].Attachments[attachmentIndex]
+			if attachment.Type != "image" {
+				continue
+			}
+			if seen >= limits.MaxImages {
+				attachment.UnreadableReason = "image_count_limit_reached"
+				continue
+			}
+			seen++
+			if !available {
+				attachment.UnreadableReason = "image_resource_reader_unavailable"
+				continue
+			}
+			remaining := limits.MaxTotalBytes - total
+			if remaining <= 0 {
+				attachment.UnreadableReason = "image_total_size_limit_reached"
+				continue
+			}
+			maxBytes := min(limits.MaxImageBytes, remaining)
+			resource, err := reader.GetMessageResource(ctx, MessageResourceRequest{
+				MessageID: out[messageIndex].MessageID,
+				FileKey:   attachment.Key,
+				Type:      "image",
+				As:        limits.As,
+				MaxBytes:  maxBytes,
+			})
+			if err != nil {
+				attachment.UnreadableReason = "image_download_failed"
+				continue
+			}
+			if resource.TooLarge || int64(len(resource.Data)) > maxBytes {
+				if maxBytes < limits.MaxImageBytes {
+					attachment.UnreadableReason = "image_total_size_limit_reached"
+				} else {
+					attachment.UnreadableReason = "image_exceeds_size_limit"
+				}
+				continue
+			}
+			mediaType := supportedImageMediaType(resource.Data)
+			if mediaType == "" {
+				attachment.UnreadableReason = "unsupported_image_type"
+				continue
+			}
+			attachment.MediaType = mediaType
+			attachment.Data = append([]byte(nil), resource.Data...)
+			attachment.Readable = true
+			attachment.UnreadableReason = ""
+			total += int64(len(resource.Data))
+		}
+	}
+	return out
+}
+
+func supportedImageMediaType(data []byte) string {
+	mediaType := strings.TrimSpace(strings.SplitN(
+		http.DetectContentType(data),
+		";",
+		2,
+	)[0])
+	switch mediaType {
+	case "image/jpeg", "image/png", "image/gif", "image/webp":
+		return mediaType
+	default:
+		return ""
+	}
 }
 
 // SearchChats searches chats visible to the requested identity.
@@ -380,6 +538,124 @@ func (s *Service) GetMessages(ctx context.Context, messageIDs []string) ([]Messa
 		}
 	}
 	return messages, nil
+}
+
+// GetSemanticReplyContext reads the exact target and paginates the same chat
+// from newest to oldest until the target-time boundary is covered.
+func (s *Service) GetSemanticReplyContext(
+	ctx context.Context,
+	req SemanticReplyContextRequest,
+) (SemanticReplyContext, error) {
+	if strings.TrimSpace(req.ChatID) == "" {
+		return SemanticReplyContext{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"chat_id is required",
+		).WithParam("chat_id")
+	}
+	if strings.TrimSpace(req.TargetMessageID) == "" {
+		return SemanticReplyContext{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"target_message_id is required",
+		).WithParam("target_message_id")
+	}
+	targets, err := s.GetMessages(ctx, []string{req.TargetMessageID})
+	if err != nil {
+		return SemanticReplyContext{}, err
+	}
+	if len(targets) == 0 {
+		return SemanticReplyContext{
+			ContextCutoff: time.Now().UTC(),
+			Withdrawn:     true,
+		}, nil
+	}
+	target := targets[0]
+	if target.ChatID != req.ChatID {
+		return SemanticReplyContext{
+			ContextCutoff: time.Now().UTC(),
+			Incomplete:    true,
+		}, nil
+	}
+	since := req.Since
+	if targetTime := parseMessageTime(target.CreateTime); since.IsZero() ||
+		(!targetTime.IsZero() && targetTime.Before(since)) {
+		since = targetTime
+	}
+	maxMessages := clamp(req.MaxMessages, 1, 200, 100)
+	byID := map[string]Message{target.MessageID: target}
+	incomplete := false
+	if target.ThreadID != "" ||
+		target.ReplyToMessageID != "" ||
+		target.RootMessageID != "" {
+		related, relationErr := s.GetMessageContext(ctx, MessageContextRequest{
+			ChatID:           req.ChatID,
+			MessageID:        target.MessageID,
+			RootMessageID:    target.RootMessageID,
+			ReplyToMessageID: target.ReplyToMessageID,
+			ThreadID:         target.ThreadID,
+			CreatedAt:        parseMessageTime(target.CreateTime),
+			Limit:            min(maxMessages, 30),
+		})
+		if relationErr != nil {
+			return SemanticReplyContext{}, relationErr
+		}
+		incomplete = related.Selection.Incomplete
+		for _, message := range related.Messages {
+			if message.ChatID == req.ChatID {
+				byID[message.MessageID] = message
+			}
+		}
+	}
+	pageToken := ""
+	for {
+		page, pageErr := s.ListRecentMessages(ctx, ListRecentMessagesRequest{
+			ChatID:    req.ChatID,
+			PageSize:  min(50, maxMessages),
+			PageToken: pageToken,
+		})
+		if pageErr != nil {
+			return SemanticReplyContext{}, pageErr
+		}
+		reachedBoundary := false
+		for _, message := range page.Items {
+			if message.ChatID != req.ChatID {
+				continue
+			}
+			createdAt := parseMessageTime(message.CreateTime)
+			if !since.IsZero() && !createdAt.IsZero() && createdAt.Before(since) {
+				reachedBoundary = true
+				continue
+			}
+			byID[message.MessageID] = message
+			if len(byID) > maxMessages {
+				incomplete = true
+				break
+			}
+			if !since.IsZero() && !createdAt.IsZero() && !createdAt.After(since) {
+				reachedBoundary = true
+			}
+		}
+		if incomplete || reachedBoundary || !page.HasMore {
+			break
+		}
+		if page.PageToken == "" || page.PageToken == pageToken {
+			incomplete = true
+			break
+		}
+		pageToken = page.PageToken
+	}
+	messages := make([]Message, 0, min(len(byID), maxMessages))
+	for _, message := range byID {
+		messages = append(messages, message)
+	}
+	sortMessagesChronologically(messages)
+	if len(messages) > maxMessages {
+		messages = messages[len(messages)-maxMessages:]
+	}
+	return SemanticReplyContext{
+		Messages:      messages,
+		ContextCutoff: time.Now().UTC(),
+		Incomplete:    incomplete,
+	}, nil
 }
 
 // ListThreadMessages reads one chronological page from a thread as the user.
@@ -981,6 +1257,87 @@ func (s *Service) DeleteReactionAsBot(ctx context.Context, messageID, reactionID
 	return err
 }
 
+// FindOwnerAckReaction reads reactions on one exact message as the user and
+// returns only configured-owner acknowledgement reactions.
+func (s *Service) FindOwnerAckReaction(
+	ctx context.Context,
+	req OwnerAckReactionRequest,
+) (OwnerAckReactionResult, error) {
+	if s.caller == nil {
+		return OwnerAckReactionResult{}, errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"IM API caller is not configured",
+		)
+	}
+	messageID := strings.TrimSpace(req.MessageID)
+	if messageID == "" {
+		return OwnerAckReactionResult{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"message_id is required",
+		).WithParam("message_id")
+	}
+	ownerOpenID := strings.TrimSpace(req.OwnerOpenID)
+	if ownerOpenID == "" {
+		ownerOpenID = s.ownerOpenID
+	}
+	if ownerOpenID == "" {
+		return OwnerAckReactionResult{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"owner_open_id is required",
+		).WithParam("owner_open_id")
+	}
+	pageSize := clamp(req.PageSize, 1, 50, 50)
+	maxPages := req.MaxPages
+	if maxPages <= 0 || maxPages > 5 {
+		maxPages = 5
+	}
+	pageToken := ""
+	for page := 0; page < maxPages; page++ {
+		params := map[string]any{
+			"page_size":    pageSize,
+			"user_id_type": "open_id",
+		}
+		if pageToken != "" {
+			params["page_token"] = pageToken
+		}
+		result, err := s.caller.CallAPI(ctx, APIRequest{
+			Method: http.MethodGet,
+			Path: fmt.Sprintf(
+				"/open-apis/im/v1/messages/%s/reactions",
+				url.PathEscape(messageID),
+			),
+			Params: params,
+			As:     IdentityUser,
+		})
+		if err != nil {
+			return OwnerAckReactionResult{}, err
+		}
+		data := responseData(result)
+		for _, raw := range arrayValue(data["items"]) {
+			reaction := parseMessageReaction(raw)
+			if reaction.OperatorType == "user" &&
+				reaction.OperatorOpenID == ownerOpenID &&
+				isAckEmoji(reaction.EmojiType) {
+				return OwnerAckReactionResult{Found: true, Reaction: reaction}, nil
+			}
+		}
+		if !boolValue(data["has_more"]) {
+			return OwnerAckReactionResult{}, nil
+		}
+		pageToken = stringValue(data["page_token"])
+		if pageToken == "" {
+			return OwnerAckReactionResult{}, errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"reaction list response is missing page_token",
+			)
+		}
+	}
+	return OwnerAckReactionResult{}, errs.NewInternalError(
+		errs.SubtypeInvalidResponse,
+		"reaction list exceeded bounded page limit",
+	)
+}
+
 // NotifyOwner sends a bot message to the owner.
 func (s *Service) NotifyOwner(ctx context.Context, req tools.NotifyRequest) error {
 	if s.caller == nil {
@@ -1039,6 +1396,29 @@ func parseReplyResult(result interface{}) tools.ReplyResult {
 	return out
 }
 
+func parseMessageReaction(raw any) MessageReaction {
+	item := mapValue(raw)
+	reaction := MessageReaction{
+		ReactionID: stringValue(item["reaction_id"]),
+	}
+	reactionType := mapValue(item["reaction_type"])
+	reaction.EmojiType = stringValue(reactionType["emoji_type"])
+	operator := mapValue(item["operator"])
+	reaction.OperatorType = stringValue(operator["operator_type"])
+	operatorID := mapValue(operator["operator_id"])
+	reaction.OperatorOpenID = stringValue(operatorID["open_id"])
+	return reaction
+}
+
+func isAckEmoji(emojiType string) bool {
+	switch strings.TrimSpace(emojiType) {
+	case "Get", "OK", "DONE", "THUMBSUP", "CheckMark", "Yes", "LGTM":
+		return true
+	default:
+		return false
+	}
+}
+
 func parseMessage(raw any) Message {
 	item := mapValue(raw)
 	if meta := mapValue(item["meta_data"]); len(meta) > 0 {
@@ -1065,10 +1445,12 @@ func parseMessage(raw any) Message {
 		SenderType:        firstString(sender, "sender_type", "type"),
 		MsgType:           firstString(item, "msg_type", "message_type"),
 		Content:           stringValue(item["content"]),
+		ResourceURLs:      resourceURLsFromContent(item["content"]),
 		Mentions:          parseMentions(item["mentions"]),
 		CreateTime:        firstString(item, "create_time", "createTime"),
 		UpdateTime:        firstString(item, "update_time", "updateTime"),
 	}
+	msg.SenderDisplayName = firstString(sender, "name", "display_name", "displayName")
 	msg.SenderOpenID = firstString(senderID, "open_id", "openId", "user_id", "userId")
 	if msg.SenderOpenID == "" {
 		msg.SenderOpenID = firstString(sender, "open_id", "openId", "sender_id", "senderId", "id")
@@ -1078,10 +1460,90 @@ func parseMessage(raw any) Message {
 	}
 	if msg.Content == "" {
 		msg.Content = textFromContent(item["body"])
+		msg.ResourceURLs = append(msg.ResourceURLs, resourceURLsFromContent(item["body"])...)
 	} else {
 		msg.Content = textFromContent(msg.Content)
 	}
+	msg.ResourceURLs = uniqueResourceURLs(msg.ResourceURLs)
+	if msg.MsgType == "image" {
+		imageKey := contentString(item["content"], "image_key")
+		if imageKey == "" {
+			imageKey = contentString(item["body"], "image_key")
+		}
+		if imageKey != "" {
+			msg.Attachments = []MessageAttachment{{Type: "image", Key: imageKey}}
+		}
+		if strings.TrimSpace(msg.Content) == "" {
+			msg.Content = "[图片]"
+		}
+	}
 	return msg
+}
+
+func resourceURLsFromContent(raw any) []string {
+	value := raw
+	if encoded, ok := raw.(string); ok {
+		var decoded any
+		if json.Unmarshal([]byte(encoded), &decoded) == nil {
+			value = decoded
+		}
+	}
+	var out []string
+	var walk func(any)
+	walk = func(current any) {
+		switch typed := current.(type) {
+		case map[string]any:
+			for _, child := range typed {
+				walk(child)
+			}
+		case []any:
+			for _, child := range typed {
+				walk(child)
+			}
+		case string:
+			for _, candidate := range strings.Fields(typed) {
+				candidate = strings.Trim(candidate, `"'()[]{}<>,，。；;`)
+				parsed, err := url.Parse(candidate)
+				if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+					continue
+				}
+				parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+				if len(parts) >= 2 {
+					switch parts[0] {
+					case "wiki", "base", "record", "doc", "docs", "docx", "sheet", "sheets":
+						out = append(out, candidate)
+					}
+				}
+			}
+		}
+	}
+	walk(value)
+	return uniqueResourceURLs(out)
+}
+
+func uniqueResourceURLs(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func contentString(raw any, key string) string {
+	value := raw
+	if encoded, ok := raw.(string); ok {
+		var decoded map[string]any
+		if json.Unmarshal([]byte(encoded), &decoded) != nil {
+			return ""
+		}
+		value = decoded
+	}
+	return firstString(mapValue(value), key)
 }
 
 func parseChat(item map[string]any) Chat {
@@ -1317,7 +1779,9 @@ func compactMessages(messages []Message, req MessageContextRequest, limit int) (
 	}
 	filtered := make([]Message, 0, len(messages))
 	for _, message := range messages {
-		if isAppContextMessage(message) && !pinned[message.MessageID] {
+		if isAppContextMessage(message) &&
+			!req.IncludeAppMessages &&
+			!pinned[message.MessageID] {
 			continue
 		}
 		filtered = append(filtered, message)

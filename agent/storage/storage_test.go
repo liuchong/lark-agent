@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/liuchong/lark-agent/agent/domain"
+	"github.com/liuchong/lark-agent/agent/replymatch"
 )
 
 func TestOpenSerializesSQLiteAccessWithBoundedBusyWait(t *testing.T) {
@@ -62,6 +63,85 @@ func TestInboxDeduplicatesByMessageID(t *testing.T) {
 	}
 	if len(items) != 1 {
 		t.Fatalf("items=%d", len(items))
+	}
+}
+
+func TestPendingDelegatedWorkAndSemanticResolutionAudit(t *testing.T) {
+	store := openStore(t)
+	for _, event := range []domain.NormalizedEvent{
+		{MessageID: "om_a", ChatID: "oc_group", Content: "发布日期？"},
+		{MessageID: "om_b", ChatID: "oc_group", Content: "负责人？"},
+		{MessageID: "om_other", ChatID: "oc_other", Content: "另一个群"},
+	} {
+		if _, err := store.EnqueueEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := store.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		if err := store.UpdateWorkItemScheduling(
+			item.ID,
+			domain.WorkKindDirectMention,
+			domain.PriorityDirectMention,
+			time.Minute,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.Exec(
+			`UPDATE work_items SET status = ? WHERE id = ?`,
+			domain.StatusWaitingUser,
+			item.ID,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pending, err := store.ListPendingDelegatedWork("oc_group")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 || pending[0].Event.MessageID != "om_a" ||
+		pending[1].Event.MessageID != "om_b" {
+		t.Fatalf("pending=%+v", pending)
+	}
+
+	cutoff := time.Date(2026, 7, 29, 3, 0, 0, 0, time.UTC)
+	resolution := replymatch.Resolution{
+		TargetMessageID:         "om_a",
+		Result:                  replymatch.ResultAnswered,
+		MatchedOwnerMessageIDs:  []string{"om_owner"},
+		Confidence:              0.97,
+		Reason:                  "owner supplied the requested date",
+		TargetIntent:            "request",
+		ResponseObligationQuote: "发布日期？",
+		OwnerAckReaction: &replymatch.OwnerAckReaction{
+			ReactionID:     "r_get",
+			EmojiType:      "Get",
+			OperatorType:   "user",
+			OperatorOpenID: "ou_owner",
+		},
+		ContextCutoff: cutoff,
+	}
+	if err := store.RecordOwnerReplyResolution(pending[0].ID, resolution); err != nil {
+		t.Fatal(err)
+	}
+	audits, err := store.ListOwnerReplyResolutions(pending[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) != 1 || audits[0].TargetMessageID != "om_a" ||
+		audits[0].Result != replymatch.ResultAnswered ||
+		len(audits[0].MatchedOwnerMessageIDs) != 1 ||
+		audits[0].MatchedOwnerMessageIDs[0] != "om_owner" ||
+		audits[0].TargetIntent != "request" ||
+		audits[0].ResponseObligationQuote != "发布日期？" ||
+		audits[0].OwnerAckReaction == nil ||
+		audits[0].OwnerAckReaction.EmojiType != "Get" ||
+		!audits[0].ContextCutoff.Equal(cutoff) {
+		t.Fatalf("audits=%+v", audits)
 	}
 }
 
@@ -829,6 +909,9 @@ func TestDecideActionWaitsForConcurrentWriterWithoutSnapshotFailure(t *testing.T
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = daemonStore.Close() })
+			if _, err := daemonStore.MarkCurrentSessionReady(context.Background()); err != nil {
+				t.Fatal(err)
+			}
 			operatorStore, err := OpenInspection(statePath)
 			if err != nil {
 				t.Fatal(err)
@@ -916,6 +999,20 @@ func TestRetryLimitDeadLettersAndRuntimeUpgradeRequeues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := store.SaveWorkReplyCandidate(item.ID, item.LeaseBy, domain.Decision{
+		Kind:         domain.DecisionReply,
+		ReplyOutcome: domain.ReplyOutcomePartial,
+		ReplyText:    "old-runtime candidate",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.HoldWorkReplyCandidate(
+		item.ID,
+		item.LeaseBy,
+		"old runtime context ambiguous",
+	); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.FinishAgentRun(context.Background(), run.ID, domain.AgentRunFailed, "bad response"); err != nil {
 		t.Fatal(err)
 	}
@@ -942,6 +1039,49 @@ func TestRetryLimitDeadLettersAndRuntimeUpgradeRequeues(t *testing.T) {
 	}
 	if items[0].Status != domain.StatusReceived || items[0].RetryCount != 0 {
 		t.Fatalf("items=%+v", items)
+	}
+	if candidate, found, err := store.ReadyWorkReplyCandidate(item.ID); err != nil || found {
+		t.Fatalf("stale candidate survived runtime upgrade: candidate=%+v found=%v err=%v", candidate, found, err)
+	}
+}
+
+func TestMarkDeadLetterClaimFencesLeaseAndPreservesReason(t *testing.T) {
+	store := openStore(t)
+	event := domain.NormalizedEvent{
+		MessageID: "om_model_non_convergence",
+		Content:   "@Owner 看看删号报 10005",
+	}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	reason := "model did not submit a terminal decision after 3 attempts"
+	if err := store.MarkDeadLetterClaim(item.ID, "wrong-lease", reason); err == nil {
+		t.Fatal("wrong lease moved work to dead letter")
+	}
+	if err := store.MarkDeadLetterClaim(item.ID, item.LeaseBy, reason); err != nil {
+		t.Fatal(err)
+	}
+	items, err := store.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Status != domain.StatusDeadLetter ||
+		items[0].RetryCount != 1 {
+		t.Fatalf("items=%+v", items)
+	}
+	var storedReason string
+	if err := store.db.QueryRow(
+		`SELECT reason FROM dead_letters WHERE work_item_id = ?`,
+		item.ID,
+	).Scan(&storedReason); err != nil {
+		t.Fatal(err)
+	}
+	if storedReason != reason {
+		t.Fatalf("stored reason=%q", storedReason)
 	}
 }
 
@@ -1002,6 +1142,504 @@ func TestReadyApprovedReplyReturnsPersistedExactDraft(t *testing.T) {
 		decision.Relevance != domain.RelevanceAssistantRequest ||
 		decision.Kind != domain.DecisionReply {
 		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestBlockReadyReplyApprovalRequiresCurrentLease(t *testing.T) {
+	store := openStore(t)
+	if _, err := store.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_block_stale_approval",
+		Content:   "question",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("initial-worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	actionID, err := store.RequestReplyApproval(
+		context.Background(),
+		item.DedupKey,
+		"exact persisted draft",
+		"code evidence",
+		"confirm backend contract",
+		domain.RelevanceAssistantRequest,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DecideAction(actionID, true); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err = store.ClaimNext("approval-worker")
+	if err != nil || !ok {
+		t.Fatalf("reclaim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	if err := store.BlockReadyReplyApprovalClaim(
+		context.Background(),
+		item.ID,
+		"stale-lease",
+		"assistant_request_from_non_owner",
+	); err == nil {
+		t.Fatal("stale lease blocked a ready approval")
+	}
+	if err := store.BlockReadyReplyApprovalClaim(
+		context.Background(),
+		item.ID,
+		item.LeaseBy,
+		"assistant_request_from_non_owner",
+	); err != nil {
+		t.Fatal(err)
+	}
+	action, err := store.GetActionAttempt(actionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Status != domain.ActionBlocked ||
+		action.Error != "assistant_request_from_non_owner" {
+		t.Fatalf("action=%+v", action)
+	}
+	if decision, found, err := store.ReadyApprovedReply(item.ID); err != nil || found {
+		t.Fatalf("decision=%+v found=%v err=%v", decision, found, err)
+	}
+}
+
+func TestWorkReplyCandidatePersistsHeldDecisionAndConsumesOnce(t *testing.T) {
+	store := openStore(t)
+	event := domain.NormalizedEvent{MessageID: "om_candidate", Content: "question"}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	decision := domain.Decision{
+		Kind:           domain.DecisionReply,
+		Relevance:      domain.RelevanceDirectMention,
+		Risk:           domain.RiskLow,
+		EvidenceStatus: domain.EvidenceVerified,
+		ReplyOutcome:   domain.ReplyOutcomePartial,
+		ReplyText:      "已确认入口存在；生产开关仍未知。",
+		Progress: domain.DecisionProgress{
+			CompletedChecks: []string{"读取生产入口"},
+			InitialFinding:  "入口存在",
+			Unknowns:        []string{"生产开关"},
+			NextStep:        "核对部署配置",
+		},
+	}
+	if err := store.SaveWorkReplyCandidate(item.ID, "stale-lease", decision); err == nil {
+		t.Fatal("stale lease saved a reply candidate")
+	}
+	if err := store.SaveWorkReplyCandidate(item.ID, item.LeaseBy, decision); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.HoldWorkReplyCandidate(item.ID, "stale-lease", "stale worker"); err == nil {
+		t.Fatal("stale lease held a reply candidate")
+	}
+	if err := store.CancelWorkReplyCandidate(item.ID, "stale-lease", "stale worker"); err == nil {
+		t.Fatal("stale lease cancelled a reply candidate")
+	}
+	if err := store.HoldWorkReplyCandidate(
+		item.ID,
+		item.LeaseBy,
+		"owner context ambiguous",
+	); err != nil {
+		t.Fatal(err)
+	}
+	candidate, found, err := store.ReadyWorkReplyCandidate(item.ID)
+	if err != nil || !found {
+		t.Fatalf("candidate=%+v found=%v err=%v", candidate, found, err)
+	}
+	if candidate.Status != domain.ReplyCandidateHeld ||
+		candidate.Decision.ReplyText != decision.ReplyText ||
+		candidate.Decision.ReplyOutcome != domain.ReplyOutcomePartial {
+		t.Fatalf("candidate=%+v", candidate)
+	}
+	if err := store.ConsumeWorkReplyCandidate(item.ID, "stale-lease"); err == nil {
+		t.Fatal("stale lease consumed a reply candidate")
+	}
+	if err := store.ConsumeWorkReplyCandidate(item.ID, item.LeaseBy); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.ReadyWorkReplyCandidate(item.ID); err != nil || found {
+		t.Fatalf("consumed candidate found=%v err=%v", found, err)
+	}
+}
+
+func TestReadyWorkReplyCandidateRejectsDigestMismatch(t *testing.T) {
+	store := openStore(t)
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_candidate_digest",
+		Content:   "question",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	if err := store.SaveWorkReplyCandidate(item.ID, item.LeaseBy, domain.Decision{
+		Kind:      domain.DecisionReply,
+		ReplyText: "validated candidate",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		`UPDATE work_reply_candidates SET digest = 'sha256:corrupt' WHERE work_item_id = ?`,
+		item.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.ReadyWorkReplyCandidate(item.ID); err == nil || found {
+		t.Fatalf("corrupt candidate found=%v err=%v", found, err)
+	}
+}
+
+func TestWorkReplyCandidateMigrationIsSchemaVersion16(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DROP TABLE work_reply_candidates`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_v15_semantic_retry",
+		Content:   "legacy ambiguous owner context",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var legacyItemID int64
+	if err := store.db.QueryRow(
+		`SELECT id FROM work_items ORDER BY id DESC LIMIT 1`,
+	).Scan(&legacyItemID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		`ALTER TABLE work_items DROP COLUMN owner_reply_retry_count`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, column := range []string{
+		"target_intent",
+		"response_obligation_quote",
+		"owner_ack_reaction_json",
+	} {
+		if _, err := store.db.Exec(
+			`ALTER TABLE owner_reply_resolutions DROP COLUMN ` + column,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.db.Exec(
+		`UPDATE work_items SET status = ?, retry_count = 2 WHERE id = ?`,
+		domain.StatusWaitingUser,
+		legacyItemID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	dropSchemaV18AuditColumns(t, store)
+	dropSchemaV19AndV20(t, store)
+	if _, err := store.db.Exec(`UPDATE schema_version SET version = 15`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	var version int
+	if err := store.db.QueryRow(`SELECT version FROM schema_version LIMIT 1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version < 16 {
+		t.Fatalf("schema version=%d, want at least 16", version)
+	}
+	var tableName, columnName string
+	if err := store.db.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'work_reply_candidates'`,
+	).Scan(&tableName); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(
+		`SELECT name FROM pragma_table_info('work_items')
+		 WHERE name = 'owner_reply_retry_count'`,
+	).Scan(&columnName); err != nil {
+		t.Fatal(err)
+	}
+	var providerRetries, semanticRetries int
+	if err := store.db.QueryRow(
+		`SELECT retry_count, owner_reply_retry_count FROM work_items WHERE id = ?`,
+		legacyItemID,
+	).Scan(&providerRetries, &semanticRetries); err != nil {
+		t.Fatal(err)
+	}
+	if providerRetries != 0 || semanticRetries != 2 {
+		t.Fatalf(
+			"migrated provider retries=%d semantic retries=%d",
+			providerRetries,
+			semanticRetries,
+		)
+	}
+}
+
+func TestOwnerReplyResolutionAuditMigrationIsSchemaVersion17(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_v16_resolution",
+		ChatID:    "oc_private",
+		ChatType:  "p2p",
+		Content:   "legacy private answer",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	cutoff := time.Date(2026, 7, 31, 4, 0, 0, 0, time.UTC)
+	if err := store.RecordOwnerReplyResolution(item.ID, replymatch.Resolution{
+		TargetMessageID: item.Event.MessageID,
+		Result:          replymatch.ResultAmbiguous,
+		Confidence:      0,
+		Reason:          "legacy ambiguous resolution",
+		ContextCutoff:   cutoff,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, column := range []string{
+		"target_intent",
+		"response_obligation_quote",
+		"owner_ack_reaction_json",
+	} {
+		if _, err := store.db.Exec(
+			`ALTER TABLE owner_reply_resolutions DROP COLUMN ` + column,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dropSchemaV18AuditColumns(t, store)
+	dropSchemaV19AndV20(t, store)
+	if _, err := store.db.Exec(`UPDATE schema_version SET version = 16`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	var version int
+	if err := store.db.QueryRow(`SELECT version FROM schema_version LIMIT 1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version < 17 {
+		t.Fatalf("schema version=%d, want at least 17", version)
+	}
+	audits, err := store.ListOwnerReplyResolutions(item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) != 1 ||
+		audits[0].TargetIntent != "" ||
+		audits[0].ResponseObligationQuote != "" ||
+		audits[0].OwnerAckReaction != nil {
+		t.Fatalf("audits=%+v", audits)
+	}
+}
+
+func TestAgentRunAuditMigrationIsSchemaVersion18(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_v18_run",
+		Content:   "inspect provider failure",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.StartAgentRun(
+		context.Background(),
+		domain.NormalizedEvent{MessageID: "om_v18_run"},
+		"primary:kimi/openai_chat/k3-256k@https://api.kimi.com/coding/v1",
+		"cfg123",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendAgentStep(context.Background(), domain.AgentStep{
+		RunID:           run.ID,
+		Sequence:        1,
+		Kind:            "model",
+		Phase:           "generate",
+		Attempt:         1,
+		RequestID:       "req_123",
+		FinishReason:    "tool_calls",
+		HTTPStatus:      400,
+		FailureCategory: "invalid_request",
+		RecoveryAction:  "stop",
+		Error:           "HTTP 400: invalid request",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dropSchemaV18AuditColumns(t, store)
+	dropSchemaV19AndV20(t, store)
+	if _, err := store.db.Exec(`UPDATE schema_version SET version = 17`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	var version int
+	if err := store.db.QueryRow(`SELECT version FROM schema_version LIMIT 1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version < 18 {
+		t.Fatalf("schema version=%d, want at least 18", version)
+	}
+	runs, err := store.ListAgentRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Role != "agent" {
+		t.Fatalf("runs=%+v", runs)
+	}
+	steps, err := store.ListAgentSteps(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Phase != "" || steps[0].HTTPStatus != 0 {
+		t.Fatalf("steps=%+v", steps)
+	}
+	run2, err := store.StartAgentRun(
+		context.Background(),
+		domain.NormalizedEvent{MessageID: "om_v18_run"},
+		"primary:kimi/openai_chat/k3-256k@https://api.kimi.com/coding/v1",
+		"cfg456",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run2.Profile != "primary" || run2.Provider != "kimi" ||
+		run2.Protocol != "openai_chat" || run2.Model != "k3-256k" {
+		t.Fatalf("run2=%+v", run2)
+	}
+}
+
+func dropSchemaV18AuditColumns(t *testing.T, store *Store) {
+	t.Helper()
+	for _, stmt := range []string{
+		`ALTER TABLE agent_runs DROP COLUMN role`,
+		`ALTER TABLE agent_runs DROP COLUMN profile`,
+		`ALTER TABLE agent_runs DROP COLUMN provider`,
+		`ALTER TABLE agent_runs DROP COLUMN protocol`,
+		`ALTER TABLE agent_runs DROP COLUMN model`,
+		`ALTER TABLE agent_steps DROP COLUMN phase`,
+		`ALTER TABLE agent_steps DROP COLUMN attempt`,
+		`ALTER TABLE agent_steps DROP COLUMN finish_reason`,
+		`ALTER TABLE agent_steps DROP COLUMN http_status`,
+		`ALTER TABLE agent_steps DROP COLUMN failure_category`,
+		`ALTER TABLE agent_steps DROP COLUMN recovery_action`,
+	} {
+		if _, err := store.db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func dropSchemaV19AndV20(t *testing.T, store *Store) {
+	t.Helper()
+	for _, stmt := range []string{
+		`DROP TABLE delegated_investigation_history`,
+		`DROP INDEX idx_work_items_resource_evidence`,
+		`ALTER TABLE work_items DROP COLUMN resource_evidence_id`,
+		`DROP TABLE resource_evidence`,
+	} {
+		if _, err := store.db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestDelegatedInvestigationHistoryMigrationIsSchemaVersion20(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := domain.NormalizedEvent{
+		MessageID: "om_v20_investigation",
+		Content:   "preserve active investigation",
+	}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("v20-worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	if _, created, err := store.BeginDelegatedInvestigation(domain.DelegatedInvestigation{
+		WorkItemID:    item.ID,
+		TaskSummary:   "preserved during v20 migration",
+		TaskClass:     domain.TaskClassInvestigation,
+		ContextCutoff: time.Now().UTC(),
+		ContextDigest: "sha256:v20",
+	}); err != nil || !created {
+		t.Fatalf("begin created=%v err=%v", created, err)
+	}
+	if _, err := store.db.Exec(`DROP TABLE delegated_investigation_history`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE schema_version SET version = 19`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	var version int
+	if err := store.db.QueryRow(`SELECT version FROM schema_version LIMIT 1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 20 {
+		t.Fatalf("schema version=%d, want 20", version)
+	}
+	investigation, found, err := store.GetDelegatedInvestigation(item.ID)
+	if err != nil || !found || investigation.TaskSummary != "preserved during v20 migration" {
+		t.Fatalf("investigation=%+v found=%v err=%v", investigation, found, err)
+	}
+	history, err := store.ListDelegatedInvestigationHistory(context.Background(), item.ID)
+	if err != nil || len(history) != 0 {
+		t.Fatalf("history=%+v err=%v", history, err)
 	}
 }
 
@@ -1217,6 +1855,22 @@ func TestPostReplyNotificationRecoversWithoutReplyReplay(t *testing.T) {
 		OwnerAction: "确认后端示例状态变更通知契约",
 		Reason:      "coordination handoff",
 	}
+	replyActionID, _, _, completedReply, err := store.BeginReplyAction(
+		context.Background(),
+		item.DedupKey,
+		decision.ReplyText,
+	)
+	if err != nil || completedReply {
+		t.Fatalf("reply action id=%d completed=%v err=%v", replyActionID, completedReply, err)
+	}
+	if err := store.CompleteReplyAction(
+		context.Background(),
+		replyActionID,
+		"om_sent_reply",
+		"",
+	); err != nil {
+		t.Fatal(err)
+	}
 	actionID, key, completed, err := store.BeginPostReplyNotification(
 		context.Background(), item.DedupKey, decision,
 	)
@@ -1248,6 +1902,38 @@ func TestPostReplyNotificationRecoversWithoutReplyReplay(t *testing.T) {
 	_, _, completed, err = store.BeginPostReplyNotification(context.Background(), item.DedupKey, decision)
 	if err != nil || !completed {
 		t.Fatalf("completed=%v err=%v", completed, err)
+	}
+}
+
+func TestCompletedPreReplyNoticeDoesNotSkipUnsentSenderReply(t *testing.T) {
+	store := openStore(t)
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		MessageID: "om_pre_reply_notice",
+		Content:   "coordinate",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	actionID, _, completed, err := store.BeginPostReplyNotification(
+		context.Background(),
+		item.DedupKey,
+		domain.Decision{
+			Kind:      domain.DecisionReply,
+			ReplyText: "智能助手准备发送的答复",
+		},
+	)
+	if err != nil || completed {
+		t.Fatalf("actionID=%d completed=%v err=%v", actionID, completed, err)
+	}
+	if err := store.CompletePostReplyNotification(context.Background(), actionID, ""); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, found, err := store.ReadyPostReplyNotification(item.ID)
+	if err != nil || found {
+		t.Fatalf("found=%v err=%v", found, err)
 	}
 }
 
@@ -1781,5 +2467,73 @@ func TestPollCursorRoundTrip(t *testing.T) {
 	}
 	if !ok || !got.Equal(want) {
 		t.Fatalf("cursor ok=%v got=%s want=%s", ok, got, want)
+	}
+}
+
+func TestSemanticReplyRetriesUseIndependentCounter(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	store.ConfigureRecovery(5)
+	store.ConfigureOwnerReplyRecovery(3)
+
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{
+		Source:    domain.SourcePoll,
+		EventID:   "evt-independent-semantic-retry",
+		MessageID: "om_independent_semantic_retry",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("transient-worker")
+	if err != nil || !ok {
+		t.Fatalf("claim ok=%v err=%v", ok, err)
+	}
+	if err := store.MarkRetryClaim(
+		item.ID,
+		item.LeaseBy,
+		"temporary provider failure",
+		time.Millisecond,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		`UPDATE work_items SET next_attempt_at = ? WHERE id = ?`,
+		time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano),
+		item.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	item, ok, err = store.ClaimNext("semantic-worker")
+	if err != nil || !ok {
+		t.Fatalf("semantic claim ok=%v err=%v", ok, err)
+	}
+	if err := store.DeferWaitingUserClaim(
+		item.ID,
+		item.LeaseBy,
+		"owner context ambiguous",
+		time.Minute,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var transientRetries, semanticRetries int
+	var status domain.WorkItemStatus
+	if err := store.db.QueryRow(
+		`SELECT retry_count, owner_reply_retry_count, status FROM work_items WHERE id = ?`,
+		item.ID,
+	).Scan(&transientRetries, &semanticRetries, &status); err != nil {
+		t.Fatal(err)
+	}
+	if transientRetries != 1 ||
+		semanticRetries != 1 ||
+		status != domain.StatusWaitingUser {
+		t.Fatalf(
+			"transient=%d semantic=%d status=%s",
+			transientRetries,
+			semanticRetries,
+			status,
+		)
 	}
 }

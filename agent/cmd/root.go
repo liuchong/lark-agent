@@ -4,11 +4,14 @@ package cmd
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,15 +22,20 @@ import (
 	"github.com/liuchong/lark-agent/agent/app"
 	"github.com/liuchong/lark-agent/agent/config"
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
+	"github.com/liuchong/lark-agent/agent/control"
 	"github.com/liuchong/lark-agent/agent/daemon"
 	"github.com/liuchong/lark-agent/agent/domain"
 	"github.com/liuchong/lark-agent/agent/feedback"
+	"github.com/liuchong/lark-agent/agent/investigation"
 	"github.com/liuchong/lark-agent/agent/lifecycle"
+	agentlocale "github.com/liuchong/lark-agent/agent/locale"
 	"github.com/liuchong/lark-agent/agent/memory"
 	"github.com/liuchong/lark-agent/agent/policy"
 	"github.com/liuchong/lark-agent/agent/poll"
 	"github.com/liuchong/lark-agent/agent/realtime"
 	"github.com/liuchong/lark-agent/agent/reply"
+	"github.com/liuchong/lark-agent/agent/replymatch"
+	agentresource "github.com/liuchong/lark-agent/agent/resource"
 	"github.com/liuchong/lark-agent/agent/router"
 	"github.com/liuchong/lark-agent/agent/rules"
 	agentruntime "github.com/liuchong/lark-agent/agent/runtime"
@@ -70,22 +78,38 @@ work to an Eino-based agent loop, and can reply as the owner in auto mode.
 Only the configured owner can mention the assistant bot in an allowed group to
 ask a question or request an operation; that path replies with bot identity.
 The configured owner can also privately message the assistant. Non-owner bot
-private messages and direct assistant mentions stay silent; non-owners can only
-trigger a reply by mentioning the human owner. Assistant mentions and owner
-mentions have independent all-groups or configured-groups scopes. Direct
-assistant requests add a keyboard working reaction before work starts and
-remove it when work finishes.
+private messages and direct assistant mentions stay silent. Human messages in
+the owner's private chats and group messages that mention the human owner may
+enter delegated reply after a three-minute semantic owner-answer window.
+Assistant mentions and owner mentions have independent all-groups or
+configured-groups scopes. Private delegated messages have an independent
+all-private or disabled scope and still honor user and chat block lists.
+Direct assistant requests add a keyboard working reaction before work starts
+and remove it when work finishes.
 Programming questions use a bounded coding investigation path with planning,
 code search fallback, source-backed verify, and replay transcript export.
 Simple questions use at most 3 model turns; coding questions use 20 turns,
-16 tool calls, and a 3-step no-progress stop by default. One interactive
+16 tool calls, a 3-step no-progress stop, and at most 3 terminal-only attempts
+after forced convergence by default. One interactive
 worker is reserved from the foreground pool, while CodingGoal work uses
 background workers. Time, date, ping, status, doctor, queue summary, and help
 use a deterministic fast path before any model loop.
-Messages received while the service is offline and work interrupted by a
-restart are recorded but never replayed automatically. Use queue inspect to
-see the last durable stage and queue resume to continue one exact message.
-跨重启任务不会自动回放；必须先检查，再显式恢复某一条消息。
+The configured owner can use /help, /status, /tasks, /task, /approvals,
+/approval, and /memory in the assistant's private chat to inspect and safely
+close durable work or curate bounded persistent memory. Contextual natural
+language maps to these commands only when the adjacent assistant notice and
+eligible durable state identify one exact operation. Group commands disclose
+no queue details and redirect the owner to private chat; non-owner commands
+remain silent. Local operators can use queue tasks, queue acknowledge, queue
+reconcile, and memory commands for the same bounded state and closure rules.
+After restart, stateless read-only work may be re-evaluated in the new ready
+session. Delegated conversation context and unsent reply candidates stay
+interrupted until the owner explicitly resumes a new classification. Exact
+approval waits are preserved and privately reported. An interrupted external
+action is never replayed: it is terminalized with an exact reconciliation
+instruction. Use queue inspect for durable evidence and queue resume for
+reviewed contextual, terminal, or manually paused work. 无状态工作可自动续跑，
+对话调查与旧回复草稿必须由 Owner 显式恢复，结果不确定的外部动作绝不重放。
 Intentional shutdown and every successfully ready session are reported through
 the assistant bot's private chat.
 
@@ -110,9 +134,9 @@ Modes:
 		newDaemonCommand(out, &configPath, &statePath),
 		newModeCommand(out, &configPath),
 		newQueueCommand(out, &configPath, &statePath),
-		newSubscriptionCommand(out, &statePath),
+		newSubscriptionCommand(out, &configPath, &statePath),
 		newApprovalCommand(out, &statePath),
-		newMemoryCommand(out),
+		newMemoryCommand(out, &statePath),
 		newRulesCommand(out, &configPath),
 		newGitHubCommand(in, out, &configPath),
 		newDoctorCommand(out, &configPath, &statePath),
@@ -473,6 +497,7 @@ func loadGitHubNotifyConfig(path string) (config.Config, error) {
 		).WithField("lark.base_url")
 	}
 	cfg.Owner.OpenID = "github-action-sender"
+	cfg.Owner.Name = "GitHub Action"
 	cfg.Workspace.Root = workspaceRoot
 	cfg.GitHub.Enabled = true
 	cfg.GitHub.APIBaseURL = firstNonEmpty(os.Getenv("GITHUB_API_URL"), cfg.GitHub.APIBaseURL)
@@ -527,7 +552,7 @@ func mergeAuthLoginInput(existing serviceim.Credentials, input authLoginInput) (
 }
 
 func newInitCommand(out io.Writer, configPath *string) *cobra.Command {
-	var workspaceRoot, appID, owner string
+	var workspaceRoot, appID, owner, ownerName, preferredLanguage, fallbackLanguage string
 	cmd := &cobra.Command{
 		Use:   "init --workspace <absolute-dir>",
 		Short: "Initialize lark-agent config",
@@ -539,6 +564,9 @@ func newInitCommand(out io.Writer, configPath *string) *cobra.Command {
 			cfg := config.Default()
 			cfg.Lark.AppID = appID
 			cfg.Owner.OpenID = owner
+			cfg.Owner.Name = strings.TrimSpace(ownerName)
+			cfg.Owner.PreferredLanguage = agentlocale.Language(preferredLanguage)
+			cfg.Owner.FallbackLanguage = agentlocale.Language(fallbackLanguage)
 			cfg.Workspace.Root = scope.ConfiguredRoot()
 			path := resolveConfigPath(*configPath)
 			if err := config.Save(path, cfg); err != nil {
@@ -554,6 +582,20 @@ func newInitCommand(out io.Writer, configPath *string) *cobra.Command {
 	cmd.Flags().StringVar(&workspaceRoot, "workspace", "", "absolute workspace root; required")
 	cmd.Flags().StringVar(&appID, "app-id", "", "Lark app_id used by the public Go SDK")
 	cmd.Flags().StringVar(&owner, "owner-open-id", "", "owner open_id")
+	cmd.Flags().StringVar(&ownerName, "owner-name", "", "owner display name used in delegated assistant replies")
+	cmd.Flags().StringVar(
+		&preferredLanguage,
+		"preferred-language",
+		string(agentlocale.LanguageAuto),
+		"outward language: auto, zh-CN, or en-US",
+	)
+	cmd.Flags().StringVar(
+		&fallbackLanguage,
+		"fallback-language",
+		string(agentlocale.LanguageChinese),
+		"fallback outward language: zh-CN or en-US",
+	)
+	_ = cmd.MarkFlagRequired("owner-name")
 	return cmd
 }
 
@@ -628,63 +670,385 @@ func newWorkspaceCommand(out io.Writer, configPath *string) *cobra.Command {
 }
 
 func newModelCommand(in io.Reader, out io.Writer, configPath *string) *cobra.Command {
-	cmd := &cobra.Command{Use: "model", Short: "Manage model credentials"}
+	cmd := &cobra.Command{Use: "model", Short: "Manage model profiles, roles, credentials, and diagnostics"}
+	cmd.AddCommand(
+		newModelProfileCommand(out, configPath),
+		newModelRoleCommand(out, configPath),
+		newModelAuthCommand(in, out, configPath),
+		newModelDoctorCommand(out, configPath),
+	)
+	return cmd
+}
+
+func newModelProfileCommand(out io.Writer, configPath *string) *cobra.Command {
+	cmd := &cobra.Command{Use: "profile", Short: "Manage non-secret model profiles"}
 	cmd.AddCommand(&cobra.Command{
-		Use:   "login",
-		Short: "Read an OpenAI-compatible API key from stdin",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if in == nil {
-				return errs.NewValidationError(errs.SubtypeInvalidArgument, "stdin is required").WithParam("stdin")
-			}
-			// The first version validates the command surface without storing
-			// secrets in files. Keychain persistence is wired in a later step.
-			return writeData(out, map[string]any{"stored": false, "hint": "keychain storage not configured in this build"})
-		},
-	})
-	cmd.AddCommand(&cobra.Command{
-		Use:   "doctor",
-		Short: "Verify native tools and tool-result protocol against the configured provider",
+		Use:   "list",
+		Short: "List configured model profiles without credentials",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(resolveConfigPath(*configPath))
 			if err != nil {
 				return err
 			}
-			apiKey := os.Getenv("OPENAI_API_KEY")
-			modelName := firstNonEmpty(os.Getenv("OPENAI_MODEL"), cfg.Model.Name)
-			baseURL := firstNonEmpty(os.Getenv("OPENAI_BASE_URL"), cfg.Model.BaseURL)
-			if apiKey == "" {
-				return errs.NewConfigError(errs.SubtypeNotConfigured, "OPENAI_API_KEY is required for model doctor").
-					WithHint("set the daemon's OpenAI-compatible API key in its private environment")
-			}
-			if modelName == "" {
-				return errs.NewConfigError(errs.SubtypeNotConfigured, "model.name or OPENAI_MODEL is required for model doctor")
-			}
-			result, err := agentruntime.DoctorNativeTools(cmd.Context(), &agentruntime.OpenAICompatibleModel{
-				APIKey:  apiKey,
-				BaseURL: baseURL,
-				Model:   modelName,
-				Timeout: cfg.Model.Timeout,
-			})
-			if err != nil {
-				return err
-			}
 			return writeData(out, map[string]any{
-				"provider": cfg.Model.Provider,
-				"model":    modelName,
-				"tools":    result,
+				"profiles": cfg.Model.Profiles,
+				"roles":    cfg.Model.Roles,
 			})
 		},
 	})
+	var provider, protocol, baseURL, modelName, credentialKey, reasoningMode, stream string
+	setCmd := &cobra.Command{
+		Use:   "set PROFILE",
+		Short: "Create or update a model profile without storing the API key",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			name := strings.TrimSpace(args[0])
+			if name == "" {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "profile name is required")
+			}
+			if cfg.Model.Profiles == nil {
+				cfg.Model.Profiles = map[string]config.ModelProfileConfig{}
+			}
+			existing := cfg.Model.Profiles[name]
+			if provider != "" {
+				existing.Provider = provider
+			}
+			if protocol != "" {
+				existing.Protocol = protocol
+			}
+			if baseURL != "" {
+				existing.BaseURL = baseURL
+			}
+			if modelName != "" {
+				existing.Name = modelName
+			}
+			if credentialKey != "" {
+				existing.CredentialKeychainKey = credentialKey
+			}
+			if reasoningMode != "" {
+				existing.Reasoning.Mode = reasoningMode
+			}
+			if stream != "" {
+				existing.Stream = stream
+			}
+			if existing.KeychainService == "" {
+				existing.KeychainService = "lark-agent"
+			}
+			if existing.Timeout <= 0 {
+				existing.Timeout = 60 * time.Second
+			}
+			cfg.Model.Profiles[name] = existing
+			cfg.Normalize()
+			if err := config.Save(resolveConfigPath(*configPath), cfg); err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"profile": name, "updated": true})
+		},
+	}
+	setCmd.Flags().StringVar(&provider, "provider", "", "model provider: kimi, openai, or anthropic")
+	setCmd.Flags().StringVar(&protocol, "protocol", "", "model protocol: openai_chat, openai_responses, or anthropic_messages")
+	setCmd.Flags().StringVar(&baseURL, "base-url", "", "provider API base URL")
+	setCmd.Flags().StringVar(&modelName, "model", "", "provider model name")
+	setCmd.Flags().StringVar(&credentialKey, "credential-keychain-key", "", "Keychain account for this profile's API key")
+	setCmd.Flags().StringVar(&reasoningMode, "reasoning-mode", "", "reasoning mode: provider_default, enabled, or disabled")
+	setCmd.Flags().StringVar(&stream, "stream", "", "stream mode: auto, disabled, or required")
+	cmd.AddCommand(setCmd)
 	return cmd
+}
+
+func newModelRoleCommand(out io.Writer, configPath *string) *cobra.Command {
+	cmd := &cobra.Command{Use: "role", Short: "Bind runtime roles to model profiles"}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "list",
+		Short: "List role bindings",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			return writeData(out, cfg.Model.Roles)
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "set ROLE PROFILE",
+		Short: "Bind one model runtime role to a profile",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			role := strings.TrimSpace(args[0])
+			profile := strings.TrimSpace(args[1])
+			if _, ok := cfg.Model.Profiles[profile]; !ok {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "model profile does not exist: %s", profile)
+			}
+			switch role {
+			case "agent":
+				cfg.Model.Roles.Agent = profile
+			case "semantic":
+				cfg.Model.Roles.Semantic = profile
+			case "finalizer":
+				cfg.Model.Roles.Finalizer = profile
+			case "compactor":
+				cfg.Model.Roles.Compactor = profile
+			case "vision":
+				cfg.Model.Roles.Vision = profile
+			default:
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "unknown model role: %s", role)
+			}
+			cfg.Normalize()
+			if err := config.Save(resolveConfigPath(*configPath), cfg); err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"role": role, "profile": profile, "updated": true})
+		},
+	})
+	return cmd
+}
+
+type modelAuthLoginInput struct {
+	APIKey string `json:"api_key"`
+}
+
+func newModelAuthCommand(in io.Reader, out io.Writer, configPath *string) *cobra.Command {
+	cmd := &cobra.Command{Use: "auth", Short: "Manage model API keys in Keychain"}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "login PROFILE",
+		Short: "Read {\"api_key\":\"...\"} from stdin and store it in Keychain",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if in == nil {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "stdin is required").WithParam("stdin")
+			}
+			cfg, profile, err := loadModelProfile(resolveConfigPath(*configPath), args[0])
+			if err != nil {
+				return err
+			}
+			var input modelAuthLoginInput
+			if err := json.NewDecoder(in).Decode(&input); err != nil {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "decode model auth login JSON from stdin").WithCause(err)
+			}
+			apiKey := strings.TrimSpace(input.APIKey)
+			if apiKey == "" {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "api_key is required")
+			}
+			if err := secretstore.Write(cmd.Context(), modelKeychainService(profile), profile.CredentialKeychainKey, apiKey); err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{
+				"profile":          args[0],
+				"stored":           true,
+				"keychain_service": modelKeychainService(profile),
+				"account":          profile.CredentialKeychainKey,
+				"config":           cfg.Version,
+			})
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "status PROFILE",
+		Short: "Check whether a model API key is readable without printing it",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, profile, err := loadModelProfile(resolveConfigPath(*configPath), args[0])
+			if err != nil {
+				return err
+			}
+			key, readErr := secretstore.Read(cmd.Context(), modelKeychainService(profile), profile.CredentialKeychainKey, modelAPIKeyEnv(args[0]))
+			return writeData(out, map[string]any{
+				"profile":          args[0],
+				"configured":       readErr == nil && strings.TrimSpace(key) != "",
+				"keychain_service": modelKeychainService(profile),
+				"account":          profile.CredentialKeychainKey,
+				"error":            errorString(readErr),
+			})
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "logout PROFILE",
+		Short: "Delete a model API key from Keychain",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, profile, err := loadModelProfile(resolveConfigPath(*configPath), args[0])
+			if err != nil {
+				return err
+			}
+			if err := secretstore.Delete(cmd.Context(), modelKeychainService(profile), profile.CredentialKeychainKey); err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"profile": args[0], "deleted": true})
+		},
+	})
+	return cmd
+}
+
+func newModelDoctorCommand(out io.Writer, configPath *string) *cobra.Command {
+	var all bool
+	cmd := &cobra.Command{
+		Use:   "doctor [PROFILE]",
+		Short: "Verify native tools and tool-result protocol against configured profile(s)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			profiles := []string{}
+			if all {
+				for name := range cfg.Model.Profiles {
+					profiles = append(profiles, name)
+				}
+			} else if len(args) > 0 {
+				profiles = append(profiles, args[0])
+			} else {
+				profiles = append(profiles, cfg.Model.Roles.Agent)
+			}
+			results := map[string]any{}
+			for _, name := range profiles {
+				_, profile, err := loadModelProfile(resolveConfigPath(*configPath), name)
+				if err != nil {
+					return err
+				}
+				if err := ensureRuntimeModelProtocol(profile); err != nil {
+					return err
+				}
+				apiKey, err := secretstore.Read(cmd.Context(), modelKeychainService(profile), profile.CredentialKeychainKey, modelAPIKeyEnv(name))
+				if err != nil {
+					return err
+				}
+				result, err := agentruntime.DoctorNativeTools(cmd.Context(), &agentruntime.OpenAICompatibleModel{
+					APIKey:  apiKey,
+					BaseURL: profile.BaseURL,
+					Model:   profile.Name,
+					Timeout: profile.Timeout,
+				})
+				if err != nil {
+					return err
+				}
+				results[name] = map[string]any{
+					"provider": profile.Provider,
+					"protocol": profile.Protocol,
+					"model":    profile.Name,
+					"tools":    result,
+				}
+			}
+			return writeData(out, map[string]any{"profiles": results})
+		},
+	}
+	cmd.Flags().BoolVar(&all, "all", false, "doctor every configured profile")
+	return cmd
+}
+
+func loadModelProfile(path, name string) (config.Config, config.ModelProfileConfig, error) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return config.Config{}, config.ModelProfileConfig{}, err
+	}
+	profile, ok := cfg.Model.Profiles[strings.TrimSpace(name)]
+	if !ok {
+		return config.Config{}, config.ModelProfileConfig{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"model profile does not exist: %s",
+			name,
+		)
+	}
+	return cfg, profile, nil
+}
+
+func modelKeychainService(profile config.ModelProfileConfig) string {
+	if strings.TrimSpace(profile.KeychainService) != "" {
+		return profile.KeychainService
+	}
+	return "lark-agent"
+}
+
+func modelAPIKeyEnv(profileName string) string {
+	if strings.TrimSpace(profileName) == "primary" {
+		return "OPENAI_API_KEY"
+	}
+	return ""
+}
+
+func modelAdapterForProfile(
+	ctx context.Context,
+	cfg config.Config,
+	profileName string,
+) (*agentruntime.OpenAICompatibleModel, config.ModelProfileConfig, string, error) {
+	profileName = strings.TrimSpace(profileName)
+	profile, ok := cfg.Model.Profiles[profileName]
+	if !ok {
+		return nil, config.ModelProfileConfig{}, "", errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"model profile does not exist: %s",
+			profileName,
+		)
+	}
+	if err := ensureRuntimeModelProtocol(profile); err != nil {
+		return nil, profile, "", err
+	}
+	apiKey, err := secretstore.Read(
+		ctx,
+		modelKeychainService(profile),
+		profile.CredentialKeychainKey,
+		modelAPIKeyEnv(profileName),
+	)
+	if err != nil || strings.TrimSpace(apiKey) == "" {
+		return nil, profile, "", nil
+	}
+	baseURL := profile.BaseURL
+	modelName := profile.Name
+	if profileName == "primary" {
+		baseURL = firstNonEmpty(os.Getenv("OPENAI_BASE_URL"), baseURL)
+		modelName = firstNonEmpty(os.Getenv("OPENAI_MODEL"), modelName)
+	}
+	timeout := profile.Timeout
+	if timeout <= 0 {
+		timeout = cfg.Model.Timeout
+	}
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	fingerprint := fmt.Sprintf(
+		"%s:%s/%s/%s@%s",
+		profileName,
+		profile.Provider,
+		profile.Protocol,
+		modelName,
+		baseURL,
+	)
+	return &agentruntime.OpenAICompatibleModel{
+		APIKey:  apiKey,
+		BaseURL: baseURL,
+		Model:   modelName,
+		Timeout: timeout,
+	}, profile, fingerprint, nil
+}
+
+func ensureRuntimeModelProtocol(profile config.ModelProfileConfig) error {
+	if strings.TrimSpace(profile.Protocol) == "openai_chat" {
+		return nil
+	}
+	return errs.NewConfigError(
+		errs.SubtypeInvalidConfig,
+		"model profile %s uses %s protocol, but daemon model execution currently supports openai_chat profiles only",
+		strings.TrimSpace(profile.Name),
+		strings.TrimSpace(profile.Protocol),
+	).WithField("model.profiles.protocol")
 }
 
 func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "daemon",
 		Short: "Run or manage the daemon",
-		Long: "Run or manage the standalone daemon. Cross-restart work is " +
-			"recorded as interrupted and will not be replayed automatically. " +
-			"跨重启任务不会自动回放。",
+		Long: "Run or manage the standalone daemon. Stateless interrupted work is " +
+			"automatically re-evaluated after a ready restart; delegated context and " +
+			"unsent reply candidates require explicit owner resume; result-uncertain " +
+			"external actions are terminalized and never replayed. " +
+			"无状态工作可自动续跑，对话调查与旧回复草稿必须由 Owner 显式恢复，结果不确定的外部动作绝不重放。",
 	}
 	var once, live, dryRun, includePrivate bool
 	var chatQuery string
@@ -694,7 +1058,8 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 		Short: "Run daemon in the foreground",
 		Long: "Run the daemon in the foreground. Non-owner requests are read-only and confined to " +
 			"same-chat plus configured-workspace evidence; environment reconnaissance and paths outside " +
-			"the workspace are refused.",
+			"the workspace are refused. Allowed group owner mentions and all inbound human private messages " +
+			"use a durable three-minute semantic owner-answer window before reply work.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(resolveConfigPath(*configPath))
 			if err != nil {
@@ -725,6 +1090,7 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 			}
 			options = append(options, app.WithWorkLeases(map[domain.WorkKind]time.Duration{
 				domain.WorkKindFastPath:       cfg.Scheduler.FastPathLease,
+				domain.WorkKindOwnerControl:   cfg.Scheduler.FastPathLease,
 				domain.WorkKindSimpleQuestion: cfg.Scheduler.SimpleLease,
 				domain.WorkKindDirectMention:  cfg.Scheduler.SimpleLease,
 				domain.WorkKindCodingQuestion: cfg.Scheduler.CodingQuestionLease,
@@ -733,7 +1099,14 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 			daemonApp := app.NewDaemon(store, agentRouter, options...)
 			var lifecycleController *lifecycle.Controller
 			if live && !dryRun && liveMessenger != nil && !once {
-				lifecycleController = lifecycle.NewDurableController(liveMessenger, store)
+				lifecycleController = lifecycle.NewDurableController(
+					liveMessenger,
+					store,
+					lifecycle.Options{
+						Language:  string(resolveConfiguredLanguage(cfg.Owner)),
+						OwnerName: cfg.Owner.Name,
+					},
+				)
 			}
 			var pollResult any
 			if live {
@@ -747,10 +1120,42 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 			if err != nil {
 				return err
 			}
+			recoveryReport, err := store.ConvergeInterruptedWork(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if liveMessenger != nil {
+				if err := flushOwnerResolutionNotifications(
+					cmd.Context(),
+					store,
+					liveMessenger,
+					cfg.Owner,
+					cmd.ErrOrStderr(),
+				); err != nil {
+					return err
+				}
+				for _, notice := range recoveryReport.Notices {
+					if err := notifyRecoveryConvergence(
+						cmd.Context(),
+						store,
+						liveMessenger,
+						notice,
+						cfg.Owner,
+					); err != nil {
+						writeError(cmd.ErrOrStderr(), err)
+					}
+				}
+			}
 			if lifecycleController != nil {
-				summary, err := lifecycleRecoverySummary(cmd.Context(), store)
+				_, remainingUncertain, err := store.RecoverySummary(cmd.Context())
 				if err != nil {
 					return err
+				}
+				summary := lifecycle.Summary{
+					Resumed:      recoveryReport.Resumed,
+					WaitingOwner: recoveryReport.WaitingOwner,
+					Terminalized: recoveryReport.Terminalized,
+					Uncertain:    recoveryReport.Uncertain + remainingUncertain,
 				}
 				if err := lifecycleController.NotifyOnline(
 					cmd.Context(),
@@ -856,6 +1261,17 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 					if _, err := daemonApp.PollOnce(cmd.Context()); err != nil {
 						writeError(cmd.ErrOrStderr(), err)
 					}
+					if liveMessenger != nil {
+						if err := flushOwnerResolutionNotifications(
+							cmd.Context(),
+							store,
+							liveMessenger,
+							cfg.Owner,
+							cmd.ErrOrStderr(),
+						); err != nil {
+							writeError(cmd.ErrOrStderr(), err)
+						}
+					}
 				}
 			}
 		},
@@ -908,7 +1324,249 @@ func lifecycleRecoverySummary(
 	if err != nil {
 		return lifecycle.Summary{}, err
 	}
-	return lifecycle.Summary{Interrupted: interrupted, Uncertain: uncertain}, nil
+	return lifecycle.Summary{
+		Paused:    interrupted,
+		Uncertain: uncertain,
+	}, nil
+}
+
+func notifyRecoveryConvergence(
+	ctx context.Context,
+	store *storage.Store,
+	messenger agenttools.Messenger,
+	notice storage.RecoveryConvergenceNotice,
+	owner config.OwnerConfig,
+) error {
+	item, err := store.GetWorkItem(ctx, notice.WorkItemID)
+	if err != nil {
+		return err
+	}
+	language := agentlocale.Resolve(
+		owner.PreferredLanguage,
+		owner.FallbackLanguage,
+		item.Event.Content,
+	)
+	text := recoveryConvergenceText(notice, owner, language)
+	return sendOwnerResolutionText(ctx, store, messenger, notice.WorkItemID, text)
+}
+
+func sendOwnerResolutionText(
+	ctx context.Context,
+	store *storage.Store,
+	messenger agenttools.Messenger,
+	workItemID int64,
+	text string,
+) error {
+	actionID, key, send, err := store.BeginOwnerResolutionNotification(
+		ctx,
+		workItemID,
+		text,
+	)
+	if err != nil || !send {
+		return err
+	}
+	return executeOwnerResolutionSend(ctx, store, messenger, actionID, key, text)
+}
+
+func sendOwnerResolutionRequirement(
+	ctx context.Context,
+	store *storage.Store,
+	messenger agenttools.Messenger,
+	requirement storage.RequiredOwnerResolutionNotification,
+	text string,
+) error {
+	actionID, key, send, err := store.BeginOwnerResolutionNotificationForRequirement(
+		ctx,
+		requirement.ID,
+		requirement.WorkItemID,
+		text,
+	)
+	if err != nil || !send {
+		return err
+	}
+	return executeOwnerResolutionSend(ctx, store, messenger, actionID, key, text)
+}
+
+func retryOwnerResolutionText(
+	ctx context.Context,
+	store *storage.Store,
+	messenger agenttools.Messenger,
+	actionID int64,
+) error {
+	notice, send, err := store.RetryOwnerResolutionNotification(ctx, actionID)
+	if err != nil || !send {
+		return err
+	}
+	return executeOwnerResolutionSend(
+		ctx,
+		store,
+		messenger,
+		notice.ID,
+		notice.IdempotencyKey,
+		notice.Text,
+	)
+}
+
+func executeOwnerResolutionSend(
+	ctx context.Context,
+	store *storage.Store,
+	messenger agenttools.Messenger,
+	actionID int64,
+	key string,
+	text string,
+) error {
+	sendErr := (agenttools.NotifyOwnerTool{Messenger: messenger}).Execute(ctx, agenttools.NotifyRequest{
+		Text:           text,
+		IdempotencyKey: key,
+	})
+	errorText := ""
+	if sendErr != nil {
+		errorText = sendErr.Error()
+	}
+	if completeErr := store.CompleteOwnerResolutionNotification(
+		context.WithoutCancel(ctx),
+		actionID,
+		errorText,
+	); completeErr != nil {
+		if sendErr != nil {
+			return errs.NewInternalError(
+				errs.SubtypeStorage,
+				"send and record recovery resolution notice",
+			).WithCause(errors.Join(sendErr, completeErr))
+		}
+		return completeErr
+	}
+	return sendErr
+}
+
+func flushOwnerResolutionNotifications(
+	ctx context.Context,
+	store *storage.Store,
+	messenger agenttools.Messenger,
+	owner config.OwnerConfig,
+	errOut io.Writer,
+) error {
+	if err := store.ConvergeOwnerResolutionRequirements(ctx); err != nil {
+		return err
+	}
+	pending, err := store.ListPendingOwnerResolutionNotifications(ctx)
+	if err != nil {
+		return err
+	}
+	for _, notice := range pending {
+		if err := retryOwnerResolutionText(
+			ctx,
+			store,
+			messenger,
+			notice.ID,
+		); err != nil {
+			writeError(errOut, err)
+		}
+	}
+	required, err := store.ListRequiredOwnerResolutionNotifications(ctx)
+	if err != nil {
+		return err
+	}
+	handler := liveTerminalFailureHandler{
+		store:     store,
+		messenger: messenger,
+		owner:     owner,
+	}
+	for _, requirement := range required {
+		item, err := store.GetWorkItem(ctx, requirement.WorkItemID)
+		if err != nil {
+			writeError(errOut, err)
+			continue
+		}
+		if err := handler.handleTerminalFailureRequirement(
+			ctx,
+			item,
+			errors.New(requirement.Reason),
+			requirement,
+		); err != nil {
+			writeError(errOut, err)
+		}
+	}
+	return nil
+}
+
+func recoveryConvergenceText(
+	notice storage.RecoveryConvergenceNotice,
+	owner config.OwnerConfig,
+	language agentlocale.Language,
+) string {
+	name := strings.TrimSpace(owner.Name)
+	if name == "" {
+		if language == agentlocale.LanguageEnglish {
+			name = "Owner"
+		} else {
+			name = "负责人"
+		}
+	}
+	if language == agentlocale.LanguageEnglish {
+		if notice.Kind == "context_review_required" {
+			return fmt.Sprintf(
+				"%s, work #%d for message %s contains delegated context or an unsent draft from an earlier daemon session. It will not resume or send that draft automatically. Review it with `lark-agent queue inspect --work-id %d`; if the original request still needs work, run `lark-agent queue resume --work-id %d` to discard the old context and classify it again.",
+				name,
+				notice.WorkItemID,
+				notice.MessageID,
+				notice.WorkItemID,
+				notice.WorkItemID,
+			)
+		}
+		if notice.Kind == "approval_required" {
+			command := "`lark-agent approval list`"
+			if notice.ActionID > 0 {
+				command = fmt.Sprintf("`lark-agent approval approve %d`", notice.ActionID)
+			}
+			return fmt.Sprintf(
+				"%s, work #%d for message %s is waiting for your exact approval. The original draft was preserved. Review it with `lark-agent queue inspect --work-id %d`, then run %s if it is correct.",
+				name,
+				notice.WorkItemID,
+				notice.MessageID,
+				notice.WorkItemID,
+				command,
+			)
+		}
+		return fmt.Sprintf(
+			"%s, work #%d for message %s was terminalized because an external action was interrupted with an uncertain result. It was not replayed. Reconcile it with `lark-agent queue inspect --work-id %d`.",
+			name,
+			notice.WorkItemID,
+			notice.MessageID,
+			notice.WorkItemID,
+		)
+	}
+	if notice.Kind == "context_review_required" {
+		return fmt.Sprintf(
+			"%s，工作 #%d（消息 %s）包含上一轮 Agent 会话保存的调查上下文或未发送草稿，不会自动续跑或发送旧草稿。先执行 `lark-agent queue inspect --work-id %d` 核对；原请求仍需处理时，执行 `lark-agent queue resume --work-id %d` 废弃旧上下文并重新识别。",
+			name,
+			notice.WorkItemID,
+			notice.MessageID,
+			notice.WorkItemID,
+			notice.WorkItemID,
+		)
+	}
+	if notice.Kind == "approval_required" {
+		command := "`lark-agent approval list`"
+		if notice.ActionID > 0 {
+			command = fmt.Sprintf("`lark-agent approval approve %d`", notice.ActionID)
+		}
+		return fmt.Sprintf(
+			"%s，工作 #%d（消息 %s）仍在等待你的明确批准，原草稿已保留。先执行 `lark-agent queue inspect --work-id %d` 核对；确认无误后执行 %s。",
+			name,
+			notice.WorkItemID,
+			notice.MessageID,
+			notice.WorkItemID,
+			command,
+		)
+	}
+	return fmt.Sprintf(
+		"%s，工作 #%d（消息 %s）已收口：中断时有外部动作正在执行，结果无法确认，因此没有重放。请执行 `lark-agent queue inspect --work-id %d` 核对外部结果。",
+		name,
+		notice.WorkItemID,
+		notice.MessageID,
+		notice.WorkItemID,
+	)
 }
 
 func notifyLifecycleOffline(
@@ -1118,6 +1776,7 @@ func buildLiveOptions(
 		return nil, nil, nil, info, nil
 	}
 	store.ConfigureRecovery(cfg.Agent.MaxRetries)
+	store.ConfigureOwnerReplyRecovery(cfg.Policy.OwnerReplyMaxRetries)
 	credentials, err := serviceim.LoadCredentials(ctx, credentialRefs(cfg))
 	if err != nil {
 		return nil, nil, nil, info, err
@@ -1135,6 +1794,26 @@ func buildLiveOptions(
 		return nil, nil, nil, info, err
 	}
 	imSvc := serviceim.NewService(apiClient, cfg.Owner.OpenID)
+	resourceSvc := serviceim.NewResourceService(apiClient)
+	resourceMonitor := agentresource.NewMonitor(
+		resourceSvc,
+		store,
+		agentresource.Config{OwnerOpenID: cfg.Owner.OpenID},
+	)
+	if err := bootstrapConfiguredResourceSubscriptions(ctx, cfg, store); err != nil {
+		return nil, nil, nil, info, err
+	}
+	resourceSync, err := resourceMonitor.SyncSubscriptions(ctx)
+	if err != nil {
+		return nil, nil, nil, info, err
+	}
+	resourceReconcile, err := resourceMonitor.Reconcile(ctx)
+	if err != nil {
+		info["resource_reconcile_error"] = err.Error()
+	} else {
+		info["resource_reconcile"] = resourceReconcile
+	}
+	info["resource_subscriptions"] = resourceSync
 	var realtimeSource realtime.Runner
 	var configuredAssistantChatIDs []string
 	if cfg.Assistant.ReplyScope == domain.ReplyScopeConfiguredGroups {
@@ -1157,6 +1836,10 @@ func buildLiveOptions(
 			AssistantReplyScope: cfg.Assistant.ReplyScope,
 			ConfiguredChatIDs:   configuredAssistantChatIDs,
 			Classify:            agentRouter.Route,
+			HandleResourceSignal: func(ctx context.Context, signal serviceim.ResourceSignal) error {
+				_, err := resourceMonitor.HandleResourceSignal(ctx, signal)
+				return err
+			},
 		})
 		info["realtime_owner_requests"] = true
 		info["realtime_requests"] = true
@@ -1199,16 +1882,27 @@ func buildLiveOptions(
 		allowedRepositories: append([]string(nil), cfg.GitHub.AllowedRepositories...),
 		githubEnabled:       cfg.GitHub.Enabled,
 		base: agentcontext.Builder{
-			Scope:  scope,
-			Rules:  ruleSet,
-			Memory: memory.NewStore(),
+			Scope:         scope,
+			Rules:         ruleSet,
+			Memory:        store,
+			RuntimePolicy: runtimePolicySnapshot(cfg),
 			User: agentcontext.UserProfile{
-				OpenID: cfg.Owner.OpenID,
+				OpenID:            cfg.Owner.OpenID,
+				Name:              cfg.Owner.Name,
+				PreferredLanguage: string(cfg.Owner.PreferredLanguage),
+				FallbackLanguage:  string(cfg.Owner.FallbackLanguage),
 			},
 		},
 		includeLarkContext: userContextEnabled,
 	}
-	options := []app.Option{app.WithContextBuilder(builder)}
+	options := []app.Option{
+		app.WithContextBuilder(builder),
+		app.WithControlHandler(control.New(store, control.Config{
+			OwnerName: cfg.Owner.Name,
+			Language:  string(resolveConfiguredLanguage(cfg.Owner)),
+			Version:   buildVersion(),
+		})),
+	}
 	info["user_context"] = userContextEnabled
 	if userContextEnabled {
 		livePoller := newConfiguredLivePoller(
@@ -1219,6 +1913,7 @@ func buildLiveOptions(
 			chatQuery,
 			configuredAssistantChatIDs,
 			includePrivate,
+			resourceMonitor,
 		)
 		options = append(options, app.WithPoller(livePoller))
 		info["user_polling"] = true
@@ -1226,23 +1921,29 @@ func buildLiveOptions(
 		info["user_polling"] = false
 		info["user_token"] = "missing"
 	}
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	baseURL := firstNonEmpty(os.Getenv("OPENAI_BASE_URL"), cfg.Model.BaseURL)
-	model := firstNonEmpty(os.Getenv("OPENAI_MODEL"), cfg.Model.Name)
-	if apiKey != "" && model != "" {
-		modelFingerprint := model + "@" + baseURL
+	var delegatedResolver app.DelegatedReplyResolver
+	modelAdapter, agentProfile, modelFingerprint, err := modelAdapterForProfile(ctx, cfg, cfg.Model.Roles.Agent)
+	if err != nil {
+		return nil, nil, nil, info, err
+	}
+	if modelAdapter != nil {
 		configFingerprint, err := agentConfigFingerprint(cfg)
 		if err != nil {
 			return nil, nil, nil, info, err
 		}
 		definitions := append([]agenttools.Definition{}, agenttools.CodeIndexDefinitions(scope, nil)...)
 		definitions = append(definitions, agenttools.WorkspaceDefinitions(scope)...)
+		definitions = append(definitions, agenttools.GitDefinitions(scope)...)
 		if userContextEnabled {
 			definitions = append(definitions, agenttools.LarkContextDefinitions(larkToolContext{svc: imSvc})...)
 		}
 		if githubClient != nil {
 			definitions = append(definitions, agenttools.GitHubContextDefinition(githubClient))
 		}
+		definitions = append(definitions, agenttools.ResourceDefinitions(agenttools.ResourceToolOptions{
+			Mode: cfg.Policy.Mode, Evidence: store, Actions: store,
+			Client: resourceToolClient{service: resourceSvc},
+		})...)
 		definitions = append(definitions,
 			agenttools.ShellDefinition(scope, agenttools.ShellOptions{
 				ApprovalRequired:     cfg.Agent.ShellApproval,
@@ -1258,19 +1959,64 @@ func buildLiveOptions(
 		if err != nil {
 			return nil, nil, nil, info, err
 		}
-		modelAdapter := &agentruntime.OpenAICompatibleModel{
-			APIKey:  apiKey,
-			BaseURL: baseURL,
-			Model:   model,
-			Timeout: cfg.Model.Timeout,
+		semanticModelAdapter, _, _, err := modelAdapterForProfile(ctx, cfg, cfg.Model.Roles.Semantic)
+		if err != nil {
+			return nil, nil, nil, info, err
+		}
+		if semanticModelAdapter == nil {
+			semanticModelAdapter = modelAdapter
+		}
+		options = append(options, app.WithSemanticControlResolver(
+			control.NewSemanticResolver(
+				semanticModelAdapter,
+				store,
+				string(resolveConfiguredLanguage(cfg.Owner)),
+			),
+		))
+		loopModelAdapter := modelAdapter
+		if visionModel := strings.TrimSpace(cfg.Agent.VisionModel); visionModel != "" {
+			loopModelAdapter = &agentruntime.OpenAICompatibleModel{
+				APIKey:  modelAdapter.APIKey,
+				BaseURL: modelAdapter.BaseURL,
+				Model:   visionModel,
+				Timeout: modelAdapter.Timeout,
+			}
+			info["vision_model"] = visionModel
+		}
+		finalizerModelAdapter, _, _, err := modelAdapterForProfile(ctx, cfg, cfg.Model.Roles.Finalizer)
+		if err != nil {
+			return nil, nil, nil, info, err
+		}
+		if finalizerModelAdapter == nil {
+			finalizerModelAdapter = loopModelAdapter
+		}
+		if userContextEnabled {
+			delegatedResolver = &liveDelegatedReplyResolver{
+				contexts:             imSvc,
+				store:                store,
+				matcher:              replymatch.New(semanticModelAdapter, cfg.Owner.OpenID),
+				ownerOpenID:          cfg.Owner.OpenID,
+				ownerWait:            cfg.Policy.OwnerWait,
+				visionEnabled:        strings.TrimSpace(cfg.Agent.VisionModel) != "",
+				maxContextImages:     cfg.Agent.MaxContextImages,
+				maxContextImageBytes: cfg.Agent.MaxContextImageBytes,
+				maxContextImageTotal: cfg.Agent.MaxContextImageTotalBytes,
+			}
+			options = append(options, app.WithDelegatedReplyResolver(
+				delegatedResolver,
+				cfg.Policy.OwnerReplyConfidenceMin,
+				cfg.Policy.OwnerReplyRetry,
+			))
 		}
 		options = append(options, app.WithDecider(agentruntime.LoopDecisionAgent{Loop: agentruntime.AgentLoop{
-			Model:             modelAdapter,
+			Model:             loopModelAdapter,
+			TerminalFinalizer: finalizerModelAdapter,
 			Tools:             registry,
 			MaxTurns:          cfg.Agent.MaxTurns,
 			MaxToolBytes:      cfg.Agent.MaxToolOutput,
 			MaxTotalBytes:     cfg.Agent.MaxTotalToolOutput,
 			MaxContextBytes:   cfg.Agent.MaxContextBytes,
+			ContextCompaction: cfg.Agent.ContextCompaction,
 			MaxElapsed:        cfg.Agent.LoopTimeout,
 			MaxRepeatedCalls:  cfg.Agent.MaxRepeatedCalls,
 			MaxToolCalls:      cfg.ToolPolicy.CodingMaxToolCalls,
@@ -1283,14 +2029,27 @@ func buildLiveOptions(
 			ConfigFingerprint: configFingerprint,
 		}}))
 		info["model_configured"] = true
-		info["model"] = model
+		info["model_profile"] = cfg.Model.Roles.Agent
+		info["model_provider"] = agentProfile.Provider
+		info["model_protocol"] = agentProfile.Protocol
+		info["model"] = modelAdapter.Model
 		info["agent_tools"] = len(registry.Infos())
 		info["runtime_fingerprint"] = modelFingerprint + ":" + configFingerprint
 	}
+	if userContextEnabled && delegatedResolver == nil {
+		delegatedResolver = unavailableDelegatedReplyResolver{}
+		options = append(options, app.WithDelegatedReplyResolver(
+			delegatedResolver,
+			cfg.Policy.OwnerReplyConfidenceMin,
+			cfg.Policy.OwnerReplyRetry,
+		))
+	}
+	info["semantic_delegated_replies"] = delegatedResolver != nil
 	if !dryRun {
-		threadState := liveThreadState{}
-		if userContextEnabled {
-			threadState.svc = imSvc
+		threadState := &liveThreadState{
+			resolver:      delegatedResolver,
+			confidenceMin: cfg.Policy.OwnerReplyConfidenceMin,
+			resolutions:   make(map[string]replymatch.Resolution),
 		}
 		gate := policy.NewReplyGate(policy.Config{
 			Mode:                cfg.Policy.Mode,
@@ -1298,17 +2057,60 @@ func buildLiveOptions(
 			ReplyScope:          cfg.Policy.ReplyScope,
 			AssistantReplyScope: cfg.Assistant.ReplyScope,
 			ReplyConfidenceMin:  cfg.Policy.ReplyConfidenceMin,
-			OwnerWait:           cfg.Policy.OwnerWait,
 			BlockChats:          cfg.Policy.BlockChats,
 			BlockUsers:          cfg.Policy.BlockUsers,
 		}, threadState)
 		options = append(options,
 			app.WithReplyHandler(reply.NewController(gate, imSvc, store)),
-			app.WithNotificationHandler(liveOwnerNotifier{messenger: imSvc}),
+			app.WithDecisionPresenter(agentlocale.DelegatedPresenter{
+				OwnerOpenID: cfg.Owner.OpenID,
+				OwnerName:   cfg.Owner.Name,
+				Preferred:   cfg.Owner.PreferredLanguage,
+				Fallback:    cfg.Owner.FallbackLanguage,
+			}),
+			app.WithNotificationHandler(liveOwnerNotifier{
+				messenger: imSvc,
+				ownerName: cfg.Owner.Name,
+				preferred: cfg.Owner.PreferredLanguage,
+				fallback:  cfg.Owner.FallbackLanguage,
+			}),
+			app.WithTerminalFailureHandler(liveTerminalFailureHandler{
+				store:     store,
+				messenger: imSvc,
+				owner:     cfg.Owner,
+			}),
 			app.WithOwnerActivityHandler(feedback.NewController(imSvc, store)),
 		)
+		if cfg.Policy.InvestigationProgress == "enabled" {
+			options = append(options, app.WithInvestigationProgressHandler(
+				investigation.New(store, imSvc, investigation.Config{
+					OwnerName: cfg.Owner.Name,
+					Language:  string(resolveConfiguredLanguage(cfg.Owner)),
+				}),
+			))
+			info["investigation_progress"] = true
+		} else {
+			info["investigation_progress"] = false
+		}
 	}
 	return options, realtimeSource, imSvc, info, nil
+}
+
+func runtimePolicySnapshot(cfg config.Config) agentcontext.RuntimePolicySnapshot {
+	return agentcontext.RuntimePolicySnapshot{
+		Authoritative:           true,
+		MustNotInferFromRules:   true,
+		Mode:                    cfg.Policy.Mode,
+		AssistantReplyScope:     cfg.Assistant.ReplyScope,
+		DelegatedReplyScope:     cfg.Policy.ReplyScope,
+		PrivateReplyScope:       cfg.Policy.PrivateReplyScope,
+		OwnerWait:               cfg.Policy.OwnerWait.String(),
+		OwnerReplyConfidenceMin: cfg.Policy.OwnerReplyConfidenceMin,
+		OwnerReplyRetry:         cfg.Policy.OwnerReplyRetry.String(),
+		OwnerReplyMaxRetries:    cfg.Policy.OwnerReplyMaxRetries,
+		ReplyConfidenceMin:      cfg.Policy.ReplyConfidenceMin,
+		InvestigationProgress:   cfg.Policy.InvestigationProgress,
+	}
 }
 
 func validateLiveReplyScope(scope domain.ReplyScope, chatQuery string) error {
@@ -1380,7 +2182,14 @@ func newConfiguredLivePoller(
 	chatQuery string,
 	configuredAssistantChatIDs []string,
 	includePrivate bool,
+	resourceMonitor *agentresource.Monitor,
 ) *poll.Poller {
+	var reconcile func(context.Context)
+	if resourceMonitor != nil {
+		reconcile = func(ctx context.Context) {
+			_, _ = resourceMonitor.Reconcile(ctx)
+		}
+	}
 	return poll.New(im, store, poll.Config{
 		OwnerOpenID:                cfg.Owner.OpenID,
 		ChatQuery:                  chatQuery,
@@ -1390,21 +2199,92 @@ func newConfiguredLivePoller(
 		IncludePrivate:             includePrivate,
 		PageSize:                   20,
 		IndexLookback:              cfg.Scheduler.PollIndexLookback,
+		OwnerWait:                  cfg.Policy.OwnerWait,
 		Classify:                   agentRouter.Route,
+		NotificationSink:           resourceMonitor,
+		ReconcileResources:         reconcile,
 	})
+}
+
+func bootstrapConfiguredResourceSubscriptions(
+	ctx context.Context,
+	cfg config.Config,
+	store *storage.Store,
+) error {
+	for _, configured := range cfg.Lark.Subscriptions {
+		url := strings.TrimSpace(configured.URL)
+		if url == "" {
+			continue
+		}
+		ref, err := serviceim.ParseResourceURL(url)
+		if err != nil {
+			return err
+		}
+		modes := append([]string(nil), configured.MonitorModes...)
+		if len(modes) == 0 {
+			modes = agentresource.MonitorModesForResource(ref.ResourceType)
+		}
+		status := domain.ResourceSubscriptionStatus(configured.Status)
+		switch status {
+		case domain.ResourceSubscriptionActive, domain.ResourceSubscriptionDegraded:
+		default:
+			status = domain.ResourceSubscriptionPending
+		}
+		if _, err := store.UpsertResourceSubscription(ctx, domain.ResourceSubscription{
+			OriginalURL:          url,
+			ResourceType:         firstNonEmpty(configured.ResourceType, string(ref.ResourceType)),
+			FileToken:            firstNonEmpty(configured.FileToken, ref.FileToken),
+			AppToken:             firstNonEmpty(configured.AppToken, ref.AppToken),
+			WikiNodeToken:        firstNonEmpty(configured.WikiNodeToken, ref.WikiNodeToken),
+			TableID:              firstNonEmpty(configured.TableID, ref.TableID),
+			ViewID:               firstNonEmpty(configured.ViewID, ref.ViewID),
+			MonitorModes:         modes,
+			RemoteSubscriptionID: configured.RemoteSubscriptionID,
+			Status:               status,
+			Cursor:               configured.Cursor,
+			LastError:            configured.LastError,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func newAgentRouter(cfg config.Config, store *storage.Store) *router.Router {
 	queueText := func() string {
-		summary, err := store.QueueSummary()
+		english := resolveConfiguredLanguage(cfg.Owner) == agentlocale.LanguageEnglish
+		action, err := store.ListOwnerTasks(context.Background(), domain.OwnerTaskQuery{
+			View: domain.OwnerTaskViewAction, Page: 1, PageSize: 1,
+		})
 		if err != nil {
-			return "队列摘要暂时不可用：" + err.Error()
+			if english {
+				return "The task summary is temporarily unavailable."
+			}
+			return "任务摘要暂时不可用，请稍后重试或发送 `/doctor` 检查。"
+		}
+		running, err := store.ListOwnerTasks(context.Background(), domain.OwnerTaskQuery{
+			View: domain.OwnerTaskViewRunning, Page: 1, PageSize: 1,
+		})
+		if err != nil {
+			if english {
+				return "The task summary is temporarily unavailable."
+			}
+			return "任务摘要暂时不可用，请稍后重试或发送 `/doctor` 检查。"
+		}
+		if english {
+			return fmt.Sprintf(
+				"Needs your action: %d. In progress or waiting automatically: %d. Use `/tasks` for details.",
+				action.Total,
+				running.Total,
+			)
 		}
 		return fmt.Sprintf(
-			"队列状态：%v；工作通道：%v；陈旧 processing：%d；fast path 命中：%d。",
-			summary.StatusCounts, summary.LaneCounts, summary.StaleProcessing, summary.FastPathHits,
+			"需要你处理 %d 条；正在执行或自动等待 %d 条。发送 `/tasks` 查看详情。",
+			action.Total,
+			running.Total,
 		)
 	}
+	language := string(resolveConfiguredLanguage(cfg.Owner))
 	return router.New(router.Config{
 		OwnerOpenID:         cfg.Owner.OpenID,
 		AssistantOpenIDs:    cfg.Assistant.OpenIDs,
@@ -1413,16 +2293,27 @@ func newAgentRouter(cfg config.Config, store *storage.Store) *router.Router {
 		OwnerDirect:         cfg.Assistant.OwnerDirect.Enabled,
 		Mode:                cfg.Policy.Mode,
 		ReplyScope:          cfg.Policy.ReplyScope,
+		PrivateReplyScope:   cfg.Policy.PrivateReplyScope,
 		AllowChats:          cfg.Policy.AllowChats,
 		BlockChats:          cfg.Policy.BlockChats,
 		BlockUsers:          cfg.Policy.BlockUsers,
 		Sensitivity:         cfg.Policy.Sensitivity,
 		DisableFastPath:     !cfg.FastPath.Enabled,
 		DisableCodingGoal:   !cfg.Goal.Enabled,
-		StatusText:          func() string { return "lark-agent 正在运行，调度器可用。" + queueText() },
-		DoctorText:          func() string { return "基础诊断正常。" + queueText() },
+		StatusText:          func() string { return queueText() },
+		DoctorText:          func() string { return queueText() },
 		QueueSummaryText:    queueText,
+		HelpText:            control.HelpText(language, ""),
+		Language:            language,
 	})
+}
+
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok || strings.TrimSpace(info.Main.Version) == "" {
+		return "development"
+	}
+	return info.Main.Version
 }
 
 func runSchedulerWorker(ctx context.Context, daemonApp *app.Daemon, errOut io.Writer) {
@@ -1527,12 +2418,504 @@ type conversationBuilder struct {
 	base                agentcontext.Builder
 }
 
+type semanticReplyContextReader interface {
+	GetSemanticReplyContext(
+		context.Context,
+		serviceim.SemanticReplyContextRequest,
+	) (serviceim.SemanticReplyContext, error)
+}
+
+type ownerAckReactionReader interface {
+	FindOwnerAckReaction(
+		context.Context,
+		serviceim.OwnerAckReactionRequest,
+	) (serviceim.OwnerAckReactionResult, error)
+}
+
+type semanticContextImageHydrator interface {
+	HydrateContextImages(
+		context.Context,
+		[]serviceim.Message,
+		serviceim.ImageHydrationLimits,
+	) []serviceim.Message
+}
+
+type semanticReplyStore interface {
+	ListPendingDelegatedWork(string) ([]domain.WorkItem, error)
+	RecordOwnerReplyResolution(int64, replymatch.Resolution) error
+}
+
+type semanticReplyMatcher interface {
+	Resolve(context.Context, replymatch.Request) (replymatch.Resolution, error)
+}
+
+type unavailableDelegatedReplyResolver struct{}
+
+func (unavailableDelegatedReplyResolver) Resolve(
+	context.Context,
+	domain.WorkItem,
+) (replymatch.Resolution, error) {
+	return replymatch.Resolution{}, errs.NewInternalError(
+		errs.SubtypeFailedPrecondition,
+		"semantic delegated reply model is unavailable",
+	)
+}
+
+type liveDelegatedReplyResolver struct {
+	contexts             semanticReplyContextReader
+	store                semanticReplyStore
+	matcher              semanticReplyMatcher
+	maxMessages          int
+	ownerOpenID          string
+	ownerWait            time.Duration
+	visionEnabled        bool
+	maxContextImages     int
+	maxContextImageBytes int64
+	maxContextImageTotal int64
+}
+
+func (r liveDelegatedReplyResolver) Resolve(
+	ctx context.Context,
+	item domain.WorkItem,
+) (replymatch.Resolution, error) {
+	ownerWait := r.ownerWait
+	if ownerWait <= 0 {
+		ownerWait = 3 * time.Minute
+	}
+	pending, err := r.store.ListPendingDelegatedWork(item.Event.ChatID)
+	if err != nil {
+		return replymatch.Resolution{}, err
+	}
+	since := item.Event.CreatedAt
+	for _, candidate := range pending {
+		if candidate.Event.CreatedAt.IsZero() {
+			continue
+		}
+		if since.IsZero() || candidate.Event.CreatedAt.Before(since) {
+			since = candidate.Event.CreatedAt
+		}
+	}
+	if reader, ok := r.contexts.(ownerAckReactionReader); ok {
+		reactionResult, reactionErr := reader.FindOwnerAckReaction(
+			ctx,
+			serviceim.OwnerAckReactionRequest{
+				MessageID:   item.Event.MessageID,
+				OwnerOpenID: r.ownerOpenID,
+			},
+		)
+		if reactionErr != nil {
+			resolution := replymatch.Resolution{
+				TargetMessageID: item.Event.MessageID,
+				Result:          replymatch.ResultAmbiguous,
+				Reason:          "owner reaction read failed",
+				ContextCutoff:   time.Now().UTC(),
+			}
+			if err := r.store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
+				return replymatch.Resolution{}, err
+			}
+			return resolution, nil
+		}
+		if reactionResult.Found {
+			resolution := replymatch.Resolution{
+				TargetMessageID: item.Event.MessageID,
+				Result:          replymatch.ResultAnswered,
+				Confidence:      1,
+				Reason:          "owner acknowledged the exact target with an allowed reaction",
+				OwnerAckReaction: &replymatch.OwnerAckReaction{
+					ReactionID:     reactionResult.Reaction.ReactionID,
+					EmojiType:      reactionResult.Reaction.EmojiType,
+					OperatorType:   reactionResult.Reaction.OperatorType,
+					OperatorOpenID: reactionResult.Reaction.OperatorOpenID,
+				},
+				ContextCutoff: time.Now().UTC(),
+			}
+			if err := r.store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
+				return replymatch.Resolution{}, err
+			}
+			return resolution, nil
+		}
+	}
+	if !since.IsZero() {
+		since = since.Add(-ownerWait)
+	}
+	maxMessages := r.maxMessages
+	if maxMessages <= 0 {
+		maxMessages = 100
+	}
+	larkContext, err := r.contexts.GetSemanticReplyContext(
+		ctx,
+		serviceim.SemanticReplyContextRequest{
+			ChatID:          item.Event.ChatID,
+			TargetMessageID: item.Event.MessageID,
+			Since:           since,
+			MaxMessages:     maxMessages,
+		},
+	)
+	if err != nil {
+		return replymatch.Resolution{}, err
+	}
+	if larkContext.Withdrawn {
+		resolution := replymatch.Resolution{
+			TargetMessageID: item.Event.MessageID,
+			Result:          replymatch.ResultWithdrawn,
+			Confidence:      1,
+			Reason:          "target message was withdrawn",
+			ContextCutoff:   larkContext.ContextCutoff,
+		}
+		if err := r.store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
+			return replymatch.Resolution{}, err
+		}
+		return resolution, nil
+	}
+	if r.visionEnabled {
+		if hydrator, ok := r.contexts.(semanticContextImageHydrator); ok {
+			larkContext.Messages = hydrator.HydrateContextImages(
+				ctx,
+				larkContext.Messages,
+				serviceim.ImageHydrationLimits{
+					MaxImages:     r.maxContextImages,
+					MaxImageBytes: r.maxContextImageBytes,
+					MaxTotalBytes: r.maxContextImageTotal,
+					As:            serviceim.IdentityUser,
+				},
+			)
+		}
+	} else {
+		for messageIndex := range larkContext.Messages {
+			for attachmentIndex := range larkContext.Messages[messageIndex].Attachments {
+				attachment := &larkContext.Messages[messageIndex].Attachments[attachmentIndex]
+				if attachment.Type == "image" && !attachment.Readable {
+					attachment.UnreadableReason = "vision_model_not_configured"
+				}
+			}
+		}
+	}
+
+	messages := normalizeToolMessages(larkContext.Messages)
+	latest := make(map[string]domain.NormalizedEvent, len(messages))
+	for _, message := range messages {
+		latest[message.MessageID] = message
+	}
+	target := item
+	if event, ok := latest[item.Event.MessageID]; ok {
+		target.Event = event
+	}
+	for index := range pending {
+		if event, ok := latest[pending[index].Event.MessageID]; ok {
+			pending[index].Event = event
+		}
+	}
+	if !target.Event.UpdatedAt.IsZero() &&
+		target.Event.UpdatedAt.After(target.Event.CreatedAt) {
+		deadline := target.Event.UpdatedAt.Add(ownerWait)
+		cutoff := larkContext.ContextCutoff
+		if cutoff.IsZero() {
+			cutoff = time.Now().UTC()
+		}
+		if deadline.After(cutoff) {
+			resolution := replymatch.Resolution{
+				TargetMessageID: item.Event.MessageID,
+				Result:          replymatch.ResultAmbiguous,
+				Reason:          "target was edited inside the owner wait window",
+				ContextCutoff:   cutoff,
+				RetryAfter:      deadline.Sub(cutoff),
+			}
+			if err := r.store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
+				return replymatch.Resolution{}, err
+			}
+			return resolution, nil
+		}
+	}
+	if larkContext.Incomplete {
+		resolution := replymatch.Resolution{
+			TargetMessageID: item.Event.MessageID,
+			Result:          replymatch.ResultAmbiguous,
+			Reason:          "same-chat context is incomplete",
+			ContextCutoff:   larkContext.ContextCutoff,
+		}
+		if err := r.store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
+			return replymatch.Resolution{}, err
+		}
+		return resolution, nil
+	}
+	resolution, err := r.matcher.Resolve(ctx, replymatch.Request{
+		Target:        target,
+		Pending:       pending,
+		Messages:      messages,
+		ContextCutoff: larkContext.ContextCutoff,
+	})
+	if err != nil {
+		resolution = replymatch.Resolution{
+			TargetMessageID: item.Event.MessageID,
+			Result:          replymatch.ResultAmbiguous,
+			Reason:          "semantic owner-reply evaluation failed",
+			ContextCutoff:   larkContext.ContextCutoff,
+		}
+	}
+	if resolution.ContextCutoff.IsZero() {
+		resolution.ContextCutoff = larkContext.ContextCutoff
+	}
+	resolution.ContextMessages = append(
+		[]domain.NormalizedEvent(nil),
+		messages...,
+	)
+	contextJSON, digestErr := json.Marshal(messages)
+	if digestErr != nil {
+		return replymatch.Resolution{}, errs.NewInternalError(
+			errs.SubtypeUnknown,
+			"encode delegated context digest",
+		).WithCause(digestErr)
+	}
+	contextDigest := sha256.Sum256(contextJSON)
+	resolution.ContextDigest = fmt.Sprintf("sha256:%x", contextDigest[:])
+	if err := r.store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
+		return replymatch.Resolution{}, err
+	}
+	return resolution, nil
+}
+
 type larkToolContext struct {
 	svc *serviceim.Service
 }
 
+type resourceToolClient struct {
+	service *serviceim.ResourceService
+}
+
+func (c resourceToolClient) ListBaseFields(
+	ctx context.Context,
+	appToken, tableID string,
+) ([]agenttools.ResourceField, error) {
+	fields, err := c.service.ListBaseFields(ctx, appToken, tableID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]agenttools.ResourceField, 0, len(fields))
+	for _, field := range fields {
+		item := agenttools.ResourceField{Name: field.Name, Type: field.Type}
+		for _, option := range field.Options {
+			item.Options = append(item.Options, option.Name)
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+func (c resourceToolClient) CompareAndUpdateBaseField(
+	ctx context.Context,
+	update agenttools.ResourceFieldUpdate,
+) (any, error) {
+	return c.service.CompareAndUpdateBaseField(ctx, serviceim.BaseFieldUpdate{
+		AppToken: update.AppToken, TableID: update.TableID, RecordID: update.RecordID,
+		FieldName: update.FieldName, Before: update.Before, After: update.After,
+	})
+}
+
+func (c resourceToolClient) ReplyToComment(
+	ctx context.Context,
+	fileToken, fileType, commentID, text string,
+) (any, error) {
+	return c.service.ReplyToComment(ctx, fileToken, fileType, commentID, text)
+}
+
 type liveOwnerNotifier struct {
 	messenger agenttools.Messenger
+	ownerName string
+	preferred agentlocale.Language
+	fallback  agentlocale.Language
+}
+
+type liveTerminalFailureHandler struct {
+	store     *storage.Store
+	messenger agenttools.Messenger
+	owner     config.OwnerConfig
+}
+
+func (h liveTerminalFailureHandler) HandleTerminalFailure(
+	ctx context.Context,
+	item domain.WorkItem,
+	runErr error,
+) error {
+	required, err := h.store.ListRequiredOwnerResolutionNotifications(ctx)
+	if err != nil {
+		return err
+	}
+	for _, requirement := range required {
+		if requirement.WorkItemID == item.ID {
+			return h.handleTerminalFailureRequirement(ctx, item, runErr, requirement)
+		}
+	}
+	current, err := h.store.GetWorkItem(ctx, item.ID)
+	if err != nil {
+		return err
+	}
+	if current.Status != domain.StatusDeadLetter {
+		return nil
+	}
+	return sendOwnerResolutionText(
+		ctx,
+		h.store,
+		h.messenger,
+		current.ID,
+		h.terminalFailureText(ctx, current, runErr),
+	)
+}
+
+func (h liveTerminalFailureHandler) handleTerminalFailureRequirement(
+	ctx context.Context,
+	item domain.WorkItem,
+	runErr error,
+	requirement storage.RequiredOwnerResolutionNotification,
+) error {
+	return sendOwnerResolutionRequirement(
+		ctx,
+		h.store,
+		h.messenger,
+		requirement,
+		h.terminalFailureText(ctx, item, runErr),
+	)
+}
+
+func (h liveTerminalFailureHandler) terminalFailureText(
+	ctx context.Context,
+	item domain.WorkItem,
+	runErr error,
+) string {
+	language := agentlocale.Resolve(
+		h.owner.PreferredLanguage,
+		h.owner.FallbackLanguage,
+		item.Event.Content,
+	)
+	name := strings.TrimSpace(h.owner.Name)
+	if name == "" {
+		if language == agentlocale.LanguageEnglish {
+			name = "Owner"
+		} else {
+			name = "负责人"
+		}
+	}
+	reason := agentlocale.LocalizedReason(language, runErr.Error())
+	candidateText := h.unsentCandidateText(ctx, item.ID, language)
+	var text string
+	if language == agentlocale.LanguageEnglish {
+		text = fmt.Sprintf(
+			"%s, work #%d for message %s has stopped after bounded retries: %s. Completed evidence and failure history were preserved.%s In the intelligent-assistant private chat, send `/task %d` to inspect it; after reviewing side effects, send `/task resume %d confirm` only if it should run again.",
+			name,
+			item.ID,
+			item.Event.MessageID,
+			reason,
+			candidateText,
+			item.ID,
+			item.ID,
+		)
+	} else {
+		text = fmt.Sprintf(
+			"%s，工作 #%d（消息 %s）在有界重试后已停止：%s。已完成的证据和失败记录均已保留。%s请在智能助手私聊发送 `/task %d` 查看；核对外部动作后，确需重做时再发送 `/task resume %d confirm`。",
+			name,
+			item.ID,
+			item.Event.MessageID,
+			reason,
+			candidateText,
+			item.ID,
+			item.ID,
+		)
+	}
+	return text
+}
+
+func (h liveTerminalFailureHandler) unsentCandidateText(
+	ctx context.Context,
+	workItemID int64,
+	language agentlocale.Language,
+) string {
+	candidate, found, err := h.store.ReadyWorkReplyCandidate(workItemID)
+	if err != nil {
+		return ""
+	}
+	if !found {
+		return h.durableRunProgressText(ctx, workItemID, language)
+	}
+	checks := strings.Join(candidate.Decision.Progress.CompletedChecks, "；")
+	unknowns := strings.Join(candidate.Decision.Progress.Unknowns, "；")
+	nextStep := strings.TrimSpace(candidate.Decision.Progress.NextStep)
+	draft := boundedOwnerSummary(candidate.Decision.ReplyText, 1200)
+	if language == agentlocale.LanguageEnglish {
+		return fmt.Sprintf(
+			" The original sender has not been answered. Unsent validated draft: %s. Completed checks: %s. Unknowns: %s. Next step: %s.",
+			draft,
+			emptySummaryValue(checks),
+			emptySummaryValue(unknowns),
+			emptySummaryValue(nextStep),
+		)
+	}
+	return fmt.Sprintf(
+		"尚未回复原提问者。未发送且已通过校验的草稿：%s。已核对：%s。未知：%s。下一步：%s。",
+		draft,
+		emptySummaryValue(checks),
+		emptySummaryValue(unknowns),
+		emptySummaryValue(nextStep),
+	)
+}
+
+func (h liveTerminalFailureHandler) durableRunProgressText(
+	ctx context.Context,
+	workItemID int64,
+	language agentlocale.Language,
+) string {
+	inspection, err := h.store.InspectWork(ctx, domain.WorkInspectionQuery{
+		WorkItemID: workItemID,
+	})
+	if err != nil || inspection.LatestRun == nil {
+		return ""
+	}
+	steps, err := h.store.ListAgentSteps(inspection.LatestRun.ID)
+	if err != nil {
+		return ""
+	}
+	checks := make([]string, 0, len(steps))
+	seen := make(map[string]bool)
+	for _, step := range steps {
+		name := strings.TrimSpace(step.ToolName)
+		if step.Kind != "tool" ||
+			strings.TrimSpace(step.Error) != "" ||
+			name == "" ||
+			name == "submit_decision" ||
+			name == "submit_investigation_plan" ||
+			seen[name] {
+			continue
+		}
+		seen[name] = true
+		checks = append(checks, name)
+	}
+	if len(checks) == 0 {
+		return ""
+	}
+	if language == agentlocale.LanguageEnglish {
+		return fmt.Sprintf(
+			" The original sender has not been answered. No sender-facing conclusion passed the safety and evidence gates. Completed checks: %s. Remaining unknown: a reliable answer to the original request.",
+			strings.Join(checks, ", "),
+		)
+	}
+	return fmt.Sprintf(
+		"尚未回复原提问者，未形成可安全发送的结论。已核对：%s。未知：原消息所需的可靠结论。",
+		strings.Join(checks, "；"),
+	)
+}
+
+func boundedOwnerSummary(value string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if maxRunes <= 0 || len(runes) <= maxRunes {
+		return value
+	}
+	return string(runes[:maxRunes]) + "…"
+}
+
+func emptySummaryValue(value string) string {
+	if value = strings.TrimSpace(value); value != "" {
+		return value
+	}
+	return "—"
 }
 
 func (n liveOwnerNotifier) HandleNotification(
@@ -1541,25 +2924,181 @@ func (n liveOwnerNotifier) HandleNotification(
 	decision domain.Decision,
 	idempotencyKey string,
 ) error {
+	language := agentlocale.Language(decision.Language)
+	if language != agentlocale.LanguageChinese && language != agentlocale.LanguageEnglish {
+		language = agentlocale.Resolve(
+			n.preferred,
+			n.fallback,
+			item.Event.Content,
+			decision.ReplyText,
+		)
+	}
 	return (agenttools.NotifyOwnerTool{Messenger: n.messenger}).Execute(ctx, agenttools.NotifyRequest{
-		Text:           ownerNotificationText(item, decision),
+		Text:           ownerNotificationText(item, decision, n.ownerName, string(language)),
 		IdempotencyKey: idempotencyKey,
 	})
 }
 
-func ownerNotificationText(item domain.WorkItem, decision domain.Decision) string {
-	if decision.Kind == domain.DecisionReply {
-		ownerAction := strings.TrimSpace(decision.OwnerAction)
-		if ownerAction == "" {
-			ownerAction = "请查看 Agent 回复并确认是否还需要后续处理"
-		}
-		return fmt.Sprintf(
-			"Agent 已回复原消息 %s。仍需你处理：%s。可在 Lark 中查看或撤回。",
-			item.Event.MessageID,
-			ownerAction,
+func (n liveOwnerNotifier) HandleApprovalNotification(
+	ctx context.Context,
+	item domain.WorkItem,
+	decision domain.Decision,
+	action domain.Action,
+) error {
+	if action.ID <= 0 || action.Status != domain.ActionAwaitingApproval {
+		return errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"reply approval notification requires a persisted awaiting approval action",
 		)
 	}
-	return fmt.Sprintf("消息 %s 需要你关注：%s", item.Event.MessageID, decision.Reason)
+	language := agentlocale.Language(decision.Language)
+	if language != agentlocale.LanguageChinese && language != agentlocale.LanguageEnglish {
+		language = agentlocale.Resolve(
+			n.preferred,
+			n.fallback,
+			item.Event.Content,
+			decision.ReplyText,
+		)
+	}
+	return (agenttools.NotifyOwnerTool{Messenger: n.messenger}).Execute(ctx, agenttools.NotifyRequest{
+		Text: approvalNotificationText(
+			item,
+			decision,
+			action,
+			n.ownerName,
+			string(language),
+		),
+		IdempotencyKey: fmt.Sprintf("owner-approval-notice:%d", action.ID),
+	})
+}
+
+func ownerNotificationText(item domain.WorkItem, decision domain.Decision, ownerName, language string) string {
+	resolved := agentlocale.Language(language)
+	if resolved != agentlocale.LanguageEnglish {
+		resolved = agentlocale.LanguageChinese
+	}
+	ownerName = strings.TrimSpace(ownerName)
+	if ownerName == "" {
+		if resolved == agentlocale.LanguageEnglish {
+			ownerName = "Owner"
+		} else {
+			ownerName = "负责人"
+		}
+	}
+	if decision.Kind == domain.DecisionReply {
+		ownerAction := strings.TrimSpace(decision.OwnerAction)
+		if ownerAction != "" && agentlocale.ValidateProse(ownerAction, resolved) != nil {
+			ownerAction = ""
+		}
+		if resolved == agentlocale.LanguageEnglish {
+			nextAction := "No action is required from you."
+			if ownerAction != "" {
+				nextAction = "After the reply is sent, you still need to: " + ownerAction
+			}
+			return fmt.Sprintf(
+				"%s, the intelligent assistant received a delegated request for message %s and will now send this reply automatically:\n\n%s\n\n%s",
+				ownerName,
+				item.Event.MessageID,
+				decision.ReplyText,
+				nextAction,
+			)
+		}
+		nextAction := "当前无需你操作"
+		if ownerAction != "" {
+			nextAction = "答复发送后仍需你处理：" + ownerAction
+		}
+		return fmt.Sprintf(
+			"%s，智能助手已收到消息 %s 的代回复请求，即将自动发送以下答复：\n\n%s\n\n%s。",
+			ownerName,
+			item.Event.MessageID,
+			decision.ReplyText,
+			nextAction,
+		)
+	}
+	reason := agentlocale.LocalizedReason(resolved, decision.Reason)
+	if resolved == agentlocale.LanguageEnglish {
+		return fmt.Sprintf(
+			"%s, message %s needs your attention: %s Inspect with `lark-agent queue inspect --message-id %s`.",
+			ownerName,
+			item.Event.MessageID,
+			reason,
+			item.Event.MessageID,
+		)
+	}
+	return fmt.Sprintf(
+		"%s，消息 %s 需要你关注：%s。可执行 `lark-agent queue inspect --message-id %s` 查看已完成的检查和下一步。",
+		ownerName,
+		item.Event.MessageID,
+		reason,
+		item.Event.MessageID,
+	)
+}
+
+func approvalNotificationText(
+	item domain.WorkItem,
+	decision domain.Decision,
+	action domain.Action,
+	ownerName,
+	language string,
+) string {
+	resolved := agentlocale.Language(language)
+	if resolved != agentlocale.LanguageEnglish {
+		resolved = agentlocale.LanguageChinese
+	}
+	ownerName = strings.TrimSpace(ownerName)
+	if ownerName == "" {
+		if resolved == agentlocale.LanguageEnglish {
+			ownerName = "Owner"
+		} else {
+			ownerName = "负责人"
+		}
+	}
+	ownerAction := strings.TrimSpace(decision.OwnerAction)
+	if ownerAction == "" || agentlocale.ValidateProse(ownerAction, resolved) != nil {
+		if resolved == agentlocale.LanguageEnglish {
+			ownerAction = "Review the exact draft and decide whether it may be sent."
+		} else {
+			ownerAction = "查看完整草稿，并决定是否允许发送"
+		}
+	}
+	delegated := isDelegatedApprovalRelevance(decision.Relevance)
+	if resolved == agentlocale.LanguageEnglish {
+		draftRole := "assistant reply draft"
+		if delegated {
+			draftRole = "delegated reply draft"
+		}
+		return fmt.Sprintf(
+			"%s, the %s for message %s is waiting for your approval (#%d) and has not been sent:\n\n%s\n\nYour next action: %s\n\nApprove: `/approval approve %d confirm`\nReject: `/approval reject %d <reason>`",
+			ownerName,
+			draftRole,
+			item.Event.MessageID,
+			action.ID,
+			decision.ReplyText,
+			ownerAction,
+			action.ID,
+			action.ID,
+		)
+	}
+	draftRole := "助手答复草稿"
+	if delegated {
+		draftRole = "代回复草稿"
+	}
+	return fmt.Sprintf(
+		"%s，消息 %s 的%s正在等待你确认（审批 #%d），尚未发送：\n\n%s\n\n仍需你处理：%s\n\n批准：`/approval approve %d confirm`\n拒绝：`/approval reject %d <原因>`",
+		ownerName,
+		item.Event.MessageID,
+		draftRole,
+		action.ID,
+		decision.ReplyText,
+		ownerAction,
+		action.ID,
+		action.ID,
+	)
+}
+
+func isDelegatedApprovalRelevance(relevance domain.Relevance) bool {
+	return relevance == domain.RelevanceDirectMention ||
+		relevance == domain.RelevancePrivateMessage
 }
 
 func (p larkToolContext) RecentMessages(
@@ -1598,6 +3137,21 @@ func normalizeToolMessages(messages []serviceim.Message) []domain.NormalizedEven
 	events := make([]domain.NormalizedEvent, 0, len(messages))
 	for _, message := range messages {
 		sum := sha256.Sum256([]byte(message.MessageID + "\x00" + message.Content))
+		attachments := make([]domain.Attachment, 0, len(message.Attachments))
+		for _, attachment := range message.Attachments {
+			normalized := domain.Attachment{
+				Type:             attachment.Type,
+				Key:              attachment.Key,
+				MediaType:        attachment.MediaType,
+				Readable:         attachment.Readable,
+				UnreadableReason: attachment.UnreadableReason,
+			}
+			if len(attachment.Data) > 0 && attachment.MediaType != "" {
+				normalized.DataURL = "data:" + attachment.MediaType + ";base64," +
+					base64.StdEncoding.EncodeToString(attachment.Data)
+			}
+			attachments = append(attachments, normalized)
+		}
 		events = append(events, domain.NormalizedEvent{
 			Source:           domain.SourcePoll,
 			MessageID:        message.MessageID,
@@ -1607,10 +3161,14 @@ func normalizeToolMessages(messages []serviceim.Message) []domain.NormalizedEven
 			ReplyToMessageID: message.ReplyToMessageID,
 			ThreadID:         message.ThreadID,
 			SenderID:         message.SenderOpenID,
+			SenderName:       message.SenderDisplayName,
 			SenderType:       message.SenderType,
 			Content:          message.Content,
+			ResourceURLs:     append([]string(nil), message.ResourceURLs...),
+			Attachments:      attachments,
 			Mentions:         message.Mentions,
 			CreatedAt:        normalizeServiceMessageTime(message.CreateTime),
+			UpdatedAt:        normalizeServiceMessageTime(message.UpdateTime),
 			RawDigest:        fmt.Sprintf("sha256:%x", sum[:]),
 		})
 	}
@@ -1629,18 +3187,62 @@ func normalizeServiceMessageTime(raw string) time.Time {
 
 func (b *conversationBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, error) {
 	builder := b.base
-	if b.includeLarkContext && b.svc != nil && item.Event.ChatID != "" {
+	if len(item.ResolvedContext) > 0 {
+		builder.Conversation = append(
+			builder.Conversation,
+			item.ResolvedContext...,
+		)
+		builder.ContextSelection = domain.ContextSelection{
+			Mode:            domain.ContextModeAdjacent,
+			AnchorMessageID: item.Event.MessageID,
+			Reason:          "shared_delegated_context_snapshot",
+		}
+		for _, event := range item.ResolvedContext {
+			if event.MessageID == item.Event.MessageID {
+				item.Event = event
+				break
+			}
+		}
+	} else if b.includeLarkContext && b.svc != nil && item.Event.ChatID != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		messageContext, err := b.svc.GetMessageContext(ctx, serviceim.MessageContextRequest{
-			ChatID:           item.Event.ChatID,
-			MessageID:        item.Event.MessageID,
-			RootMessageID:    item.Event.RootMessageID,
-			ReplyToMessageID: item.Event.ReplyToMessageID,
-			ThreadID:         item.Event.ThreadID,
-			CreatedAt:        item.Event.CreatedAt,
-			Limit:            30,
-		})
+		var messages []serviceim.Message
+		var selection domain.ContextSelection
+		var err error
+		if item.WorkKind == domain.WorkKindDirectMention {
+			var semanticContext serviceim.SemanticReplyContext
+			semanticContext, err = b.svc.GetSemanticReplyContext(
+				ctx,
+				serviceim.SemanticReplyContextRequest{
+					ChatID:          item.Event.ChatID,
+					TargetMessageID: item.Event.MessageID,
+					Since:           item.Event.CreatedAt,
+					MaxMessages:     100,
+				},
+			)
+			messages = semanticContext.Messages
+			selection = domain.ContextSelection{
+				Mode:            domain.ContextModeAdjacent,
+				AnchorMessageID: item.Event.MessageID,
+				Incomplete:      semanticContext.Incomplete || semanticContext.Withdrawn,
+				Reason:          "delegated_post_target_window",
+			}
+		} else {
+			var messageContext serviceim.MessageContext
+			messageContext, err = b.svc.GetMessageContext(ctx, serviceim.MessageContextRequest{
+				ChatID:           item.Event.ChatID,
+				MessageID:        item.Event.MessageID,
+				RootMessageID:    item.Event.RootMessageID,
+				ReplyToMessageID: item.Event.ReplyToMessageID,
+				ThreadID:         item.Event.ThreadID,
+				CreatedAt:        item.Event.CreatedAt,
+				Limit:            30,
+				IncludeAppMessages: item.Event.ChatType == "p2p" &&
+					item.Event.SenderID == b.base.User.OpenID,
+			})
+			messages = messageContext.Messages
+			selection = messageContext.Selection
+		}
 		if err != nil {
 			builder.ContextSelection = domain.ContextSelection{
 				Mode:             domain.ContextModeAdjacent,
@@ -1650,41 +3252,77 @@ func (b *conversationBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, 
 				Incomplete:       true,
 				Reason:           "lark_context_unavailable",
 			}
-			if err := b.applyStoredGitHubReference(&builder, item.Event); err != nil {
-				return agentcontext.Bundle{}, err
-			}
-			return builder.Build(item)
-		}
-		builder.Conversation = append(builder.Conversation, normalizeToolMessages(messageContext.Messages)...)
-		builder.ContextSelection = messageContext.Selection
-		if b.githubEnabled {
-			verified, ok, err := agentcontext.ResolveGitHubReference(
-				item.Event,
-				builder.Conversation,
-				b.currentAppID,
-				b.allowedRepositories,
-				b.referenceSigningKey,
-			)
-			if err != nil {
-				return agentcontext.Bundle{}, err
-			}
-			if ok {
-				if b.store != nil {
-					verified, err = b.store.UpsertExternalReference(context.Background(), verified)
-					if err != nil {
-						return agentcontext.Bundle{}, err
+		} else {
+			normalized := normalizeToolMessages(messages)
+			builder.Conversation = append(builder.Conversation, normalized...)
+			builder.ContextSelection = selection
+			if item.WorkKind == domain.WorkKindDirectMention {
+				for _, event := range normalized {
+					if event.MessageID == item.Event.MessageID {
+						item.Event = event
+						break
 					}
 				}
-				ref := verified.Reference
-				builder.GitHubReference = &ref
-			} else if err := b.applyStoredGitHubReference(&builder, item.Event); err != nil {
-				return agentcontext.Bundle{}, err
 			}
 		}
-	} else if err := b.applyStoredGitHubReference(&builder, item.Event); err != nil {
+	}
+	if err := b.resolveGitHubReference(&builder, item.Event); err != nil {
 		return agentcontext.Bundle{}, err
 	}
+	resolveBuilderUser(&builder, item.Event)
 	return builder.Build(item)
+}
+
+func (b *conversationBuilder) resolveGitHubReference(
+	builder *agentcontext.Builder,
+	event domain.NormalizedEvent,
+) error {
+	if !b.githubEnabled {
+		return nil
+	}
+	verified, ok, err := agentcontext.ResolveGitHubReference(
+		event,
+		builder.Conversation,
+		b.currentAppID,
+		b.allowedRepositories,
+		b.referenceSigningKey,
+	)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return b.applyStoredGitHubReference(builder, event)
+	}
+	if b.store != nil {
+		verified, err = b.store.UpsertExternalReference(context.Background(), verified)
+		if err != nil {
+			return err
+		}
+	}
+	ref := verified.Reference
+	builder.GitHubReference = &ref
+	return nil
+}
+
+func resolveBuilderUser(builder *agentcontext.Builder, event domain.NormalizedEvent) {
+	if strings.TrimSpace(builder.User.Name) == "" {
+		for _, mention := range event.Mentions {
+			if mention.OpenID == builder.User.OpenID && strings.TrimSpace(mention.Name) != "" {
+				builder.User.Name = strings.TrimSpace(mention.Name)
+				break
+			}
+		}
+	}
+	samples := make([]string, 0, len(builder.Conversation)+1)
+	samples = append(samples, event.Content)
+	for _, message := range builder.Conversation {
+		samples = append(samples, message.Content)
+	}
+	builder.User.Language = string(agentlocale.Resolve(
+		agentlocale.Language(builder.User.PreferredLanguage),
+		agentlocale.Language(builder.User.FallbackLanguage),
+		samples...,
+	))
 }
 
 func (b *conversationBuilder) applyStoredGitHubReference(
@@ -1721,27 +3359,81 @@ func (b *conversationBuilder) applyStoredGitHubReference(
 }
 
 type liveThreadState struct {
-	svc *serviceim.Service
+	resolver      app.DelegatedReplyResolver
+	confidenceMin float64
+	mu            sync.Mutex
+	resolutions   map[string]replymatch.Resolution
 }
 
-func (s liveThreadState) OwnerAlreadyReplied(ctx context.Context, item domain.WorkItem) (bool, error) {
-	if s.svc == nil || item.Event.ChatID == "" {
+func (s *liveThreadState) OwnerAlreadyReplied(
+	ctx context.Context,
+	item domain.WorkItem,
+) (bool, error) {
+	if s == nil || s.resolver == nil || item.WorkKind != domain.WorkKindDirectMention {
 		return false, nil
 	}
-	messageContext, err := s.svc.GetMessageContext(ctx, serviceim.MessageContextRequest{
-		ChatID:    item.Event.ChatID,
-		MessageID: item.Event.MessageID,
-		Limit:     20,
-		After:     item.Event.CreatedAt,
-	})
+	key := semanticThreadStateKey(item)
+	s.mu.Lock()
+	resolution, ok := s.resolutions[key]
+	if ok {
+		delete(s.resolutions, key)
+	}
+	s.mu.Unlock()
+	if !ok {
+		var err error
+		resolution, err = s.resolve(ctx, item)
+		if err != nil {
+			return false, err
+		}
+	}
+	return resolution.Result == replymatch.ResultAnswered ||
+		resolution.Result == replymatch.ResultNoReplyNeeded, nil
+}
+
+func (s *liveThreadState) MessageWithdrawn(
+	ctx context.Context,
+	item domain.WorkItem,
+) (bool, error) {
+	if s == nil || s.resolver == nil || item.WorkKind != domain.WorkKindDirectMention {
+		return false, nil
+	}
+	resolution, err := s.resolve(ctx, item)
 	if err != nil {
 		return false, err
 	}
-	return messageContext.OwnerReplied, nil
+	if resolution.Result == replymatch.ResultWithdrawn {
+		return true, nil
+	}
+	key := semanticThreadStateKey(item)
+	s.mu.Lock()
+	s.resolutions[key] = resolution
+	s.mu.Unlock()
+	return false, nil
 }
 
-func (s liveThreadState) MessageWithdrawn(context.Context, domain.WorkItem) (bool, error) {
-	return false, nil
+func (s *liveThreadState) resolve(
+	ctx context.Context,
+	item domain.WorkItem,
+) (replymatch.Resolution, error) {
+	resolution, err := s.resolver.Resolve(ctx, item)
+	if err != nil {
+		return replymatch.Resolution{}, err
+	}
+	if resolution.Confidence < s.confidenceMin ||
+		resolution.Result == replymatch.ResultAmbiguous {
+		return replymatch.Resolution{}, errs.NewInternalError(
+			errs.SubtypeFailedPrecondition,
+			"final semantic owner-reply state is ambiguous",
+		)
+	}
+	return resolution, nil
+}
+
+func semanticThreadStateKey(item domain.WorkItem) string {
+	if item.ID != 0 {
+		return strconv.FormatInt(item.ID, 10)
+	}
+	return item.DedupKey
 }
 
 func firstNonEmpty(values ...string) string {
@@ -1751,6 +3443,17 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func resolveConfiguredLanguage(owner config.OwnerConfig) agentlocale.Language {
+	if owner.PreferredLanguage == agentlocale.LanguageChinese ||
+		owner.PreferredLanguage == agentlocale.LanguageEnglish {
+		return owner.PreferredLanguage
+	}
+	if owner.FallbackLanguage == agentlocale.LanguageEnglish {
+		return agentlocale.LanguageEnglish
+	}
+	return agentlocale.LanguageChinese
 }
 
 func newModeCommand(out io.Writer, configPath *string) *cobra.Command {
@@ -1785,8 +3488,9 @@ func newQueueCommand(out io.Writer, configPath, statePath *string) *cobra.Comman
 	cmd := &cobra.Command{
 		Use:   "queue",
 		Short: "Inspect or repair the durable queue",
-		Long: "Inspect or explicitly repair the durable queue. Cross-restart work " +
-			"is never replayed automatically. 跨重启任务不会自动回放。",
+		Long: "Inspect or explicitly repair the durable queue. Ready startup " +
+			"automatically re-evaluates safe interrupted work, while uncertain " +
+			"external actions remain terminal and are never replayed.",
 	}
 	cmd.AddCommand(&cobra.Command{
 		Use:   "list",
@@ -1825,13 +3529,225 @@ func newQueueCommand(out io.Writer, configPath, statePath *string) *cobra.Comman
 	cmd.AddCommand(newQueueBackfillCommand(out, configPath, statePath))
 	cmd.AddCommand(newQueueRetryCommand(out, statePath))
 	cmd.AddCommand(newQueueExportCommand(out, statePath))
-	cmd.AddCommand(&cobra.Command{
-		Use:   "cancel",
-		Short: "cancel queued work",
+	cmd.AddCommand(newQueueCancelCommand(out, statePath))
+	cmd.AddCommand(newQueueTasksCommand(out, statePath))
+	cmd.AddCommand(newQueueAcknowledgeCommand(out, statePath))
+	cmd.AddCommand(newQueueReconcileCommand(out, statePath))
+	return cmd
+}
+
+func newQueueTasksCommand(out io.Writer, statePath *string) *cobra.Command {
+	var view string
+	var page int
+	var pageSize int
+	cmd := &cobra.Command{
+		Use:   "tasks",
+		Short: "List bounded owner-action task views",
+		Long: "List the same bounded action, running, recent, or all task view " +
+			"used by the owner-private Lark control commands.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return writeData(out, map[string]any{"action": "cancel", "changed": 0})
+			store, err := storage.OpenInspection(resolveStatePath(*statePath))
+			if err != nil {
+				return err
+			}
+			defer store.Close() //nolint:errcheck // diagnostic command
+			result, err := store.ListOwnerTasks(cmd.Context(), domain.OwnerTaskQuery{
+				View:     domain.OwnerTaskView(view),
+				Page:     page,
+				PageSize: pageSize,
+			})
+			if err != nil {
+				return err
+			}
+			return writeData(out, result)
 		},
-	})
+	}
+	cmd.Flags().StringVar(
+		&view,
+		"view",
+		string(domain.OwnerTaskViewAction),
+		"task view: action, running, recent, or all",
+	)
+	cmd.Flags().IntVar(&page, "page", 1, "one-based result page")
+	cmd.Flags().IntVar(&pageSize, "page-size", 10, "result count per page (maximum 20)")
+	return cmd
+}
+
+func newQueueAcknowledgeCommand(out io.Writer, statePath *string) *cobra.Command {
+	var workItemID int64
+	var reason string
+	cmd := &cobra.Command{
+		Use:   "acknowledge",
+		Short: "Acknowledge and close one interrupted or stopped task",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if workItemID <= 0 {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"queue acknowledge requires --work-id",
+				).WithParam("--work-id")
+			}
+			if strings.TrimSpace(reason) == "" {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"queue acknowledge requires --reason",
+				).WithParam("--reason")
+			}
+			return executeQueueOwnerMutation(
+				cmd.Context(),
+				out,
+				statePath,
+				domain.OwnerControlCommand{
+					Name:       domain.OwnerControlTaskAcknowledge,
+					WorkItemID: workItemID,
+					Reason:     reason,
+				},
+			)
+		},
+	}
+	cmd.Flags().Int64Var(&workItemID, "work-id", 0, "exact durable work item ID")
+	cmd.Flags().StringVar(&reason, "reason", "", "auditable acknowledgement note")
+	return cmd
+}
+
+func newQueueReconcileCommand(out io.Writer, statePath *string) *cobra.Command {
+	var workItemID int64
+	var result string
+	var reason string
+	cmd := &cobra.Command{
+		Use:   "reconcile",
+		Short: "Record the verified result of one uncertain external action",
+		Long: "Record completed, not-completed, or unknown after manual " +
+			"verification. The uncertain action is never replayed.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if workItemID <= 0 {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"queue reconcile requires --work-id",
+				).WithParam("--work-id")
+			}
+			if strings.TrimSpace(reason) == "" {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"queue reconcile requires --reason",
+				).WithParam("--reason")
+			}
+			disposition := domain.OwnerResolutionDisposition(
+				strings.ReplaceAll(strings.TrimSpace(result), "-", "_"),
+			)
+			switch disposition {
+			case domain.OwnerResolutionCompleted,
+				domain.OwnerResolutionNotCompleted,
+				domain.OwnerResolutionUnknown:
+			default:
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"queue reconcile --result must be completed, not-completed, or unknown",
+				).WithParam("--result")
+			}
+			return executeQueueOwnerMutation(
+				cmd.Context(),
+				out,
+				statePath,
+				domain.OwnerControlCommand{
+					Name:        domain.OwnerControlTaskReconcile,
+					WorkItemID:  workItemID,
+					Disposition: disposition,
+					Reason:      reason,
+				},
+			)
+		},
+	}
+	cmd.Flags().Int64Var(&workItemID, "work-id", 0, "exact durable work item ID")
+	cmd.Flags().StringVar(
+		&result,
+		"result",
+		"",
+		"verified result: completed, not-completed, or unknown",
+	)
+	cmd.Flags().StringVar(&reason, "reason", "", "auditable verification note")
+	return cmd
+}
+
+func executeQueueOwnerMutation(
+	ctx context.Context,
+	out io.Writer,
+	statePath *string,
+	command domain.OwnerControlCommand,
+) error {
+	store, err := storage.OpenInspection(resolveStatePath(*statePath))
+	if err != nil {
+		return err
+	}
+	defer store.Close() //nolint:errcheck // diagnostic command
+	commandID := fmt.Sprintf(
+		"cli:%s:%d:%d",
+		command.Name,
+		command.WorkItemID,
+		time.Now().UTC().UnixNano(),
+	)
+	result, err := store.ExecuteOwnerMutation(ctx, commandID, command)
+	if err != nil {
+		return err
+	}
+	return writeData(out, result)
+}
+
+func newQueueCancelCommand(out io.Writer, statePath *string) *cobra.Command {
+	var workItemIDs []int64
+	var messageIDs []string
+	var allInterrupted bool
+	var keepWorkItemIDs []int64
+	var reason string
+	cmd := &cobra.Command{
+		Use:   "cancel",
+		Short: "Durably cancel audited queue work",
+		Long: "Durably cancel exact work/message IDs, or all interrupted work except " +
+			"explicitly kept IDs. The command requires an audit reason, never deletes " +
+			"history, never sends a Lark message, and fails atomically for running or " +
+			"result-uncertain actions.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if strings.TrimSpace(reason) == "" {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"queue cancel requires --reason",
+				).WithParam("--reason")
+			}
+			hasExact := len(workItemIDs) > 0 || len(messageIDs) > 0
+			if allInterrupted == hasExact {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"queue cancel requires either exact ids or --all-interrupted",
+				)
+			}
+			if !allInterrupted && len(keepWorkItemIDs) > 0 {
+				return errs.NewValidationError(
+					errs.SubtypeInvalidArgument,
+					"--keep-work-id requires --all-interrupted",
+				).WithParam("--keep-work-id")
+			}
+			store, err := storage.OpenInspection(resolveStatePath(*statePath))
+			if err != nil {
+				return err
+			}
+			defer store.Close() //nolint:errcheck // bounded queue repair command
+			result, err := store.CancelWork(cmd.Context(), domain.CancelWorkRequest{
+				WorkItemIDs:     workItemIDs,
+				MessageIDs:      messageIDs,
+				AllInterrupted:  allInterrupted,
+				KeepWorkItemIDs: keepWorkItemIDs,
+				Reason:          reason,
+			})
+			if err != nil {
+				return err
+			}
+			return writeData(out, result)
+		},
+	}
+	cmd.Flags().Int64SliceVar(&workItemIDs, "work-id", nil, "exact durable work item id; repeat for multiple items")
+	cmd.Flags().StringSliceVar(&messageIDs, "message-id", nil, "exact Lark message id; repeat for multiple messages")
+	cmd.Flags().BoolVar(&allInterrupted, "all-interrupted", false, "cancel every interrupted item except kept work ids")
+	cmd.Flags().Int64SliceVar(&keepWorkItemIDs, "keep-work-id", nil, "interrupted work id to keep; requires --all-interrupted")
+	cmd.Flags().StringVar(&reason, "reason", "", "required operator audit reason")
 	return cmd
 }
 
@@ -1842,7 +3758,8 @@ func newQueueInspectCommand(out io.Writer, statePath *string) *cobra.Command {
 		Use:   "inspect",
 		Short: "Inspect one exact message or durable work item",
 		Long: "Inspect the intake receipt, latest durable stage, action, and " +
-			"interruption state for one exact message. Inspection never replays work.",
+			"interruption state for one exact message. A held validated reply candidate " +
+			"is included and remains explicitly unsent. Inspection never replays work.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := storage.OpenInspection(resolveStatePath(*statePath))
 			if err != nil {
@@ -1870,11 +3787,13 @@ func newQueueResumeCommand(out io.Writer, statePath *string) *cobra.Command {
 	var forceTerminal bool
 	cmd := &cobra.Command{
 		Use:   "resume",
-		Short: "Explicitly resume one interrupted or offline message",
+		Short: "Explicitly resume one reviewed interrupted, paused, terminal, or offline message",
 		Long: "Explicitly admit one exact offline message or interrupted work item. " +
-			"Cross-restart work is never replayed without this command. " +
+			"Stateless cross-restart work is re-evaluated automatically, while delegated context and unsent reply candidates require explicit resume. " +
+			"Result-uncertain external actions are never replayed automatically. " +
 			"Completed, ignored, cancelled, or dead-letter work additionally requires --force-terminal. " +
-			"跨重启任务不会自动回放。",
+			"Explicit resume archives the prior investigation, cancels any held reply candidate, and starts a newly classified investigation; it never sends or hydrates the old draft or context. " +
+			"结果不确定的外部动作不会自动重放；仅在核对外部结果后，才可显式恢复终态工作。",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := storage.OpenInspection(resolveStatePath(*statePath))
 			if err != nil {
@@ -1982,6 +3901,7 @@ func newQueueBackfillCommand(out io.Writer, configPath, statePath *string) *cobr
 				chatQuery,
 				nil,
 				includePrivate,
+				nil,
 			)
 			result, err := poller.Backfill(cmd.Context(), poll.BackfillRequest{
 				ChatQuery: chatQuery,
@@ -2140,8 +4060,9 @@ func newApprovalCommand(out io.Writer, statePath *string) *cobra.Command {
 	return cmd
 }
 
-func newSubscriptionCommand(out io.Writer, statePath *string) *cobra.Command {
+func newSubscriptionCommand(out io.Writer, configPath, statePath *string) *cobra.Command {
 	cmd := &cobra.Command{Use: "subscription", Short: "Manage document and Base monitoring subscriptions"}
+	var removeRemote bool
 	cmd.AddCommand(&cobra.Command{
 		Use:   "add URL",
 		Short: "Add a Wiki, document, or Base resource subscription",
@@ -2156,10 +4077,7 @@ func newSubscriptionCommand(out io.Writer, statePath *string) *cobra.Command {
 				return err
 			}
 			defer store.Close() //nolint:errcheck
-			modes := []string{"document_comment", "cloud_docs_notice"}
-			if ref.ResourceType == serviceim.ResourceTypeBase {
-				modes = []string{"base_record", "base_field", "cloud_docs_notice"}
-			}
+			modes := agentresource.MonitorModesForResource(ref.ResourceType)
 			sub, err := store.UpsertResourceSubscription(cmd.Context(), domain.ResourceSubscription{
 				OriginalURL:   ref.OriginalURL,
 				ResourceType:  string(ref.ResourceType),
@@ -2210,7 +4128,7 @@ func newSubscriptionCommand(out io.Writer, statePath *string) *cobra.Command {
 			return writeData(out, sub)
 		},
 	})
-	cmd.AddCommand(&cobra.Command{
+	removeCmd := &cobra.Command{
 		Use:   "remove URL",
 		Short: "Mark one resource subscription removed",
 		Args:  cobra.ExactArgs(1),
@@ -2220,29 +4138,110 @@ func newSubscriptionCommand(out io.Writer, statePath *string) *cobra.Command {
 				return err
 			}
 			defer store.Close() //nolint:errcheck
-			sub, err := store.RemoveResourceSubscription(cmd.Context(), args[0])
+			sub, err := store.GetResourceSubscription(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			if removeRemote &&
+				sub.Status != domain.ResourceSubscriptionRemoved &&
+				sub.ResourceType != string(serviceim.ResourceTypeBase) {
+				cfg, err := config.Load(resolveConfigPath(*configPath))
+				if err != nil {
+					return err
+				}
+				credentials, err := serviceim.LoadCredentials(cmd.Context(), credentialRefs(cfg))
+				if err != nil {
+					return err
+				}
+				client, err := serviceim.NewClient(serviceim.ClientConfig{
+					AppID: cfg.Lark.AppID, AppSecret: credentials.AppSecret,
+					UserAccessToken: credentials.UserAccessToken,
+					RefreshToken:    credentials.RefreshToken,
+					UserTokenStore:  serviceim.NewKeychainUserTokenStore(credentialRefs(cfg)),
+					BaseURL:         cfg.Lark.BaseURL, Timeout: 30 * time.Second,
+				})
+				if err != nil {
+					return err
+				}
+				if _, err := serviceim.NewResourceService(client).SetCommentSubscription(
+					cmd.Context(),
+					serviceim.ResourceRef{
+						OriginalURL:  sub.OriginalURL,
+						ResourceType: serviceim.ResourceType(sub.ResourceType),
+						FileToken:    sub.FileToken, AppToken: sub.AppToken,
+						WikiNodeToken: sub.WikiNodeToken, TableID: sub.TableID, ViewID: sub.ViewID,
+					},
+					false,
+				); err != nil {
+					return err
+				}
+			}
+			sub, err = store.RemoveResourceSubscription(cmd.Context(), args[0])
 			if err != nil {
 				return err
 			}
 			return writeData(out, sub)
 		},
-	})
+	}
+	removeCmd.Flags().BoolVar(
+		&removeRemote,
+		"remote",
+		false,
+		"unsubscribe remotely before marking the local subscription removed",
+	)
+	cmd.AddCommand(removeCmd)
 	cmd.AddCommand(&cobra.Command{
 		Use:   "sync",
-		Short: "Report local resource subscription sync state",
+		Short: "Resolve resources and activate their supported monitoring paths",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			credentials, err := serviceim.LoadCredentials(cmd.Context(), credentialRefs(cfg))
+			if err != nil {
+				return err
+			}
+			client, err := serviceim.NewClient(serviceim.ClientConfig{
+				AppID: cfg.Lark.AppID, AppSecret: credentials.AppSecret,
+				UserAccessToken: credentials.UserAccessToken,
+				RefreshToken:    credentials.RefreshToken,
+				UserTokenStore:  serviceim.NewKeychainUserTokenStore(credentialRefs(cfg)),
+				BaseURL:         cfg.Lark.BaseURL, Timeout: 30 * time.Second,
+			})
+			if err != nil {
+				return err
+			}
 			store, err := storage.OpenInspection(resolveStatePath(*statePath))
 			if err != nil {
 				return err
 			}
 			defer store.Close() //nolint:errcheck
+			if err := bootstrapConfiguredResourceSubscriptions(cmd.Context(), cfg, store); err != nil {
+				return err
+			}
+			monitor := agentresource.NewMonitor(
+				serviceim.NewResourceService(client),
+				store,
+				agentresource.Config{OwnerOpenID: cfg.Owner.OpenID},
+			)
+			syncResult, err := monitor.SyncSubscriptions(cmd.Context())
+			if err != nil {
+				return err
+			}
+			reconcileResult, err := monitor.Reconcile(cmd.Context())
+			if err != nil {
+				return err
+			}
 			subs, err := store.ListResourceSubscriptions(cmd.Context())
 			if err != nil {
 				return err
 			}
 			return writeData(out, map[string]any{
 				"subscriptions": subs,
-				"remote_scope":  "base subscriptions are app/file scoped; table filtering is local and view is context only",
+				"sync":          syncResult,
+				"reconcile":     reconcileResult,
+				"remote_scope":  "Base record/field events are app-scoped; there is no per-resource remote subscription ID; table filtering is local and view is context only",
 			})
 		},
 	})
@@ -2314,19 +4313,133 @@ func parseApprovalID(raw string) (int64, error) {
 	return id, nil
 }
 
-func newMemoryCommand(out io.Writer) *cobra.Command {
-	cmd := &cobra.Command{Use: "memory", Short: "Inspect or delete explicit memory"}
-	for _, name := range []string{"list", "delete"} {
-		n := name
-		cmd.AddCommand(&cobra.Command{
-			Use:   n,
-			Short: n + " memory",
-			RunE: func(cmd *cobra.Command, args []string) error {
-				return writeData(out, map[string]any{"action": n, "items": []any{}})
-			},
-		})
+func newMemoryCommand(out io.Writer, statePath *string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "memory",
+		Short: "Manage durable explicit memory",
+		Long: "List, add, review, or delete bounded durable memory. " +
+			"Only confirmed, non-deleted entries are supplied to the model.",
 	}
+	cmd.AddCommand(
+		newMemoryListCommand(out, statePath),
+		newMemoryAddCommand(out, statePath),
+		newMemoryDeleteCommand(out, statePath),
+		newMemoryFeedbackCommand(out, statePath),
+	)
 	return cmd
+}
+
+func newMemoryListCommand(out io.Writer, statePath *string) *cobra.Command {
+	var scope string
+	var includeDeleted bool
+	var limit int
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List bounded memory entries",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := storage.OpenInspection(resolveStatePath(*statePath))
+			if err != nil {
+				return err
+			}
+			defer store.Close() //nolint:errcheck
+			records, err := store.ListMemories(cmd.Context(), scope, includeDeleted, limit)
+			if err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"memories": records})
+		},
+	}
+	cmd.Flags().StringVar(&scope, "scope", "global", "exact memory scope")
+	cmd.Flags().BoolVar(&includeDeleted, "include-deleted", false, "include tombstoned entries")
+	cmd.Flags().IntVar(&limit, "limit", 20, "maximum entries to return (1-100)")
+	return cmd
+}
+
+func newMemoryAddCommand(out io.Writer, statePath *string) *cobra.Command {
+	var scope string
+	cmd := &cobra.Command{
+		Use:   "add KIND CONTENT",
+		Short: "Add one confirmed explicit memory",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := storage.OpenInspection(resolveStatePath(*statePath))
+			if err != nil {
+				return err
+			}
+			defer store.Close() //nolint:errcheck
+			record, err := store.AddMemory(cmd.Context(), memory.Record{
+				Kind:       memory.Kind(args[0]),
+				Scope:      scope,
+				Status:     memory.StatusConfirmed,
+				Text:       args[1],
+				Confidence: 1,
+			})
+			if err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"memory": record})
+		},
+	}
+	cmd.Flags().StringVar(&scope, "scope", "global", "exact memory scope")
+	return cmd
+}
+
+func newMemoryDeleteCommand(out io.Writer, statePath *string) *cobra.Command {
+	var confirm bool
+	cmd := &cobra.Command{
+		Use:   "delete ID",
+		Short: "Tombstone one exact memory entry",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !confirm {
+				return errs.NewValidationError(
+					errs.SubtypeFailedPrecondition,
+					"memory delete requires --confirm",
+				).WithParam("confirm")
+			}
+			store, err := storage.OpenInspection(resolveStatePath(*statePath))
+			if err != nil {
+				return err
+			}
+			defer store.Close() //nolint:errcheck
+			deleted, err := store.DeleteMemory(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"deleted": deleted, "id": args[0]})
+		},
+	}
+	cmd.Flags().BoolVar(&confirm, "confirm", false, "confirm the irreversible tombstone")
+	return cmd
+}
+
+func newMemoryFeedbackCommand(out io.Writer, statePath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "feedback ID VERDICT [NOTE]",
+		Short: "Record confirm, reject, helpful, or unhelpful owner feedback",
+		Args:  cobra.RangeArgs(2, 3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			note := ""
+			if len(args) == 3 {
+				note = args[2]
+			}
+			store, err := storage.OpenInspection(resolveStatePath(*statePath))
+			if err != nil {
+				return err
+			}
+			defer store.Close() //nolint:errcheck
+			feedback, err := store.RecordMemoryFeedback(cmd.Context(), memory.Feedback{
+				MemoryEntryID: args[0],
+				Verdict:       memory.FeedbackVerdict(args[1]),
+				Note:          note,
+			})
+			if err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{"feedback": feedback})
+		},
+	}
 }
 
 func newRulesCommand(out io.Writer, configPath *string) *cobra.Command {
@@ -2406,6 +4519,12 @@ func newDoctorCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 				"reply_scopes": map[string]any{
 					"assistant_mentions": cfg.Assistant.ReplyScope,
 					"owner_mentions":     cfg.Policy.ReplyScope,
+					"private_messages":   cfg.Policy.PrivateReplyScope,
+				},
+				"delegated_reply": map[string]any{
+					"owner_wait":            cfg.Policy.OwnerWait.String(),
+					"owner_reply_threshold": cfg.Policy.OwnerReplyConfidenceMin,
+					"ambiguous_retry":       cfg.Policy.OwnerReplyRetry.String(),
 				},
 				"reply_scope": cfg.Policy.ReplyScope,
 				"scheduler": map[string]any{

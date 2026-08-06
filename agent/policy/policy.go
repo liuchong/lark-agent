@@ -3,7 +3,6 @@ package policy
 
 import (
 	"context"
-	"time"
 
 	"github.com/liuchong/lark-agent/agent/domain"
 )
@@ -21,10 +20,8 @@ type Config struct {
 	ReplyScope          domain.ReplyScope
 	AssistantReplyScope domain.ReplyScope
 	ReplyConfidenceMin  float64
-	OwnerWait           time.Duration
 	BlockChats          []string
 	BlockUsers          []string
-	Sleeper             func(context.Context, time.Duration) error
 }
 
 // ReplyGate prepares a reply action or blocks/cancels it.
@@ -45,7 +42,7 @@ func NewReplyGate(cfg Config, state ThreadState) *ReplyGate {
 		cfg.AssistantReplyScope = domain.ReplyScopeAllGroups
 	}
 	if cfg.ReplyConfidenceMin == 0 {
-		cfg.ReplyConfidenceMin = 0.85
+		cfg.ReplyConfidenceMin = 0.70
 	}
 	return &ReplyGate{cfg: cfg, state: state}
 }
@@ -74,11 +71,6 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 		action.CancelReason = "forbidden_risk"
 		return action, nil
 	}
-	if decision.Confidence < g.replyConfidenceMin(decision) {
-		action.Status = domain.ActionAwaitingApproval
-		action.CancelReason = "low_confidence"
-		return action, nil
-	}
 	if contains(g.cfg.BlockChats, item.Event.ChatID) || contains(g.cfg.BlockUsers, item.Event.SenderID) {
 		action.Status = domain.ActionBlocked
 		action.CancelReason = "blocked_target"
@@ -98,26 +90,6 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 		action.Status = domain.ActionBlocked
 		action.CancelReason = "outside_assistant_reply_scope"
 		return action, nil
-	}
-	if g.cfg.OwnerWait > 0 &&
-		decision.WorkKind != domain.WorkKindFastPath &&
-		!isAssistantFacingRequest(decision.Relevance) {
-		sleep := g.cfg.Sleeper
-		if sleep == nil {
-			sleep = func(ctx context.Context, d time.Duration) error {
-				timer := time.NewTimer(d)
-				defer timer.Stop()
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-timer.C:
-					return nil
-				}
-			}
-		}
-		if err := sleep(ctx, g.cfg.OwnerWait); err != nil {
-			return action, err
-		}
 	}
 	if g.state != nil {
 		withdrawn, err := g.state.MessageWithdrawn(ctx, item)
@@ -141,6 +113,16 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 			}
 		}
 	}
+	if decision.Risk == domain.RiskMedium || decision.Risk == domain.RiskHigh {
+		action.Status = domain.ActionAwaitingApproval
+		action.CancelReason = "risk_requires_approval"
+		return action, nil
+	}
+	if decision.Confidence < g.replyConfidenceMin(decision) {
+		action.Status = domain.ActionAwaitingApproval
+		action.CancelReason = "low_confidence"
+		return action, nil
+	}
 	if g.cfg.Mode == domain.ModeApproval {
 		action.Status = domain.ActionAwaitingApproval
 		return action, nil
@@ -148,6 +130,16 @@ func (g *ReplyGate) Prepare(ctx context.Context, item domain.WorkItem, decision 
 	action.Status = domain.ActionReady
 	action.Idempotency = domain.DedupKey(item.Event) + ":reply"
 	return action, nil
+}
+
+// RequiresApproval reports deterministic approval holds that can be known
+// before the final live thread-state checks run.
+func (g *ReplyGate) RequiresApproval(decision domain.Decision) bool {
+	return decision.Kind == domain.DecisionReply &&
+		(decision.Risk == domain.RiskMedium ||
+			decision.Risk == domain.RiskHigh ||
+			decision.Confidence < g.replyConfidenceMin(decision) ||
+			g.cfg.Mode == domain.ModeApproval)
 }
 
 func (g *ReplyGate) replyConfidenceMin(decision domain.Decision) float64 {

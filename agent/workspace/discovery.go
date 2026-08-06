@@ -32,6 +32,24 @@ type DirectorySnapshot struct {
 	Omitted   int              `json:"omitted" yaml:"omitted"`
 }
 
+// HasGitRepositoryMarker reports a non-symlink .git marker in one directory
+// already confined to the workspace.
+func (s *Scope) HasGitRepositoryMarker(relative string) bool {
+	directory := s.realRoot
+	if relative != "" && filepath.Clean(relative) != "." {
+		var err error
+		directory, err = s.ResolveReadPath(relative)
+		if err != nil {
+			return false
+		}
+	}
+	info, err := vfs.Lstat(filepath.Join(directory, ".git"))
+	if err != nil || info.Mode()&fs.ModeSymlink != 0 {
+		return false
+	}
+	return info.IsDir() || info.Mode().IsRegular()
+}
+
 // ControlFiles is a bounded index of workspace-local rules and skills.
 type ControlFiles struct {
 	RuleFiles  []string `json:"rule_files" yaml:"rule_files"`

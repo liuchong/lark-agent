@@ -14,7 +14,10 @@ INSTALL_BACKUP="$APP_SUPPORT/.install-backup.$$"
 APP_DIR="$HOME/Applications/Lark Agent.app"
 APP_CONTENTS="$APP_DIR/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
+APP_RESOURCES="$APP_CONTENTS/Resources"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
+APP_ICON="$APP_RESOURCES/LarkAgent.icns"
+STATUS_ICON="$APP_RESOURCES/StatusIconTemplate.png"
 STATUS_APP="$APP_MACOS/LarkAgentStatus"
 STATUS_CANDIDATE="$APP_MACOS/.LarkAgentStatus.candidate.$$"
 LAUNCH_AGENT_PLIST="$HOME/Library/LaunchAgents/com.liuchong.lark-agent.plist"
@@ -24,12 +27,18 @@ CHAT_QUERY="${CHAT_QUERY:-Test Group}"
 POLL_INTERVAL="${POLL_INTERVAL:-10s}"
 INSTALL_LOAD="${INSTALL_LOAD:-1}"
 OPEN_STATUS_APP="${OPEN_STATUS_APP:-1}"
+MODEL_MIGRATION_DOCTOR="${MODEL_MIGRATION_DOCTOR:-1}"
 LABEL="com.liuchong.lark-agent"
 lock_acquired=0
 backup_prepared=0
 service_stopped=0
 service_was_loaded=0
 install_succeeded=0
+model_keychain_modified=0
+model_keychain_had_old=0
+model_keychain_old_value=""
+model_keychain_service="lark-agent"
+model_keychain_account="model/primary/api-key"
 backup_targets=()
 backup_copies=()
 
@@ -43,6 +52,8 @@ backup_installation() {
     "$CONF_FILE" \
     "$ENV_FILE" \
     "$INFO_PLIST" \
+    "$APP_ICON" \
+    "$STATUS_ICON" \
     "$STATUS_APP" \
     "$LAUNCH_AGENT_PLIST" \
     "$CONFIG_PATH" \
@@ -96,6 +107,21 @@ cleanup() {
   local rollback_failed=0
   set +e
   rm -f "$AGENT_CANDIDATE" "$STATUS_CANDIDATE"
+  if [ "$install_succeeded" -ne 1 ] && [ "$model_keychain_modified" -eq 1 ]; then
+    if [ "$model_keychain_had_old" -eq 1 ]; then
+      if ! security add-generic-password -U \
+        -s "$model_keychain_service" \
+        -a "$model_keychain_account" \
+        -w "$model_keychain_old_value" >/dev/null 2>&1; then
+        echo "Failed to restore previous model API key in Keychain." >&2
+        rollback_failed=1
+      fi
+    else
+      security delete-generic-password \
+        -s "$model_keychain_service" \
+        -a "$model_keychain_account" >/dev/null 2>&1 || true
+    fi
+  fi
   if [ "$install_succeeded" -ne 1 ] && [ "$backup_prepared" -eq 1 ]; then
     if ! restore_installation; then
       rollback_failed=1
@@ -132,9 +158,79 @@ cleanup() {
 }
 trap cleanup EXIT
 
+read_private_env_value() {
+  local key="$1"
+  if [ ! -f "$ENV_FILE" ]; then
+    return 0
+  fi
+  env -i HOME="$HOME" bash -c '
+    set -a
+    # shellcheck disable=SC1090
+    source "$1"
+    set +a
+    printf "%s" "${!2:-}"
+  ' _ "$ENV_FILE" "$key"
+}
+
+migrate_legacy_model_env() {
+  local env_api_key env_base_url env_model api_key base_url model profile_args=()
+  if [ "${OPENAI_API_KEY+x}" = x ]; then
+    api_key="${OPENAI_API_KEY:-}"
+  else
+    env_api_key="$(read_private_env_value OPENAI_API_KEY)"
+    api_key="$env_api_key"
+  fi
+  if [ "${OPENAI_BASE_URL+x}" = x ]; then
+    base_url="${OPENAI_BASE_URL:-}"
+  else
+    env_base_url="$(read_private_env_value OPENAI_BASE_URL)"
+    base_url="$env_base_url"
+  fi
+  if [ "${OPENAI_MODEL+x}" = x ]; then
+    model="${OPENAI_MODEL:-}"
+  else
+    env_model="$(read_private_env_value OPENAI_MODEL)"
+    model="$env_model"
+  fi
+
+  if [ -n "$base_url" ] || [ -n "$model" ]; then
+    profile_args=(model profile set primary --provider kimi --protocol openai_chat)
+    if [ -n "$base_url" ]; then
+      profile_args+=(--base-url "$base_url")
+    fi
+    if [ -n "$model" ]; then
+      profile_args+=(--model "$model")
+    fi
+    "$AGENT_CANDIDATE" --config "$CONFIG_PATH" "${profile_args[@]}" >/dev/null
+  fi
+
+  if [ -n "$api_key" ]; then
+    model_keychain_old_value="$(security find-generic-password \
+      -w \
+      -s "$model_keychain_service" \
+      -a "$model_keychain_account" 2>/dev/null || true)"
+    if [ -n "$model_keychain_old_value" ]; then
+      model_keychain_had_old=1
+    fi
+    security add-generic-password -U \
+      -s "$model_keychain_service" \
+      -a "$model_keychain_account" \
+      -w "$api_key" >/dev/null
+    model_keychain_modified=1
+    if [ "$MODEL_MIGRATION_DOCTOR" = "1" ]; then
+      "$AGENT_CANDIDATE" --config "$CONFIG_PATH" model doctor primary >/dev/null
+    fi
+    OPENAI_API_KEY= OPENAI_BASE_URL= OPENAI_MODEL= \
+      bash "$ROOT/scripts/macos/update-private-env.sh" "$ENV_FILE"
+  elif [ -n "$base_url" ] || [ -n "$model" ]; then
+    "$AGENT_CANDIDATE" --config "$CONFIG_PATH" model auth status primary >/dev/null
+  fi
+}
+
 mkdir -p \
   "$BIN_DIR" \
   "$APP_MACOS" \
+  "$APP_RESOURCES" \
   "$HOME/Library/Logs/lark-agent" \
   "$(dirname "$CONFIG_PATH")" \
   "$(dirname "$STATE_PATH")"
@@ -155,6 +251,14 @@ fi
 
 echo "Building menu bar status app candidate..."
 swiftc "$ROOT/macos/LarkAgentStatus/main.swift" -framework AppKit -o "$STATUS_CANDIDATE"
+for asset in \
+  "$ROOT/assets/brand/LarkAgent.icns" \
+  "$ROOT/assets/brand/lark-agent-status-template.png"; do
+  if [ ! -f "$asset" ]; then
+    echo "Required brand asset is missing: $asset" >&2
+    exit 1
+  fi
+done
 
 if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
   service_was_loaded=1
@@ -177,6 +281,9 @@ if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
   echo "The standalone LaunchAgent was loaded again during upgrade; refusing to replace its files." >&2
   exit 1
 fi
+
+echo "Migrating model profile and Keychain configuration..."
+migrate_legacy_model_env
 
 echo "Running full readiness doctor against the candidate..."
 "$AGENT_CANDIDATE" \
@@ -209,12 +316,7 @@ chmod 700 "$WRAPPER"
 } > "$CONF_FILE"
 chmod 600 "$CONF_FILE"
 
-{
-  [ -n "${OPENAI_API_KEY:-}" ] && printf 'OPENAI_API_KEY=%q\n' "$OPENAI_API_KEY"
-  [ -n "${OPENAI_BASE_URL:-}" ] && printf 'OPENAI_BASE_URL=%q\n' "$OPENAI_BASE_URL"
-  [ -n "${OPENAI_MODEL:-}" ] && printf 'OPENAI_MODEL=%q\n' "$OPENAI_MODEL"
-} > "$ENV_FILE"
-chmod 600 "$ENV_FILE"
+bash "$ROOT/scripts/macos/update-private-env.sh" "$ENV_FILE"
 
 cat > "$INFO_PLIST" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -227,6 +329,8 @@ cat > "$INFO_PLIST" <<'EOF'
   <string>com.liuchong.lark-agent.status</string>
   <key>CFBundleName</key>
   <string>Lark Agent</string>
+  <key>CFBundleIconFile</key>
+  <string>LarkAgent</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>LSUIElement</key>
@@ -235,6 +339,8 @@ cat > "$INFO_PLIST" <<'EOF'
 </plist>
 EOF
 
+install -m 644 "$ROOT/assets/brand/LarkAgent.icns" "$APP_ICON"
+install -m 644 "$ROOT/assets/brand/lark-agent-status-template.png" "$STATUS_ICON"
 mv -f "$STATUS_CANDIDATE" "$STATUS_APP"
 
 install_args=(

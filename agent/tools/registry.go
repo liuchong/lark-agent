@@ -60,6 +60,7 @@ type Definition struct {
 	SideEffect              bool
 	OwnerOnly               bool
 	NonOwnerReadOnly        bool
+	ResourceHandoffOnly     bool
 	SameChatArgument        string
 	RequiresGitHubReference bool
 	Execute                 func(context.Context, json.RawMessage) (Execution, error)
@@ -78,6 +79,7 @@ type InvocationScope struct {
 	Owner           bool
 	ReadOnly        bool
 	ChatID          string
+	WorkKind        domain.WorkKind
 	GitHubReference *domain.GitHubReference
 }
 
@@ -216,6 +218,9 @@ func (r *Registry) Execute(ctx context.Context, name string, arguments json.RawM
 }
 
 func toolAllowedForScope(definition Definition, scope InvocationScope) bool {
+	if definition.ResourceHandoffOnly && scope.WorkKind != domain.WorkKindResourceHandoff {
+		return false
+	}
 	if definition.RequiresGitHubReference && scope.GitHubReference == nil {
 		return false
 	}
@@ -225,7 +230,7 @@ func toolAllowedForScope(definition Definition, scope InvocationScope) bool {
 	if definition.OwnerOnly {
 		return false
 	}
-	if scope.ReadOnly && definition.SideEffect {
+	if scope.ReadOnly && definition.SideEffect && !definition.ResourceHandoffOnly {
 		return false
 	}
 	return definition.NonOwnerReadOnly

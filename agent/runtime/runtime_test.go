@@ -33,6 +33,13 @@ func TestParseDecisionJSON(t *testing.T) {
 		"reply_confidence":0.93,
 		"risk":"low",
 		"evidence_status":"insufficient",
+		"reply_outcome":"partial",
+		"progress":{
+			"completed_checks":["读取消息入口"],
+			"initial_finding":"当前只能确认入口存在",
+			"unknowns":["生产配置是否启用"],
+			"next_step":"提供生产配置路径"
+		},
 		"reply_text":"我来跟进",
 		"owner_action":"确认后端通知契约",
 		"reason":"direct mention"
@@ -42,8 +49,46 @@ func TestParseDecisionJSON(t *testing.T) {
 	}
 	if decision.Kind != domain.DecisionReply || decision.Confidence != 0.93 ||
 		decision.EvidenceStatus != domain.EvidenceInsufficient ||
+		decision.ReplyOutcome != domain.ReplyOutcomePartial ||
+		len(decision.Progress.CompletedChecks) != 1 ||
+		decision.Progress.InitialFinding != "当前只能确认入口存在" ||
+		len(decision.Progress.Unknowns) != 1 ||
+		decision.Progress.NextStep != "提供生产配置路径" ||
 		decision.ReplyText != "我来跟进" || decision.OwnerAction != "确认后端通知契约" {
 		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestParseDecisionDefaultsLegacyReplyToCompleteOutcome(t *testing.T) {
+	decision, err := ParseDecision(`{
+		"decision":"reply",
+		"relevance_confidence":0.91,
+		"reply_confidence":0.93,
+		"risk":"low",
+		"evidence_status":"verified",
+		"reply_text":"结论明确",
+		"reason":"source backed"
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.ReplyOutcome != domain.ReplyOutcomeComplete {
+		t.Fatalf("outcome=%q", decision.ReplyOutcome)
+	}
+}
+
+func TestParseDecisionRejectsInvalidReplyOutcome(t *testing.T) {
+	_, err := ParseDecision(`{
+		"decision":"reply",
+		"relevance_confidence":0.91,
+		"reply_confidence":0.93,
+		"risk":"low",
+		"reply_outcome":"best_effort",
+		"reply_text":"结论明确",
+		"reason":"unsupported outcome"
+	}`)
+	if err == nil || !strings.Contains(err.Error(), "invalid reply_outcome") {
+		t.Fatalf("err=%v", err)
 	}
 }
 

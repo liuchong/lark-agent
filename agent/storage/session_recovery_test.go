@@ -3,12 +3,305 @@ package storage
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/liuchong/lark-agent/agent/domain"
 	"github.com/liuchong/lark-agent/internal/apperr"
 )
+
+func TestCancelInterruptedWorkExceptKeptItemsPreservesAudit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, messageID := range []string{"om_cancel_approval", "om_cancel_plain", "om_cancel_keep"} {
+		if _, err := first.EnqueueEvent(domain.NormalizedEvent{
+			MessageID: messageID,
+			Content:   messageID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := first.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make(map[string]int64, len(items))
+	for _, item := range items {
+		ids[item.Event.MessageID] = item.ID
+	}
+	approvalItem, ok, err := first.ClaimNext("approval-worker")
+	if err != nil || !ok || approvalItem.Event.MessageID != "om_cancel_approval" {
+		t.Fatalf("approval claim item=%+v ok=%v err=%v", approvalItem, ok, err)
+	}
+	approvalID, err := first.RequestShellApproval(
+		context.Background(), approvalItem.DedupKey, "gofmt -w .", ".",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = current.Close() })
+	result, err := current.CancelWork(context.Background(), domain.CancelWorkRequest{
+		AllInterrupted: true,
+		KeepWorkItemIDs: []int64{
+			ids["om_cancel_keep"],
+		},
+		Reason: "audited as stale",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.CancelledWorkItemIDs) != 2 ||
+		result.CancelledWorkItemIDs[0] != ids["om_cancel_approval"] ||
+		result.CancelledWorkItemIDs[1] != ids["om_cancel_plain"] {
+		t.Fatalf("result=%+v ids=%+v", result, ids)
+	}
+	for messageID, id := range ids {
+		inspection, err := current.InspectWork(
+			context.Background(),
+			domain.WorkInspectionQuery{WorkItemID: id},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if messageID == "om_cancel_keep" {
+			if inspection.WorkItem == nil || inspection.WorkItem.Status != domain.StatusInterrupted {
+				t.Fatalf("kept inspection=%+v", inspection)
+			}
+			continue
+		}
+		if inspection.WorkItem == nil || inspection.WorkItem.Status != domain.StatusCancelled ||
+			inspection.LatestInterruption == nil || inspection.LatestInterruption.ResumedAt.IsZero() ||
+			inspection.LatestAction == nil || inspection.LatestAction.Kind != "operator_cancel" ||
+			inspection.LatestAction.Status != domain.ActionCompleted ||
+			!strings.Contains(inspection.LatestAction.RequestJSON, "audited as stale") {
+			t.Fatalf("cancelled %s inspection=%+v", messageID, inspection)
+		}
+	}
+	approval, err := current.GetActionAttempt(approvalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approval.Status != domain.ActionCancelled {
+		t.Fatalf("approval=%+v", approval)
+	}
+}
+
+func TestCancelInterruptedWorkIsAtomicForUncertainAction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, messageID := range []string{"om_cancel_safe", "om_cancel_uncertain"} {
+		if _, err := first.EnqueueEvent(domain.NormalizedEvent{
+			MessageID: messageID,
+			Content:   messageID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := first.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make(map[string]int64, len(items))
+	for _, item := range items {
+		ids[item.Event.MessageID] = item.ID
+	}
+	unsafe, ok, err := first.ClaimNext("unsafe-worker")
+	if err != nil || !ok || unsafe.Event.MessageID != "om_cancel_safe" {
+		t.Fatalf("claim item=%+v ok=%v err=%v", unsafe, ok, err)
+	}
+	if _, _, _, err := first.BeginShellAction(
+		context.Background(), unsafe.DedupKey, "go test ./...", ".",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = current.Close() })
+	_, err = current.CancelWork(context.Background(), domain.CancelWorkRequest{
+		AllInterrupted: true,
+		Reason:         "must fail atomically",
+	})
+	if err == nil {
+		t.Fatal("uncertain interrupted action was cancelled")
+	}
+	for messageID, id := range ids {
+		inspection, inspectErr := current.InspectWork(
+			context.Background(),
+			domain.WorkInspectionQuery{WorkItemID: id},
+		)
+		if inspectErr != nil {
+			t.Fatal(inspectErr)
+		}
+		if inspection.WorkItem == nil || inspection.WorkItem.Status != domain.StatusInterrupted {
+			t.Fatalf("%s changed after failed batch: %+v", messageID, inspection)
+		}
+	}
+}
+
+func TestApprovalMovesOlderWorkToLatestReadySession(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	event := domain.NormalizedEvent{MessageID: "om_old_approval", Content: "run formatter"}
+	if _, err := first.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	actionID, err := first.RequestShellApproval(
+		context.Background(), domain.DedupKey(event), "gofmt -w .", ".",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = current.Close() })
+	ready, err := current.MarkCurrentSessionReady(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	operator, err := OpenInspection(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = operator.Close() })
+	if err := operator.DecideAction(actionID, true); err != nil {
+		t.Fatal(err)
+	}
+	items, err := current.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Status != domain.StatusReceived ||
+		items[0].SessionID != ready.ID {
+		t.Fatalf("items=%+v ready=%+v", items, ready)
+	}
+}
+
+func TestApprovalWithoutReadySessionRemainsInterrupted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	runtimeStore, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := domain.NormalizedEvent{MessageID: "om_paused_approval", Content: "run formatter"}
+	if _, err := runtimeStore.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	actionID, err := runtimeStore.RequestShellApproval(
+		context.Background(), domain.DedupKey(event), "gofmt -w .", ".",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtimeStore.PauseCurrentSessionWork(context.Background(), "test stop"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtimeStore.StopCurrentSession(context.Background(), "test stop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtimeStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	operator, err := OpenInspection(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = operator.Close() })
+	if err := operator.DecideAction(actionID, true); err != nil {
+		t.Fatal(err)
+	}
+	action, err := operator.GetActionAttempt(actionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := operator.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Status != domain.ActionReady || len(items) != 1 ||
+		items[0].Status != domain.StatusInterrupted {
+		t.Fatalf("action=%+v items=%+v", action, items)
+	}
+}
+
+func TestApprovalDoesNotReturnWorkToOlderReadySessionDuringStartup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	older, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = older.Close() })
+	if _, err := older.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	event := domain.NormalizedEvent{MessageID: "om_starting_approval", Content: "run formatter"}
+	if _, err := older.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	actionID, err := older.RequestShellApproval(
+		context.Background(), domain.DedupKey(event), "gofmt -w .", ".",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	starting, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = starting.Close() })
+	if starting.CurrentSession().Status != domain.OnlineSessionStarting {
+		t.Fatalf("starting session=%+v", starting.CurrentSession())
+	}
+	operator, err := OpenInspection(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = operator.Close() })
+	if err := operator.DecideAction(actionID, true); err != nil {
+		t.Fatal(err)
+	}
+	items, err := operator.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Status != domain.StatusInterrupted {
+		t.Fatalf("items=%+v older=%+v starting=%+v", items, older.CurrentSession(), starting.CurrentSession())
+	}
+}
 
 func TestOnlineSessionLifecycleIsPersistedAndUnique(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
@@ -276,6 +569,81 @@ func TestRecordIntakeSeparatesOfflineBacklogFromCurrentDelayedDelivery(t *testin
 	}
 }
 
+func TestRestartReadmitsOnlyPristineWaitingUserWork(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := first.CurrentSession().StartedAt.Add(time.Second)
+	for _, messageID := range []string{"om_wait_pristine", "om_wait_with_run"} {
+		item := domain.NewWorkItem(domain.NormalizedEvent{
+			Source:    domain.SourcePoll,
+			EventID:   "poll:" + messageID,
+			MessageID: messageID,
+			ChatID:    "oc_group",
+			CreatedAt: createdAt,
+		})
+		item.Status = domain.StatusWaitingUser
+		item.WorkKind = domain.WorkKindDirectMention
+		item.NextAttemptAt = time.Now().UTC().Add(-time.Second)
+		if _, err := first.RecordWorkIntake(context.Background(), item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := first.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		if item.Event.MessageID != "om_wait_with_run" {
+			continue
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := first.db.Exec(
+			`INSERT INTO agent_runs(
+				id, work_item_id, dedup_key, status, started_at
+			 ) VALUES ('run-waiting', ?, ?, ?, ?)`,
+			item.ID,
+			item.DedupKey,
+			domain.AgentRunCompleted,
+			now,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	items, err = second.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := map[string]domain.WorkItemStatus{}
+	sessions := map[string]string{}
+	for _, item := range items {
+		statuses[item.Event.MessageID] = item.Status
+		sessions[item.Event.MessageID] = item.SessionID
+	}
+	if statuses["om_wait_pristine"] != domain.StatusWaitingUser ||
+		sessions["om_wait_pristine"] != second.CurrentSession().ID {
+		t.Fatalf("pristine waiting item was not readmitted: items=%+v", items)
+	}
+	if statuses["om_wait_with_run"] != domain.StatusInterrupted {
+		t.Fatalf("model-started waiting item was replayable: items=%+v", items)
+	}
+	claimed, ok, err := second.ClaimNext("new-worker")
+	if err != nil || !ok || claimed.Event.MessageID != "om_wait_pristine" {
+		t.Fatalf("claim item=%+v ok=%v err=%v", claimed, ok, err)
+	}
+}
+
 func TestExistingCompletedMessageAddsDuplicateReceiptWithoutReplay(t *testing.T) {
 	store := openStore(t)
 	event := domain.NormalizedEvent{
@@ -460,5 +828,205 @@ func TestLifecycleActionsFenceCompletedAndUncertainWrites(t *testing.T) {
 	}
 	if uncertain != 1 {
 		t.Fatalf("uncertain=%d want=1", uncertain)
+	}
+}
+
+func TestConvergeInterruptedWorkResumesSafeWaitsForApprovalAndTerminalizesUncertain(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := []domain.NormalizedEvent{
+		{MessageID: "om_safe_recovery", Content: "read current code"},
+		{MessageID: "om_waiting_approval", Content: "send exact approved reply"},
+		{MessageID: "om_uncertain_action", Content: "run external action"},
+	}
+	for _, event := range events {
+		if _, err := first.EnqueueEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := first.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byMessage := make(map[string]domain.WorkItem, len(items))
+	for _, item := range items {
+		byMessage[item.Event.MessageID] = item
+	}
+	waiting := byMessage["om_waiting_approval"]
+	if _, err := first.RequestReplyApproval(
+		context.Background(),
+		waiting.DedupKey,
+		"已完成前期核对",
+		"需要本人批准",
+		"确认是否发送",
+		domain.RelevanceDirectMention,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.db.Exec(
+		`UPDATE work_items SET status = ? WHERE id = ?`,
+		domain.StatusAwaitingApproval,
+		waiting.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	uncertain := byMessage["om_uncertain_action"]
+	if _, _, _, err := first.BeginShellAction(
+		context.Background(),
+		uncertain.DedupKey,
+		"go test ./...",
+		".",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = current.Close() })
+	ready, err := current.MarkCurrentSessionReady(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := current.ConvergeInterruptedWork(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Resumed != 1 || report.WaitingOwner != 1 ||
+		report.Terminalized != 1 || report.Uncertain != 1 ||
+		len(report.Notices) != 2 {
+		t.Fatalf("report=%+v", report)
+	}
+	items, err = current.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := make(map[string]domain.WorkItem, len(items))
+	for _, item := range items {
+		statuses[item.Event.MessageID] = item
+	}
+	if safe := statuses["om_safe_recovery"]; safe.Status != domain.StatusReceived ||
+		safe.SessionID != ready.ID {
+		t.Fatalf("safe=%+v ready=%+v", safe, ready)
+	}
+	if waiting := statuses["om_waiting_approval"]; waiting.Status != domain.StatusAwaitingApproval {
+		t.Fatalf("waiting=%+v", waiting)
+	}
+	if uncertain := statuses["om_uncertain_action"]; uncertain.Status != domain.StatusDeadLetter {
+		t.Fatalf("uncertain=%+v", uncertain)
+	}
+	interrupted, _, err := current.RecoverySummary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if interrupted != 0 {
+		t.Fatalf("interrupted=%d", interrupted)
+	}
+}
+
+func TestConvergeInterruptedApprovalHoldsReplyCandidate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := domain.NormalizedEvent{
+		MessageID: "om_approval_candidate_restart",
+		Content:   "reply after approval",
+	}
+	if _, err := first.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := first.ClaimNext("approval-candidate-worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	if err := first.SaveWorkReplyCandidate(item.ID, item.LeaseBy, domain.Decision{
+		Kind:      domain.DecisionReply,
+		ReplyText: "held exact draft",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.RequestReplyApproval(
+		context.Background(),
+		item.DedupKey,
+		"held exact draft",
+		"approval required",
+		"",
+		domain.RelevanceDirectMention,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.db.Exec(
+		`UPDATE work_items SET status = ?, lease_by = NULL, lease_time = NULL WHERE id = ?`,
+		domain.StatusAwaitingApproval,
+		item.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = current.Close() })
+	if _, err := current.MarkCurrentSessionReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	report, err := current.ConvergeInterruptedWork(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.WaitingOwner != 1 || report.Resumed != 0 {
+		t.Fatalf("report=%+v", report)
+	}
+	candidate, found, err := current.ReadyWorkReplyCandidate(item.ID)
+	if err != nil || !found || candidate.Status != domain.ReplyCandidateHeld {
+		t.Fatalf("candidate=%+v found=%v err=%v", candidate, found, err)
+	}
+	work, err := current.GetWorkItem(context.Background(), item.ID)
+	if err != nil || work.Status != domain.StatusAwaitingApproval {
+		t.Fatalf("work=%+v err=%v", work, err)
+	}
+}
+
+func TestOwnerResolutionNotificationIsDurableAndIdempotent(t *testing.T) {
+	store := openStore(t)
+	if _, err := store.EnqueueEvent(domain.NormalizedEvent{MessageID: "om_resolution"}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := store.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := items[0]
+	id, key, send, err := store.BeginOwnerResolutionNotification(
+		context.Background(),
+		item.ID,
+		"需要核对外部动作结果",
+	)
+	if err != nil || !send || id == 0 || key == "" || len(key) > 50 {
+		t.Fatalf("id=%d key=%q send=%v err=%v", id, key, send, err)
+	}
+	if err := store.CompleteOwnerResolutionNotification(context.Background(), id, ""); err != nil {
+		t.Fatal(err)
+	}
+	sameID, sameKey, send, err := store.BeginOwnerResolutionNotification(
+		context.Background(),
+		item.ID,
+		"需要核对外部动作结果",
+	)
+	if err != nil || send || sameID != id || sameKey != key {
+		t.Fatalf("id=%d key=%q send=%v err=%v", sameID, sameKey, send, err)
 	}
 }

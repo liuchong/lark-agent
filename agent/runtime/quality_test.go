@@ -81,6 +81,41 @@ func TestDelegatedReplyQualityAcceptsConciseCompletedResearch(t *testing.T) {
 	}
 }
 
+func TestDelegatedReplyQualityUsesStructuredProgressInsteadOfFixedWording(t *testing.T) {
+	err := validateResponseQuality(delegatedBundle("请先调研图片审核接入点并同步初步结论"), domain.Decision{
+		Kind:         domain.DecisionReply,
+		Risk:         domain.RiskLow,
+		ReplyOutcome: domain.ReplyOutcomePartial,
+		ReplyText:    "上传入口已经接入缩略图审核；文件消息的生产透传没有足够证据。",
+		Progress: domain.DecisionProgress{
+			CompletedChecks: []string{"读取上传入口和消息关联实现"},
+			InitialFinding:  "缩略图路径已有审核调用",
+			Unknowns:        []string{"文件消息是否透传 SampleRule"},
+			NextStep:        "提供文件消息生产入口路径",
+		},
+		Sources: []domain.SourceRef{{
+			RelativePath: "service/message/upload.go",
+			Digest:       "sha256:prod",
+			Kind:         "workspace_file",
+		}},
+	}, responseEvidence{SuccessfulReads: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDelegatedReplyQualityRejectsEmptyStructuredProgress(t *testing.T) {
+	err := validateResponseQuality(delegatedBundle("请先调研图片审核接入点并同步初步结论"), domain.Decision{
+		Kind:         domain.DecisionReply,
+		Risk:         domain.RiskLow,
+		ReplyOutcome: domain.ReplyOutcomePartial,
+		ReplyText:    "目前还不清楚。",
+	}, responseEvidence{SuccessfulReads: 1})
+	if err == nil || !strings.Contains(err.Error(), "structured progress") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestDelegatedReplyQualityRejectsUnauthorizedFutureCommitment(t *testing.T) {
 	err := validateResponseQuality(delegatedBundle("请确认审核时机"), domain.Decision{
 		Kind:      domain.DecisionReply,
@@ -97,6 +132,31 @@ func TestDelegatedReplyQualityRejectsUnauthorizedFutureCommitment(t *testing.T) 
 	}
 	if !strings.Contains(err.Error(), "future commitment") {
 		t.Fatalf("wrong error: %v", err)
+	}
+}
+
+func TestDelegatedReplyQualityRejectsImplicitFutureSynchronization(t *testing.T) {
+	err := validateResponseQuality(delegatedBundle("请确认示例事件生产状态"), domain.Decision{
+		Kind:      domain.DecisionReply,
+		Risk:      domain.RiskLow,
+		ReplyText: "我来确认示例事件后台服务在 prod 的部署状态，之后同步给大家。",
+	}, responseEvidence{SuccessfulReads: 1})
+	if err == nil {
+		t.Fatal("accepted implicit future synchronization without durable investigation")
+	}
+	if !strings.Contains(err.Error(), "future commitment") {
+		t.Fatalf("wrong error: %v", err)
+	}
+}
+
+func TestResponseEvidenceCountsOnlyUniqueNonEmptyReads(t *testing.T) {
+	var evidence responseEvidence
+	evidence.RecordRelevantRead("context:sha256:abc", true)
+	evidence.RecordRelevantRead("context:sha256:abc", true)
+	evidence.RecordRelevantRead("image:sha256:empty", false)
+	evidence.RecordRelevantRead("workspace:sha256:def", true)
+	if evidence.SuccessfulReads != 2 {
+		t.Fatalf("successful reads=%d, want 2", evidence.SuccessfulReads)
 	}
 }
 

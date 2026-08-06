@@ -10,19 +10,23 @@ import (
 type ResourceType string
 
 const (
-	ResourceTypeWiki     ResourceType = "wiki"
-	ResourceTypeBase     ResourceType = "base"
-	ResourceTypeDocument ResourceType = "document"
+	ResourceTypeWiki       ResourceType = "wiki"
+	ResourceTypeBase       ResourceType = "base"
+	ResourceTypeBaseRecord ResourceType = "base_record"
+	ResourceTypeDocument   ResourceType = "document"
 )
 
 type ResourceRef struct {
-	OriginalURL   string       `json:"url"`
-	ResourceType  ResourceType `json:"resource_type"`
-	FileToken     string       `json:"file_token,omitempty"`
-	WikiNodeToken string       `json:"wiki_node_token,omitempty"`
-	AppToken      string       `json:"app_token,omitempty"`
-	TableID       string       `json:"table_id,omitempty"`
-	ViewID        string       `json:"view_id,omitempty"`
+	OriginalURL      string       `json:"url"`
+	ResourceType     ResourceType `json:"resource_type"`
+	FileToken        string       `json:"file_token,omitempty"`
+	WikiNodeToken    string       `json:"wiki_node_token,omitempty"`
+	AppToken         string       `json:"app_token,omitempty"`
+	FileType         string       `json:"file_type,omitempty"`
+	TableID          string       `json:"table_id,omitempty"`
+	ViewID           string       `json:"view_id,omitempty"`
+	RecordID         string       `json:"record_id,omitempty"`
+	RecordShareToken string       `json:"record_share_token,omitempty"`
 }
 
 func ParseResourceURL(raw string) (ResourceRef, error) {
@@ -46,6 +50,10 @@ func ParseResourceURL(raw string) (ResourceRef, error) {
 	case "base":
 		ref.ResourceType = ResourceTypeBase
 		ref.AppToken = parts[1]
+		ref.RecordID = parsed.Query().Get("record")
+	case "record":
+		ref.ResourceType = ResourceTypeBaseRecord
+		ref.RecordShareToken = parts[1]
 	case "doc", "docs", "docx", "sheet", "sheets":
 		ref.ResourceType = ResourceTypeDocument
 		ref.FileToken = parts[1]

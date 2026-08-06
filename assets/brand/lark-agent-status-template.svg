@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="#FFFFFF" color="#FFFFFF" role="img" aria-labelledby="title desc">
+  <title id="title">Lark Agent menu bar template icon</title>
+  <desc id="desc">A monochrome bird and chat bubble with a connected agent antenna and tool loop.</desc>
+  <defs>
+    <mask id="agent-tool-cutout">
+      <rect width="512" height="512" fill="#FFFFFF"/>
+      <g id="tool-loop" fill="#000000" stroke="#000000">
+        <path d="M222 345c31 45 75 61 122 44" fill="none" stroke-width="22" stroke-linecap="round"/>
+        <circle cx="222" cy="345" r="22" stroke="none"/>
+        <circle cx="344" cy="389" r="24" stroke="none"/>
+      </g>
+    </mask>
+  </defs>
+  <g mask="url(#agent-tool-cutout)">
+    <path d="M76 92c64 42 124 64 186 67 63 3 113 31 129 84 40-24 88-16 109 19-44 6-70 34-91 82-33 78-100 124-191 133 26-22 46-45 60-72-89 9-161-39-183-127 38 33 84 49 137 45-81-21-133-82-148-176-4-20-4-38-2-55Z"/>
+    <g id="agent-antenna">
+      <path d="M388 247c24-28 28-62 13-99" fill="none" stroke="currentColor" stroke-width="17" stroke-linecap="round"/>
+      <circle cx="389" cy="246" r="16"/>
+      <path d="M399 37c8 32 25 49 57 57-32 8-49 25-57 57-8-32-25-49-57-57 32-8 49-25 57-57Z"/>
+    </g>
+  </g>
+</svg>

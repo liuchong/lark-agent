@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	sdklark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/core/accesstoken/refreshtoken"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	errs "github.com/liuchong/lark-agent/internal/apperr"
 )
@@ -49,6 +51,22 @@ type Client struct {
 	timeout         time.Duration
 }
 
+// MessageResourceRequest identifies one image or file attached to a message.
+type MessageResourceRequest struct {
+	MessageID string
+	FileKey   string
+	Type      string
+	As        Identity
+	MaxBytes  int64
+}
+
+// MessageResource is a bounded resource body returned by the public Lark SDK.
+type MessageResource struct {
+	Data     []byte
+	FileName string
+	TooLarge bool
+}
+
 func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.AppID == "" {
 		return nil, errs.NewConfigError(errs.SubtypeNotConfigured, "lark app_id is not configured").WithField("lark.app_id")
@@ -57,7 +75,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		return nil, errs.NewConfigError(errs.SubtypeNotConfigured, "lark app secret is not configured").
 			WithHint("run `lark-agent auth login` to store credentials in Keychain")
 	}
-	options := []sdklark.ClientOptionFunc{}
+	options := []sdklark.ClientOptionFunc{
+		sdklark.WithLogger(newCredentialSafeSDKLogger()),
+	}
 	if cfg.BaseURL != "" {
 		options = append(options, sdklark.WithOpenBaseUrl(cfg.BaseURL))
 	}
@@ -116,6 +136,107 @@ func (c *Client) CallAPI(ctx context.Context, request APIRequest) (any, error) {
 			WithParam("identity")
 	}
 	return c.callAPIOnce(ctx, request, "")
+}
+
+// GetMessageResource downloads one bounded message resource through the
+// official public SDK. The caller chooses user or bot identity explicitly.
+func (c *Client) GetMessageResource(
+	ctx context.Context,
+	request MessageResourceRequest,
+) (MessageResource, error) {
+	if c == nil || c.sdk == nil {
+		return MessageResource{}, errs.NewConfigError(
+			errs.SubtypeNotConfigured,
+			"lark SDK client is not configured",
+		)
+	}
+	if request.MessageID == "" || request.FileKey == "" || request.Type == "" {
+		return MessageResource{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"message_id, file_key, and type are required",
+		)
+	}
+	identity := request.As
+	if identity == "" {
+		identity = IdentityUser
+	}
+	if identity == IdentityBot {
+		return c.getMessageResourceOnce(ctx, request, "")
+	}
+	if identity != IdentityUser {
+		return MessageResource{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"unsupported lark identity %q",
+			identity,
+		).WithParam("identity")
+	}
+	accessToken, _ := c.currentUserTokens()
+	if accessToken == "" {
+		return MessageResource{}, errs.NewConfigError(
+			errs.SubtypeNotConfigured,
+			"lark user access token is not configured",
+		).WithHint("run `lark-agent auth login` before user-identity operations")
+	}
+	result, err := c.getMessageResourceOnce(ctx, request, accessToken)
+	if err == nil || !isExpiredUserToken(err) {
+		return result, err
+	}
+	accessToken, err = c.recoverUserToken(ctx, accessToken)
+	if err != nil {
+		return MessageResource{}, err
+	}
+	return c.getMessageResourceOnce(ctx, request, accessToken)
+}
+
+func (c *Client) getMessageResourceOnce(
+	ctx context.Context,
+	request MessageResourceRequest,
+	userAccessToken string,
+) (MessageResource, error) {
+	sdkRequest := larkim.NewGetMessageResourceReqBuilder().
+		MessageId(request.MessageID).
+		FileKey(request.FileKey).
+		Type(request.Type).
+		Build()
+	options := []larkcore.RequestOptionFunc{}
+	if request.As == IdentityUser || (request.As == "" && userAccessToken != "") {
+		options = append(options, larkcore.WithUserAccessToken(userAccessToken))
+	}
+	ctx, cancel := contextWithOptionalTimeout(ctx, c.timeout)
+	defer cancel()
+	response, err := c.sdk.Im.MessageResource.Get(ctx, sdkRequest, options...)
+	if err != nil {
+		return MessageResource{}, errs.NewNetworkError(
+			errs.SubtypeNetworkTransport,
+			"get lark message resource",
+		).WithCause(err)
+	}
+	if response == nil {
+		return MessageResource{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"lark message resource response is empty",
+		)
+	}
+	if !response.Success() {
+		return MessageResource{}, apiProblem(response.Code, map[string]any{
+			"msg": response.Msg,
+		}, request.As)
+	}
+	limit := request.MaxBytes
+	if limit <= 0 {
+		limit = 1 << 20
+	}
+	data, err := io.ReadAll(io.LimitReader(response.File, limit+1))
+	if err != nil {
+		return MessageResource{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"read lark message resource",
+		).WithCause(err)
+	}
+	if int64(len(data)) > limit {
+		return MessageResource{FileName: response.FileName, TooLarge: true}, nil
+	}
+	return MessageResource{Data: data, FileName: response.FileName}, nil
 }
 
 func (c *Client) callAPIOnce(ctx context.Context, request APIRequest, userAccessToken string) (any, error) {
@@ -293,9 +414,30 @@ func apiProblem(code int, body map[string]any, identity Identity) error {
 	if message == "" {
 		message = "lark API returned an error"
 	}
-	return errs.NewAPIError(errs.SubtypeServerError, "%s", message).
+	problem := errs.NewAPIError(errs.SubtypeServerError, "%s", message).
 		WithCode(code).
 		WithIdentity(identity)
+	if field, description := firstFieldViolation(body); field != "" || description != "" {
+		if field != "" {
+			problem = problem.WithParam(field)
+		}
+		if description != "" {
+			problem = problem.WithHint("%s", description)
+		}
+	}
+	return problem
+}
+
+func firstFieldViolation(body map[string]any) (string, string) {
+	errorBody, _ := body["error"].(map[string]any)
+	violations, _ := errorBody["field_violations"].([]any)
+	if len(violations) == 0 {
+		return "", ""
+	}
+	violation, _ := violations[0].(map[string]any)
+	field, _ := violation["field"].(string)
+	description, _ := violation["description"].(string)
+	return strings.TrimSpace(field), strings.TrimSpace(description)
 }
 
 func contextWithOptionalTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

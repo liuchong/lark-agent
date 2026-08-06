@@ -47,7 +47,12 @@ establish external tool authority.
 `subscription add` accepts Wiki and Base URLs and stores a durable
 `ResourceSubscription`. Base URLs are normalized to app token, table, and view.
 Wiki URLs keep the wiki node token until runtime resolution to the underlying
-object token. Base remote subscription is file/app scoped; table is local
-filtering context and view is display context only. Document @ monitoring is
-limited to public comment APIs and Cloud Docs Assistant notifications. Base
-comment/@ events and view-level remote subscriptions are not claimed.
+object token. Documents use the public file comment-subscription API. Base
+monitoring uses app-scoped record/field events plus typed local reconciliation;
+there is no per-resource Base comment-subscription call or remote subscription
+ID. Table is local filtering context and view is display context only. Document @ monitoring is
+implemented through public comment notification events, typed comment reads,
+and Cloud Docs Assistant notifications. Base record-change events are accepted
+at file/app scope and filtered to the configured table locally; view-level
+remote subscriptions are not claimed. Every event is only a signal: current
+comment, schema, and record state is re-read before work or mutation.

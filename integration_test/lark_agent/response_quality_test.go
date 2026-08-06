@@ -243,6 +243,57 @@ func TestDelegatedReplyCannotUseMetaReadsAsRelevantInvestigation(t *testing.T) {
 	}
 }
 
+func TestDelegatedReplyCannotBurnGeneralTurnsAfterForcedDecision(t *testing.T) {
+	model := &responseQualityModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall("read", "read_workspace", `{"path":"account.go"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall("over_budget", "read_workspace", `{"path":"error.go"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall("ignored_1", "search_workspace", `{"query":"10005 one"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall("ignored_2", "search_workspace", `{"query":"10005 two"}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall("ignored_3", "search_workspace", `{"query":"10005 three"}`)}),
+	}}
+	searchCalls := 0
+	registry, err := agenttools.NewRegistry(
+		agenttools.Definition{
+			Info:             &schema.ToolInfo{Name: "read_workspace"},
+			NonOwnerReadOnly: true,
+			Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+				return agenttools.Execution{Content: "delete account request"}, nil
+			},
+		},
+		agenttools.Definition{
+			Info:             &schema.ToolInfo{Name: "search_workspace"},
+			NonOwnerReadOnly: true,
+			Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+				searchCalls++
+				return agenttools.Execution{Content: "must not execute"}, nil
+			},
+		},
+		agentruntime.SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = (agentruntime.AgentLoop{
+		Model: model, Tools: registry, MaxTurns: 20, MaxToolCalls: 1,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		WorkKind: domain.WorkKindDirectMention,
+		User:     agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event: domain.NormalizedEvent{
+			MessageID: "om_forced_terminal",
+			ChatID:    "oc_backend",
+			SenderID:  "ou_teammate",
+			Content:   "@Owner 看看删号报 10005",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "terminal decision after 3 attempts") {
+		t.Fatalf("err=%v", err)
+	}
+	if model.calls != 4 || searchCalls != 0 {
+		t.Fatalf("modelCalls=%d searchCalls=%d", model.calls, searchCalls)
+	}
+}
+
 func TestNonOwnerCannotExecuteHiddenSideEffectTool(t *testing.T) {
 	model := &responseQualityModel{responses: []*schema.Message{
 		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
