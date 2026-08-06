@@ -1892,6 +1892,13 @@ The multi-step loop is accepted by these executable BDD scenarios:
 - Given a bounded conversation URL resolves only to a document, Base app, or
   table without one exact Base record, when conversational evidence resolution
   runs, then it rejects the URL without persisting or linking authority.
+- Given a conversational resource handoff starts with an exact Base record URL
+  but the user-identity API denies the required Base read scope, when
+  `get_resource_evidence` fails, then the run closes broad investigation,
+  exposes only `submit_decision`, and replies with the exact authorization gap
+  and re-authorization next step. It must not inspect adjacent chat subjects,
+  search workspace code, propose a status mutation, or claim the issue was
+  verified.
 - Given a delegated resource handoff has a validated current-generation reply
   and the sender-facing send fails with a known retryable error, when the work
   retries, then the same candidate is rechecked and retried without another

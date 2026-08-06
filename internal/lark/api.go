@@ -414,9 +414,19 @@ func apiProblem(code int, body map[string]any, identity Identity) error {
 	if message == "" {
 		message = "lark API returned an error"
 	}
-	problem := errs.NewAPIError(errs.SubtypeServerError, "%s", message).
-		WithCode(code).
-		WithIdentity(identity)
+	var problem *errs.Problem
+	lowerMessage := strings.ToLower(message)
+	switch {
+	case strings.Contains(lowerMessage, "required one of these privileges"),
+		strings.Contains(lowerMessage, "required scope"),
+		strings.Contains(lowerMessage, "missing scope"):
+		problem = errs.NewPermissionError(errs.SubtypeMissingScope, "%s", message)
+	case code == http.StatusUnauthorized || code == http.StatusForbidden:
+		problem = errs.NewPermissionError(errs.SubtypeFailedPrecondition, "%s", message)
+	default:
+		problem = errs.NewAPIError(errs.SubtypeServerError, "%s", message)
+	}
+	problem = problem.WithCode(code).WithIdentity(identity)
 	if field, description := firstFieldViolation(body); field != "" || description != "" {
 		if field != "" {
 			problem = problem.WithParam(field)

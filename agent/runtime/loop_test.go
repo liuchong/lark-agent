@@ -203,6 +203,118 @@ func TestResourceHandoffTerminalDecisionSeparatesNotificationsFromHumanRequests(
 	}
 }
 
+func TestResourceHandoffConvergesAfterBaseScopeDenial(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall(
+			"evidence",
+			"get_resource_evidence",
+			`{"resource_url":"https://example.larksuite.com/record/shr_bug"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"evidence_status":"insufficient",
+			"reply_outcome":"clarification",
+			"relevance_confidence":0.98,
+			"reply_confidence":0.95,
+			"risk":"low",
+			"progress":{
+				"unknowns":["当前授权不能读取引用的 Base 记录，因此无法核实问题或状态"],
+				"next_step":"重新授权 Base 记录读取权限后重试"
+			},
+			"reply_text":"我已定位到引用记录，但当前飞书授权缺少 Base 记录读取权限，无法核实问题内容、修复证据或更新状态。请重新授权 Base 读取权限后再试。",
+			"reason":"resource evidence read was denied by user authorization"
+		}`)}),
+	}}
+	searchCalls := 0
+	registry, err := agenttools.NewRegistry(
+		testTool("get_resource_evidence", func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+			return agenttools.Execution{}, errs.NewPermissionError(
+				errs.SubtypeMissingScope,
+				"Base record read requires bitable:app:readonly",
+			).WithIdentity("user").WithMissingScopes("bitable:app:readonly")
+		}),
+		testTool("search_code_symbols", func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+			searchCalls++
+			return agenttools.Execution{Content: `{"matches":["unrelated.go"]}`}, nil
+		}),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, trajectory, err := (AgentLoop{
+		Model:    model,
+		Tools:    registry,
+		MaxTurns: 3,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		WorkKind:    domain.WorkKindResourceHandoff,
+		TaskSummary: "locate the referenced issue, verify its fix evidence, and update its workflow status",
+		User:        agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event: domain.NormalizedEvent{
+			MessageID:  "om_handoff",
+			ChatID:     "oc_group",
+			ChatType:   "group",
+			SenderID:   "ou_teammate",
+			SenderType: "user",
+			Content:    "@测试负责人 这个问题修复后改下状态",
+			Mentions:   []domain.Mention{{OpenID: "ou_owner"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		decision.EvidenceStatus != domain.EvidenceInsufficient ||
+		decision.ReplyOutcome != domain.ReplyOutcomeClarification {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if searchCalls != 0 {
+		t.Fatalf("workspace search ran after authoritative resource denial: %d", searchCalls)
+	}
+	if got := strings.Join(model.toolNames[1], ","); got != "submit_decision" {
+		t.Fatalf("post-denial tools=%q want submit_decision", got)
+	}
+	if !trajectoryContains(trajectory, "Base record read requires bitable:app:readonly") {
+		t.Fatalf("trajectory missing exact authorization gap: %+v", trajectory)
+	}
+}
+
+func TestResourceEvidenceConvergencePreservesRepairAndExistingEvidence(t *testing.T) {
+	bundle := agentcontext.Bundle{WorkKind: domain.WorkKindResourceHandoff}
+	invalidArguments := errs.NewValidationError(
+		errs.SubtypeInvalidArgument,
+		"invalid agent tool arguments",
+	)
+	if resourceEvidenceFailureRequiresConvergence(
+		bundle,
+		"get_resource_evidence",
+		invalidArguments,
+		false,
+	) {
+		t.Fatal("repairable tool arguments forced terminal convergence")
+	}
+	scopeDenial := errs.NewPermissionError(
+		errs.SubtypeMissingScope,
+		"Base record read requires bitable:app:readonly",
+	)
+	if !resourceEvidenceFailureRequiresConvergence(
+		bundle,
+		"get_resource_evidence",
+		scopeDenial,
+		false,
+	) {
+		t.Fatal("initial authoritative scope denial did not force convergence")
+	}
+	if resourceEvidenceFailureRequiresConvergence(
+		bundle,
+		"get_resource_evidence",
+		scopeDenial,
+		true,
+	) {
+		t.Fatal("later failure discarded already verified resource evidence")
+	}
+}
+
 func TestResourceStatusMutationRequiresRulesCodeTestsGitAndSchema(t *testing.T) {
 	bundle := agentcontext.Bundle{WorkKind: domain.WorkKindResourceHandoff}
 	var progress resourceHandoffProgress

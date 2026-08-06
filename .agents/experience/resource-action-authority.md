@@ -29,6 +29,11 @@
   A conversational status handoff requires one exact Base record with app,
   table, and record coordinates; a document, app, or table-only URL must fail
   before evidence persistence.
+- If that first authoritative record read fails with a non-retryable
+  authorization, configuration, or record-link validation error, close broad
+  investigation immediately. Expose only `submit_decision` and report the
+  exact gap and recovery step; never fall through to adjacent chat context,
+  workspace search, status proposals, or inferred issue identity.
 - A validated conversational resource-handoff reply must be persisted as the
   current-generation candidate before the sender-facing send. It creates no
   separate owner notice. A known send failure retries that candidate after

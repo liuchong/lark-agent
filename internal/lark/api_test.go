@@ -48,3 +48,30 @@ func TestAPIProblemPreservesFieldViolation(t *testing.T) {
 		t.Fatalf("problem=%+v", problem)
 	}
 }
+
+func TestAPIProblemClassifiesRequiredPrivilegesAsMissingScope(t *testing.T) {
+	err := apiProblem(403, map[string]any{
+		"msg": "Unauthorized. You do not have permission to perform the requested operation on the resource. " +
+			"Please request user re-authorization and try again. required one of these privileges under the user identity: " +
+			"[bitable:app:readonly, bitable:app, base:record:retrieve]",
+	}, IdentityUser)
+	problem, ok := errs.ProblemOf(err)
+	if !ok ||
+		problem.Category != errs.CategoryAuthorization ||
+		problem.Subtype != errs.SubtypeMissingScope ||
+		problem.Identity != string(IdentityUser) {
+		t.Fatalf("problem=%+v", problem)
+	}
+}
+
+func TestAPIProblemKeepsGenericResourceDenialDistinctFromMissingScope(t *testing.T) {
+	err := apiProblem(403, map[string]any{
+		"msg": "You do not have permission to access this Base record",
+	}, IdentityUser)
+	problem, ok := errs.ProblemOf(err)
+	if !ok ||
+		problem.Category != errs.CategoryAuthorization ||
+		problem.Subtype != errs.SubtypeFailedPrecondition {
+		t.Fatalf("problem=%+v", problem)
+	}
+}

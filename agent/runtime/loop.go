@@ -798,6 +798,22 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 						submittedProgress.Unknowns...,
 					)
 				}
+				if resourceEvidenceFailureRequiresConvergence(
+					bundle,
+					call.Function.Name,
+					toolErr,
+					resourceProgress.resourceEvidence,
+				) {
+					forceDecision = true
+					terminalRepair.Unknowns = appendUniqueString(
+						terminalRepair.Unknowns,
+						toolErr.Error(),
+					)
+					postToolPrompts = append(
+						postToolPrompts,
+						resourceEvidenceFailureConvergencePrompt(toolErr),
+					)
+				}
 			}
 			fingerprint := toolResultFingerprint(
 				call.Function.Name,
@@ -899,6 +915,44 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		}
 	}
 	return domain.Decision{}, trajectory, errs.NewInternalError(errs.SubtypeInvalidResponse, "agent loop exceeded maximum turns")
+}
+
+func resourceEvidenceFailureRequiresConvergence(
+	bundle agentcontext.Bundle,
+	toolName string,
+	err error,
+	resourceEvidenceAvailable bool,
+) bool {
+	if bundle.WorkKind != domain.WorkKindResourceHandoff ||
+		toolName != "get_resource_evidence" ||
+		err == nil ||
+		resourceEvidenceAvailable {
+		return false
+	}
+	problem, ok := errs.ProblemOf(err)
+	if !ok || problem.Retryable {
+		return false
+	}
+	switch problem.Category {
+	case errs.CategoryAuthorization, errs.CategoryConfig:
+		return true
+	case errs.CategoryValidation:
+		return problem.Subtype == errs.SubtypeFailedPrecondition
+	default:
+		return false
+	}
+}
+
+func resourceEvidenceFailureConvergencePrompt(err error) string {
+	return fmt.Sprintf(
+		"Authoritative resource evidence is unavailable: %v. Broad investigation is closed. "+
+			"Only submit_decision is allowed now. For a human handoff, reply with "+
+			"evidence_status=insufficient and reply_outcome=clarification, state this exact "+
+			"authorization, configuration, or record-link gap, and give the concrete recovery "+
+			"step. Do not inspect adjacent chat subjects, search workspace code, propose a "+
+			"status mutation, or claim that the issue was verified.",
+		err,
+	)
 }
 
 func filterBundleTools(

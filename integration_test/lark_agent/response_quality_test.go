@@ -16,6 +16,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/policy"
 	agentruntime "github.com/liuchong/lark-agent/agent/runtime"
 	agenttools "github.com/liuchong/lark-agent/agent/tools"
+	errs "github.com/liuchong/lark-agent/internal/apperr"
 )
 
 type responseQualityModel struct {
@@ -34,6 +35,98 @@ func (m *responseQualityModel) Generate(_ context.Context, _ []*schema.Message, 
 
 func (m *responseQualityModel) Stream(context.Context, []*schema.Message, ...einomodel.Option) (*schema.StreamReader[*schema.Message], error) {
 	return nil, errors.New("not implemented")
+}
+
+func TestResourceHandoffScopeDenialCannotFallThroughToUnrelatedCode(t *testing.T) {
+	model := &responseQualityModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
+			"evidence",
+			"get_resource_evidence",
+			`{"resource_url":"https://example.larksuite.com/record/shrExampleRecordToken001"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
+			"wrong_search",
+			"search_code_symbols",
+			`{"query":"perform_sample_action"}`,
+		)}),
+		schema.AssistantMessage("", []schema.ToolCall{responseQualityToolCall(
+			"submit",
+			"submit_decision",
+			`{
+				"decision":"reply",
+				"evidence_status":"insufficient",
+				"reply_outcome":"clarification",
+				"relevance_confidence":0.98,
+				"reply_confidence":0.95,
+				"risk":"low",
+				"progress":{
+					"unknowns":["当前用户授权缺少 Base 记录读取权限，无法核实引用问题"],
+					"next_step":"重新授权 Base 记录读取权限后恢复该工作"
+				},
+				"reply_text":"我已定位到引用记录，但当前飞书用户授权缺少 Base 记录读取权限，无法核实问题内容、修复证据或更新状态。请重新授权 Base 读取权限后再试。",
+				"reason":"authoritative Base evidence is unavailable"
+			}`,
+		)}),
+	}}
+	searchCalls := 0
+	registry, err := agenttools.NewRegistry(
+		agenttools.Definition{
+			Info:                &schema.ToolInfo{Name: "get_resource_evidence"},
+			ResourceHandoffOnly: true,
+			NonOwnerReadOnly:    true,
+			Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+				return agenttools.Execution{}, errs.NewPermissionError(
+					errs.SubtypeMissingScope,
+					"Base record read requires bitable:app:readonly",
+				).WithIdentity("user").WithMissingScopes("bitable:app:readonly")
+			},
+		},
+		agenttools.Definition{
+			Info:             &schema.ToolInfo{Name: "search_code_symbols"},
+			NonOwnerReadOnly: true,
+			Execute: func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+				searchCalls++
+				return agenttools.Execution{Content: `{"matches":["unrelated.go"]}`}, nil
+			},
+		},
+		agentruntime.SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, trajectory, err := (agentruntime.AgentLoop{
+		Model:    model,
+		Tools:    registry,
+		MaxTurns: 4,
+	}).Decide(context.Background(), agentcontext.Bundle{
+		WorkKind:    domain.WorkKindResourceHandoff,
+		TaskSummary: "locate the referenced issue, verify its fix evidence, and update its workflow status",
+		User:        agentcontext.UserProfile{OpenID: "ou_owner"},
+		Event: domain.NormalizedEvent{
+			MessageID:  "om_6210",
+			ChatID:     "oc_backend",
+			ChatType:   "group",
+			SenderID:   "ou_teammate",
+			SenderType: "user",
+			Content:    "@测试负责人 这个问题修复后改下状态",
+			Mentions:   []domain.Mention{{OpenID: "ou_owner"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if searchCalls != 0 {
+		t.Fatalf("unrelated workspace search executed after Base scope denial: %d", searchCalls)
+	}
+	if decision.Kind != domain.DecisionReply ||
+		decision.EvidenceStatus != domain.EvidenceInsufficient ||
+		decision.ReplyOutcome != domain.ReplyOutcomeClarification ||
+		strings.Contains(decision.ReplyText, "群邀请") {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if !trajectoryContains(trajectory, "tool search_code_symbols is not available") {
+		t.Fatalf("trajectory missing hard convergence rejection: %+v", trajectory)
+	}
 }
 
 func TestDelegatedBackendReplayRepairsEmptyCommitmentWithReadEvidence(t *testing.T) {
