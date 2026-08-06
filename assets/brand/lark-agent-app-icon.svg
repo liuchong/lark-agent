@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
   <title id="title">Lark Agent macOS app icon</title>
-  <desc id="desc">A white bird and chat bubble with an agent spark on a blue and cyan rounded square.</desc>
+  <desc id="desc">A white bird and chat bubble with a connected agent antenna and tool loop.</desc>
   <defs>
     <linearGradient id="background" x1="130" y1="116" x2="890" y2="914" gradientUnits="userSpaceOnUse">
       <stop stop-color="#245BFF"/>
@@ -19,5 +19,14 @@
   <g filter="url(#shadow)" transform="translate(52 94) scale(1.75)">
     <path fill="#FFFFFF" d="M91 72c58 38 113 58 169 61 59 3 106 29 121 79 38-22 83-15 103 18-42 6-66 32-86 78-31 73-94 116-179 124 24-20 43-42 56-67-84 8-151-37-172-119 36 31 79 46 129 42-76-20-125-77-139-165-3-18-3-35-2-51Z"/>
   </g>
-  <path fill="url(#spark)" d="M770 158c14 58 44 88 102 102-58 14-88 44-102 102-14-58-44-88-102-102 58-14 88-44 102-102Z"/>
+  <g id="agent-antenna" fill="url(#spark)" stroke="url(#spark)">
+    <path d="M711 473c48-39 68-77 59-118" fill="none" stroke-width="25" stroke-linecap="round"/>
+    <circle cx="712" cy="472" r="23" stroke="none"/>
+    <path d="M770 158c14 58 44 88 102 102-58 14-88 44-102 102-14-58-44-88-102-102 58-14 88-44 102-102Z" stroke="none"/>
+  </g>
+  <g id="tool-loop" fill="#2D66E8" stroke="#2D66E8">
+    <path d="M397 683c31 50 78 75 134 68" fill="none" stroke-width="24" stroke-linecap="round"/>
+    <circle cx="397" cy="683" r="23" stroke="none"/>
+    <circle cx="531" cy="751" r="26" stroke="none"/>
+  </g>
 </svg>

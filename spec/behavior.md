@@ -581,11 +581,17 @@ The App bundle carries the repository's branded macOS icon through
 not a fixed-color or fixed-white bitmap: AppKit tints the template white or
 black to match the active macOS menu bar. Status counts may appear beside the
 mark, but the legacy `LA` text is not the primary status item.
+Across the README mark, App icon, and menu bar template, the bird/chat shape
+retains a connected intelligence-spark antenna and a two-node tool loop. These
+elements make the Agent role explicit without introducing text or details that
+disappear at menu bar size.
 
 Given a clean or upgraded installation, when the status App bundle is written,
 then its branded `.icns` and monochrome template resource are installed,
 `Info.plist` references the branded icon, and the status controller loads the
 template resource with template rendering enabled.
+Given any shipped brand variant, when its vector source is inspected, then the
+connected Agent antenna and tool-loop groups are present in that variant.
 
 The user-level installation may write files only under the current user's
 `~/.config/lark-agent`, `~/Applications`,

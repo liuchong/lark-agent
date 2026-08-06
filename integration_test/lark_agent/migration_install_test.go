@@ -34,6 +34,24 @@ func TestStatusAppUsesMacOSTemplateIcon(t *testing.T) {
 	}
 }
 
+func TestBrandVariantsExposeAgentVisualLanguage(t *testing.T) {
+	for _, name := range []string{
+		"lark-agent-mark.svg",
+		"lark-agent-app-icon.svg",
+		"lark-agent-status-template.svg",
+	} {
+		source, err := os.ReadFile(filepath.Join(repoRoot(t), "assets", "brand", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, expected := range []string{`id="agent-antenna"`, `id="tool-loop"`} {
+			if !strings.Contains(string(source), expected) {
+				t.Errorf("%s does not expose the Agent visual element %s", name, expected)
+			}
+		}
+	}
+}
+
 func TestQueueRetryCannotBypassExplicitPriorSessionResume(t *testing.T) {
 	bin := buildAgentBinary(t)
 	statePath := filepath.Join(t.TempDir(), "state.db")
