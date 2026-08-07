@@ -8,6 +8,9 @@ Always read `AGENTS.md` first.
   `.agents/knowledge/standalone-boundary.md`
 - shell, Workspace, permissions, security:
   `AGENTS.md` hard boundaries and `spec/behavior.md`
+- public repository, sensitive data, redaction, fixture, history rewrite,
+  filter-repo, hidden PR refs, voice or speech notification:
+  `.agents/knowledge/public-repository-safety.md`
 - persistence, session, recovery, resume, schema migration:
   `spec/behavior.md` and `changes/standalone-repository-rewrite.md`
 - install, deploy, restart, launchd:

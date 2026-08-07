@@ -22,6 +22,11 @@
 - Workspace shell 必须由代码限制在配置的 Workspace 真实路径内；提示词不能代替
   路径、符号链接和子进程边界检查。
 - secret、token、私钥和连接凭据不得进入仓库、测试 fixture、日志或提交。
+- 公开仓库的代码、测试、fixture、文档、规则、示例、提交信息和全部 Git 历史必须
+  遵守 `.agents/knowledge/public-repository-safety.md`：不得保留真实标识、人员、
+  私有项目结构或具体业务场景，历史清理必须验证远端隐藏引用。
+- 用户要求本地语音通知时，只能在提交、推送和远端验证成功后朗读本地提供的称呼；
+  称呼和通知内容不得写入公开仓库。
 - 新源码不增加版权或 SPDX 文件头；第三方归属统一记录在
   `THIRD_PARTY_NOTICES.md` 和 `LICENSES/`。
 
