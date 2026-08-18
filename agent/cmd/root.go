@@ -1951,6 +1951,10 @@ func buildLiveOptions(
 		}
 		definitions := append([]agenttools.Definition{}, agenttools.CodeIndexDefinitions(scope, nil)...)
 		definitions = append(definitions, agenttools.WorkspaceDefinitions(scope)...)
+		definitions = append(definitions, agenttools.WorkspaceMutationDefinitions(scope, agenttools.WorkspaceMutationOptions{
+			ApprovalRequired: cfg.Agent.ShellApproval,
+			Approvals:        store,
+		})...)
 		definitions = append(definitions, agenttools.GitDefinitions(scope)...)
 		if userContextEnabled {
 			definitions = append(definitions, agenttools.LarkContextDefinitions(larkToolContext{svc: imSvc})...)

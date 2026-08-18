@@ -23,3 +23,26 @@ func TestIsCodingQuestionRecognizesSourceInvestigationLanguage(t *testing.T) {
 		}
 	}
 }
+
+func TestIsWorkspaceWriteRequestedRequiresExplicitMutationLanguage(t *testing.T) {
+	for _, content := range []string{
+		"请修复 router.go 里的分页上限",
+		"帮我实现这个限流函数",
+		"把 timeout 改成 30 秒",
+		"fix the rate limit in router.go",
+		"please implement the bounded search helper",
+	} {
+		if !IsWorkspaceWriteRequested(content) {
+			t.Fatalf("content=%q was not classified as a write request", content)
+		}
+	}
+	for _, content := range []string{
+		"请核对仓库里的一个相关测试或实现文件作为证据",
+		"这个代码入口为什么每次都访问 SampleDB",
+		"请从源码确认缩略图审核流程",
+	} {
+		if IsWorkspaceWriteRequested(content) {
+			t.Fatalf("investigation %q was classified as a write request", content)
+		}
+	}
+}

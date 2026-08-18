@@ -17,6 +17,7 @@ import (
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
 	agenttools "github.com/liuchong/lark-agent/agent/tools"
+	"github.com/liuchong/lark-agent/agent/workspace"
 	errs "github.com/liuchong/lark-agent/internal/apperr"
 )
 
@@ -2532,6 +2533,145 @@ func TestToolCallAndNoProgressBudgetsForceConvergence(t *testing.T) {
 	if executions != 3 || decision.Kind != domain.DecisionIgnore {
 		t.Fatalf("executions=%d decision=%+v", executions, decision)
 	}
+}
+
+func TestAgentLoopDoesNotExecuteTruncatedToolCalls(t *testing.T) {
+	truncated := schema.AssistantMessage("", []schema.ToolCall{toolCall("call_edit", "search_workspace", `{"query":"RateLimit"}`)})
+	truncated.ResponseMeta = &schema.ResponseMeta{FinishReason: "length"}
+	model := &scriptedModel{responses: []*schema.Message{
+		truncated,
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"relevance_confidence":0.95,
+			"reply_confidence":0.92,
+			"risk":"low",
+			"reply_text":"未执行截断的工具调用。",
+			"reason":"truncated tool calls were skipped",
+			"evidence_status":"insufficient",
+			"progress":{"unknowns":["need a complete tool call"],"next_step":"retry the search"}
+		}`)}),
+	}}
+	executed := false
+	registry, err := agenttools.NewRegistry(
+		testTool("search_workspace", func(context.Context, json.RawMessage) (agenttools.Execution, error) {
+			executed = true
+			return agenttools.Execution{Content: `{"results":[]}`}, nil
+		}),
+		SubmitDecisionDefinition(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, trajectory, err := (AgentLoop{Model: model, Tools: registry, MaxTurns: 6, SimpleMaxTurns: 6}).Decide(
+		context.Background(),
+		agentcontext.Bundle{
+			WorkKind: domain.WorkKindSimpleQuestion,
+			Event:    domain.NormalizedEvent{MessageID: "om_trunc", Content: "请用一句话确认当前状态"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executed {
+		t.Fatal("truncated tool call was executed")
+	}
+	if decision.Kind != domain.DecisionReply {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if !trajectoryContains(trajectory, "incomplete tool call was not executed") {
+		t.Fatalf("trajectory=%+v", trajectory)
+	}
+}
+
+func TestAgentLoopExposesWriteToolsOnlyForExplicitOwnerMutation(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "router.go"), []byte("limit := 10\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agenttools.NewRegistry(append(
+		agenttools.WorkspaceDefinitions(scope),
+		append(
+			agenttools.WorkspaceMutationDefinitions(scope, agenttools.WorkspaceMutationOptions{}),
+			SubmitDecisionDefinition(),
+		)...,
+	)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readModel := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"relevance_confidence":0.95,
+			"reply_confidence":0.92,
+			"risk":"low",
+			"reply_text":"只读调查。",
+			"reason":"no mutation requested",
+			"evidence_status":"insufficient",
+			"progress":{"unknowns":["no write tools"],"next_step":"ask to modify if needed"}
+		}`)}),
+	}}
+	_, _, err = (AgentLoop{Model: readModel, Tools: registry, MaxTurns: 4, SimpleMaxTurns: 4}).Decide(
+		context.Background(),
+		agentcontext.Bundle{
+			WorkKind: domain.WorkKindSimpleQuestion,
+			User:     agentcontext.UserProfile{OpenID: "ou_owner"},
+			Event: domain.NormalizedEvent{
+				MessageID: "om_read",
+				SenderID:  "ou_owner",
+				Content:   "请检查本周销售数据并给出业务结论",
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsString(readModel.toolNames[0], "edit_workspace") || containsString(readModel.toolNames[0], "write_workspace") {
+		t.Fatalf("write tools exposed for investigation: %v", readModel.toolNames[0])
+	}
+
+	writeModel := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("submit", "submit_decision", `{
+			"decision":"reply",
+			"relevance_confidence":0.95,
+			"reply_confidence":0.92,
+			"risk":"low",
+			"reply_text":"可以改文件。",
+			"reason":"write tools available",
+			"evidence_status":"insufficient",
+			"progress":{"unknowns":["not edited yet"],"next_step":"edit after confirmation"}
+		}`)}),
+	}}
+	_, _, err = (AgentLoop{Model: writeModel, Tools: registry, MaxTurns: 4, SimpleMaxTurns: 4}).Decide(
+		context.Background(),
+		agentcontext.Bundle{
+			WorkKind: domain.WorkKindSimpleQuestion,
+			User:     agentcontext.UserProfile{OpenID: "ou_owner"},
+			Event: domain.NormalizedEvent{
+				MessageID: "om_write",
+				SenderID:  "ou_owner",
+				Content:   "请修复 router.go 里的分页上限",
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(writeModel.toolNames[0], "edit_workspace") || !containsString(writeModel.toolNames[0], "write_workspace") {
+		t.Fatalf("write tools missing: %v", writeModel.toolNames[0])
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func messagesContain(messages []*schema.Message, text string) bool {

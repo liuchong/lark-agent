@@ -232,6 +232,41 @@ func TestShellDefinitionRejectsDirectLarkMessageSends(t *testing.T) {
 	}
 }
 
+func TestAttachCapturedShellStreamSpillsOversizedOutput(t *testing.T) {
+	root := t.TempDir()
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temp, err := os.CreateTemp(root, "capture-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(temp.Name()) }()
+	full := strings.Repeat("a", 200)
+	if _, err := temp.WriteString(full); err != nil {
+		t.Fatal(err)
+	}
+	preview := limitedBuffer{max: 16}
+	_, _ = preview.Write([]byte(full))
+	var text, pathOut, digest string
+	var size int
+	var truncated bool
+	if err := attachCapturedShellStream(scope, "work-1", "stdout", temp, preview, &text, &pathOut, &digest, &size, &truncated); err != nil {
+		t.Fatal(err)
+	}
+	if !truncated || pathOut == "" || digest == "" || size != 200 || !strings.Contains(text, "output truncated") {
+		t.Fatalf("text=%q path=%s digest=%s size=%d truncated=%v", text, pathOut, digest, size, truncated)
+	}
+	spilled, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(pathOut)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(spilled) != full {
+		t.Fatalf("spilled=%q", spilled)
+	}
+}
+
 type fakeShellApprovals struct {
 	approved bool
 }

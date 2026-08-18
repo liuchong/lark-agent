@@ -62,6 +62,8 @@ For direct owner mentions, incomplete facts are acceptable only when the reply i
 Use notify only for non-delegated background work that genuinely needs owner attention; it is not a terminal outcome for an unanswered delegated message, assistant_request, or owner_request.
 Use request_approval for an exact commitment or risky response that needs the owner's approval, and include the exact proposed reply_text plus any owner_action.
 Shell output can locate evidence but is not a citable source. Before replying from a shell-discovered file, use read_workspace to obtain its digest-backed source reference.
+When edit_workspace or write_workspace appear in the available tools, the current owner message requested a modification, fix, or implementation. Use those tools instead of shell to change workspace files. edit_workspace applies exact unique replacements against the original file; multiple replacements in one call must not overlap. write_workspace creates a file or overwrites an entire file. Stay inside the workspace. After any successful file change, call read_workspace again before citing that file. If those write tools are absent, do not modify files.
+read_workspace accepts optional 1-based offset and limit to read a line range; the digest is always the whole file. search_workspace accepts optional glob, literal, regex, and context_lines. list_workspace accepts optional glob to list matching files. If a model turn is truncated, incomplete tool calls are not executed; retry with complete calls.
 Use reply for a useful source-backed response; the runtime chooses bot identity for assistant_request and owner_request, and user identity for delegated replies.
 Examples, tests, fixtures, and docs are supporting evidence only. Do not claim a production implementation until you have read a production source; otherwise say that production behavior remains unverified.
 Never invent an owner or team commitment, completion state, delivery time, promise to coordinate later, or promise to report back.`
@@ -483,10 +485,12 @@ func defaultToolSpecs() []ToolSpec {
 	return []ToolSpec{
 		{Name: "search_code_symbols", Description: "Search code symbols and paths first; falls back to bounded workspace search if the code index is unavailable", Available: true},
 		{Name: "trace_code_path", Description: "Trace indexed symbol or call relationships when a code index is configured", Available: true},
-		{Name: "list_workspace", Description: "List a bounded workspace directory", Available: true},
+		{Name: "list_workspace", Description: "List a bounded workspace directory or glob-matching files", Available: true},
 		{Name: "explore_workspace", Description: "Run a bounded read-only exploration subtask and return a compact evidence summary", Available: true},
-		{Name: "search_workspace", Description: "Search workspace files using model-chosen queries", Available: true},
-		{Name: "read_workspace", Description: "Read a bounded workspace text file", Available: true},
+		{Name: "search_workspace", Description: "Search workspace files using model-chosen queries, optional glob, literal or regex, and context lines", Available: true},
+		{Name: "read_workspace", Description: "Read a bounded workspace text file or a 1-based line range", Available: true},
+		{Name: "edit_workspace", Description: "Replace exact unique text in an existing workspace file", SideEffect: true, Available: true},
+		{Name: "write_workspace", Description: "Create a workspace file or overwrite an entire file", SideEffect: true, Available: true},
 		{Name: "read_workspace_rules", Description: "Load workspace rules applicable to a path", Available: true},
 		{Name: "list_skills", Description: "List workspace-local skills", Available: true},
 		{Name: "load_skill", Description: "Load one workspace-local skill", Available: true},

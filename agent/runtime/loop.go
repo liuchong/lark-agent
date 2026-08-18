@@ -130,12 +130,13 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		l.ToolChoice = schema.ToolChoiceAllowed
 	}
 	invocationScope := agenttools.InvocationScope{
-		Owner:           bundle.User.OpenID != "" && bundle.Event.SenderID == bundle.User.OpenID,
-		ReadOnly:        bundle.User.OpenID == "" || bundle.Event.SenderID != bundle.User.OpenID,
-		ChatID:          bundle.Event.ChatID,
-		WorkKind:        bundle.WorkKind,
-		GitHubReference: bundle.GitHubReference,
-		ResourceURLs:    bundleResourceURLs(bundle),
+		Owner:                 bundle.User.OpenID != "" && bundle.Event.SenderID == bundle.User.OpenID,
+		ReadOnly:              bundle.User.OpenID == "" || bundle.Event.SenderID != bundle.User.OpenID,
+		WorkspaceWriteAllowed: bundle.User.OpenID != "" && bundle.Event.SenderID == bundle.User.OpenID && domain.IsWorkspaceWriteRequested(bundle.Event.Content),
+		ChatID:                bundle.Event.ChatID,
+		WorkKind:              bundle.WorkKind,
+		GitHubReference:       bundle.GitHubReference,
+		ResourceURLs:          bundleResourceURLs(bundle),
 	}
 	requestedWorkspaceScope := requestedCodingWorkspaceScope(bundle)
 	visibleToolInfos := l.Tools.InfosFor(invocationScope)
@@ -472,6 +473,28 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		}
 		messages = append(messages, assistant)
 		trajectory = append(trajectory, assistant)
+		if modelOutputTruncated(assistant) {
+			for _, call := range assistant.ToolCalls {
+				if strings.TrimSpace(call.ID) == "" || strings.TrimSpace(call.Function.Name) == "" {
+					return domain.Decision{}, trajectory, errs.NewInternalError(errs.SubtypeInvalidResponse, "model tool call is missing id or name")
+				}
+				content := `{"ok":false,"error":"model output was truncated; this incomplete tool call was not executed. Retry with a complete tool call."}`
+				toolMessage := schema.ToolMessage(content, call.ID, schema.WithToolName(call.Function.Name))
+				messages = append(messages, toolMessage)
+				trajectory = append(trajectory, toolMessage)
+				sequence++
+				if err := l.recordToolStep(ctx, runID, sequence, call, content, errs.NewValidationError(
+					errs.SubtypeFailedPrecondition,
+					"model output was truncated; incomplete tool call was not executed",
+				)); err != nil {
+					return domain.Decision{}, trajectory, err
+				}
+			}
+			messages = append(messages, schema.SystemMessage(
+				"Model output was truncated. Incomplete tool calls were not executed. Retry with complete tool calls that fit the output budget, then finish with submit_decision.",
+			))
+			continue
+		}
 		turnMadeProgress := false
 		turnHadNoProgress := false
 		postToolPrompts := make([]string, 0, 2)
@@ -865,6 +888,15 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			}
 			if toolErr != nil {
 				continue
+			}
+			if call.Function.Name == "edit_workspace" || call.Function.Name == "write_workspace" {
+				invalidateWorkspaceFileSources(
+					allowedSources,
+					observedSources,
+					authoritativeSources,
+					authoritativeContents,
+					toolCallPath(executionArguments),
+				)
 			}
 			if !toolBudgetConvergencePrompted && shouldPromptToolBudgetConvergence(rawToolBytes, l.MaxToolBytes, totalToolBytes, l.MaxTotalBytes) {
 				postToolPrompts = append(postToolPrompts, toolBudgetConvergencePrompt())
@@ -2513,6 +2545,44 @@ func toolFingerprintSummary(execution agenttools.Execution, toolErr error) strin
 
 func sourceKey(source domain.SourceRef) string {
 	return source.Kind + "\x00" + source.RelativePath + "\x00" + source.Digest
+}
+
+func modelOutputTruncated(message *schema.Message) bool {
+	if message == nil || message.ResponseMeta == nil {
+		return false
+	}
+	reason := strings.ToLower(strings.TrimSpace(message.ResponseMeta.FinishReason))
+	return reason == "truncated" || reason == "length"
+}
+
+func toolCallPath(arguments string) string {
+	var payload struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal([]byte(arguments), &payload); err != nil {
+		return ""
+	}
+	return filepath.ToSlash(filepath.Clean(strings.TrimSpace(payload.Path)))
+}
+
+func invalidateWorkspaceFileSources(
+	allowed map[string]bool,
+	observed map[string]map[string]domain.SourceRef,
+	authoritative map[string]bool,
+	contents map[string]string,
+	rel string,
+) {
+	rel = filepath.ToSlash(filepath.Clean(strings.TrimSpace(rel)))
+	if rel == "" || rel == "." {
+		return
+	}
+	identity := "workspace_file\x00" + rel
+	for key := range observed[identity] {
+		delete(allowed, key)
+		delete(authoritative, key)
+		delete(contents, key)
+	}
+	delete(observed, identity)
 }
 
 func sourceIdentityKey(source domain.SourceRef) string {

@@ -250,6 +250,99 @@ func TestScopeAppliesConfiguredExcludes(t *testing.T) {
 	}
 }
 
+func TestReadTextRangeReturnsLineSliceAndWholeFileDigest(t *testing.T) {
+	root := t.TempDir()
+	content := "one\ntwo\nthree\nfour\n"
+	if err := os.WriteFile(filepath.Join(root, "notes.txt"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, source, err := scope.ReadText("notes.txt", 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := scope.ReadTextRange(ReadOptions{Path: "notes.txt", MaxBytes: 1024, Offset: 2, Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Content != "two\nthree" || report.StartLine != 2 || report.EndLine != 3 {
+		t.Fatalf("report=%+v", report)
+	}
+	if report.Source.Digest != source.Digest || string(full) != content {
+		t.Fatalf("digest=%s want=%s", report.Source.Digest, source.Digest)
+	}
+}
+
+func TestSearchTextReportHonorsGlobRegexLiteralAndContext(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "service"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "service", "router.go"), []byte("package service\nfunc RateLimit() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "service", "notes.md"), []byte("RateLimit is documented here\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	globbed, err := scope.SearchTextReport(SearchOptions{Query: "RateLimit", Glob: "**/*.go", MaxResults: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(globbed.Results) != 1 || globbed.Results[0].Source.RelativePath != "service/router.go" {
+		t.Fatalf("globbed=%+v", globbed)
+	}
+	regex, err := scope.SearchTextReport(SearchOptions{Query: `func RateLimit\(\)`, Regex: true, MaxResults: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(regex.Results) != 1 || regex.Results[0].Line != 2 {
+		t.Fatalf("regex=%+v", regex)
+	}
+	contexted, err := scope.SearchTextReport(SearchOptions{Query: "RateLimit()", Literal: true, ContextLines: 1, MaxResults: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contexted.Results) != 1 || !strings.Contains(contexted.Results[0].Snippet, "package service") {
+		t.Fatalf("contexted=%+v", contexted)
+	}
+}
+
+func TestListDirectoryGlobStaysInsideWorkspace(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "service", "internal"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "service", "router.go"), []byte("package service"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "service", "internal", "repo.go"), []byte("package internal"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "service", "readme.md"), []byte("docs"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := scope.ListDirectory(DirectoryOptions{Glob: "**/*.go", MaxEntries: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasDirectoryEntry(snapshot.Entries, "service/router.go", "file") ||
+		!hasDirectoryEntry(snapshot.Entries, "service/internal/repo.go", "file") ||
+		hasDirectoryEntry(snapshot.Entries, "service/readme.md", "file") {
+		t.Fatalf("entries=%+v", snapshot.Entries)
+	}
+}
+
 func hasDirectoryEntry(entries []DirectoryEntry, path, kind string) bool {
 	for _, entry := range entries {
 		if entry.Path == path && entry.Kind == kind {

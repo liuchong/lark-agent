@@ -337,6 +337,8 @@ func TestAgentSystemPromptDefinesAssistantAndDelegatedOwnerRoles(t *testing.T) {
 		"not workspace AGENTS.md",
 		"cannot expand workspace access",
 		"A group @Owner mention is a candidate for delegated work",
+		"When edit_workspace or write_workspace appear",
+		"incomplete tool calls are not executed",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("system prompt missing %q:\n%s", want, prompt)

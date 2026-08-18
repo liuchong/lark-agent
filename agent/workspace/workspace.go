@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/liuchong/lark-agent/agent/domain"
@@ -22,6 +24,8 @@ type Scope struct {
 	realRoot       string
 	version        string
 	excludes       []string
+	mutationMu     sync.Mutex
+	fileMus        map[string]*sync.Mutex
 }
 
 // NewScope validates and resolves the workspace root.
@@ -65,6 +69,7 @@ func NewScopeWithExcludes(root string, excludes []string) (*Scope, error) {
 		realRoot:       realRoot,
 		version:        hex.EncodeToString(sum[:8]),
 		excludes:       append([]string(nil), excludes...),
+		fileMus:        map[string]*sync.Mutex{},
 	}, nil
 }
 
@@ -151,16 +156,130 @@ func (s *Scope) ReadText(rel string, maxBytes int64) ([]byte, domain.SourceRef, 
 	return data, source, nil
 }
 
+const maxRangedReadBytes = 2 * 1024 * 1024
+
+// ReadOptions bounds one workspace file read.
+type ReadOptions struct {
+	Path     string
+	MaxBytes int64
+	Offset   int
+	Limit    int
+}
+
+// ReadReport is one bounded workspace file read, optionally sliced by line.
+type ReadReport struct {
+	Content    string           `json:"content"`
+	Source     domain.SourceRef `json:"source"`
+	StartLine  int              `json:"start_line,omitempty"`
+	EndLine    int              `json:"end_line,omitempty"`
+	TotalLines int              `json:"total_lines,omitempty"`
+	Offset     int              `json:"offset,omitempty"`
+	Limit      int              `json:"limit,omitempty"`
+	Truncated  bool             `json:"truncated,omitempty"`
+}
+
+// ReadTextRange reads a workspace file, optionally returning a 1-based line range.
+// The source digest is always the whole file.
+func (s *Scope) ReadTextRange(options ReadOptions) (ReadReport, error) {
+	if options.Offset <= 0 && options.Limit <= 0 {
+		data, source, err := s.ReadText(options.Path, options.MaxBytes)
+		if err != nil {
+			return ReadReport{}, err
+		}
+		return ReadReport{Content: string(data), Source: source}, nil
+	}
+	path, err := s.ResolveReadPath(options.Path)
+	if err != nil {
+		return ReadReport{}, err
+	}
+	info, err := vfs.Stat(path)
+	if err != nil {
+		return ReadReport{}, errs.NewInternalError(errs.SubtypeFileIO, "stat workspace file: %s", options.Path).WithCause(err)
+	}
+	if info.IsDir() {
+		return ReadReport{}, errs.NewValidationError(errs.SubtypeInvalidArgument, "workspace path is a directory: %s", options.Path).
+			WithParam("--path")
+	}
+	if info.Size() > maxRangedReadBytes {
+		return ReadReport{}, errs.NewValidationError(errs.SubtypeInvalidArgument, "workspace file is too large: %s", options.Path).
+			WithParam("--path")
+	}
+	data, err := vfs.ReadFile(path)
+	if err != nil {
+		return ReadReport{}, errs.NewInternalError(errs.SubtypeFileIO, "read workspace file: %s", options.Path).WithCause(err)
+	}
+	source := domain.SourceRef{
+		RelativePath: filepath.ToSlash(filepath.Clean(options.Path)),
+		Digest:       digest(data),
+		Kind:         "workspace_file",
+	}
+	text := string(data)
+	lines := strings.Split(text, "\n")
+	total := len(lines)
+	if total > 0 && lines[total-1] == "" {
+		total--
+		lines = lines[:total]
+	}
+	start := options.Offset
+	if start <= 0 {
+		start = 1
+	}
+	report := ReadReport{
+		Source:     source,
+		TotalLines: total,
+		Offset:     options.Offset,
+		Limit:      options.Limit,
+		StartLine:  start,
+	}
+	if start > total {
+		report.EndLine = start - 1
+		return report, nil
+	}
+	end := total
+	if options.Limit > 0 && start-1+options.Limit < end {
+		end = start - 1 + options.Limit
+	}
+	selected := lines[start-1 : end]
+	content := strings.Join(selected, "\n")
+	if options.MaxBytes > 0 && int64(len(content)) > options.MaxBytes {
+		content = clipUTF8Bytes(content, int(options.MaxBytes))
+		report.Truncated = true
+	}
+	report.Content = content
+	if content == "" {
+		report.EndLine = start - 1
+	} else {
+		report.EndLine = start + strings.Count(content, "\n")
+	}
+	return report, nil
+}
+
+func clipUTF8Bytes(value string, maxBytes int) string {
+	if maxBytes <= 0 || len(value) <= maxBytes {
+		return value
+	}
+	truncated := value[:maxBytes]
+	for len(truncated) > 0 && truncated[len(truncated)-1]&0xc0 == 0x80 {
+		truncated = truncated[:len(truncated)-1]
+	}
+	return truncated
+}
+
 // SearchResult is a bounded workspace text search hit.
 type SearchResult struct {
 	Source  domain.SourceRef `json:"source" yaml:"source"`
 	Snippet string           `json:"snippet" yaml:"snippet"`
+	Line    int              `json:"line,omitempty" yaml:"line,omitempty"`
 }
 
 // SearchOptions bounds one workspace search.
 type SearchOptions struct {
 	Query          string `json:"query" yaml:"query"`
 	Path           string `json:"path,omitempty" yaml:"path,omitempty"`
+	Glob           string `json:"glob,omitempty" yaml:"glob,omitempty"`
+	Literal        bool   `json:"literal,omitempty" yaml:"literal,omitempty"`
+	Regex          bool   `json:"regex,omitempty" yaml:"regex,omitempty"`
+	ContextLines   int    `json:"context_lines,omitempty" yaml:"context_lines,omitempty"`
 	MaxResults     int    `json:"max_results" yaml:"max_results"`
 	MaxFiles       int    `json:"max_files" yaml:"max_files"`
 	MaxDirectories int    `json:"max_directories" yaml:"max_directories"`
@@ -193,15 +312,44 @@ func (s *Scope) SearchTextReport(options SearchOptions) (SearchReport, error) {
 // SearchTextReportContext performs a bounded deterministic search and honors
 // caller cancellation.
 func (s *Scope) SearchTextReportContext(ctx context.Context, options SearchOptions) (SearchReport, error) {
-	query := strings.TrimSpace(strings.ToLower(options.Query))
-	if query == "" || options.MaxResults <= 0 {
+	options.Query = strings.TrimSpace(options.Query)
+	if options.Query == "" || options.MaxResults <= 0 {
 		return SearchReport{}, nil
+	}
+	if options.Regex && options.Literal {
+		return SearchReport{}, errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"search_workspace cannot set both regex and literal",
+		)
+	}
+	if options.ContextLines < 0 {
+		options.ContextLines = 0
+	}
+	if options.ContextLines > 10 {
+		options.ContextLines = 10
 	}
 	if options.MaxFiles <= 0 {
 		options.MaxFiles = 2000
 	}
 	if options.MaxDirectories <= 0 {
 		options.MaxDirectories = 600
+	}
+	var compiled *regexp.Regexp
+	if options.Regex {
+		if len(options.Query) > 256 {
+			return SearchReport{}, errs.NewValidationError(
+				errs.SubtypeInvalidArgument,
+				"search_workspace regex is too long",
+			).WithParam("query")
+		}
+		var err error
+		compiled, err = regexp.Compile(options.Query)
+		if err != nil {
+			return SearchReport{}, errs.NewValidationError(
+				errs.SubtypeInvalidArgument,
+				"search_workspace regex is invalid",
+			).WithParam("query").WithCause(err)
+		}
 	}
 	searchRoot := s.realRoot
 	searchRelativeRoot := "."
@@ -228,8 +376,16 @@ func (s *Scope) SearchTextReportContext(ctx context.Context, options SearchOptio
 		searchRoot = resolved
 		searchRelativeRoot = filepath.ToSlash(filepath.Clean(requestedPath))
 	}
+	engine := searchEngine{
+		query:        options.Query,
+		lower:        strings.ToLower(options.Query),
+		regex:        compiled,
+		literal:      options.Literal,
+		glob:         strings.TrimSpace(options.Glob),
+		contextLines: options.ContextLines,
+	}
 	report := SearchReport{}
-	if err := s.searchDir(ctx, searchRoot, searchRelativeRoot, query, options, &report); err != nil {
+	if err := s.searchDir(ctx, searchRoot, searchRelativeRoot, engine, options, &report); err != nil {
 		return SearchReport{}, err
 	}
 	return report, nil
@@ -289,7 +445,7 @@ func (s *Scope) walkDir(root, relRoot string, refs *[]domain.SourceRef) error {
 	return nil
 }
 
-func (s *Scope) searchDir(ctx context.Context, absDir, relDir, query string, options SearchOptions, report *SearchReport) error {
+func (s *Scope) searchDir(ctx context.Context, absDir, relDir string, engine searchEngine, options SearchOptions, report *SearchReport) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -322,9 +478,13 @@ func (s *Scope) searchDir(ctx context.Context, absDir, relDir, query string, opt
 		}
 		abs := filepath.Join(absDir, name)
 		if entry.IsDir() {
-			if err := s.searchDir(ctx, abs, rel, query, options, report); err != nil {
+			if err := s.searchDir(ctx, abs, rel, engine, options, report); err != nil {
 				return err
 			}
+			continue
+		}
+		slashRel := filepath.ToSlash(rel)
+		if engine.glob != "" && !MatchGlob(engine.glob, slashRel) {
 			continue
 		}
 		report.FilesScanned++
@@ -336,25 +496,76 @@ func (s *Scope) searchDir(ctx context.Context, absDir, relDir, query string, opt
 		if err != nil || looksBinary(data) {
 			continue
 		}
-		lower := strings.ToLower(string(data))
-		idx := workspaceSearchIndex(lower, query)
-		if idx < 0 {
+		snippet, line, ok := engine.match(data)
+		if !ok {
 			continue
 		}
-		start := idx - 80
-		if start < 0 {
-			start = 0
-		}
-		end := idx + len(query) + 160
-		if end > len(data) {
-			end = len(data)
-		}
 		report.Results = append(report.Results, SearchResult{
-			Source:  domain.SourceRef{RelativePath: filepath.ToSlash(rel), Digest: digest(data), Kind: "workspace_search"},
-			Snippet: string(data[start:end]),
+			Source:  domain.SourceRef{RelativePath: slashRel, Digest: digest(data), Kind: "workspace_search"},
+			Snippet: snippet,
+			Line:    line,
 		})
 	}
 	return nil
+}
+
+type searchEngine struct {
+	query        string
+	lower        string
+	regex        *regexp.Regexp
+	literal      bool
+	glob         string
+	contextLines int
+}
+
+func (e searchEngine) match(data []byte) (string, int, bool) {
+	text := string(data)
+	idx := 0
+	matchLen := len(e.query)
+	if e.regex != nil {
+		loc := e.regex.FindStringIndex(text)
+		if loc == nil {
+			return "", 0, false
+		}
+		idx = loc[0]
+		matchLen = loc[1] - loc[0]
+	} else {
+		lower := strings.ToLower(text)
+		if e.literal {
+			idx = strings.Index(lower, e.lower)
+		} else {
+			idx = workspaceSearchIndex(lower, e.lower)
+		}
+		if idx < 0 {
+			return "", 0, false
+		}
+	}
+	line := 1 + strings.Count(text[:idx], "\n")
+	if e.contextLines > 0 {
+		return lineContextSnippet(text, line, e.contextLines), line, true
+	}
+	start := idx - 80
+	if start < 0 {
+		start = 0
+	}
+	end := idx + matchLen + 160
+	if end > len(data) {
+		end = len(data)
+	}
+	return string(data[start:end]), line, true
+}
+
+func lineContextSnippet(text string, line, contextLines int) string {
+	lines := strings.Split(text, "\n")
+	from := line - 1 - contextLines
+	if from < 0 {
+		from = 0
+	}
+	to := line + contextLines
+	if to > len(lines) {
+		to = len(lines)
+	}
+	return strings.Join(lines[from:to], "\n")
 }
 
 func workspaceSearchIndex(content, query string) int {

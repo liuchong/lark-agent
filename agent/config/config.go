@@ -398,6 +398,8 @@ func Default() Config {
 				"search_code_symbols":   "allow",
 				"trace_code_path":       "allow",
 				"explore_workspace":     "allow",
+				"edit_workspace":        "allow",
+				"write_workspace":       "allow",
 				"shell":                 "allow",
 				"direct_lark_im_send":   "deny",
 				"production_file_write": "deny",

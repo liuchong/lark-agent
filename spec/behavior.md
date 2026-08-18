@@ -935,12 +935,43 @@ than the sixteen-query display bound falls back to the conservative template
 instead of inventing metadata or silently hiding evidence. A bare optional
 code-index miss without a bounded workspace scan receipt also falls back.
 
-The coding investigation is read-only by default. Plan-mode coding work may
-write only the active plan artifact; production code edits, shell writes,
-commits, pushes, deployments, and direct Lark sends remain denied or routed
-through durable approval. One-off technical questions remain `CodingQuestion`
-work. Only questions that need multi-turn follow-up with explicit completion
-and blocking conditions become `CodingGoal` work.
+The coding investigation is read-only by default. Write tools are absent unless
+the target message explicitly asks to modify, fix, or implement something in
+the workspace. Locating an implementation file is not a write request.
+Non-owner runs never receive write tools.
+
+When write tools are open, they are owner-only, confined to the configured
+workspace real root, and serialized per relative path. `edit_workspace`
+applies one or more exact unique replacements against the original file bytes
+in a single call; overlapping or non-unique `old_text` fails and leaves the
+file unchanged. `write_workspace` creates a file or overwrites it entirely,
+and may create parent directories inside the workspace. Structured mutation is
+the primary way to change files; `shell` must not be used to paper over missing
+edit tools. After a successful mutation, previous `workspace_file` digests for
+that path are no longer citable; the model must `read_workspace` again before
+using the file as evidence. The terminal action remains `submit_decision`.
+
+`read_workspace` may take a 1-based line `offset` and `limit` so a large file
+can be read in slices; the source digest is always the whole file. Returned
+content still obeys `max_bytes`. `search_workspace` may take `glob`, `literal`,
+`regex`, and `context_lines` without leaving the workspace; the default remains
+a case-insensitive phrase, then every whitespace-separated term in one file.
+`list_workspace` may take `glob` to list matching files inside the same bound.
+When a sandbox command's stdout or stderr exceeds the configured output bound,
+the runtime stores the full stream in a workspace-local file under
+`.local/lark-agent/runtime/shell-output/` and returns a short preview plus path,
+digest, and byte count.
+
+If a model turn finishes truncated (`truncated` or provider `length`) and that
+turn contains tool calls, those calls are incomplete: the runtime does not
+execute them, writes a failure receipt for each call id, and asks the model to
+retry with complete calls.
+
+Plan-mode coding work may write only the active plan artifact; production code
+edits, shell writes, commits, pushes, deployments, and direct Lark sends remain
+denied or routed through durable approval. One-off technical questions remain
+`CodingQuestion` work. Only questions that need multi-turn follow-up with
+explicit completion and blocking conditions become `CodingGoal` work.
 
 `CodingQuestion` is foreground work with a finite reply budget. It may inspect
 code, summarize evidence, ask for a missing interface or path, and reply. It
@@ -2150,6 +2181,38 @@ The multi-step loop is accepted by these executable BDD scenarios:
   production code, run a write shell command, commit, push, deploy, or send
   Lark messages directly, then the runtime denies that operation until the plan
   exits through the configured approval path.
+- Given the owner target message explicitly asks to modify, fix, or implement
+  a workspace file, when the run starts, then `edit_workspace` and
+  `write_workspace` are visible, stay inside the configured workspace, and a
+  successful unique replacement changes the file digest; a later
+  `read_workspace` of that path is required before the file can be cited.
+- Given a coding question only asks what current code does, when the run
+  starts, then write tools are absent from the catalog and an
+  `edit_workspace` call is denied without changing the file.
+- Given a non-owner sender, when the run starts, then write tools are hidden
+  and denied.
+- Given one `edit_workspace` call has overlapping or non-unique `old_text`,
+  when it executes, then it fails and the file bytes are unchanged.
+- Given `write_workspace` targets a missing workspace-relative path, when it
+  executes, then it creates parent directories inside the workspace and writes
+  the file; an overwrite replaces the whole file and returns a new digest.
+- Given two mutations name the same relative path in one turn, when they run,
+  then they are applied one after another and neither write is dropped.
+- Given the model finish reason is truncated and the turn contains tool calls,
+  when the loop handles that turn, then no tool executor runs and each call id
+  receives a failure receipt telling the model to retry with complete calls.
+- Given `read_workspace` is called with 1-based `offset` and `limit`, when the
+  file is larger than the default byte cap, then the result contains only that
+  line range and the source digest is the whole file.
+- Given `search_workspace` is called with `glob`, `literal` or `regex`, and
+  `context_lines`, when matches exist, then results stay inside the workspace
+  or requested subtree and include the requested context.
+- Given `list_workspace` is called with `glob`, when matching files exist,
+  then the listing stays inside the workspace and does not follow symlink
+  escapes.
+- Given sandbox command output exceeds the configured byte bound, when the
+  command finishes, then the model-visible result is a preview plus a
+  workspace-local spill file with digest and size.
 - Given a coding question only needs a one-off technical answer, when it is
   processed, then it remains `CodingQuestion` work; given the question requires
   multi-turn follow-up with explicit completion and blocking conditions, then it

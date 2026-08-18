@@ -137,6 +137,37 @@ func TestExploreWorkspaceReturnsReadOnlyEvidenceSummary(t *testing.T) {
 	}
 }
 
+func TestWorkspaceReadSearchAndListAcceptRangeGlobAndRegex(t *testing.T) {
+	root := t.TempDir()
+	writeToolFixture(t, filepath.Join(root, "service", "router.go"), "package service\nfunc RateLimit() {}\nfunc Timeout() {}\n")
+	writeToolFixture(t, filepath.Join(root, "service", "notes.md"), "RateLimit notes\n")
+	scope, err := workspace.NewScope(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := NewRegistry(WorkspaceDefinitions(scope)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, err := registry.Execute(context.Background(), "read_workspace", []byte(`{"path":"service/router.go","offset":2,"limit":1}`))
+	if err != nil || !strings.Contains(read.Content, "func RateLimit()") || !strings.Contains(read.Content, `"start_line":2`) {
+		t.Fatalf("read=%+v err=%v", read, err)
+	}
+	search, err := registry.Execute(context.Background(), "search_workspace", []byte(`{
+		"query":"func RateLimit\\(\\)",
+		"regex":true,
+		"glob":"**/*.go",
+		"context_lines":1
+	}`))
+	if err != nil || !strings.Contains(search.Content, "service/router.go") || strings.Contains(search.Content, "notes.md") {
+		t.Fatalf("search=%+v err=%v", search, err)
+	}
+	listed, err := registry.Execute(context.Background(), "list_workspace", []byte(`{"glob":"**/*.go"}`))
+	if err != nil || !strings.Contains(listed.Content, "service/router.go") || strings.Contains(listed.Content, "notes.md") {
+		t.Fatalf("listed=%+v err=%v", listed, err)
+	}
+}
+
 func writeToolFixture(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

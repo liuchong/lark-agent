@@ -60,6 +60,7 @@ type Definition struct {
 	SideEffect              bool
 	OwnerOnly               bool
 	NonOwnerReadOnly        bool
+	WorkspaceWriteOnly      bool
 	ResourceHandoffOnly     bool
 	SameChatArgument        string
 	RequiresGitHubReference bool
@@ -76,12 +77,13 @@ type invocationScopeContextKey struct{}
 
 // InvocationScope is derived from durable sender identity and source chat.
 type InvocationScope struct {
-	Owner           bool
-	ReadOnly        bool
-	ChatID          string
-	WorkKind        domain.WorkKind
-	GitHubReference *domain.GitHubReference
-	ResourceURLs    []string
+	Owner                 bool
+	ReadOnly              bool
+	WorkspaceWriteAllowed bool
+	ChatID                string
+	WorkKind              domain.WorkKind
+	GitHubReference       *domain.GitHubReference
+	ResourceURLs          []string
 }
 
 // WithWorkItemDedup makes the current durable work identity available to tools.
@@ -223,6 +225,9 @@ func toolAllowedForScope(definition Definition, scope InvocationScope) bool {
 		return false
 	}
 	if definition.RequiresGitHubReference && scope.GitHubReference == nil {
+		return false
+	}
+	if definition.WorkspaceWriteOnly && (!scope.Owner || !scope.WorkspaceWriteAllowed) {
 		return false
 	}
 	if scope.Owner {

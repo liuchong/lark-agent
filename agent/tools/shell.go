@@ -3,8 +3,11 @@ package tools
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,6 +50,14 @@ type shellResult struct {
 	ApprovalRequired bool   `json:"approval_required,omitempty"`
 	ActionID         int64  `json:"action_id,omitempty"`
 	Uncertain        bool   `json:"uncertain,omitempty"`
+	StdoutTruncated  bool   `json:"stdout_truncated,omitempty"`
+	StdoutPath       string `json:"stdout_path,omitempty"`
+	StdoutDigest     string `json:"stdout_digest,omitempty"`
+	StdoutBytes      int    `json:"stdout_bytes,omitempty"`
+	StderrTruncated  bool   `json:"stderr_truncated,omitempty"`
+	StderrPath       string `json:"stderr_path,omitempty"`
+	StderrDigest     string `json:"stderr_digest,omitempty"`
+	StderrBytes      int    `json:"stderr_bytes,omitempty"`
 }
 
 // ShellDefinition executes commands under a macOS Seatbelt workspace boundary.
@@ -154,7 +165,8 @@ func ShellDefinition(scope *workspace.Scope, options ShellOptions) Definition {
 			if timeout <= 0 || timeout > options.MaxTimeout {
 				timeout = options.MaxTimeout
 			}
-			result, err := runSandboxedShell(ctx, scope, args.Command, args.CWD, timeout, options.MaxOutputBytes)
+			spillName := workItemDedup(ctx)
+			result, err := runSandboxedShell(ctx, scope, args.Command, args.CWD, timeout, options.MaxOutputBytes, spillName)
 			if approvalID != 0 {
 				resultJSON, _ := json.Marshal(result)
 				errorText := ""
@@ -170,7 +182,7 @@ func ShellDefinition(scope *workspace.Scope, options ShellOptions) Definition {
 	}
 }
 
-func runSandboxedShell(ctx context.Context, scope *workspace.Scope, command, cwd string, timeout time.Duration, outputBytes int) (shellResult, error) {
+func runSandboxedShell(ctx context.Context, scope *workspace.Scope, command, cwd string, timeout time.Duration, outputBytes int, spillName string) (shellResult, error) {
 	if runtime.GOOS != "darwin" {
 		return shellResult{}, errs.NewValidationError(errs.SubtypeFailedPrecondition, "workspace shell requires macOS Seatbelt")
 	}
@@ -200,6 +212,22 @@ func runSandboxedShell(ctx context.Context, scope *workspace.Scope, command, cwd
 			return shellResult{}, errs.NewInternalError(errs.SubtypeFileIO, "create sandbox runtime directory").WithCause(err)
 		}
 	}
+	stdoutFile, err := os.CreateTemp(temp, "shell-stdout-*")
+	if err != nil {
+		return shellResult{}, errs.NewInternalError(errs.SubtypeFileIO, "create sandbox stdout capture").WithCause(err)
+	}
+	defer func() {
+		_ = stdoutFile.Close()
+		_ = os.Remove(stdoutFile.Name())
+	}()
+	stderrFile, err := os.CreateTemp(temp, "shell-stderr-*")
+	if err != nil {
+		return shellResult{}, errs.NewInternalError(errs.SubtypeFileIO, "create sandbox stderr capture").WithCause(err)
+	}
+	defer func() {
+		_ = stderrFile.Close()
+		_ = os.Remove(stderrFile.Name())
+	}()
 	deniedPaths, err := scope.SandboxDeniedPaths()
 	if err != nil {
 		return shellResult{}, err
@@ -213,15 +241,19 @@ func runSandboxedShell(ctx context.Context, scope *workspace.Scope, command, cwd
 	var stdout, stderr limitedBuffer
 	stdout.max = outputBytes
 	stderr.max = outputBytes
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stdout = io.MultiWriter(&stdout, stdoutFile)
+	cmd.Stderr = io.MultiWriter(&stderr, stderrFile)
 	err = cmd.Run()
 	result := shellResult{
 		ExitCode:  0,
-		Stdout:    stdout.String(),
-		Stderr:    stderr.String(),
 		TimedOut:  errors.Is(runCtx.Err(), context.DeadlineExceeded),
 		Sandboxed: true,
+	}
+	if captureErr := attachCapturedShellStream(scope, spillName, "stdout", stdoutFile, stdout, &result.Stdout, &result.StdoutPath, &result.StdoutDigest, &result.StdoutBytes, &result.StdoutTruncated); captureErr != nil {
+		return shellResult{}, captureErr
+	}
+	if captureErr := attachCapturedShellStream(scope, spillName, "stderr", stderrFile, stderr, &result.Stderr, &result.StderrPath, &result.StderrDigest, &result.StderrBytes, &result.StderrTruncated); captureErr != nil {
+		return shellResult{}, captureErr
 	}
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -563,4 +595,75 @@ func (b *limitedBuffer) String() string {
 		return b.buf.String() + "\n... output truncated"
 	}
 	return b.buf.String()
+}
+
+func attachCapturedShellStream(
+	scope *workspace.Scope,
+	spillName, label string,
+	file *os.File,
+	preview limitedBuffer,
+	text, pathOut, digestOut *string,
+	bytesOut *int,
+	truncatedOut *bool,
+) error {
+	*text = preview.String()
+	if file == nil {
+		return nil
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return errs.NewInternalError(errs.SubtypeFileIO, "rewind captured shell %s", label).WithCause(err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return errs.NewInternalError(errs.SubtypeFileIO, "stat captured shell %s", label).WithCause(err)
+	}
+	*bytesOut = int(info.Size())
+	if !preview.truncated {
+		return nil
+	}
+	*truncatedOut = true
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return errs.NewInternalError(errs.SubtypeFileIO, "read captured shell %s", label).WithCause(err)
+	}
+	sum := sha256.Sum256(data)
+	*digestOut = "sha256:" + hex.EncodeToString(sum[:8])
+	safe := sanitizeShellSpillName(spillName)
+	rel := filepath.ToSlash(filepath.Join(".local", "lark-agent", "runtime", "shell-output", safe+"-"+label+".txt"))
+	resolved, err := scope.ResolveWritePath(rel)
+	if err != nil {
+		return err
+	}
+	if err := vfs.AtomicWrite(resolved, data, 0o600); err != nil {
+		return errs.NewInternalError(errs.SubtypeFileIO, "store oversized shell %s", label).WithCause(err)
+	}
+	*pathOut = rel
+	return nil
+}
+
+func sanitizeShellSpillName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "shell"
+	}
+	var builder strings.Builder
+	for _, char := range name {
+		switch {
+		case char >= 'a' && char <= 'z',
+			char >= 'A' && char <= 'Z',
+			char >= '0' && char <= '9',
+			char == '.', char == '_', char == '-':
+			builder.WriteRune(char)
+		default:
+			builder.WriteByte('-')
+		}
+	}
+	out := strings.Trim(builder.String(), "-")
+	if out == "" {
+		return "shell"
+	}
+	if len(out) > 48 {
+		return out[:48]
+	}
+	return out
 }

@@ -111,23 +111,33 @@ type exploreQueryReport struct {
 
 func listWorkspaceDefinition(scope *workspace.Scope) Definition {
 	return Definition{
-		Info: toolInfo("list_workspace", "List a bounded workspace directory. Use it to understand structure before reading files.", map[string]*schema.ParameterInfo{
+		Info: toolInfo("list_workspace", "List a bounded workspace directory. Set glob to list matching files inside the workspace.", map[string]*schema.ParameterInfo{
 			"path":      {Type: schema.String},
 			"max_depth": {Type: schema.Integer},
+			"glob":      {Type: schema.String},
 		}),
 		Execute: func(ctx context.Context, raw json.RawMessage) (Execution, error) {
 			var args struct {
 				Path     string `json:"path"`
 				MaxDepth int    `json:"max_depth"`
+				Glob     string `json:"glob"`
 			}
 			if err := decodeArgs(raw, &args); err != nil {
 				return Execution{}, err
 			}
-			if args.MaxDepth <= 0 || args.MaxDepth > 4 {
+			if strings.TrimSpace(args.Glob) != "" {
+				if args.MaxDepth <= 0 {
+					args.MaxDepth = 12
+				}
+				if args.MaxDepth > 16 {
+					args.MaxDepth = 16
+				}
+			} else if args.MaxDepth <= 0 || args.MaxDepth > 4 {
 				args.MaxDepth = 2
 			}
 			snapshot, err := scope.ListDirectory(workspace.DirectoryOptions{
 				Path:          args.Path,
+				Glob:          args.Glob,
 				MaxDepth:      args.MaxDepth,
 				MaxEntries:    400,
 				MaxPerDir:     80,
@@ -140,16 +150,24 @@ func listWorkspaceDefinition(scope *workspace.Scope) Definition {
 
 func searchWorkspaceDefinition(scope *workspace.Scope) Definition {
 	return Definition{
-		Info: toolInfo("search_workspace", "Search bounded workspace text by a case-insensitive literal phrase or by requiring every whitespace-separated term in one file. Set path to the exact repository or subtree when one is named, inspect snippets, then read relevant files.", map[string]*schema.ParameterInfo{
-			"query":       {Type: schema.String, Required: true},
-			"path":        {Type: schema.String},
-			"max_results": {Type: schema.Integer},
+		Info: toolInfo("search_workspace", "Search bounded workspace text by a case-insensitive literal phrase or by requiring every whitespace-separated term in one file. Set literal to skip term splitting, regex for a regular expression, glob to filter files, and context_lines for surrounding lines. Set path to the exact repository or subtree when one is named, inspect snippets, then read relevant files.", map[string]*schema.ParameterInfo{
+			"query":         {Type: schema.String, Required: true},
+			"path":          {Type: schema.String},
+			"glob":          {Type: schema.String},
+			"literal":       {Type: schema.Boolean},
+			"regex":         {Type: schema.Boolean},
+			"context_lines": {Type: schema.Integer},
+			"max_results":   {Type: schema.Integer},
 		}),
 		Execute: func(ctx context.Context, raw json.RawMessage) (Execution, error) {
 			var args struct {
-				Query      string `json:"query"`
-				Path       string `json:"path"`
-				MaxResults int    `json:"max_results"`
+				Query        string `json:"query"`
+				Path         string `json:"path"`
+				Glob         string `json:"glob"`
+				Literal      bool   `json:"literal"`
+				Regex        bool   `json:"regex"`
+				ContextLines int    `json:"context_lines"`
+				MaxResults   int    `json:"max_results"`
 			}
 			if err := decodeArgs(raw, &args); err != nil {
 				return Execution{}, err
@@ -163,6 +181,10 @@ func searchWorkspaceDefinition(scope *workspace.Scope) Definition {
 			report, err := scope.SearchTextReportContext(ctx, workspace.SearchOptions{
 				Query:          args.Query,
 				Path:           args.Path,
+				Glob:           args.Glob,
+				Literal:        args.Literal,
+				Regex:          args.Regex,
+				ContextLines:   args.ContextLines,
 				MaxResults:     args.MaxResults,
 				MaxFiles:       2000,
 				MaxDirectories: 600,
@@ -181,14 +203,18 @@ func searchWorkspaceDefinition(scope *workspace.Scope) Definition {
 
 func readWorkspaceDefinition(scope *workspace.Scope) Definition {
 	return Definition{
-		Info: toolInfo("read_workspace", "Read one bounded text file after locating it. Returns a digest-backed source reference.", map[string]*schema.ParameterInfo{
+		Info: toolInfo("read_workspace", "Read one bounded text file after locating it. Returns a digest-backed source reference. Optional 1-based offset and limit read a line range; the digest is always the whole file.", map[string]*schema.ParameterInfo{
 			"path":      {Type: schema.String, Required: true},
 			"max_bytes": {Type: schema.Integer},
+			"offset":    {Type: schema.Integer},
+			"limit":     {Type: schema.Integer},
 		}),
 		Execute: func(_ context.Context, raw json.RawMessage) (Execution, error) {
 			var args struct {
 				Path     string `json:"path"`
 				MaxBytes int64  `json:"max_bytes"`
+				Offset   int    `json:"offset"`
+				Limit    int    `json:"limit"`
 			}
 			if err := decodeArgs(raw, &args); err != nil {
 				return Execution{}, err
@@ -196,11 +222,19 @@ func readWorkspaceDefinition(scope *workspace.Scope) Definition {
 			if args.MaxBytes <= 0 || args.MaxBytes > 256*1024 {
 				args.MaxBytes = 64 * 1024
 			}
-			data, source, err := scope.ReadText(args.Path, args.MaxBytes)
+			report, err := scope.ReadTextRange(workspace.ReadOptions{
+				Path:     args.Path,
+				MaxBytes: args.MaxBytes,
+				Offset:   args.Offset,
+				Limit:    args.Limit,
+			})
 			if err != nil {
 				return Execution{}, err
 			}
-			return Execution{Content: string(data), Sources: []domain.SourceRef{source}}, nil
+			if args.Offset <= 0 && args.Limit <= 0 {
+				return Execution{Content: report.Content, Sources: []domain.SourceRef{report.Source}}, nil
+			}
+			return jsonExecution(report, []domain.SourceRef{report.Source}, nil)
 		},
 	}
 }

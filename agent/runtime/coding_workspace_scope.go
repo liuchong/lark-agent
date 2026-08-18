@@ -138,6 +138,8 @@ func exactScopeToolAllowed(toolName string) bool {
 	case "list_workspace",
 		"search_workspace",
 		"read_workspace",
+		"edit_workspace",
+		"write_workspace",
 		"inspect_git_history",
 		"get_lark_context",
 		"submit_investigation_plan",
@@ -203,7 +205,7 @@ func prepareCodingWorkspaceToolArguments(
 		if len(entryPoints) > 0 {
 			payload["entry_points"], _ = json.Marshal(entryPoints)
 		}
-	case "list_workspace", "search_workspace", "read_workspace", "inspect_git_history":
+	case "list_workspace", "search_workspace", "read_workspace", "edit_workspace", "write_workspace", "inspect_git_history":
 		var requestedPath string
 		if raw, ok := payload["path"]; ok {
 			if err := json.Unmarshal(raw, &requestedPath); err != nil {
@@ -240,7 +242,7 @@ func validateCodingWorkspaceToolRealPath(
 	workspaceRoot string,
 ) error {
 	switch toolName {
-	case "list_workspace", "search_workspace", "read_workspace", "inspect_git_history":
+	case "list_workspace", "search_workspace", "read_workspace", "edit_workspace", "write_workspace", "inspect_git_history":
 	default:
 		return nil
 	}

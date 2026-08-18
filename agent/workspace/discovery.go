@@ -13,6 +13,7 @@ import (
 // DirectoryOptions bounds a deterministic workspace overview.
 type DirectoryOptions struct {
 	Path          string
+	Glob          string
 	MaxDepth      int
 	MaxEntries    int
 	MaxPerDir     int
@@ -65,6 +66,9 @@ type SandboxDeniedPath struct {
 
 // ListDirectory returns a sorted, depth- and count-bounded directory overview.
 func (s *Scope) ListDirectory(opts DirectoryOptions) (DirectorySnapshot, error) {
+	if strings.TrimSpace(opts.Glob) != "" {
+		return s.findFiles(opts)
+	}
 	if opts.MaxDepth <= 0 {
 		opts.MaxDepth = 3
 	}
@@ -157,6 +161,89 @@ func (s *Scope) ListDirectory(opts DirectoryOptions) (DirectorySnapshot, error) 
 					depth: current.depth + 1,
 				})
 			}
+		}
+	}
+	sort.Slice(snapshot.Entries, func(i, j int) bool {
+		return snapshot.Entries[i].Path < snapshot.Entries[j].Path
+	})
+	return snapshot, nil
+}
+
+func (s *Scope) findFiles(opts DirectoryOptions) (DirectorySnapshot, error) {
+	if opts.MaxDepth <= 0 {
+		opts.MaxDepth = 12
+	}
+	if opts.MaxDepth > 16 {
+		opts.MaxDepth = 16
+	}
+	if opts.MaxEntries <= 0 {
+		opts.MaxEntries = 200
+	}
+	pattern := strings.TrimSpace(opts.Glob)
+	var snapshot DirectorySnapshot
+	type pendingDir struct {
+		abs   string
+		rel   string
+		depth int
+	}
+	startRel := filepath.Clean(opts.Path)
+	startAbs := s.realRoot
+	if opts.Path == "" || startRel == "." {
+		startRel = "."
+	} else {
+		var err error
+		startAbs, err = s.ResolveReadPath(opts.Path)
+		if err != nil {
+			return DirectorySnapshot{}, err
+		}
+		info, err := vfs.Stat(startAbs)
+		if err != nil {
+			return DirectorySnapshot{}, errs.NewInternalError(errs.SubtypeFileIO, "stat workspace directory: %s", opts.Path).WithCause(err)
+		}
+		if !info.IsDir() {
+			return DirectorySnapshot{}, errs.NewValidationError(errs.SubtypeInvalidArgument, "workspace path is not a directory: %s", opts.Path).
+				WithParam("--path")
+		}
+	}
+	queue := []pendingDir{{abs: startAbs, rel: startRel, depth: 0}}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		entries, err := vfs.ReadDir(current.abs)
+		if err != nil {
+			return DirectorySnapshot{}, errs.NewInternalError(errs.SubtypeFileIO, "list workspace directory: %s", current.rel).WithCause(err)
+		}
+		for _, entry := range entries {
+			rel := entry.Name()
+			if current.rel != "." {
+				rel = filepath.Join(current.rel, entry.Name())
+			}
+			if entry.Type()&fs.ModeSymlink != 0 || s.shouldExcludePath(rel) {
+				continue
+			}
+			if !opts.IncludeHidden && strings.HasPrefix(entry.Name(), ".") && entry.Name() != ".agents" {
+				continue
+			}
+			slash := filepath.ToSlash(rel)
+			if entry.IsDir() {
+				if current.depth+1 < opts.MaxDepth {
+					queue = append(queue, pendingDir{
+						abs:   filepath.Join(current.abs, entry.Name()),
+						rel:   rel,
+						depth: current.depth + 1,
+					})
+				}
+				continue
+			}
+			if !MatchGlob(pattern, slash) {
+				continue
+			}
+			if len(snapshot.Entries) >= opts.MaxEntries {
+				snapshot.Truncated = true
+				snapshot.Omitted++
+				continue
+			}
+			snapshot.Entries = append(snapshot.Entries, DirectoryEntry{Path: slash, Kind: "file"})
 		}
 	}
 	sort.Slice(snapshot.Entries, func(i, j int) bool {
