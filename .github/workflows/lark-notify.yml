@@ -17,6 +17,7 @@ jobs:
   notify:
     runs-on: ubuntu-latest
     environment: lark-production
+    timeout-minutes: 10
     steps:
       - name: Check out trusted default branch action
         uses: actions/checkout@v4

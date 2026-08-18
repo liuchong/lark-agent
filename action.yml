@@ -1,6 +1,10 @@
 name: Lark workflow notification
-description: Send trusted GitHub workflow facts to Lark without starting a second event listener
+description: Send trusted GitHub workflow facts to Lark or run a smart command without starting a second event listener
 inputs:
+  mode:
+    description: notify for ordinary GitHub notification, run for a smart command
+    required: false
+    default: notify
   lark_app_id:
     description: Lark application ID
     required: true
@@ -9,21 +13,45 @@ inputs:
     required: true
   lark_chat_id:
     description: Exact destination Lark chat ID
-    required: true
+    required: false
   github_token:
-    description: Read-only GitHub token, normally github.token
+    description: GitHub token, normally github.token
     required: true
   lark_base_url:
     description: Explicit Lark or Feishu OpenAPI base URL
     required: true
+  prompt_file:
+    description: Workspace-relative smart-command prompt file
+    required: false
+    default: ""
+  rules_file:
+    description: Workspace-relative extra rules file
+    required: false
+    default: ""
+  allowed_actions:
+    description: Comma-separated smart-command write tools
+    required: false
+    default: ""
+  dry_run:
+    description: Deny every write tool when true
+    required: false
+    default: "false"
+  message:
+    description: Inline smart-command message
+    required: false
+    default: ""
 runs:
   using: docker
   image: Dockerfile
   env:
+    LARK_AGENT_MODE: ${{ inputs.mode }}
     LARK_AGENT_APP_ID: ${{ inputs.lark_app_id }}
     LARK_AGENT_APP_SECRET: ${{ inputs.lark_app_secret }}
     LARK_AGENT_LARK_BASE_URL: ${{ inputs.lark_base_url }}
+    LARK_CHAT_ID: ${{ inputs.lark_chat_id }}
     GITHUB_TOKEN: ${{ inputs.github_token }}
-  args:
-    - --chat-id
-    - ${{ inputs.lark_chat_id }}
+    LARK_AGENT_PROMPT_FILE: ${{ inputs.prompt_file }}
+    LARK_AGENT_RULES_FILE: ${{ inputs.rules_file }}
+    LARK_AGENT_ALLOWED_ACTIONS: ${{ inputs.allowed_actions }}
+    LARK_AGENT_DRY_RUN: ${{ inputs.dry_run }}
+    LARK_AGENT_MESSAGE: ${{ inputs.message }}

@@ -227,3 +227,104 @@ func larkEventSources(events []domain.NormalizedEvent) []domain.SourceRef {
 	}
 	return sources
 }
+
+// BoundLarkContextDefinitions exposes Lark reads bound to one configured chat.
+func BoundLarkContextDefinitions(provider LarkContextProvider, chatID string) []Definition {
+	chatID = strings.TrimSpace(chatID)
+	bindChat := func(requested string) (string, error) {
+		requested = strings.TrimSpace(requested)
+		if requested == "" {
+			return chatID, nil
+		}
+		if requested != chatID {
+			return "", errs.NewValidationError(
+				errs.SubtypeInvalidArgument,
+				"invalid chat_id: smart command Lark reads are bound to the configured chat",
+			).WithParam("chat_id")
+		}
+		return chatID, nil
+	}
+	return []Definition{
+		{
+			NonOwnerReadOnly: true,
+			Info: toolInfo("get_lark_context", "Read bounded same-chat context for the configured chat.", map[string]*schema.ParameterInfo{
+				"chat_id":    {Type: schema.String},
+				"message_id": {Type: schema.String},
+				"mode": {
+					Type: schema.String,
+					Enum: []string{"auto", "adjacent", "reply_chain", "thread"},
+				},
+				"limit": {Type: schema.Integer},
+			}),
+			Execute: func(ctx context.Context, raw json.RawMessage) (Execution, error) {
+				var args struct {
+					ChatID    string `json:"chat_id"`
+					MessageID string `json:"message_id"`
+					Mode      string `json:"mode"`
+					Limit     int    `json:"limit"`
+				}
+				if err := decodeArgs(raw, &args); err != nil {
+					return Execution{}, err
+				}
+				bound, err := bindChat(args.ChatID)
+				if err != nil {
+					return Execution{}, err
+				}
+				if args.Limit <= 0 || args.Limit > 30 {
+					args.Limit = 20
+				}
+				mode, err := parseContextMode(args.Mode)
+				if err != nil {
+					return Execution{}, err
+				}
+				result, err := provider.RecentMessages(ctx, LarkContextRequest{
+					Mode:      mode,
+					ChatID:    bound,
+					MessageID: args.MessageID,
+					Limit:     args.Limit,
+				})
+				report := larkContextReport{
+					Messages:     result.Messages,
+					Selection:    result.Selection,
+					NoNewContext: larkContextHasNoTarget(result.Messages, args.MessageID),
+				}
+				if report.NoNewContext {
+					report.Reason = "recent context did not include the target message"
+				} else if result.Selection.Incomplete {
+					report.Reason = result.Selection.Reason
+				}
+				return jsonExecution(report, larkEventSources(result.Messages), err)
+			},
+		},
+		{
+			NonOwnerReadOnly: true,
+			Info: toolInfo("search_lark_messages", "Search messages in the configured chat.", map[string]*schema.ParameterInfo{
+				"query":   {Type: schema.String, Required: true},
+				"chat_id": {Type: schema.String},
+				"limit":   {Type: schema.Integer},
+			}),
+			Execute: func(ctx context.Context, raw json.RawMessage) (Execution, error) {
+				var args struct {
+					Query  string `json:"query"`
+					ChatID string `json:"chat_id"`
+					Limit  int    `json:"limit"`
+				}
+				if err := decodeArgs(raw, &args); err != nil {
+					return Execution{}, err
+				}
+				if strings.TrimSpace(args.Query) == "" {
+					return Execution{}, errs.NewValidationError(errs.SubtypeInvalidArgument, "search_lark_messages query is required")
+				}
+				bound, err := bindChat(args.ChatID)
+				if err != nil {
+					return Execution{}, err
+				}
+				if args.Limit <= 0 || args.Limit > 30 {
+					args.Limit = 20
+				}
+				events, err := provider.SearchMessages(ctx, args.Query, []string{bound}, args.Limit)
+				return jsonExecution(events, larkEventSources(events), err)
+			},
+		},
+	}
+}

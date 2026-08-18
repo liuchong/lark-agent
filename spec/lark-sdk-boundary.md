@@ -35,6 +35,11 @@ HTTP-only bot message send. The notification process must not create an SDK
 WebSocket client. Its stable message UUID is validated before the SDK call and
 its typed result contains the sent message ID and chat ID.
 
+Smart commands (`run` and `github run`) use the same HTTP-only SDK path for
+Lark send and on-demand message read. They must not create an SDK WebSocket
+client. GitHub Actions supply app secret and model key through environment
+injection for those processes; YAML still stores no secret values.
+
 A quoted GitHub marker is trusted only when the corresponding same-chat
 relation message was authored by the configured current Lark app, its
 HMAC-SHA256 signature verifies with the same Lark app secret, and the

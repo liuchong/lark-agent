@@ -92,6 +92,14 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 			want: []string{"--chat-id", "--dry-run", "GITHUB_EVENT_PATH", "HTTP-only"},
 		},
 		{
+			args: []string{"run", "--help"},
+			want: []string{"smart command", "WebSocket", "--prompt-file", "--allowed-actions", "--dry-run"},
+		},
+		{
+			args: []string{"github", "run", "--help"},
+			want: []string{"smart command", "WebSocket", "--prompt-file", "--allowed-actions", "--dry-run", "GITHUB_EVENT_PATH"},
+		},
+		{
 			args: []string{"github", "auth", "--help"},
 			want: []string{"login", "status", "Keychain", "stdin"},
 		},
@@ -139,6 +147,7 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"docs/configuration.md",
 		"docs/operations.md",
 		"docs/development.md",
+		"docs/smart-command.md",
 		"spec/behavior.md",
 		"spec/architecture.md",
 	} {

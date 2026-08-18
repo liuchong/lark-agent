@@ -140,8 +140,9 @@ Modes:
 		newApprovalCommand(out, &statePath),
 		newMemoryCommand(out, &statePath),
 		newRulesCommand(out, &configPath),
-		newGitHubCommand(in, out, &configPath),
+		newGitHubCommand(in, out, &configPath, &statePath),
 		newDoctorCommand(out, &configPath, &statePath),
+		newRunCommand(out, &configPath, &statePath),
 	)
 	return cmd
 }
@@ -228,14 +229,15 @@ type authLoginInput struct {
 	RefreshToken    string `json:"refresh_token"`
 }
 
-func newGitHubCommand(in io.Reader, out io.Writer, configPath *string) *cobra.Command {
+func newGitHubCommand(in io.Reader, out io.Writer, configPath, statePath *string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "github",
 		Short: "Bridge trusted GitHub workflow facts into Lark",
-		Long: "Send HTTP-only GitHub workflow notifications and manage the local read-only " +
-			"GitHub token. The token is read as JSON from stdin and stored in Keychain.",
+		Long: "Send HTTP-only GitHub workflow notifications, run a smart command with built-in GitHub support, " +
+			"and manage the local read-only GitHub token. The token is read as JSON from stdin and stored in Keychain.",
 	}
 	cmd.AddCommand(newGitHubAuthCommand(in, out, configPath))
+	cmd.AddCommand(newGitHubRunCommand(out, configPath, statePath))
 
 	var chatID, eventPath, eventName string
 	var dryRun bool

@@ -77,8 +77,10 @@ func (a LoopDecisionAgent) Decide(ctx context.Context, bundle agentcontext.Bundl
 
 // Decide runs until submit_decision produces a validated terminal decision.
 func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (decision domain.Decision, trajectory []*schema.Message, err error) {
-	if guardedDecision, guarded := guardedRequestDecision(bundle); guarded {
-		return guardedDecision, nil, nil
+	if bundle.WorkKind != domain.WorkKindSmartCommand {
+		if guardedDecision, guarded := guardedRequestDecision(bundle); guarded {
+			return guardedDecision, nil, nil
+		}
 	}
 	if l.Model == nil {
 		return domain.Decision{}, nil, errs.NewInternalError(errs.SubtypeUnknown, "agent loop model is not configured")
@@ -1034,6 +1036,8 @@ func (l AgentLoop) maxTurnsForWorkKind(kind domain.WorkKind) int {
 		if l.GoalMaxTurns > 0 && l.MaxTurns > l.GoalMaxTurns {
 			return l.GoalMaxTurns
 		}
+	case domain.WorkKindSmartCommand:
+		return 20
 	}
 	return l.MaxTurns
 }
@@ -1991,10 +1995,19 @@ func SubmitDecisionDefinition() agenttools.Definition {
 				},
 			}),
 		},
-		Execute: func(_ context.Context, raw json.RawMessage) (agenttools.Execution, error) {
+		Execute: func(ctx context.Context, raw json.RawMessage) (agenttools.Execution, error) {
 			decision, err := ParseDecision(string(raw))
 			if err != nil {
 				return agenttools.Execution{}, err
+			}
+			if scope, ok := agenttools.InvocationScopeFrom(ctx); ok && scope.WorkKind == domain.WorkKindSmartCommand {
+				if decision.Kind != domain.DecisionRecord {
+					return agenttools.Execution{}, errs.NewValidationError(
+						errs.SubtypeInvalidArgument,
+						"smart command must finish with decision=record",
+					)
+				}
+				decision.ReplyText = ""
 			}
 			return agenttools.Execution{Content: `{"accepted":true}`, Decision: &decision}, nil
 		},
@@ -2161,6 +2174,15 @@ func canonicalizeDecisionSources(
 }
 
 func validateTerminalDecision(bundle agentcontext.Bundle, decision domain.Decision) error {
+	if bundle.WorkKind == domain.WorkKindSmartCommand {
+		if decision.Kind != domain.DecisionRecord {
+			return errs.NewInternalError(
+				errs.SubtypeInvalidResponse,
+				"smart command must finish with decision=record",
+			)
+		}
+		return nil
+	}
 	if bundle.WorkKind == domain.WorkKindResourceHandoff {
 		if resourceHandoffIsNotification(bundle) {
 			if decision.Kind == domain.DecisionNotify {

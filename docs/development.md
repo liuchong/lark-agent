@@ -74,7 +74,7 @@ go test -race ./...
 go vet ./...
 go mod tidy
 go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.1.6 run
-actionlint .github/workflows/lark-notify.yml
+actionlint .github/workflows/*.yml
 ```
 
 并确认：
@@ -100,6 +100,9 @@ live 验收必须在代码完成验证、提交并安装该提交之后执行；
 数据。集成测试必须证明工作流只检出默认分支的 Action 实现，不引用触发 run 的
 `head_sha`，不下载 artifacts，也没有执行 PR 内容的 `run` 步骤。
 
-本地可用 `github notify --dry-run` 验证消息结构。真实同账号并发验收时，只启动现有
-daemon 的一个 WebSocket 消费者，再独立运行一次 HTTP-only notify；不能为 Action
-启动第二个 daemon。消息必须发送到用户明确授权的精确 chat ID，不能按群名猜测。
+本地可用 `github notify --dry-run` 或 `github run --dry-run` 验证消息结构和智能
+命令信封。真实同账号并发验收时，只启动现有 daemon 的一个 WebSocket 消费者，再
+独立运行一次 HTTP-only notify 或 github run；不能为 Action 启动第二个 daemon。
+消息必须发送到用户明确授权的精确 chat ID，不能按群名猜测。智能命令的评论唤醒词
+是 `@lark-agent`；斜杠命令只有 `/review`、`/title`、`/check`，不是每个示范工作流
+各对应一个斜杠命令。

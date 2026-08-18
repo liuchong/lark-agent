@@ -82,6 +82,8 @@ func githubSource(ref domain.GitHubReference, data []byte) domain.SourceRef {
 		path += "/actions/runs/" + strconv.FormatInt(ref.WorkflowRunID, 10)
 	case domain.GitHubReferencePullRequest:
 		path += "/pull/" + strconv.Itoa(ref.PullRequestNumber)
+	case domain.GitHubReferenceIssue:
+		path += "/issues/" + strconv.Itoa(ref.IssueNumber)
 	}
 	return domain.SourceRef{
 		RelativePath: path,

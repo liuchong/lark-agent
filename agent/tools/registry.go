@@ -102,6 +102,11 @@ func WithInvocationScope(ctx context.Context, scope InvocationScope) context.Con
 }
 
 func invocationScope(ctx context.Context) (InvocationScope, bool) {
+	return InvocationScopeFrom(ctx)
+}
+
+// InvocationScopeFrom returns the durable invocation scope bound to ctx.
+func InvocationScopeFrom(ctx context.Context) (InvocationScope, bool) {
 	value, ok := ctx.Value(invocationScopeContextKey{}).(InvocationScope)
 	return value, ok
 }

@@ -1,0 +1,86 @@
+name: Lark Agent release notes
+
+on:
+  workflow_dispatch:
+
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    environment: lark-production
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      changelog: ${{ steps.notes.outputs.changelog }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - id: notes
+        uses: ./
+        with:
+          mode: run
+          lark_app_id: ${{ vars.LARK_APP_ID }}
+          lark_app_secret: ${{ secrets.LARK_APP_SECRET }}
+          lark_base_url: ${{ vars.LARK_BASE_URL }}
+          github_token: ${{ github.token }}
+          prompt_file: .github/lark-agent/prompts/release-notes.md
+          allowed_actions: write_job_output
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  verify:
+    needs: notes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make verify
+  release:
+    needs: verify
+    if: success()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANGELOG: ${{ needs.notes.outputs.changelog }}
+        run: gh release create "draft-${GITHUB_RUN_ID}" --draft --title "Draft release notes" --notes "$CHANGELOG"
+  notify:
+    needs: release
+    if: success()
+    runs-on: ubuntu-latest
+    environment: lark-production
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: ./
+        with:
+          lark_app_id: ${{ vars.LARK_APP_ID }}
+          lark_app_secret: ${{ secrets.LARK_APP_SECRET }}
+          lark_chat_id: ${{ vars.LARK_CHAT_ID }}
+          lark_base_url: ${{ vars.LARK_BASE_URL }}
+          github_token: ${{ github.token }}

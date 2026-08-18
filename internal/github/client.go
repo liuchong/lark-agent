@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -221,6 +220,42 @@ func normalizeSections(sections []Section) ([]Section, error) {
 }
 
 func (c *Client) fetchSummary(ctx context.Context, ref Reference, result *ContextResult) error {
+	switch ref.Kind {
+	case ReferenceIssue:
+		var issue struct {
+			Number  int    `json:"number"`
+			Title   string `json:"title"`
+			State   string `json:"state"`
+			HTMLURL string `json:"html_url"`
+		}
+		if err := c.getJSON(ctx, c.repoPath(ref.Repository, "issues/"+strconv.Itoa(ref.IssueNumber)), &issue); err != nil {
+			return err
+		}
+		if issue.Number != ref.IssueNumber {
+			return Failure{Kind: FailureInvalidData, Message: "issue response has a mismatched number"}
+		}
+		result.Name = issue.Title
+		result.Status = issue.State
+		return nil
+	case ReferenceRelease:
+		var rel struct {
+			TagName string `json:"tag_name"`
+			HTMLURL string `json:"html_url"`
+			Name    string `json:"name"`
+		}
+		if err := c.getJSON(ctx, c.repoPath(ref.Repository, "releases/tags/"+url.PathEscape(ref.TagName)), &rel); err != nil {
+			return err
+		}
+		result.Name = firstNonEmpty(rel.Name, rel.TagName)
+		return nil
+	case ReferencePullRequest, ReferenceWorkflowDispatch:
+		if ref.PullRequestNumber <= 0 {
+			return nil
+		}
+		return c.fetchPullSummary(ctx, ref, result)
+	case ReferencePush:
+		return nil
+	}
 	if ref.WorkflowRunID > 0 {
 		var run workflowRunEnvelope
 		if err := c.getJSON(ctx, c.repoPath(ref.Repository, "actions/runs/"+strconv.FormatInt(ref.WorkflowRunID, 10)), &run); err != nil {
@@ -234,12 +269,22 @@ func (c *Client) fetchSummary(ctx context.Context, ref Reference, result *Contex
 		result.Conclusion = run.Conclusion
 		return nil
 	}
+	if ref.PullRequestNumber > 0 {
+		return c.fetchPullSummary(ctx, ref, result)
+	}
+	return nil
+}
+
+func (c *Client) fetchPullSummary(ctx context.Context, ref Reference, result *ContextResult) error {
 	var pull struct {
 		Number  int    `json:"number"`
 		Title   string `json:"title"`
 		State   string `json:"state"`
 		Merged  bool   `json:"merged"`
 		HTMLURL string `json:"html_url"`
+		Head    struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
 	}
 	if err := c.getJSON(ctx, c.repoPath(ref.Repository, "pulls/"+strconv.Itoa(ref.PullRequestNumber)), &pull); err != nil {
 		return err
@@ -371,33 +416,7 @@ func (c *Client) repoPath(repository, suffix string) string {
 }
 
 func (c *Client) getJSON(ctx context.Context, path string, target any) error {
-	endpoint := c.baseURL.ResolveReference(&url.URL{Path: path})
-	if index := strings.IndexByte(path, '?'); index >= 0 {
-		endpoint = c.baseURL.ResolveReference(&url.URL{Path: path[:index], RawQuery: path[index+1:]})
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-	if err != nil {
-		return Failure{Kind: FailureInvalidData, Message: err.Error()}
-	}
-	request.Header.Set("Accept", "application/vnd.github+json")
-	request.Header.Set("Authorization", "Bearer "+c.token)
-	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	response, err := c.httpClient.Do(request)
-	if err != nil {
-		return Failure{Kind: FailureTransport, Message: err.Error()}
-	}
-	defer response.Body.Close() //nolint:errcheck
-	body, err := io.ReadAll(io.LimitReader(response.Body, 4*1024*1024))
-	if err != nil {
-		return Failure{Kind: FailureTransport, Message: err.Error()}
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return failureFromResponse(response, body)
-	}
-	if err := json.Unmarshal(body, target); err != nil {
-		return Failure{Kind: FailureInvalidData, StatusCode: response.StatusCode, Message: "decode github response: " + err.Error()}
-	}
-	return nil
+	return c.doJSON(ctx, http.MethodGet, path, nil, target)
 }
 
 func failureFromResponse(response *http.Response, body []byte) Failure {

@@ -63,6 +63,7 @@ type Snapshot struct {
 	Annotations []AnnotationSummary `json:"annotations,omitempty"`
 	Omitted     OmittedCounts       `json:"omitted,omitempty"`
 	Partial     bool                `json:"partial,omitempty"`
+	CommentBody string              `json:"comment_body,omitempty"`
 }
 
 type repositoryEnvelope struct {
@@ -158,8 +159,261 @@ func ParseEvent(eventName string, data []byte) (Snapshot, error) {
 			Action:    event.Action,
 			Title:     event.PullRequest.Title,
 		}, nil
+	case "issues":
+		return parseIssuesEvent(data)
+	case "issue_comment":
+		return parseIssueCommentEvent(data)
+	case "pull_request_review_comment":
+		return parseReviewCommentEvent(data)
+	case "push":
+		return parsePushEvent(data)
+	case "release":
+		return parseReleaseEvent(data)
+	case "workflow_dispatch":
+		return parseWorkflowDispatchEvent(data)
 	default:
 		return Snapshot{}, fmt.Errorf("unsupported github event %q", eventName)
+	}
+}
+
+type issuesEvent struct {
+	Action     string             `json:"action"`
+	Repository repositoryEnvelope `json:"repository"`
+	Issue      struct {
+		Number  int    `json:"number"`
+		Title   string `json:"title"`
+		HTMLURL string `json:"html_url"`
+	} `json:"issue"`
+}
+
+func parseIssuesEvent(data []byte) (Snapshot, error) {
+	var event issuesEvent
+	if err := decodeExactJSON(data, &event); err != nil {
+		return Snapshot{}, err
+	}
+	ref := Reference{
+		SchemaVersion: 1,
+		Repository:    event.Repository.FullName,
+		Kind:          ReferenceIssue,
+		IssueNumber:   event.Issue.Number,
+		HTMLURL:       event.Issue.HTMLURL,
+	}
+	if err := ref.Validate(); err != nil {
+		return Snapshot{}, fmt.Errorf("invalid issues event: %w", err)
+	}
+	return Snapshot{Reference: ref, Action: event.Action, Title: event.Issue.Title, Name: "issue"}, nil
+}
+
+type issueCommentEvent struct {
+	Action     string             `json:"action"`
+	Repository repositoryEnvelope `json:"repository"`
+	Issue      struct {
+		Number      int    `json:"number"`
+		Title       string `json:"title"`
+		HTMLURL     string `json:"html_url"`
+		PullRequest *struct {
+			HTMLURL string `json:"html_url"`
+		} `json:"pull_request"`
+	} `json:"issue"`
+	Comment struct {
+		ID   int64  `json:"id"`
+		Body string `json:"body"`
+	} `json:"comment"`
+}
+
+func parseIssueCommentEvent(data []byte) (Snapshot, error) {
+	var event issueCommentEvent
+	if err := decodeExactJSON(data, &event); err != nil {
+		return Snapshot{}, err
+	}
+	if event.Comment.ID <= 0 {
+		return Snapshot{}, fmt.Errorf("invalid issue_comment event: comment id is required")
+	}
+	ref := Reference{
+		SchemaVersion: 1,
+		Repository:    event.Repository.FullName,
+		IssueNumber:   event.Issue.Number,
+		CommentID:     event.Comment.ID,
+		HTMLURL:       event.Issue.HTMLURL,
+	}
+	if event.Issue.PullRequest != nil {
+		ref.Kind = ReferencePullRequest
+		ref.PullRequestNumber = event.Issue.Number
+		if event.Issue.PullRequest.HTMLURL != "" {
+			ref.HTMLURL = event.Issue.PullRequest.HTMLURL
+		}
+	} else {
+		ref.Kind = ReferenceIssue
+	}
+	if err := ref.Validate(); err != nil {
+		return Snapshot{}, fmt.Errorf("invalid issue_comment event: %w", err)
+	}
+	return Snapshot{
+		Reference:   ref,
+		Action:      event.Action,
+		Title:       event.Issue.Title,
+		Name:        "issue comment",
+		CommentBody: event.Comment.Body,
+	}, nil
+}
+
+type reviewCommentEvent struct {
+	Action      string             `json:"action"`
+	Repository  repositoryEnvelope `json:"repository"`
+	PullRequest struct {
+		Number  int    `json:"number"`
+		HTMLURL string `json:"html_url"`
+		Title   string `json:"title"`
+		Head    struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
+	} `json:"pull_request"`
+	Comment struct {
+		ID   int64  `json:"id"`
+		Body string `json:"body"`
+	} `json:"comment"`
+}
+
+func parseReviewCommentEvent(data []byte) (Snapshot, error) {
+	var event reviewCommentEvent
+	if err := decodeExactJSON(data, &event); err != nil {
+		return Snapshot{}, err
+	}
+	if event.Comment.ID <= 0 {
+		return Snapshot{}, fmt.Errorf("invalid pull_request_review_comment event: comment id is required")
+	}
+	ref := Reference{
+		SchemaVersion:     1,
+		Repository:        event.Repository.FullName,
+		Kind:              ReferencePullRequest,
+		PullRequestNumber: event.PullRequest.Number,
+		IssueNumber:       event.PullRequest.Number,
+		CommentID:         event.Comment.ID,
+		HeadSHA:           event.PullRequest.Head.SHA,
+		HTMLURL:           event.PullRequest.HTMLURL,
+	}
+	if err := ref.Validate(); err != nil {
+		return Snapshot{}, fmt.Errorf("invalid pull_request_review_comment event: %w", err)
+	}
+	return Snapshot{
+		Reference:   ref,
+		Action:      event.Action,
+		Title:       event.PullRequest.Title,
+		Name:        "review comment",
+		CommentBody: event.Comment.Body,
+	}, nil
+}
+
+type pushEvent struct {
+	Ref        string             `json:"ref"`
+	Before     string             `json:"before"`
+	After      string             `json:"after"`
+	Repository repositoryEnvelope `json:"repository"`
+	HeadCommit struct {
+		ID string `json:"id"`
+	} `json:"head_commit"`
+}
+
+func parsePushEvent(data []byte) (Snapshot, error) {
+	var event pushEvent
+	if err := decodeExactJSON(data, &event); err != nil {
+		return Snapshot{}, err
+	}
+	head := strings.TrimSpace(event.After)
+	if head == "" {
+		head = strings.TrimSpace(event.HeadCommit.ID)
+	}
+	ref := Reference{
+		SchemaVersion: 1,
+		Repository:    event.Repository.FullName,
+		Kind:          ReferencePush,
+		HeadSHA:       head,
+		BeforeSHA:     strings.TrimSpace(event.Before),
+		Ref:           event.Ref,
+	}
+	if err := ref.Validate(); err != nil {
+		return Snapshot{}, fmt.Errorf("invalid push event: %w", err)
+	}
+	return Snapshot{Reference: ref, Name: "push", Action: "push"}, nil
+}
+
+type releaseEvent struct {
+	Action     string             `json:"action"`
+	Repository repositoryEnvelope `json:"repository"`
+	Release    struct {
+		TagName string `json:"tag_name"`
+		HTMLURL string `json:"html_url"`
+	} `json:"release"`
+}
+
+func parseReleaseEvent(data []byte) (Snapshot, error) {
+	var event releaseEvent
+	if err := decodeExactJSON(data, &event); err != nil {
+		return Snapshot{}, err
+	}
+	ref := Reference{
+		SchemaVersion: 1,
+		Repository:    event.Repository.FullName,
+		Kind:          ReferenceRelease,
+		TagName:       event.Release.TagName,
+		HTMLURL:       event.Release.HTMLURL,
+	}
+	if err := ref.Validate(); err != nil {
+		return Snapshot{}, fmt.Errorf("invalid release event: %w", err)
+	}
+	return Snapshot{Reference: ref, Action: event.Action, Title: event.Release.TagName, Name: "release"}, nil
+}
+
+type workflowDispatchEvent struct {
+	Inputs     map[string]any     `json:"inputs"`
+	Repository repositoryEnvelope `json:"repository"`
+}
+
+func parseWorkflowDispatchEvent(data []byte) (Snapshot, error) {
+	var event workflowDispatchEvent
+	if err := decodeExactJSON(data, &event); err != nil {
+		return Snapshot{}, err
+	}
+	ref := Reference{
+		SchemaVersion: 1,
+		Repository:    event.Repository.FullName,
+		Kind:          ReferenceWorkflowDispatch,
+	}
+	if event.Inputs != nil {
+		if raw, ok := event.Inputs["pr_number"]; ok && raw != nil {
+			number, err := parseDispatchPRNumber(raw)
+			if err != nil {
+				return Snapshot{}, fmt.Errorf("invalid workflow_dispatch event: %w", err)
+			}
+			ref.PullRequestNumber = number
+		}
+	}
+	if err := ref.Validate(); err != nil {
+		return Snapshot{}, fmt.Errorf("invalid workflow_dispatch event: %w", err)
+	}
+	return Snapshot{Reference: ref, Name: "workflow dispatch", Action: "workflow_dispatch"}, nil
+}
+
+func parseDispatchPRNumber(raw any) (int, error) {
+	switch value := raw.(type) {
+	case string:
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return 0, fmt.Errorf("pr_number is empty")
+		}
+		var number int
+		if _, err := fmt.Sscanf(trimmed, "%d", &number); err != nil || number <= 0 || trimmed != fmt.Sprintf("%d", number) {
+			return 0, fmt.Errorf("pr_number must be a positive integer")
+		}
+		return number, nil
+	case float64:
+		number := int(value)
+		if float64(number) != value || number <= 0 {
+			return 0, fmt.Errorf("pr_number must be a positive integer")
+		}
+		return number, nil
+	default:
+		return 0, fmt.Errorf("pr_number must be a positive integer")
 	}
 }
 

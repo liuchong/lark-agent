@@ -1095,7 +1095,12 @@ func cleanAgentTestEnv(env []string) []string {
 			strings.HasPrefix(item, "GITHUB_REPOSITORY="),
 			strings.HasPrefix(item, "GITHUB_API_URL="),
 			strings.HasPrefix(item, "GITHUB_WORKSPACE="),
-			strings.HasPrefix(item, "GITHUB_TOKEN="):
+			strings.HasPrefix(item, "GITHUB_TOKEN="),
+			strings.HasPrefix(item, "GITHUB_OUTPUT="),
+			strings.HasPrefix(item, "GITHUB_RUN_ID="),
+			strings.HasPrefix(item, "OPENAI_API_KEY="),
+			strings.HasPrefix(item, "OPENAI_BASE_URL="),
+			strings.HasPrefix(item, "OPENAI_MODEL="):
 			continue
 		}
 		out = append(out, item)

@@ -22,18 +22,28 @@ as a subprocess and does not copy the official CLI's internal Go implementation.
 7. `internal/github` is the only GitHub HTTP and event-decoding boundary. It
    returns Agent-owned typed values and never executes pull-request code,
    artifacts, logs, or event-derived shell commands.
-8. A GitHub Action is a short-lived Lark HTTP sender. The installed daemon is
-   the single WebSocket event consumer even when both processes authenticate as
-   the same Lark application.
+8. Ordinary command `github notify` is an HTTP-only Lark sender. Smart command
+   `run` / `github run` also must not create a Lark WebSocket. The installed
+   daemon is the single long-running WebSocket consumer even when a GitHub
+   Action uses the same Lark application to send HTTP. Smart-command stdout,
+   tools, events, and example workflows are specified in `spec/smart-command.md`.
+9. Built-in GitHub support loads events, `GITHUB_TOKEN` / configured token,
+   Actions secrets and variables, and repository bytes at the event SHA, then
+   starts a smart command. Example workflows invoke that support; they are not
+   a second agent runtime. The testable contract is `spec/smart-command.md`.
 
 No production package imports `github.com/larksuite/cli`; no production path
 depends on a local `lark-cli` executable, profile, stdout envelope, or event
 stdin lifecycle. YAML stores only non-secret app and Keychain references.
 
-GitHub follow-up tools take their repository and run identity from the verified
-invocation reference, never from model arguments. Missing or untrusted
-references make the tool unavailable. Non-owner invocations retain the same
-read-only authority they have for workspace and same-chat evidence.
+GitHub follow-up tools on the daemon take their repository and run identity
+from the verified quoted Lark reference, never from model arguments. Smart
+commands using built-in GitHub support take identity from the current parsed
+event the same way: never from model arguments. Missing or untrusted
+references make GitHub tools unavailable. Non-owner daemon invocations retain
+the same read-only authority they have for workspace and same-chat evidence.
+Smart-command GitHub write tools are gated by `--allowed-actions`, not by
+daemon Owner identity.
 
 ## Durable state
 

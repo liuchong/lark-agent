@@ -138,6 +138,7 @@ func ParseDecision(raw string) (domain.Decision, error) {
 		ReplyText           string                  `json:"reply_text"`
 		OwnerAction         string                  `json:"owner_action"`
 		Reason              string                  `json:"reason"`
+		Skipped             bool                    `json:"skipped"`
 		SourceRefs          []domain.SourceRef      `json:"source_refs"`
 	}
 	rawJSON, err := extractFirstJSONObject(raw)
@@ -186,10 +187,13 @@ func ParseDecision(raw string) (domain.Decision, error) {
 			payload.ReplyOutcome,
 		)
 	}
-	if replyOutcome != "" && kind != domain.DecisionReply && kind != domain.DecisionRequestApproval {
+	if replyOutcome != "" &&
+		kind != domain.DecisionReply &&
+		kind != domain.DecisionRequestApproval &&
+		kind != domain.DecisionRecord {
 		return domain.Decision{}, errs.NewInternalError(
 			errs.SubtypeInvalidResponse,
-			"reply_outcome is only valid for reply or request_approval decisions",
+			"reply_outcome is only valid for reply, request_approval, or record decisions",
 		)
 	}
 	if kind == domain.DecisionReply && payload.ReplyConfidence == nil {
@@ -226,6 +230,7 @@ func ParseDecision(raw string) (domain.Decision, error) {
 		Progress:       normalizeDecisionProgress(payload.Progress),
 		Reason:         payload.Reason,
 		ReplyText:      strings.TrimSpace(payload.ReplyText),
+		Skipped:        payload.Skipped,
 		OwnerAction:    strings.TrimSpace(payload.OwnerAction),
 		Sources:        payload.SourceRefs,
 	}, nil

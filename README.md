@@ -42,9 +42,11 @@
   调研前直接拒绝。
 - 代回复必须先完成可审计的相关读取，并简要说明已检查内容、初步发现或明确未知；
   “已提醒 Owner”、复述原问题和未经批准的后续承诺不会发送。
-- GitHub Actions 可以用同一个 Lark 应用身份把可信的工作流结果发进指定群。Action
-  只通过 HTTP 发送一次消息，不启动第二个 WebSocket 监听；常驻 Agent 验证被引用的
-  机器人消息及其 HMAC 签名后，才允许模型按该引用读取有界、只读的 GitHub 事实。
+- GitHub Actions 可以用同一个 Lark 应用身份把可信的工作流结果发进指定群，也可以
+  跑一条智能命令（同一套 Agent 主循环，不启动第二个 WebSocket）。Action 的
+  `mode` 默认仍是普通通知；`mode: run` 才会读 GitHub 事件并调用具名写入工具。
+  常驻 Agent 验证被引用的机器人消息及其 HMAC 签名后，才允许模型按该引用读取
+  有界、只读的 GitHub 事实。
 - 所有消息、语义判断、模型步骤和外部动作都写入 SQLite 账本。重启后，无状态只读
   工作可以安全重算；对话调查和未发送回复候选保持中断，必须由 Owner 核对并显式
   恢复后重新识别；待批准草稿会保留并私聊 Owner 精确操作方式；
@@ -138,6 +140,9 @@ lark-agent memory delete MEMORY_ID --confirm
 lark-agent rules check
 lark-agent rules init
 lark-agent github auth status
+lark-agent run --help
+lark-agent github run --help
+lark-agent github notify --help
 ```
 
 Owner 还可以在智能助手私聊中发送 `/help` 查看控制命令，用 `/status` 查看当前会话，
@@ -165,9 +170,12 @@ gitignore，换上下文时优先在这里找本地实例材料。运行中的�
 ## GitHub 与 Lark
 
 仓库根目录的 `action.yml` 和 `.github/workflows/lark-notify.yml` 提供完整通知路径。
-`workflow_run` 工作流只检出可信默认分支上的 Action 实现，不检出 PR 头、不下载
-不可信产物，也不执行 PR 中的代码。GitHub Environment `lark-production` 保存 Lark
-app secret 和目标 chat ID；仓库配置不保存这些秘密或部署值。
+`mode` 默认是普通通知，现有工作流不用改。`.github/workflows/lark-agent-*.yml`
+是智能命令示范：评论 `@lark-agent`、PR 审查、事件摘要、changelog、发布说明、
+合并检查和标题改写。这些工作流只检出可信默认分支上的 Action 实现，不检出 PR
+头、不下载不可信产物，也不执行 PR 中的代码。需要飞书或模型密钥的 job 使用
+GitHub Environment `lark-production`。详细行为见
+[智能命令与内建 GitHub 支持](docs/smart-command.md)。
 
 本地常驻 Agent 的 GitHub 读取令牌单独放在 macOS Keychain：
 
@@ -193,6 +201,7 @@ workflow run、检查结果和审查信息，不提供评论、合并、重跑�
 - [macOS 安装](docs/install-macos.md)
 - [配置说明](docs/configuration.md)
 - [运行、恢复与故障处理](docs/operations.md)
+- [智能命令与 GitHub](docs/smart-command.md)
 - [开发与验证](docs/development.md)
 - [长期行为规格](spec/behavior.md)
 - [架构边界](spec/architecture.md)

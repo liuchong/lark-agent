@@ -23,14 +23,24 @@ provider protocol adaptation, and rollback decisions are enforced by code
 outside the prompt.
 
 The runtime may also bridge a trusted GitHub workflow notification into Lark.
-A short-lived GitHub Action sends one bot-authored notification through the
-HTTP API and exits. The installed daemon remains the only WebSocket consumer.
-The Action requires an explicit Lark OpenAPI base URL and never relies on the
-official SDK's Feishu default for an international Lark installation.
+A GitHub Action may send one bot-authored notification through the HTTP API
+and exit (`github notify`, an ordinary command). The installed daemon remains
+the only WebSocket consumer. The Action requires an explicit Lark OpenAPI base
+URL and never relies on the official SDK's Feishu default for an international
+Lark installation.
 When a human replies to that notification, the daemon verifies a versioned
 GitHub reference from the quoted current-app message and may expose fresh,
 bounded, read-only GitHub evidence to the model. It never treats a human or
 another app's marker as trusted control data.
+
+The runtime also supports smart commands: the same agent main loop started for
+one process, without a Lark WebSocket, using on-demand HTTP for Lark when a
+tool needs it, then exiting. Ordinary commands compose primitive capabilities
+in fixed code and do not run a model. Built-in GitHub support sits on smart
+commands and is required to read GitHub events, repository content at an event
+SHA, and GitHub Actions secrets and variables. GitHub example workflows are
+committed YAML and prompt files that invoke that support. They do not replace
+it. The Smart Commands section below is the long-lived contract.
 
 ## Harness Architecture
 
@@ -1798,6 +1808,89 @@ Credentials, authorization headers, and unsanitized process environments are
 never stored. Large tool output is bounded for the model and stored only after
 secret filtering, with digest and truncation metadata.
 
+## Smart Commands And Built-In GitHub Support
+
+A smart command starts the agent main loop in one process, never opens a Lark
+WebSocket, may pull or send Lark over HTTP when an allowlisted tool needs it,
+and exits when the run reaches a terminal decision, configured turn limit, or
+failure. An ordinary command does not run a model. `github notify` is an
+ordinary command.
+
+`lark-agent run` is the smart-command entry. `lark-agent github run` is built-in
+GitHub support: it reads `GITHUB_EVENT_PATH` / `GITHUB_EVENT_NAME`, the current
+repository allowlist, `GITHUB_TOKEN` or configured token, and Actions
+secrets/vars, parses a typed event, and then runs the same smart-command loop.
+Without that GitHub layer the process cannot observe GitHub events, repository
+bytes, or Actions secrets. Prompt and rule files are read from the trusted
+checkout (Actions check out the repository default branch and do not check out
+or execute a pull-request head). File contents at the event SHA are read through
+the GitHub API as data.
+
+Write tools are exactly the names in `--allowed-actions` after slash-command
+expansion: `post_github_comment`, `upsert_github_check`,
+`update_github_issue_title`, `send_lark_message`, `write_job_output`. The model
+cannot pass repository, issue, SHA, API base URL, credential, or chat id.
+`--dry-run` disables all of those writes. Shell, merge, delete, artifact, and
+raw job-log tools are absent from this entry.
+
+Comment events that contain `@lark-agent` (case-insensitive token) may start
+`github run`. Text after the mention is extra prompt unless the next token is
+`/review`, `/title`, or `/check`. `@lark-agent review` without a slash is prose.
+`--dry-run` is the only comment flag. Unknown `/foo` posts a help comment when
+comments are allowed and does not run the model. Slash commands only add
+allowlist entries and a contract prompt; they are not one command per example
+workflow. Example workflows live under `.github/workflows/` and
+`examples/github-agent/` and call this GitHub support.
+
+The numbered scenes `SC-01` … `SC-13` below plus `SC-14` … `SC-80` in
+`spec/smart-command.md` are the behavior contract. Tests must cite the scene
+id. `spec/smart-command.md` is the only complete contract for parse fixtures,
+event fields, allowlist algebra, tool JSON, HTTP allow/deny, stdout envelope,
+exit rules, Action/Docker dispatcher, prompt paths, and example-workflow
+tables `GW-01` … `GW-10`. `changes/smart-command-and-github.md` is the
+this-round design note.
+
+- **SC-01.** Given `lark-agent run` or `github run` starts, when the process
+  initializes Lark, then no SDK WebSocket client is created.
+- **SC-02.** Given `GITHUB_EVENT_NAME` is unsupported, when `github run`
+  starts, then it exits non-zero before any model call.
+- **SC-03.** Given a valid `workflow_run` event and `--dry-run`, when
+  `github run` executes, then stdout is the CLI envelope `ok=true` with
+  `data.mode` equal to `run`, `data.dry_run` true, `data.event_name` equal
+  to `workflow_run`, `data.allowed_actions` equal to `[]`, and no GitHub or
+  Lark mutating HTTP occurs.
+- **SC-04.** Given `allowed_actions` omits `update_github_issue_title`, when
+  the model requests that tool, then Go rejects it and no PATCH is sent.
+- **SC-05.** Given a tool argument names another repository or chat id, when
+  the tool executes, then Go rejects it as invalid data.
+- **SC-06.** Given comment body `@lark-agent why is this failing`, when the
+  mention parser runs, then command is empty and extra_prompt is
+  `why is this failing`.
+- **SC-07.** Given comment body `@lark-agent /review focus on auth`, when the
+  parser runs, then command is `review` and extra_prompt contains
+  `focus on auth`.
+- **SC-08.** Given comment body `@lark-agent review now`, when the parser
+  runs, then command is empty and extra_prompt includes `review now`.
+- **SC-09.** Given comment body `@lark-agent /nope`, when `post_github_comment`
+  is allowed, then one help comment lists `/review`, `/title`, `/check`, and
+  `--dry-run`, and the model is not called.
+- **SC-10.** Given `--dry-run` on CLI or comment, when the model requests
+  `post_github_comment`, then Go rejects the write.
+- **SC-11.** Given `OPENAI_API_KEY` and Keychain model key are both missing,
+  when `run` starts, then it exits non-zero and performs no GitHub writes.
+- **SC-12.** Given `pull_request` opened, when the merge-check job runs, then
+  it may upsert a check on `head_sha` and must not call merge APIs.
+- **SC-13.** Given `ParseEvent` input `issues`, `push`, `release`,
+  `workflow_dispatch`, `issue_comment`, or `pull_request_review_comment` with
+  required identifiers listed in `spec/smart-command.md`, when decoding
+  succeeds, then a validated reference is produced; empty JSON or unknown event
+  names fail (`SC-02`, `SC-29`, `SC-30`).
+
+`SC-14` through `SC-80` (CLI flags, skip-on-no-mention, allowlist, prompt
+path, state isolation, context injection, secret leak, Action mode, HMAC
+footer, tool JSON, check/comment limits, workflow YAML guards) are specified
+only in `spec/smart-command.md` and are mandatory.
+
 ## Verification Requirements
 
 Every behavior change must have an integration test. Required regression areas:
@@ -1815,6 +1908,17 @@ for HTTP-only notification sending, stable Lark idempotency keys, hostile
 pull-request text, verified and spoofed quoted references, owner and non-owner
 permission behavior, bounded GitHub results, truthful API failures, and
 reference recovery after restart.
+
+Smart commands and built-in GitHub support additionally require executable
+coverage for: no WebSocket on `run` or `github run`; event injection from
+`GITHUB_EVENT_PATH`; allowlisted write tools only; model arguments cannot
+change repository, SHA, or chat id; `@lark-agent` grammar (slash commands,
+`--dry-run`, unknown `/foo`, unsashed `review` as prose); `--dry-run` performs
+no mutating HTTP; missing model key fails without writes; comment workflows
+skip non-collaborators; default-branch checkout only; no
+`pull_request_target`; ParseEvent for `issue_comment`, `issues`, `push`,
+`release`, and `workflow_dispatch`; merge APIs never called from merge-check
+jobs.
 
 The multi-step loop is accepted by these executable BDD scenarios:
 

@@ -158,9 +158,10 @@ github:
 ```
 
 本地令牌用 `lark-agent github auth login` 从标准输入写入 Keychain，输入格式为
-`{"token":"..."}`。GitHub Action 运行时使用当前仓库的只读 `GITHUB_TOKEN`；
-Lark app secret 只来自受保护的 GitHub Environment。两者都不会写入 YAML、消息、
-日志或命令参数。
+`{"token":"..."}`。GitHub Action 运行时使用当前仓库的 `GITHUB_TOKEN`；
+Lark app secret 只来自受保护的 GitHub Environment。智能命令还从进程环境读取
+`OPENAI_API_KEY`（可选 `OPENAI_BASE_URL`、`OPENAI_MODEL`）。这些值都不会写入
+YAML、消息、日志或命令参数，也不会通过 `/actions/secrets` HTTP 去拉。
 
 普通文本中的仓库名、PR 号或 run ID 不是权限来源。可信范围有两个代码验证入口：
 当前 Lark 应用发送且同群引用关系和 HMAC 签名均有效的通知；或 Owner/智能助手明确

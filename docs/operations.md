@@ -389,22 +389,29 @@ Owner 是否已处理，以及该消息本身是否合理期待回复。真人�
 时，智能助手应说明已完成的有限核对和准确的未知项或拒绝原因，不能编造，也不能静默
 吞掉消息。
 
-## GitHub 通知与追问
+## GitHub 通知、智能命令与追问
 
 本地令牌状态：
 
 ```bash
 lark-agent github auth status
 lark-agent doctor
+lark-agent run --help
+lark-agent github run --help
 ```
+
+`lark-agent run` 和 `lark-agent github run` 跑一条智能命令后退出，不启动飞书长连接。
+`github notify` 仍是不跑模型的 HTTP 通知。详细入口、评论语法和工作流见
+[智能命令与 GitHub](smart-command.md)。
 
 `doctor.github` 会显示是否启用、精确仓库 allowlist、令牌是否可读、`read_only` 和
 `single_lark_listener`。GitHub 未启用或令牌缺失都不阻止普通 Lark 消息链路；如果
 当前请求明确要求审查远程 PR，系统会直接返回对应配置阻塞，不会转而搜索本地 Git
 历史。
 
-GitHub Action 是一次性 HTTP 发送者。它可以与已安装 daemon 使用同一个 Lark app
-ID 和 app secret，但不会启动 WebSocket；已安装 daemon 始终是唯一实时事件监听者。
+GitHub Action 可以是一次性 HTTP 通知，也可以是 `mode: run` 的智能命令。两种形态
+都可以与已安装 daemon 使用同一个 Lark app ID 和 app secret，但都不会启动
+WebSocket；已安装 daemon 始终是唯一实时事件监听者。
 Action 消息带有机器可验证的引用标记。用户在 Lark 中回复或引用该消息后，daemon
 只在以下条件全部成立时开放 `get_github_context`：
 

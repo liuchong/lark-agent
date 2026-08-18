@@ -262,8 +262,12 @@ type ResourceEvidenceQuery struct {
 type GitHubReferenceKind string
 
 const (
-	GitHubReferenceWorkflowRun GitHubReferenceKind = "workflow_run"
-	GitHubReferencePullRequest GitHubReferenceKind = "pull_request"
+	GitHubReferenceWorkflowRun      GitHubReferenceKind = "workflow_run"
+	GitHubReferencePullRequest      GitHubReferenceKind = "pull_request"
+	GitHubReferenceIssue            GitHubReferenceKind = "issue"
+	GitHubReferencePush             GitHubReferenceKind = "push"
+	GitHubReferenceRelease          GitHubReferenceKind = "release"
+	GitHubReferenceWorkflowDispatch GitHubReferenceKind = "workflow_dispatch"
 )
 
 // GitHubReference is trusted only after the Lark relation and app sender are
@@ -275,7 +279,12 @@ type GitHubReference struct {
 	WorkflowRunID      int64               `json:"workflow_run_id,omitempty" yaml:"workflow_run_id,omitempty"`
 	WorkflowRunAttempt int                 `json:"workflow_run_attempt,omitempty" yaml:"workflow_run_attempt,omitempty"`
 	PullRequestNumber  int                 `json:"pull_request_number,omitempty" yaml:"pull_request_number,omitempty"`
+	IssueNumber        int                 `json:"issue_number,omitempty" yaml:"issue_number,omitempty"`
+	CommentID          int64               `json:"comment_id,omitempty" yaml:"comment_id,omitempty"`
 	HeadSHA            string              `json:"head_sha,omitempty" yaml:"head_sha,omitempty"`
+	BeforeSHA          string              `json:"before_sha,omitempty" yaml:"before_sha,omitempty"`
+	Ref                string              `json:"ref,omitempty" yaml:"ref,omitempty"`
+	TagName            string              `json:"tag_name,omitempty" yaml:"tag_name,omitempty"`
 	HTMLURL            string              `json:"html_url,omitempty" yaml:"html_url,omitempty"`
 }
 
@@ -303,14 +312,39 @@ func (r GitHubReference) Validate() error {
 		if r.PullRequestNumber <= 0 {
 			return fmt.Errorf("github pull_request_number must be positive")
 		}
+	case GitHubReferenceIssue:
+		if r.IssueNumber <= 0 {
+			return fmt.Errorf("github issue_number must be positive")
+		}
+	case GitHubReferencePush:
+		if strings.TrimSpace(r.Ref) == "" {
+			return fmt.Errorf("github push ref is required")
+		}
+		if r.HeadSHA == "" || !gitHubSHAPattern.MatchString(r.HeadSHA) {
+			return fmt.Errorf("invalid github head_sha")
+		}
+	case GitHubReferenceRelease:
+		if strings.TrimSpace(r.TagName) == "" {
+			return fmt.Errorf("github release tag_name is required")
+		}
+	case GitHubReferenceWorkflowDispatch:
 	default:
 		return fmt.Errorf("unsupported github reference kind %q", r.Kind)
 	}
 	if r.PullRequestNumber < 0 {
 		return fmt.Errorf("github pull_request_number cannot be negative")
 	}
+	if r.IssueNumber < 0 {
+		return fmt.Errorf("github issue_number cannot be negative")
+	}
+	if r.CommentID < 0 {
+		return fmt.Errorf("github comment_id cannot be negative")
+	}
 	if r.HeadSHA != "" && !gitHubSHAPattern.MatchString(r.HeadSHA) {
 		return fmt.Errorf("invalid github head_sha")
+	}
+	if r.BeforeSHA != "" && !gitHubSHAPattern.MatchString(r.BeforeSHA) {
+		return fmt.Errorf("invalid github before_sha")
 	}
 	if r.HTMLURL != "" {
 		parsed, err := url.Parse(r.HTMLURL)
@@ -327,6 +361,20 @@ func (r GitHubReference) ExternalKey() string {
 		return fmt.Sprintf("%s:workflow_run:%d:%d", r.Repository, r.WorkflowRunID, r.WorkflowRunAttempt)
 	case GitHubReferencePullRequest:
 		return fmt.Sprintf("%s:pull_request:%d", r.Repository, r.PullRequestNumber)
+	case GitHubReferenceIssue:
+		return fmt.Sprintf("%s:issue:%d", r.Repository, r.IssueNumber)
+	case GitHubReferencePush:
+		return fmt.Sprintf("%s:push:%s", r.Repository, r.HeadSHA)
+	case GitHubReferenceRelease:
+		return fmt.Sprintf("%s:release:%s", r.Repository, r.TagName)
+	case GitHubReferenceWorkflowDispatch:
+		if r.PullRequestNumber > 0 {
+			return fmt.Sprintf("%s:workflow_dispatch:%d", r.Repository, r.PullRequestNumber)
+		}
+		if r.WorkflowRunID > 0 {
+			return fmt.Sprintf("%s:workflow_dispatch:%d", r.Repository, r.WorkflowRunID)
+		}
+		return r.Repository + ":workflow_dispatch"
 	default:
 		return ""
 	}
@@ -402,6 +450,7 @@ const (
 	WorkKindResourceHandoff WorkKind = "resource_handoff"
 	WorkKindCodingQuestion  WorkKind = "coding_question"
 	WorkKindCodingGoal      WorkKind = "coding_goal"
+	WorkKindSmartCommand    WorkKind = "smart_command"
 )
 
 // TaskClass describes the work implied by bounded conversation context.
@@ -687,6 +736,7 @@ type Decision struct {
 	Progress        DecisionProgress     `json:"progress,omitempty" yaml:"progress,omitempty"`
 	Reason          string               `json:"reason" yaml:"reason"`
 	ReplyText       string               `json:"reply_text,omitempty" yaml:"reply_text,omitempty"`
+	Skipped         bool                 `json:"skipped,omitempty" yaml:"skipped,omitempty"`
 	OwnerAction     string               `json:"owner_action,omitempty" yaml:"owner_action,omitempty"`
 	Language        string               `json:"language,omitempty" yaml:"language,omitempty"`
 	Sources         []SourceRef          `json:"sources,omitempty" yaml:"sources,omitempty"`

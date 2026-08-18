@@ -18,8 +18,12 @@ type Reference = domain.GitHubReference
 type ReferenceKind = domain.GitHubReferenceKind
 
 const (
-	ReferenceWorkflowRun = domain.GitHubReferenceWorkflowRun
-	ReferencePullRequest = domain.GitHubReferencePullRequest
+	ReferenceWorkflowRun      = domain.GitHubReferenceWorkflowRun
+	ReferencePullRequest      = domain.GitHubReferencePullRequest
+	ReferenceIssue            = domain.GitHubReferenceIssue
+	ReferencePush             = domain.GitHubReferencePush
+	ReferenceRelease          = domain.GitHubReferenceRelease
+	ReferenceWorkflowDispatch = domain.GitHubReferenceWorkflowDispatch
 )
 
 // EncodeReferenceMarker serializes one validated reference into a compact
@@ -94,4 +98,11 @@ func referenceSignature(data []byte, signingKey string) []byte {
 func StableNotificationKey(chatID string, ref Reference) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(chatID) + "\x00" + ref.ExternalKey() + "\x00v1"))
 	return fmt.Sprintf("ghn-%x", sum[:16])
+}
+
+// StableSmartCommandKey returns a Lark-compatible idempotency UUID for one
+// smart-command Lark send. It must not collide with notify keys.
+func StableSmartCommandKey(chatID string, ref Reference) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(chatID) + "\x00" + ref.ExternalKey() + "\x00v1"))
+	return fmt.Sprintf("ghs-%x", sum[:16])
 }

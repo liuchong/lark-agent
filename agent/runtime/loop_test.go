@@ -2491,6 +2491,48 @@ func TestKindSpecificTurnBudgetsAreEnforced(t *testing.T) {
 	if got := loop.maxTurnsForWorkKind(domain.WorkKindCodingGoal); got != 150 {
 		t.Fatalf("goal max turns=%d", got)
 	}
+	if got := loop.maxTurnsForWorkKind(domain.WorkKindSmartCommand); got != 20 {
+		t.Fatalf("smart command max turns=%d", got)
+	}
+}
+
+func TestSmartCommandSubmitDecisionRecordOnly(t *testing.T) {
+	model := &scriptedModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("reply", "submit_decision", `{
+			"decision":"reply",
+			"relevance_confidence":0.9,
+			"reply_confidence":0.9,
+			"risk":"low",
+			"reply_text":"should not send",
+			"reason":"wrong terminal"
+		}`)}),
+		schema.AssistantMessage("", []schema.ToolCall{toolCall("record", "submit_decision", `{
+			"decision":"record",
+			"relevance_confidence":0.9,
+			"risk":"low",
+			"reason":"done",
+			"skipped":true,
+			"reply_outcome":"complete"
+		}`)}),
+	}}
+	registry, err := agenttools.NewRegistry(SubmitDecisionDefinition())
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, _, err := (AgentLoop{Model: model, Tools: registry, MaxTurns: 20}).Decide(context.Background(), agentcontext.Bundle{
+		WorkKind: domain.WorkKindSmartCommand,
+		User:     agentcontext.UserProfile{OpenID: "smart-command"},
+		Event:    domain.NormalizedEvent{SenderID: "smart-command", Content: "finish"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Kind != domain.DecisionRecord || !decision.Skipped {
+		t.Fatalf("SC-40 decision=%+v", decision)
+	}
+	if err := validateTerminalDecision(agentcontext.Bundle{WorkKind: domain.WorkKindSmartCommand}, domain.Decision{Kind: domain.DecisionReply}); err == nil {
+		t.Fatal("SC-40 reply must not be a smart-command terminal")
+	}
 }
 
 func TestToolCallAndNoProgressBudgetsForceConvergence(t *testing.T) {

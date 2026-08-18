@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+mode="${LARK_AGENT_MODE:-notify}"
+case "$mode" in
+  notify|"")
+    exec /usr/local/bin/lark-agent github notify --chat-id "${LARK_CHAT_ID:-}"
+    ;;
+  run)
+    set -- github run
+    if [ -n "${LARK_AGENT_PROMPT_FILE:-}" ]; then
+      set -- "$@" --prompt-file "$LARK_AGENT_PROMPT_FILE"
+    fi
+    if [ -n "${LARK_AGENT_RULES_FILE:-}" ]; then
+      set -- "$@" --rules-file "$LARK_AGENT_RULES_FILE"
+    fi
+    if [ -n "${LARK_AGENT_ALLOWED_ACTIONS:-}" ]; then
+      set -- "$@" --allowed-actions "$LARK_AGENT_ALLOWED_ACTIONS"
+    fi
+    if [ -n "${LARK_AGENT_MESSAGE:-}" ]; then
+      set -- "$@" --message "$LARK_AGENT_MESSAGE"
+    fi
+    if [ -n "${LARK_CHAT_ID:-}" ]; then
+      set -- "$@" --chat-id "$LARK_CHAT_ID"
+    fi
+    if [ "${LARK_AGENT_DRY_RUN:-}" = "true" ]; then
+      set -- "$@" --dry-run
+    fi
+    exec /usr/local/bin/lark-agent "$@"
+    ;;
+  *)
+    printf '%s\n' '{"ok":false,"error":{"type":"validation","subtype":"invalid_argument","message":"unknown mode"}}' >&2
+    exit 2
+    ;;
+esac
