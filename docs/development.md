@@ -19,6 +19,8 @@ Go SDK，并把 SDK HTTP 响应或 WebSocket 事件转为有类型数据。
 - `internal/github`：唯一 GitHub HTTP、事件解析和可信通知适配层。
 - `integration_test/lark_agent`：跨包行为和隔离安装验收。
 - `spec`：合并后长期行为、架构和资源订阅契约。
+- `/.local/`：git 忽略的本机目录。推荐把当前安装实例不含秘密的配置备份到
+  `/.local/owner-config/`，换上下文时从这里找回。
 
 ## 开发流程
 

@@ -167,6 +167,7 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"all_groups",
 		"all_private",
 		"非 Owner 私聊机器人或直接 @机器人时保持静默",
+		"/.local/owner-config/",
 	} {
 		if !strings.Contains(string(readme), want) {
 			t.Fatalf("README missing %q", want)
@@ -186,6 +187,7 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"inspect_git_history",
 		"task_rules",
 		"TASK_RULES.md",
+		"/.local/owner-config/",
 	} {
 		if !strings.Contains(string(configuration), want) {
 			t.Fatalf("configuration docs missing %q", want)

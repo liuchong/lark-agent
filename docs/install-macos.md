@@ -5,6 +5,9 @@
 安装只写当前用户目录，不需要管理员权限：
 
 - 配置：`~/.config/lark-agent/config.yaml`
+- 推荐把本机安装实例里不含秘密的配置备份到仓库 `/.local/owner-config/`（已被
+  gitignore）。换上下文时优先在这里找本地实例材料；运行中的配置仍以
+  `~/.config/lark-agent/` 为准，token 和密钥不要放进这个备份。
 - 状态和已安装二进制：`~/Library/Application Support/lark-agent/`
 - 日志：`~/Library/Logs/lark-agent/`
 - 服务：`~/Library/LaunchAgents/com.liuchong.lark-agent.plist`

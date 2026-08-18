@@ -41,3 +41,5 @@
   当前核心验收的问题，范围外改进交由用户决定。
 - 每阶段结束判断是否应将可复用经验写入 `.agents/experience/` 或将重复易错操作
   写成 `.agents/tools/`；不得为形式完整无限扩项。
+- 本机安装实例的非秘密配置建议备份到 `/.local/owner-config/`（已被 gitignore）。
+  换上下文查找本地实例时先看这里；secret 仍只放 Keychain。
