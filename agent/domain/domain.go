@@ -496,6 +496,7 @@ type WorkItem struct {
 	ResolvedContext     []NormalizedEvent `json:"-" yaml:"-"`
 	InvestigationActive bool              `json:"-" yaml:"-"`
 	ResourceEvidenceID  int64             `json:"-" yaml:"-"`
+	TaskRulesDigest     string            `json:"-" yaml:"-"`
 }
 
 // CodingWorkKind distinguishes one-shot answers from durable follow-up goals.
@@ -674,22 +675,23 @@ type DecisionProgress struct {
 
 // Decision is an auditable routing or agent decision.
 type Decision struct {
-	Kind           DecisionKind         `json:"kind" yaml:"kind"`
-	Mode           Mode                 `json:"mode" yaml:"mode"`
-	Relevance      Relevance            `json:"relevance" yaml:"relevance"`
-	WorkKind       WorkKind             `json:"work_kind,omitempty" yaml:"work_kind,omitempty"`
-	Priority       int                  `json:"priority,omitempty" yaml:"priority,omitempty"`
-	Confidence     float64              `json:"confidence" yaml:"confidence"`
-	Risk           Risk                 `json:"risk" yaml:"risk"`
-	EvidenceStatus EvidenceStatus       `json:"evidence_status,omitempty" yaml:"evidence_status,omitempty"`
-	ReplyOutcome   ReplyOutcome         `json:"reply_outcome,omitempty" yaml:"reply_outcome,omitempty"`
-	Progress       DecisionProgress     `json:"progress,omitempty" yaml:"progress,omitempty"`
-	Reason         string               `json:"reason" yaml:"reason"`
-	ReplyText      string               `json:"reply_text,omitempty" yaml:"reply_text,omitempty"`
-	OwnerAction    string               `json:"owner_action,omitempty" yaml:"owner_action,omitempty"`
-	Language       string               `json:"language,omitempty" yaml:"language,omitempty"`
-	Sources        []SourceRef          `json:"sources,omitempty" yaml:"sources,omitempty"`
-	ControlCommand *OwnerControlCommand `json:"control_command,omitempty" yaml:"control_command,omitempty"`
+	Kind            DecisionKind         `json:"kind" yaml:"kind"`
+	Mode            Mode                 `json:"mode" yaml:"mode"`
+	Relevance       Relevance            `json:"relevance" yaml:"relevance"`
+	WorkKind        WorkKind             `json:"work_kind,omitempty" yaml:"work_kind,omitempty"`
+	Priority        int                  `json:"priority,omitempty" yaml:"priority,omitempty"`
+	Confidence      float64              `json:"confidence" yaml:"confidence"`
+	Risk            Risk                 `json:"risk" yaml:"risk"`
+	EvidenceStatus  EvidenceStatus       `json:"evidence_status,omitempty" yaml:"evidence_status,omitempty"`
+	ReplyOutcome    ReplyOutcome         `json:"reply_outcome,omitempty" yaml:"reply_outcome,omitempty"`
+	Progress        DecisionProgress     `json:"progress,omitempty" yaml:"progress,omitempty"`
+	Reason          string               `json:"reason" yaml:"reason"`
+	ReplyText       string               `json:"reply_text,omitempty" yaml:"reply_text,omitempty"`
+	OwnerAction     string               `json:"owner_action,omitempty" yaml:"owner_action,omitempty"`
+	Language        string               `json:"language,omitempty" yaml:"language,omitempty"`
+	Sources         []SourceRef          `json:"sources,omitempty" yaml:"sources,omitempty"`
+	ControlCommand  *OwnerControlCommand `json:"control_command,omitempty" yaml:"control_command,omitempty"`
+	TaskRulesDigest string               `json:"task_rules_digest,omitempty" yaml:"task_rules_digest,omitempty"`
 }
 
 // ReplyCandidateStatus is the durable lifecycle of one validated but not yet
@@ -923,6 +925,7 @@ const (
 	OwnerControlRecent          OwnerControlName = "recent"
 	OwnerControlVersion         OwnerControlName = "version"
 	OwnerControlPing            OwnerControlName = "ping"
+	OwnerControlRules           OwnerControlName = "rules"
 	OwnerControlMemoryList      OwnerControlName = "memory_list"
 	OwnerControlMemoryAdd       OwnerControlName = "memory_add"
 	OwnerControlMemoryDelete    OwnerControlName = "memory_delete"

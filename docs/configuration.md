@@ -40,6 +40,10 @@ lark-agent config show
   令牌的 Keychain 引用。
 - `github.max_files`、`max_patch_bytes`、`max_annotations`、`max_reviews`：
   单次模型读取的硬上限。
+- `github.proactive_review.enabled`：是否允许处理没有 `@Owner` 或 `@智能助手` 的
+  群内 PR 审查请求。默认 `false`。
+- `github.proactive_review.chat_ids`：主动审查开启时必填的精确群 ID 列表。主动审查
+  只能把结果私聊通知 Owner，不能在原群回复请求者。
 - `owner.open_id`：唯一 Owner 的 open ID。
 - `owner.name`：必填。智能助手代回复和私聊通知中使用的具体姓名。缺失时配置校验
   直接失败，代回复不会用“用户”或“负责人”代替。
@@ -148,6 +152,9 @@ github:
   max_patch_bytes: 65536
   max_annotations: 50
   max_reviews: 50
+  proactive_review:
+    enabled: false
+    chat_ids: []
 ```
 
 本地令牌用 `lark-agent github auth login` 从标准输入写入 Keychain，输入格式为
@@ -155,10 +162,17 @@ github:
 Lark app secret 只来自受保护的 GitHub Environment。两者都不会写入 YAML、消息、
 日志或命令参数。
 
-消息中的仓库名、PR 号或 run ID 不是权限来源。只有当前 Lark 应用自己发送、同群
-引用关系可验证、标记 HMAC 签名能由相同 Lark app secret 验证且仓库在 allowlist
-中的通知，才能建立后续 GitHub 读取范围。工具参数只能选择 `summary`、`checks`、
-`files`、`reviews`，不能改变仓库、PR 或 workflow run。
+普通文本中的仓库名、PR 号或 run ID 不是权限来源。可信范围有两个代码验证入口：
+当前 Lark 应用发送且同群引用关系和 HMAC 签名均有效的通知；或 Owner/智能助手明确
+收到的完整 PR URL。后者由 Go 解析 URL、核对精确仓库 allowlist 并保存发送者和授权
+路由，模型不能提供或改写仓库、PR、API 地址或凭据。工具参数只能选择 `summary`、
+`checks`、`files`、`reviews`。
+
+PR 审查直接读取远程 GitHub API，并在一次取证前后核对相同的 head SHA；同一运行中
+后续读取也必须匹配首次绑定的 head。`checks` 会读取该 head 对应的检查运行与有界注释。
+它不依赖 `gh` 登录状态，不向当前仓库执行 fetch/pull/checkout，不运行 PR 代码。
+GitHub 未启用或只读凭据缺失时会直接说明配置阻塞，不会把“本地仓库里没找到”当作
+远程 PR 不存在。
 
 ## 模式
 
@@ -233,6 +247,25 @@ policy:
   限流和模型供应商瞬时失败次数互相占用。
 - `policy.reply_confidence_min` 是主模型完成只读核对后自动代回复的最低可信度。
   达到 `0.70` 的低风险答复会先私聊通知 Owner，再直接发送，不会等待 Owner 在线。
+
+## 私人任务规则
+
+规则正文是私人配置，不是编译进代码的业务策略。默认文件是配置目录旁的
+`TASK_RULES.md`。已有安装保持 `task_rules.enabled: false`，直到本机执行
+`lark-agent rules init`，或新安装的 `lark-agent init` 写入通用模板并启用。
+
+```yaml
+task_rules:
+  enabled: false
+  path: TASK_RULES.md
+  max_bytes: 32768
+```
+
+- `path` 必须是配置目录内的相对路径，不能使用 `..` 或绝对路径。
+- 分类器、主 Agent、收尾修复和发送前检查每次按摘要重新加载同一份快照。
+- 群里 `@Owner` 只是候选；没有目标原文或当前快照里的义务证据时，不会创建代回复任务。
+- 规则可以收窄或补充工作，但不能扩大 Workspace、跳过审批、授予写入或改发送身份。
+- `/rules` 和 `lark-agent rules check` 只显示启用状态、文件状态、字节数、摘要和文件名，不输出正文或绝对路径。
 
 这些不含凭据的当前值会作为权威运行策略随每个普通模型请求发送。助手回答“当前
 怎么配置、是否自动发送、两个阈值分别管什么”时必须直接使用这份策略，不能从

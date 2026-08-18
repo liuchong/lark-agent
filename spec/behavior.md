@@ -296,25 +296,42 @@ the older target's shared context so its subject cannot be replaced by the
 newer request. For an ordinary
 private message that does not explicitly mention
 the owner, the resolver also decides whether the target reasonably calls for a
-response at all. A high-confidence semantic answer cancels only the matched
-target; an `answered` result with validated later owner messages or owner
-acknowledgement reaction cancels only that matched target. A `no_reply_needed`
-result cancels a private answer, acknowledgement, reaction, owner-led
-conversational continuation, or group `@Owner` social acknowledgement that
-contains no explicit new action obligation, without inventing another response.
-These suppressive outcomes use a lower safety floor than `unanswered` because
-they do not send anything on the owner's behalf. A high-confidence unanswered
-result admits only that target to the delegated agent loop after it records a
-target intent and an exact response-obligation quote from the target message. If
-the target is classified as an answer, acknowledgement, continuation, social
-compliment, or informative product/design statement and does not contain such an
-obligation, the runtime normalizes it to `no_reply_needed` instead of starting an
-investigation. Explicit group `@Owner` remains the required entry condition for
-group delegated work, but the semantic gate may still suppress messages that
-only acknowledge, compliment, react, share information, or were handled by later
-owner messages. Ambiguous, malformed, truncated, unavailable, or truly
+response at all. A group `@Owner` mention is only a candidate for that same
+obligation check; it is not by itself a must-reply. A high-confidence semantic
+answer cancels only the matched target; an `answered` result with validated
+later owner messages or owner acknowledgement reaction cancels only that matched
+target. A `no_reply_needed` result cancels a private answer, acknowledgement,
+reaction, owner-led conversational continuation, or group `@Owner` informational
+announcement, discussion opinion, or social acknowledgement that contains no
+proven owner action obligation, without inventing another response. These
+suppressive outcomes use a lower safety floor than `unanswered` because they do
+not send anything on the owner's behalf. A high-confidence unanswered result
+admits only that target to the delegated agent loop after it records a target
+intent and obligation evidence. Obligation evidence is either an exact quote
+copied from the target message or an exact quote copied from the current private
+task-rules snapshot. If the target is classified as an answer, acknowledgement,
+continuation, social compliment, discussion opinion, or informational
+announcement and does not contain such an obligation, the runtime normalizes it
+to `no_reply_needed` instead of starting an investigation or retrying into a
+dead letter. Explicit group `@Owner` remains the required entry condition for
+group delegated work. Ambiguous, malformed, truncated, unavailable, or truly
 low-confidence resolution fails closed and retries after the configured semantic
-retry delay.
+retry delay only when a proven obligation still exists.
+
+Owner task-rule text is private local configuration, not compiled business
+policy. The default file is `TASK_RULES.md` beside `config.yaml`. Existing
+installs keep `task_rules.enabled` false until `lark-agent rules init` or a new
+`lark-agent init` writes the generic template and enables it. Classifier, main
+Agent, terminal repair, and pre-send review reload one snapshot by digest and
+project that snapshot by role. The body is never copied into SQLite, logs,
+owner-facing command output, or public tests. Instruction order is Go security,
+the current owner command, the private snapshot, workspace rules, then untrusted
+data. Private rules may create or narrow work; they cannot enlarge Workspace,
+skip approval, grant write permission, change send identity, or override a
+Go-verified explicit action request in the target. An enabled but missing,
+unreadable, oversized, or escaped file stops new sender-facing sends and
+notifies the owner once. A digest change cancels any held unsent draft and
+reclassifies it.
 
 Immediately before semantic classification, before finishing durable
 investigation, and before sending a held candidate, the resolver reads reactions
@@ -1189,8 +1206,8 @@ force flag.
 
 The configured owner has the same durable control capability through commands
 sent in the assistant bot's private Lark chat. `/help`, `/status`, `/doctor`,
-`/tasks`, `/task`, `/approvals`, `/approval`, `/recent`, `/version`, and
-`/ping` form a typed owner-private control plane. Read-only commands never call
+`/tasks`, `/task`, `/approvals`, `/approval`, `/recent`, `/memory`, `/rules`,
+`/version`, and `/ping` form a typed owner-private control plane. Read-only commands never call
 the model. Mutation commands require exact work or action IDs and use the same
 storage transitions as their CLI equivalents. An owner command in a group only
 receives a private-control redirect; a non-owner command remains silent.
@@ -1218,7 +1235,10 @@ includes mode, assistant/delegated/private reply scopes, owner wait, semantic
 owner-answer threshold, delegated direct-send threshold, retry interval, and
 investigation-progress mode. It is authoritative for questions about the
 assistant's current behavior. Workspace rules govern project investigation and
-must never be used to infer or override these runtime facts. The model must
+must never be used to infer or override these runtime facts. Private owner
+task rules are a separate trusted snapshot: they describe which messages create
+work for the owner, survive context compaction as a role projection, and still
+cannot override runtime policy or security gates. The model must
 distinguish `policy.owner_reply_confidence_min`, which decides whether observed
 conversation evidence is strong enough to classify the owner's own response,
 from `policy.reply_confidence_min`, which decides whether a low-risk delegated
@@ -1869,6 +1889,32 @@ The multi-step loop is accepted by these executable BDD scenarios:
   compliment, or social acknowledgement and no new action obligation, when
   semantic resolution runs, then it becomes `no_reply_needed` and does not
   enter retry/dead-letter owner-summary flow.
+- Given a group `@Owner` informational announcement or discussion opinion
+  contains no confirm, investigate, or handle request, when semantic resolution
+  returns `answered`, `ambiguous`, or `unanswered` without obligation evidence,
+  then the runtime normalizes it to `no_reply_needed`, the main Agent is not
+  called, and no owner terminal-failure notice is sent.
+- Given private task rules are disabled or the file is empty, when that same
+  informational mention arrives, then the obligation gate still suppresses it
+  because the gate is mechanism, not compiled business content.
+- Given private task rules say a class of informational notices must be
+  investigated and the target matches that class without a message-level ask,
+  when semantic resolution runs against that snapshot, then obligation source is
+  `task_rules`, the quoted evidence exists in the snapshot, and delegated work
+  is admitted.
+- Given private task rules say a class of notices may be ignored and the target
+  also contains an explicit action request, when validation runs, then the
+  message obligation wins.
+- Given `task_rules.enabled` is true and the file is missing, unreadable,
+  oversized, or outside the config directory, when a new delegated send would
+  occur, then the original sender is not answered and the owner receives one
+  file-fault diagnosis.
+- Given a held unsent draft was produced under digest A and the private file
+  now has digest B, when the pre-send check runs, then the draft is cancelled
+  and the work is reclassified.
+- Given `/rules` or `lark-agent rules check` runs, then the owner sees enabled
+  state, status, byte size, and digest, never the private body or an absolute
+  path.
 - Given a group message explicitly mentions the owner with a clear request such
   as asking the owner to confirm, investigate, look into, or handle something,
   when semantic resolution runs, then a model-provided `no_reply_needed` result

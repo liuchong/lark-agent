@@ -22,6 +22,7 @@ func TestParseReadOnlyCommandsAndAliases(t *testing.T) {
 		{"/recent 5", domain.OwnerControlCommand{Name: domain.OwnerControlRecent, Count: 5}},
 		{"/version", domain.OwnerControlCommand{Name: domain.OwnerControlVersion}},
 		{"/ping", domain.OwnerControlCommand{Name: domain.OwnerControlPing}},
+		{"/rules", domain.OwnerControlCommand{Name: domain.OwnerControlRules}},
 	}
 	for _, test := range tests {
 		t.Run(test.input, func(t *testing.T) {

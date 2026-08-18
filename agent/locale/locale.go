@@ -233,6 +233,22 @@ func (p DelegatedPresenter) Present(item domain.WorkItem, decision domain.Decisi
 func LocalizedReason(language Language, reason string) string {
 	lower := strings.ToLower(reason)
 	switch {
+	case strings.Contains(lower, "task_rules_unavailable"):
+		if language == LanguageEnglish {
+			return "The private task-rules file is enabled but cannot be read."
+		}
+		return "已启用的私人任务规则文件当前无法读取"
+	case strings.Contains(lower, "task_rules_changed"):
+		if language == LanguageEnglish {
+			return "The private task-rules file changed; the previous draft was cancelled."
+		}
+		return "私人任务规则已更新，旧草稿已取消"
+	case strings.Contains(lower, "owner_reply_ambiguous") ||
+		strings.Contains(lower, "did not converge"):
+		if language == LanguageEnglish {
+			return "The delegated reply could not be confirmed before the retry limit."
+		}
+		return "在重试上限内未能确认这条委托回复"
 	case strings.Contains(lower, "owner_reaction_read_failed") ||
 		strings.Contains(lower, "owner reaction read failed"):
 		if language == LanguageEnglish {
@@ -251,11 +267,36 @@ func LocalizedReason(language Language, reason string) string {
 			return "The model did not converge within the configured budget."
 		}
 		return "模型未能在配置预算内形成有效结论"
-	case strings.Contains(lower, "rate") || strings.Contains(lower, "timeout"):
+	case strings.Contains(lower, "model provider authentication"):
 		if language == LanguageEnglish {
-			return "The external model service did not complete successfully."
+			return "The model provider rejected its configured credential."
 		}
-		return "外部模型服务未能正常完成"
+		return "模型供应商拒绝了当前配置的凭据"
+	case strings.Contains(lower, "model provider permission"):
+		if language == LanguageEnglish {
+			return "The model provider denied this request."
+		}
+		return "模型供应商拒绝了本次请求权限"
+	case strings.Contains(lower, "model provider quota_exhausted"):
+		if language == LanguageEnglish {
+			return "The model provider quota is exhausted."
+		}
+		return "模型供应商额度已耗尽"
+	case strings.Contains(lower, "model provider overloaded"):
+		if language == LanguageEnglish {
+			return "The model provider remained overloaded after bounded retries."
+		}
+		return "模型供应商持续过载，已用尽有界重试"
+	case strings.Contains(lower, "model provider rate_limit"):
+		if language == LanguageEnglish {
+			return "The model provider remained rate-limited after bounded retries."
+		}
+		return "模型供应商持续限流，已用尽有界重试"
+	case strings.Contains(lower, "timeout"):
+		if language == LanguageEnglish {
+			return "The model provider timed out after bounded retries."
+		}
+		return "模型供应商持续超时，已用尽有界重试"
 	default:
 		if language == LanguageEnglish {
 			return "Processing stopped before a reliable result could be produced."

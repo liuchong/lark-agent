@@ -530,6 +530,11 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 				d.replyResolutionRetry,
 			)
 		}
+		if handled, result, failErr := d.failClosedTaskRules(item, resolution, nil); handled {
+			return result, failErr
+		}
+		decision.TaskRulesDigest = resolution.TaskRulesDigest
+		item.TaskRulesDigest = resolution.TaskRulesDigest
 		if semanticSuppressesDelegatedReply(resolution, d.replyConfidenceMin) {
 			switch resolution.Result {
 			case replymatch.ResultAnswered:
@@ -815,6 +820,14 @@ func (d *Daemon) RunOnce(ctx context.Context) (Result, error) {
 			d.markRetry(item, err)
 			return Result{}, err
 		}
+		if handled, result, failErr := d.failClosedTaskRules(item, latest, func() replyCandidateStore {
+			if candidateSaved {
+				return candidates
+			}
+			return nil
+		}()); handled {
+			return result, failErr
+		}
 		if semanticSuppressesDelegatedReply(latest, d.replyConfidenceMin) {
 			switch latest.Result {
 			case replymatch.ResultAnswered:
@@ -954,6 +967,25 @@ func (d *Daemon) resolveHeldReplyCandidate(
 			d.replyResolutionRetry,
 		)
 	}
+	if handled, result, failErr := d.failClosedTaskRules(item, resolution, candidates); handled {
+		return result, failErr
+	}
+	if candidate.Decision.TaskRulesDigest != resolution.TaskRulesDigest {
+		if err := candidates.CancelWorkReplyCandidate(
+			item.ID,
+			item.LeaseBy,
+			"task_rules_changed",
+		); err != nil {
+			d.markRetry(item, err)
+			return Result{}, err
+		}
+		return d.deferDelegatedReply(
+			item,
+			candidate.Decision,
+			"task_rules_changed",
+			d.replyResolutionRetry,
+		)
+	}
 	if semanticSuppressesDelegatedReply(resolution, d.replyConfidenceMin) {
 		if err := candidates.CancelWorkReplyCandidate(
 			item.ID,
@@ -1081,6 +1113,46 @@ func delegatedReplyAmbiguousReason(
 		return "owner_reaction_read_failed"
 	}
 	return fallback
+}
+
+func taskRulesUnavailable(resolution replymatch.Resolution) bool {
+	return strings.Contains(strings.ToLower(resolution.Reason), "task_rules_unavailable")
+}
+
+func (d *Daemon) failClosedTaskRules(
+	item domain.WorkItem,
+	resolution replymatch.Resolution,
+	candidates replyCandidateStore,
+) (bool, Result, error) {
+	if !taskRulesUnavailable(resolution) {
+		return false, Result{}, nil
+	}
+	if candidates != nil {
+		if err := candidates.CancelWorkReplyCandidate(
+			item.ID,
+			item.LeaseBy,
+			"task_rules_unavailable",
+		); err != nil {
+			d.markRetry(item, err)
+			return true, Result{}, err
+		}
+	}
+	err := errs.NewInternalError(
+		errs.SubtypeFailedPrecondition,
+		"task_rules_unavailable: %s",
+		strings.TrimSpace(resolution.Reason),
+	)
+	if !d.markPermanentFailure(item, err) {
+		d.markRetry(item, err)
+		return true, Result{}, err
+	}
+	return true, Result{
+		Processed: true,
+		Decision: domain.Decision{
+			Kind:   domain.DecisionIgnore,
+			Reason: "task_rules_unavailable",
+		},
+	}, nil
 }
 
 func semanticSuppressesDelegatedReply(
@@ -1603,6 +1675,9 @@ func inheritRouteFields(modelDecision, routeDecision domain.Decision) domain.Dec
 	}
 	if modelDecision.Priority == 0 {
 		modelDecision.Priority = routeDecision.Priority
+	}
+	if modelDecision.TaskRulesDigest == "" {
+		modelDecision.TaskRulesDigest = routeDecision.TaskRulesDigest
 	}
 	return modelDecision
 }

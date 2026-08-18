@@ -9,6 +9,7 @@ import (
 
 	"github.com/liuchong/lark-agent/agent/domain"
 	"github.com/liuchong/lark-agent/agent/memory"
+	"github.com/liuchong/lark-agent/agent/taskrules"
 	errs "github.com/liuchong/lark-agent/internal/apperr"
 )
 
@@ -39,6 +40,7 @@ type Config struct {
 	OwnerName string
 	Language  string
 	Version   string
+	TaskRules func() taskrules.PublicView
 }
 
 type Handler struct {
@@ -116,6 +118,8 @@ func (h *Handler) execute(
 		return "智能助手版本：" + version, nil
 	case domain.OwnerControlPing:
 		return "pong", nil
+	case domain.OwnerControlRules:
+		return h.rulesText(), nil
 	default:
 		result, err := h.store.ExecuteOwnerMutation(
 			ctx,
@@ -222,6 +226,31 @@ func (h *Handler) doctorText(ctx context.Context) (string, error) {
 		action.Total,
 		summary.StaleProcessing,
 	), nil
+}
+
+func (h *Handler) rulesText() string {
+	view := taskrules.PublicView{Status: taskrules.StatusDisabled}
+	if h.cfg.TaskRules != nil {
+		view = h.cfg.TaskRules()
+	}
+	if h.english() {
+		return fmt.Sprintf(
+			"Private task rules: enabled=%t status=%s bytes=%d digest=%s file=%s.\nThis command never prints the file body or an absolute path. Use `lark-agent rules init` locally to create the generic template.",
+			view.Enabled,
+			view.Status,
+			view.Bytes,
+			strings.TrimSpace(view.Digest),
+			strings.TrimSpace(view.FileName),
+		)
+	}
+	return fmt.Sprintf(
+		"私人任务规则：启用=%t 状态=%s 字节=%d 摘要=%s 文件=%s。\n本命令不输出规则正文或绝对路径。本机可用 `lark-agent rules init` 写入通用模板。",
+		view.Enabled,
+		view.Status,
+		view.Bytes,
+		strings.TrimSpace(view.Digest),
+		strings.TrimSpace(view.FileName),
+	)
 }
 
 func (h *Handler) tasksText(ctx context.Context, query domain.OwnerTaskQuery) (string, error) {
@@ -585,6 +614,7 @@ func HelpText(language, topic string) string {
 			lines = append(lines, fmt.Sprintf("- `%s`: %s.", spec.UsageEN, spec.PurposeEN))
 		}
 		lines = append(lines, "For model profile and provider diagnostics, run `lark-agent model doctor primary` locally; credentials stay in Keychain.")
+		lines = append(lines, "An explicit allowed GitHub pull-request URL is reviewed from bounded remote API evidence; the current local checkout is never fetched into or executed.")
 		lines = append(lines, "For document/Base monitoring, run `lark-agent subscription add URL` and `lark-agent subscription sync` locally.")
 		lines = append(lines, "Natural-language equivalents are accepted only in the owner's assistant private chat when context identifies one exact command.")
 		return strings.Join(lines, "\n")
@@ -594,6 +624,7 @@ func HelpText(language, topic string) string {
 		lines = append(lines, fmt.Sprintf("- `%s`：%s。", spec.UsageZH, spec.PurposeZH))
 	}
 	lines = append(lines, "模型档案和供应商诊断请在本机执行 `lark-agent model doctor primary`；密钥只保存在 Keychain。")
+	lines = append(lines, "显式提交且位于白名单内的 GitHub PR 链接会通过有界远程 API 证据审查；不会向当前本地代码树拉取，也不会执行 PR 代码。")
 	lines = append(lines, "文档和 Base 监控请在本机执行 `lark-agent subscription add URL` 和 `lark-agent subscription sync`。")
 	lines = append(lines, "只有用户与智能助手私聊且上下文能唯一确定命令时，才接受自然语言等价表达。")
 	return strings.Join(lines, "\n")
@@ -666,6 +697,25 @@ func detailedHelp(english bool, topic string) string {
 			"`/memory delete <记忆号> confirm`",
 			"`/memory feedback <记忆号> confirm|reject|helpful|unhelpful [说明]`",
 			"只有已确认且未删除的记忆会进入后续模型上下文。",
+		}, "\n")
+	case "rules", "task-rules", "任务规则":
+		if english {
+			return strings.Join([]string{
+				"Private task rules:",
+				"`/rules` shows enabled state, status, byte size, digest, and filename.",
+				"It never prints the file body or an absolute path.",
+				"Rule content lives in a local Markdown file beside the config, not in compiled policy.",
+				"Create or enable it locally with `lark-agent rules init`.",
+				"Inspect status locally with `lark-agent rules check`.",
+			}, "\n")
+		}
+		return strings.Join([]string{
+			"私人任务规则：",
+			"`/rules` 只显示启用状态、文件状态、字节数、摘要和文件名。",
+			"不会输出规则正文或绝对路径。",
+			"规则内容是配置目录旁的私人 Markdown，不是编译进代码的业务策略。",
+			"本机用 `lark-agent rules init` 写入通用模板并启用。",
+			"本机用 `lark-agent rules check` 查看状态。",
 		}, "\n")
 	default:
 		return ""

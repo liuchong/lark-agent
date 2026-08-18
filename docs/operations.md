@@ -74,6 +74,7 @@ attempt、finish reason、HTTP 状态、失败类别和恢复动作；不会展�
 /memory add fact|preference|project|response_feedback 内容
 /memory delete 记忆号 confirm
 /memory feedback 记忆号 confirm|reject|helpful|unhelpful [说明]
+/rules
 /version
 /ping
 ```
@@ -102,9 +103,14 @@ lark-agent memory list
 lark-agent memory add project "示例事件服务位于 sample-service"
 lark-agent memory feedback MEMORY_ID helpful "项目定位正确"
 lark-agent memory delete MEMORY_ID --confirm
+lark-agent rules check
+lark-agent rules init
 ```
 
 删除采用可审计墓碑，不会进入后续模型上下文；凭据样式内容会被拒绝。
+`lark-agent rules check` 和私聊 `/rules` 只显示私人任务规则的启用状态、文件状态、
+字节数、摘要和文件名，不输出正文或绝对路径。规则内容是配置目录旁的 Markdown，
+不是编译进代码的业务策略。群里 `@Owner` 只是候选；没有义务证据时不会创建代回复任务。
 
 Owner 在群聊中发送这些命令时只收到转到私聊的提示，群里不展示任务数量和内容。
 同样，群里 `@机器人 status`、`doctor`、`queue summary`、`help` 或询问“为什么没回答”
@@ -384,7 +390,9 @@ lark-agent doctor
 ```
 
 `doctor.github` 会显示是否启用、精确仓库 allowlist、令牌是否可读、`read_only` 和
-`single_lark_listener`。令牌缺失只会禁用 GitHub 增强，不会阻止普通 Lark 消息链路。
+`single_lark_listener`。GitHub 未启用或令牌缺失都不阻止普通 Lark 消息链路；如果
+当前请求明确要求审查远程 PR，系统会直接返回对应配置阻塞，不会转而搜索本地 Git
+历史。
 
 GitHub Action 是一次性 HTTP 发送者。它可以与已安装 daemon 使用同一个 Lark app
 ID 和 app secret，但不会启动 WebSocket；已安装 daemon 始终是唯一实时事件监听者。
@@ -397,9 +405,23 @@ Action 消息带有机器可验证的引用标记。用户在 Lark 中回复或�
 - 仓库位于 `github.allowed_repositories`；
 - 本地只读 GitHub 令牌可用。
 
+另一个入口是 Owner 或智能助手明确收到的完整 PR URL。Go 会解析配置对应的 GitHub
+Web 主机、仓库和正整数 PR 号，拒绝凭据、查询参数、片段、额外路径和白名单外仓库，
+并持久化来源发送者与授权路由。模型不能自行拼出或替换引用。
+
+未 `@Owner` 或 `@智能助手` 的群消息默认不触发 PR 审查。只有同时设置
+`github.proactive_review.enabled: true` 和精确 `chat_ids` 才会进入只读后台审查；
+结果只能私聊 Owner，最终发送门禁禁止在原群回复或发起审批。
+
 模型只能选择读取摘要、检查、文件或审查；仓库、PR 和 run 身份来自已验证引用。
 GitHub API 不可用、限流、拒绝或返回不一致对象时，回复必须标明证据不完整，不能
 根据通知标题补写不存在的原因。
+
+PR 摘要会绑定远程 head SHA；读取文件、审查或检查后会再次读取摘要，同一运行中的
+后续 GitHub 读取也必须匹配首次绑定的 head。若 head 已变化，本次调用不返回证据，
+不能把两个版本混成一个结论。`checks` 读取该 commit 的检查运行和有界注释。默认
+路径只调用 GitHub API，不创建 checkout，不修改当前仓库的 HEAD、索引、文件、
+remote 或 hook，也不执行 PR 代码。
 
 生产工作流使用受保护的 GitHub Environment `lark-production`。其中
 `LARK_APP_SECRET` 是 secret，`LARK_APP_ID`、`LARK_CHAT_ID` 和 `LARK_BASE_URL`

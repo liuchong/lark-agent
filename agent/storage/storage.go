@@ -587,6 +587,20 @@ func (s *Store) migrate() error {
 			`CREATE INDEX IF NOT EXISTS idx_action_attempts_work_generation
 			 ON action_attempts(work_item_id, generation, kind, status, id)`,
 		}},
+		{version: 22, statements: []string{
+			`ALTER TABLE owner_reply_resolutions
+			 ADD COLUMN owner_obligation TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE owner_reply_resolutions
+			 ADD COLUMN obligation_source TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE owner_reply_resolutions
+			 ADD COLUMN task_rule_evidence TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE owner_reply_resolutions
+			 ADD COLUMN task_rules_digest TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE work_items
+			 ADD COLUMN task_rules_digest TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE agent_runs
+			 ADD COLUMN task_rules_digest TEXT NOT NULL DEFAULT ''`,
+		}},
 	}
 	for _, migration := range migrations {
 		if version >= migration.version {
@@ -4059,9 +4073,10 @@ func (s *Store) RecordOwnerReplyResolution(
 			work_item_id, target_message_id, result,
 			matched_owner_message_ids_json, confidence, reason,
 			target_intent, response_obligation_quote, owner_ack_reaction_json,
+			owner_obligation, obligation_source, task_rule_evidence, task_rules_digest,
 			task_summary, task_class, classification_confidence,
 			requires_progress, context_cutoff, evaluated_at
-		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		workItemID,
 		resolution.TargetMessageID,
 		resolution.Result,
@@ -4071,6 +4086,10 @@ func (s *Store) RecordOwnerReplyResolution(
 		resolution.TargetIntent,
 		resolution.ResponseObligationQuote,
 		ownerAckReactionJSON,
+		resolution.OwnerObligation,
+		resolution.ObligationSource,
+		resolution.TaskRuleEvidence,
+		resolution.TaskRulesDigest,
 		resolution.TaskSummary,
 		resolution.TaskClass,
 		resolution.ClassificationConfidence,
@@ -4084,6 +4103,17 @@ func (s *Store) RecordOwnerReplyResolution(
 			"record semantic owner-reply resolution",
 		).WithCause(err)
 	}
+	if _, err := s.db.ExecContext(
+		context.Background(),
+		`UPDATE work_items SET task_rules_digest = ? WHERE id = ?`,
+		resolution.TaskRulesDigest,
+		workItemID,
+	); err != nil {
+		return errs.NewInternalError(
+			errs.SubtypeStorage,
+			"record work item task-rules digest",
+		).WithCause(err)
+	}
 	return nil
 }
 
@@ -4095,7 +4125,8 @@ func (s *Store) ListOwnerReplyResolutions(
 		context.Background(),
 		`SELECT target_message_id, result, matched_owner_message_ids_json,
 		        confidence, reason, target_intent, response_obligation_quote,
-		        owner_ack_reaction_json, task_summary, task_class,
+		        owner_ack_reaction_json, owner_obligation, obligation_source,
+		        task_rule_evidence, task_rules_digest, task_summary, task_class,
 		        classification_confidence, requires_progress, context_cutoff
 		 FROM owner_reply_resolutions
 		 WHERE work_item_id = ?
@@ -4124,6 +4155,10 @@ func (s *Store) ListOwnerReplyResolutions(
 			&resolution.TargetIntent,
 			&resolution.ResponseObligationQuote,
 			&ownerAckReactionRaw,
+			&resolution.OwnerObligation,
+			&resolution.ObligationSource,
+			&resolution.TaskRuleEvidence,
+			&resolution.TaskRulesDigest,
 			&resolution.TaskSummary,
 			&taskClassRaw,
 			&resolution.ClassificationConfidence,
@@ -5425,7 +5460,7 @@ type rowScanner interface {
 
 const workItemSelect = `SELECT id, dedup_key, status, work_kind, priority, generation,
 		duplicate_of, session_id, COALESCE(resource_evidence_id, 0), event_json, lease_by, lease_time, retry_count,
-		next_attempt_at, created_at, updated_at
+		next_attempt_at, created_at, updated_at, task_rules_digest
 	FROM work_items`
 
 func scanWorkItem(row rowScanner) (domain.WorkItem, error) {
@@ -5435,7 +5470,7 @@ func scanWorkItem(row rowScanner) (domain.WorkItem, error) {
 	var duplicateOf sql.NullInt64
 	if err := row.Scan(&item.ID, &item.DedupKey, &status, &workKind,
 		&item.Priority, &item.Generation, &duplicateOf, &sessionID, &item.ResourceEvidenceID, &eventJSON, &leaseBy,
-		&leaseTime, &item.RetryCount, &nextAttemptAt, &createdAt, &updatedAt); err != nil {
+		&leaseTime, &item.RetryCount, &nextAttemptAt, &createdAt, &updatedAt, &item.TaskRulesDigest); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.WorkItem{}, err
 		}

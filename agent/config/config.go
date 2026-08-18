@@ -12,11 +12,12 @@ import (
 
 	"github.com/liuchong/lark-agent/agent/domain"
 	agentlocale "github.com/liuchong/lark-agent/agent/locale"
+	"github.com/liuchong/lark-agent/agent/taskrules"
 	errs "github.com/liuchong/lark-agent/internal/apperr"
 	"github.com/liuchong/lark-agent/internal/fsx"
 )
 
-const currentVersion = 5
+const currentVersion = 6
 
 // Config is the YAML configuration stored under the standalone lark-agent config directory.
 type Config struct {
@@ -36,6 +37,8 @@ type Config struct {
 	Policy     PolicyConfig     `json:"policy" yaml:"policy"`
 	Workspace  WorkspaceConfig  `json:"workspace" yaml:"workspace"`
 	Retention  RetentionConfig  `json:"retention" yaml:"retention"`
+	TaskRules  TaskRulesConfig  `json:"task_rules" yaml:"task_rules"`
+	configDir  string           `json:"-" yaml:"-"`
 }
 
 // AgentConfig bounds the multi-step loop and workspace shell.
@@ -120,15 +123,23 @@ type LarkConfig struct {
 // GitHubConfig controls the optional trusted GitHub evidence bridge. Tokens are
 // referenced by Keychain account and never serialized here.
 type GitHubConfig struct {
-	Enabled              bool     `json:"enabled" yaml:"enabled"`
-	APIBaseURL           string   `json:"api_base_url" yaml:"api_base_url"`
-	TokenKeychainService string   `json:"token_keychain_service" yaml:"token_keychain_service"`
-	TokenKeychainKey     string   `json:"token_keychain_key" yaml:"token_keychain_key"`
-	AllowedRepositories  []string `json:"allowed_repositories,omitempty" yaml:"allowed_repositories,omitempty"`
-	MaxFiles             int      `json:"max_files" yaml:"max_files"`
-	MaxPatchBytes        int      `json:"max_patch_bytes" yaml:"max_patch_bytes"`
-	MaxAnnotations       int      `json:"max_annotations" yaml:"max_annotations"`
-	MaxReviews           int      `json:"max_reviews" yaml:"max_reviews"`
+	Enabled              bool                        `json:"enabled" yaml:"enabled"`
+	APIBaseURL           string                      `json:"api_base_url" yaml:"api_base_url"`
+	TokenKeychainService string                      `json:"token_keychain_service" yaml:"token_keychain_service"`
+	TokenKeychainKey     string                      `json:"token_keychain_key" yaml:"token_keychain_key"`
+	AllowedRepositories  []string                    `json:"allowed_repositories,omitempty" yaml:"allowed_repositories,omitempty"`
+	MaxFiles             int                         `json:"max_files" yaml:"max_files"`
+	MaxPatchBytes        int                         `json:"max_patch_bytes" yaml:"max_patch_bytes"`
+	MaxAnnotations       int                         `json:"max_annotations" yaml:"max_annotations"`
+	MaxReviews           int                         `json:"max_reviews" yaml:"max_reviews"`
+	ProactiveReview      GitHubProactiveReviewConfig `json:"proactive_review" yaml:"proactive_review"`
+}
+
+// GitHubProactiveReviewConfig controls optional private Owner review of
+// unmentioned pull-request requests in exact allowlisted chats.
+type GitHubProactiveReviewConfig struct {
+	Enabled bool     `json:"enabled" yaml:"enabled"`
+	ChatIDs []string `json:"chat_ids,omitempty" yaml:"chat_ids,omitempty"`
 }
 
 // ResourceSubscription is the config-level projection used before the durable
@@ -262,6 +273,34 @@ type RetentionConfig struct {
 	Days int `json:"days" yaml:"days"`
 }
 
+// TaskRulesConfig locates the owner's private Markdown file beside this config.
+// The file content is never compiled into business policy.
+type TaskRulesConfig struct {
+	Enabled  bool   `json:"enabled" yaml:"enabled"`
+	Path     string `json:"path" yaml:"path"`
+	MaxBytes int    `json:"max_bytes" yaml:"max_bytes"`
+}
+
+// ConfigDirectory is the directory containing the loaded YAML file.
+func (c Config) ConfigDirectory() string {
+	return c.configDir
+}
+
+// TaskRulesLoad returns the snapshot loader settings for the current config file.
+func (c Config) TaskRulesLoad() taskrules.Config {
+	path := strings.TrimSpace(c.TaskRules.Path)
+	if path == "" {
+		path = taskrules.DefaultFileName
+	}
+	return taskrules.Config{
+		Enabled:   c.TaskRules.Enabled,
+		ConfigDir: c.configDir,
+		Path:      path,
+		MaxBytes:  c.TaskRules.MaxBytes,
+		FileName:  filepath.Base(path),
+	}
+}
+
 // Default returns conservative defaults. Workspace is intentionally empty and
 // must be set explicitly.
 func Default() Config {
@@ -388,6 +427,11 @@ func Default() Config {
 			Excludes: []string{".git", ".env*", "node_modules", "vendor", "dist", "build", "*.pem", "*.key"},
 		},
 		Retention: RetentionConfig{Days: 30},
+		TaskRules: TaskRulesConfig{
+			Enabled:  false,
+			Path:     taskrules.DefaultFileName,
+			MaxBytes: taskrules.DefaultMaxBytes,
+		},
 	}
 }
 
@@ -404,6 +448,7 @@ func Load(path string) (Config, error) {
 		return Config{}, errs.NewConfigError(errs.SubtypeInvalidConfig, "parse agent config: %s", path).WithCause(err)
 	}
 	cfg.Normalize()
+	cfg.configDir = filepath.Dir(path)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -439,6 +484,12 @@ func (c *Config) Normalize() {
 		c.Version = currentVersion
 	}
 	c.Model.normalize(legacyVersion)
+	if strings.TrimSpace(c.TaskRules.Path) == "" {
+		c.TaskRules.Path = taskrules.DefaultFileName
+	}
+	if c.TaskRules.MaxBytes <= 0 {
+		c.TaskRules.MaxBytes = taskrules.DefaultMaxBytes
+	}
 }
 
 // Validate checks semantic configuration constraints.
@@ -630,6 +681,31 @@ func (c Config) Validate() error {
 			errs.SubtypeInvalidConfig,
 			"workspace.root must be an absolute path",
 		).WithField("workspace.root")
+	}
+	if err := validateTaskRulesConfig(c.TaskRules); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateTaskRulesConfig(cfg TaskRulesConfig) error {
+	path := strings.TrimSpace(cfg.Path)
+	if path == "" {
+		path = taskrules.DefaultFileName
+	}
+	if filepath.IsAbs(path) || strings.Contains(path, "..") {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"task_rules.path must be a relative path inside the config directory",
+		).WithField("task_rules.path")
+	}
+	if cfg.MaxBytes < taskrules.MinMaxBytes || cfg.MaxBytes > taskrules.MaxMaxBytes {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"task_rules.max_bytes must be between %d and %d",
+			taskrules.MinMaxBytes,
+			taskrules.MaxMaxBytes,
+		).WithField("task_rules.max_bytes")
 	}
 	return nil
 }
@@ -846,6 +922,18 @@ func validateGitHubConfig(cfg GitHubConfig) error {
 			"github.allowed_repositories is required when github is enabled",
 		).WithField("github.allowed_repositories")
 	}
+	if cfg.ProactiveReview.Enabled && !cfg.Enabled {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"github.proactive_review requires github.enabled",
+		).WithField("github.proactive_review.enabled")
+	}
+	if cfg.ProactiveReview.Enabled && len(cfg.ProactiveReview.ChatIDs) == 0 {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"github.proactive_review.chat_ids is required when proactive review is enabled",
+		).WithField("github.proactive_review.chat_ids")
+	}
 	seen := map[string]bool{}
 	for _, repository := range cfg.AllowedRepositories {
 		parts := strings.Split(repository, "/")
@@ -859,6 +947,17 @@ func validateGitHubConfig(cfg GitHubConfig) error {
 				WithField("github.allowed_repositories")
 		}
 		seen[canonical] = true
+	}
+	seenChats := map[string]bool{}
+	for _, chatID := range cfg.ProactiveReview.ChatIDs {
+		chatID = strings.TrimSpace(chatID)
+		if chatID == "" || seenChats[chatID] {
+			return errs.NewConfigError(
+				errs.SubtypeInvalidConfig,
+				"github.proactive_review.chat_ids must contain unique non-empty chat ids",
+			).WithField("github.proactive_review.chat_ids")
+		}
+		seenChats[chatID] = true
 	}
 	return nil
 }

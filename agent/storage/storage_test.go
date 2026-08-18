@@ -6,7 +6,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -144,6 +146,70 @@ func TestPendingDelegatedWorkAndSemanticResolutionAudit(t *testing.T) {
 		audits[0].OwnerAckReaction.EmojiType != "Get" ||
 		!audits[0].ContextCutoff.Equal(cutoff) {
 		t.Fatalf("audits=%+v", audits)
+	}
+}
+
+func TestOwnerReplyResolutionPersistsDigestWithoutPrivateBody(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	event := domain.NormalizedEvent{
+		MessageID: "om_rules",
+		ChatID:    "oc_group",
+		Content:   "@测试负责人 REVIEW-QUEUE item 7 is ready.",
+	}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	item, ok, err := store.ClaimNext("worker")
+	if err != nil || !ok {
+		t.Fatalf("claim item=%+v ok=%v err=%v", item, ok, err)
+	}
+	privateBody := "PRIVATE-TASK-RULE-BODY-MUST-NOT-BE-STORED"
+	resolution := replymatch.Resolution{
+		TargetMessageID:          event.MessageID,
+		Result:                   replymatch.ResultUnanswered,
+		Confidence:               0.94,
+		Reason:                   "private task rules require investigation",
+		OwnerObligation:          replymatch.ObligationInvestigate,
+		ObligationSource:         replymatch.ObligationSourceTaskRules,
+		TaskRuleEvidence:         "Investigate every message that contains REVIEW-QUEUE.",
+		TaskRulesDigest:          "sha256:digest-only",
+		TaskSummary:              "Investigate REVIEW-QUEUE item 7.",
+		TaskClass:                domain.TaskClassInvestigation,
+		ClassificationConfidence: 0.91,
+		RequiresProgress:         true,
+		ContextCutoff:            time.Now().UTC(),
+	}
+	if err := store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
+		t.Fatal(err)
+	}
+	audits, err := store.ListOwnerReplyResolutions(item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) != 1 ||
+		audits[0].ObligationSource != replymatch.ObligationSourceTaskRules ||
+		audits[0].TaskRuleEvidence != resolution.TaskRuleEvidence ||
+		audits[0].TaskRulesDigest != "sha256:digest-only" {
+		t.Fatalf("audits=%+v", audits)
+	}
+	stored, err := store.GetWorkItem(context.Background(), item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.TaskRulesDigest != "sha256:digest-only" {
+		t.Fatalf("work item digest=%q", stored.TaskRulesDigest)
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), privateBody) {
+		t.Fatal("sqlite stored the private task-rule body")
 	}
 }
 
@@ -1590,10 +1656,27 @@ func dropSchemaV19AndV20(t *testing.T, store *Store) {
 
 func dropSchemaV21(t *testing.T, store *Store) {
 	t.Helper()
+	dropSchemaV22(t, store)
 	for _, stmt := range []string{
 		`DROP INDEX idx_action_attempts_work_generation`,
 		`ALTER TABLE action_attempts DROP COLUMN generation`,
 		`ALTER TABLE work_items DROP COLUMN generation`,
+	} {
+		if _, err := store.db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func dropSchemaV22(t *testing.T, store *Store) {
+	t.Helper()
+	for _, stmt := range []string{
+		`ALTER TABLE owner_reply_resolutions DROP COLUMN owner_obligation`,
+		`ALTER TABLE owner_reply_resolutions DROP COLUMN obligation_source`,
+		`ALTER TABLE owner_reply_resolutions DROP COLUMN task_rule_evidence`,
+		`ALTER TABLE owner_reply_resolutions DROP COLUMN task_rules_digest`,
+		`ALTER TABLE work_items DROP COLUMN task_rules_digest`,
+		`ALTER TABLE agent_runs DROP COLUMN task_rules_digest`,
 	} {
 		if _, err := store.db.Exec(stmt); err != nil {
 			t.Fatal(err)
@@ -1647,8 +1730,8 @@ func TestDelegatedInvestigationHistoryMigrationIsSchemaVersion20(t *testing.T) {
 	if err := store.db.QueryRow(`SELECT version FROM schema_version LIMIT 1`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 21 {
-		t.Fatalf("schema version=%d, want 21", version)
+	if version != 22 {
+		t.Fatalf("schema version=%d, want 22", version)
 	}
 	investigation, found, err := store.GetDelegatedInvestigation(item.ID)
 	if err != nil || !found || investigation.TaskSummary != "preserved during v20 migration" {

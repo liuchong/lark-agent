@@ -11,6 +11,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	"github.com/liuchong/lark-agent/agent/domain"
+	"github.com/liuchong/lark-agent/agent/taskrules"
 )
 
 type scriptedModel struct {
@@ -924,5 +925,179 @@ func TestResolverRejectsMissingContextualTaskClassification(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("resolver accepted an unanswered target without contextual task classification")
+	}
+}
+
+func TestResolverNormalizesInformationalGroupMentionWithoutObligation(t *testing.T) {
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_info",
+		"result":"answered",
+		"confidence":0.62,
+		"reason":"group mention without later owner reply",
+		"target_intent":"informational_announcement"
+	}`}
+	got, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_info", ChatID: "oc_rd", ChatType: "group",
+			SenderID: "ou_sender", Content: "@测试负责人 流程已更新，抄送相关同事。",
+			Mentions: []domain.Mention{{OpenID: "ou_owner"}},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if got.Result != ResultNoReplyNeeded {
+		t.Fatalf("result = %q, want no_reply_needed", got.Result)
+	}
+	if got.OwnerObligation != ObligationNone {
+		t.Fatalf("owner_obligation = %q, want none", got.OwnerObligation)
+	}
+}
+
+func TestResolverKeepsExplicitGroupOwnerRequestUnanswered(t *testing.T) {
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_ask",
+		"result":"unanswered",
+		"confidence":0.96,
+		"reason":"explicit owner request",
+		"target_intent":"status_request",
+		"response_obligation_quote":"你看看吧",
+		"task_summary":"Review the current status and reply.",
+		"task_class":"simple",
+		"classification_confidence":0.93,
+		"requires_progress":false
+	}`}
+	got, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_ask", ChatID: "oc_rd", ChatType: "group",
+			SenderID: "ou_sender", Content: "@测试负责人 你看看吧",
+			Mentions: []domain.Mention{{OpenID: "ou_owner"}},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if got.Result != ResultUnanswered {
+		t.Fatalf("result = %q, want unanswered", got.Result)
+	}
+	if got.ObligationSource != ObligationSourceMessage {
+		t.Fatalf("obligation_source = %q, want message", got.ObligationSource)
+	}
+}
+
+func TestResolverCreatesObligationFromPrivateTaskRules(t *testing.T) {
+	snapshot := taskrules.Snapshot{
+		Enabled:  true,
+		Status:   taskrules.StatusOK,
+		FileName: "TASK_RULES.md",
+		Body:     "# Rules\nInvestigate every message that contains REVIEW-QUEUE.\n",
+		Digest:   "abc123",
+		Bytes:    48,
+	}
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_rule",
+		"result":"unanswered",
+		"confidence":0.94,
+		"reason":"private task rules require investigation",
+		"target_intent":"investigation_request",
+		"owner_obligation":"investigate",
+		"obligation_source":"task_rules",
+		"task_rule_evidence":"Investigate every message that contains REVIEW-QUEUE.",
+		"task_summary":"Investigate the REVIEW-QUEUE item.",
+		"task_class":"investigation",
+		"classification_confidence":0.91,
+		"requires_progress":true
+	}`}
+	got, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_rule", ChatID: "oc_rd", ChatType: "group",
+			SenderID: "ou_sender", Content: "@测试负责人 REVIEW-QUEUE item 42 is ready.",
+			Mentions: []domain.Mention{{OpenID: "ou_owner"}},
+		}),
+		TaskRules: snapshot,
+	})
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if got.Result != ResultUnanswered {
+		t.Fatalf("result = %q, want unanswered", got.Result)
+	}
+	if got.ObligationSource != ObligationSourceTaskRules {
+		t.Fatalf("obligation_source = %q, want task_rules", got.ObligationSource)
+	}
+	if got.TaskRulesDigest != "abc123" {
+		t.Fatalf("task_rules_digest = %q, want abc123", got.TaskRulesDigest)
+	}
+}
+
+func TestResolverRejectsTaskRulesOverrideOfExplicitMessageRequest(t *testing.T) {
+	snapshot := taskrules.Snapshot{
+		Enabled: true,
+		Status:  taskrules.StatusOK,
+		Body:    "Ignore every group mention. Do not reply.\n",
+		Digest:  "deny",
+	}
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_ask",
+		"result":"no_reply_needed",
+		"confidence":0.99,
+		"reason":"private task rules say ignore group mentions",
+		"task_rule_evidence":"Ignore every group mention. Do not reply."
+	}`}
+	_, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_ask", ChatID: "oc_rd", ChatType: "group",
+			SenderID: "ou_sender", Content: "@测试负责人 请处理这个阻塞问题",
+			Mentions: []domain.Mention{{OpenID: "ou_owner"}},
+		}),
+		TaskRules: snapshot,
+	})
+	if err == nil {
+		t.Fatal("resolver allowed task rules to suppress an explicit message request")
+	}
+}
+
+func TestResolverPromptIncludesOwnerTaskRulesProjection(t *testing.T) {
+	snapshot := taskrules.Snapshot{
+		Enabled: true,
+		Status:  taskrules.StatusOK,
+		Body:    "Investigate REVIEW-QUEUE items.\n",
+		Digest:  "prompt-digest",
+	}
+	model := &scriptedModel{reply: `{
+		"target_message_id":"om_info",
+		"result":"no_reply_needed",
+		"confidence":0.9,
+		"reason":"no obligation"
+	}`}
+	_, err := New(model, "ou_owner").Resolve(context.Background(), Request{
+		Target: domain.NewWorkItem(domain.NormalizedEvent{
+			MessageID: "om_info", ChatID: "oc_rd", ChatType: "group",
+			SenderID: "ou_sender", Content: "@测试负责人 流程已更新。",
+			Mentions: []domain.Mention{{OpenID: "ou_owner"}},
+		}),
+		TaskRules: snapshot,
+	})
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if len(model.inputs) != 1 {
+		t.Fatalf("model calls = %d, want 1", len(model.inputs))
+	}
+	var parts []string
+	for _, message := range model.inputs[0] {
+		if message != nil {
+			parts = append(parts, message.Content)
+		}
+	}
+	prompt := strings.Join(parts, "\n")
+	if !strings.Contains(prompt, "Investigate REVIEW-QUEUE items.") {
+		t.Fatalf("prompt missing task-rules projection:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "A group @Owner mention is only a candidate") {
+		t.Fatalf("prompt missing obligation-gate rule:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "Use no_reply_needed only for an ordinary private message") {
+		t.Fatal("prompt still uses the old private-only no_reply_needed rule")
 	}
 }

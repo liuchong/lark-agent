@@ -40,6 +40,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/rules"
 	agentruntime "github.com/liuchong/lark-agent/agent/runtime"
 	"github.com/liuchong/lark-agent/agent/storage"
+	"github.com/liuchong/lark-agent/agent/taskrules"
 	agenttools "github.com/liuchong/lark-agent/agent/tools"
 	"github.com/liuchong/lark-agent/agent/workspace"
 	"github.com/liuchong/lark-agent/internal/apperr"
@@ -95,8 +96,9 @@ worker is reserved from the foreground pool, while CodingGoal work uses
 background workers. Time, date, ping, status, doctor, queue summary, and help
 use a deterministic fast path before any model loop.
 The configured owner can use /help, /status, /tasks, /task, /approvals,
-/approval, and /memory in the assistant's private chat to inspect and safely
-close durable work or curate bounded persistent memory. Contextual natural
+/approval, /memory, and /rules in the assistant's private chat to inspect and safely
+close durable work, curate bounded persistent memory, or inspect private task-rule
+status. Contextual natural
 language maps to these commands only when the adjacent assistant notice and
 eligible durable state identify one exact operation. Group commands disclose
 no queue details and redirect the owner to private chat; non-owner commands
@@ -568,9 +570,21 @@ func newInitCommand(out io.Writer, configPath *string) *cobra.Command {
 			cfg.Owner.PreferredLanguage = agentlocale.Language(preferredLanguage)
 			cfg.Owner.FallbackLanguage = agentlocale.Language(fallbackLanguage)
 			cfg.Workspace.Root = scope.ConfiguredRoot()
+			cfg.TaskRules.Enabled = true
 			path := resolveConfigPath(*configPath)
 			if err := config.Save(path, cfg); err != nil {
 				return err
+			}
+			if _, err := taskrules.WriteTemplate(taskrules.Config{
+				Enabled:   true,
+				ConfigDir: filepath.Dir(path),
+				Path:      cfg.TaskRules.Path,
+				MaxBytes:  cfg.TaskRules.MaxBytes,
+			}); err != nil {
+				return errs.NewInternalError(
+					errs.SubtypeFileIO,
+					"write private task-rules template",
+				).WithCause(err)
 			}
 			return writeData(out, map[string]any{
 				"config":    path,
@@ -1894,6 +1908,7 @@ func buildLiveOptions(
 			},
 		},
 		includeLarkContext: userContextEnabled,
+		taskRules:          cfg.TaskRulesLoad(),
 	}
 	options := []app.Option{
 		app.WithContextBuilder(builder),
@@ -1901,6 +1916,9 @@ func buildLiveOptions(
 			OwnerName: cfg.Owner.Name,
 			Language:  string(resolveConfiguredLanguage(cfg.Owner)),
 			Version:   buildVersion(),
+			TaskRules: func() taskrules.PublicView {
+				return taskrules.Load(cfg.TaskRulesLoad()).Public()
+			},
 		})),
 	}
 	info["user_context"] = userContextEnabled
@@ -2002,6 +2020,7 @@ func buildLiveOptions(
 				maxContextImages:     cfg.Agent.MaxContextImages,
 				maxContextImageBytes: cfg.Agent.MaxContextImageBytes,
 				maxContextImageTotal: cfg.Agent.MaxContextImageTotalBytes,
+				taskRules:            cfg.TaskRulesLoad(),
 			}
 			options = append(options, app.WithDelegatedReplyResolver(
 				delegatedResolver,
@@ -2417,6 +2436,7 @@ type conversationBuilder struct {
 	githubEnabled       bool
 	includeLarkContext  bool
 	base                agentcontext.Builder
+	taskRules           taskrules.Config
 }
 
 type semanticReplyContextReader interface {
@@ -2473,12 +2493,28 @@ type liveDelegatedReplyResolver struct {
 	maxContextImages     int
 	maxContextImageBytes int64
 	maxContextImageTotal int64
+	taskRules            taskrules.Config
 }
 
 func (r liveDelegatedReplyResolver) Resolve(
 	ctx context.Context,
 	item domain.WorkItem,
 ) (replymatch.Resolution, error) {
+	snapshot := taskrules.Load(r.taskRules)
+	if snapshot.Fault() {
+		resolution := replymatch.Resolution{
+			TargetMessageID: item.Event.MessageID,
+			Result:          replymatch.ResultAmbiguous,
+			Confidence:      1,
+			Reason:          "task_rules_unavailable:" + snapshot.Status,
+			ContextCutoff:   time.Now().UTC(),
+			TaskRulesDigest: snapshot.Digest,
+		}
+		if err := r.store.RecordOwnerReplyResolution(item.ID, resolution); err != nil {
+			return replymatch.Resolution{}, err
+		}
+		return resolution, nil
+	}
 	ownerWait := r.ownerWait
 	if ownerWait <= 0 {
 		ownerWait = 3 * time.Minute
@@ -2647,6 +2683,7 @@ func (r liveDelegatedReplyResolver) Resolve(
 		Pending:       pending,
 		Messages:      messages,
 		ContextCutoff: larkContext.ContextCutoff,
+		TaskRules:     snapshot,
 	})
 	if err != nil {
 		resolution = replymatch.Resolution{
@@ -2654,7 +2691,11 @@ func (r liveDelegatedReplyResolver) Resolve(
 			Result:          replymatch.ResultAmbiguous,
 			Reason:          "semantic owner-reply evaluation failed",
 			ContextCutoff:   larkContext.ContextCutoff,
+			TaskRulesDigest: snapshot.Digest,
 		}
+	}
+	if resolution.TaskRulesDigest == "" {
+		resolution.TaskRulesDigest = snapshot.Digest
 	}
 	if resolution.ContextCutoff.IsZero() {
 		resolution.ContextCutoff = larkContext.ContextCutoff
@@ -3278,6 +3319,7 @@ func (b *conversationBuilder) Build(item domain.WorkItem) (agentcontext.Bundle, 
 		return agentcontext.Bundle{}, err
 	}
 	resolveBuilderUser(&builder, item.Event)
+	builder.TaskRules = taskrules.Load(b.taskRules)
 	return builder.Build(item)
 }
 
@@ -4451,7 +4493,7 @@ func newMemoryFeedbackCommand(out io.Writer, statePath *string) *cobra.Command {
 }
 
 func newRulesCommand(out io.Writer, configPath *string) *cobra.Command {
-	cmd := &cobra.Command{Use: "rules", Short: "Explain loaded workspace rules"}
+	cmd := &cobra.Command{Use: "rules", Short: "Inspect workspace rules and private task rules"}
 	cmd.AddCommand(&cobra.Command{
 		Use:   "explain",
 		Short: "List rule files inside the workspace",
@@ -4469,6 +4511,46 @@ func newRulesCommand(out io.Writer, configPath *string) *cobra.Command {
 				return err
 			}
 			return writeData(out, map[string]any{"rules": refs})
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "check",
+		Short: "Show private task-rules status without the file body",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(resolveConfigPath(*configPath))
+			if err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{
+				"task_rules": taskrules.Load(cfg.TaskRulesLoad()).Public(),
+			})
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "init",
+		Short: "Write the generic private template if missing and enable task rules",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path := resolveConfigPath(*configPath)
+			cfg, err := config.Load(path)
+			if err != nil {
+				return err
+			}
+			cfg.TaskRules.Enabled = true
+			if strings.TrimSpace(cfg.TaskRules.Path) == "" {
+				cfg.TaskRules.Path = taskrules.DefaultFileName
+			}
+			if _, err := taskrules.WriteTemplate(cfg.TaskRulesLoad()); err != nil {
+				return errs.NewInternalError(
+					errs.SubtypeFileIO,
+					"write private task-rules template",
+				).WithCause(err)
+			}
+			if err := config.Save(path, cfg); err != nil {
+				return err
+			}
+			return writeData(out, map[string]any{
+				"task_rules": taskrules.Load(cfg.TaskRulesLoad()).Public(),
+			})
 		},
 	})
 	return cmd
@@ -4534,6 +4616,7 @@ func newDoctorCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 					"owner_reply_threshold": cfg.Policy.OwnerReplyConfidenceMin,
 					"ambiguous_retry":       cfg.Policy.OwnerReplyRetry.String(),
 				},
+				"task_rules":  taskrules.Load(cfg.TaskRulesLoad()).Public(),
 				"reply_scope": cfg.Policy.ReplyScope,
 				"scheduler": map[string]any{
 					"fast_path_enabled":     cfg.FastPath.Enabled,

@@ -99,3 +99,36 @@ func TestLocalizedReasonDistinguishesReactionReadFailure(t *testing.T) {
 		t.Fatalf("reason=%q", got)
 	}
 }
+
+func TestLocalizedReasonDoesNotCallRetryCeilingAContextGap(t *testing.T) {
+	got := LocalizedReason(
+		LanguageChinese,
+		"delegated reply context did not converge before the retry ceiling: owner_reply_ambiguous",
+	)
+	if got != "在重试上限内未能确认这条委托回复" {
+		t.Fatalf("reason=%q", got)
+	}
+	if strings.Contains(got, "上下文") {
+		t.Fatalf("retry ceiling localized as a context gap: %q", got)
+	}
+	got = LocalizedReason(LanguageChinese, "task_rules_unavailable: missing")
+	if got != "已启用的私人任务规则文件当前无法读取" {
+		t.Fatalf("task-rules reason=%q", got)
+	}
+}
+
+func TestLocalizedReasonPreservesTypedProviderFailure(t *testing.T) {
+	for _, testCase := range []struct {
+		reason string
+		want   string
+	}{
+		{reason: "model provider rate_limit: synthetic", want: "持续限流"},
+		{reason: "model provider overloaded: synthetic", want: "持续过载"},
+		{reason: "model provider authentication: synthetic", want: "拒绝了当前配置的凭据"},
+		{reason: "model provider quota_exhausted: synthetic", want: "额度已耗尽"},
+	} {
+		if got := LocalizedReason(LanguageChinese, testCase.reason); !strings.Contains(got, testCase.want) {
+			t.Fatalf("reason=%q got=%q want substring %q", testCase.reason, got, testCase.want)
+		}
+	}
+}

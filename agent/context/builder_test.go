@@ -12,6 +12,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/domain"
 	"github.com/liuchong/lark-agent/agent/memory"
 	"github.com/liuchong/lark-agent/agent/rules"
+	"github.com/liuchong/lark-agent/agent/taskrules"
 	"github.com/liuchong/lark-agent/agent/workspace"
 )
 
@@ -332,6 +333,10 @@ func TestAgentSystemPromptDefinesAssistantAndDelegatedOwnerRoles(t *testing.T) {
 		"concrete business questions",
 		"run is read-only",
 		"runtime chooses bot identity for assistant_request and owner_request",
+		"Owner private task rules are a local config-file snapshot",
+		"not workspace AGENTS.md",
+		"cannot expand workspace access",
+		"A group @Owner mention is a candidate for delegated work",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("system prompt missing %q:\n%s", want, prompt)
@@ -353,6 +358,33 @@ func TestAgentTaskProcessPromptSeparatesCodingFlowAndTypedOutcomes(t *testing.T)
 		"partial",
 		"clarification",
 		"structured progress",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("task process prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestAgentTaskProcessPromptKeepsPrivateTaskRulesProjection(t *testing.T) {
+	prompt := AgentTaskProcessPrompt(Bundle{
+		WorkKind: domain.WorkKindDirectMention,
+		Event: domain.NormalizedEvent{
+			ChatType: "group",
+			Content:  "@测试负责人 请核对 REVIEW-QUEUE item 7",
+			Mentions: []domain.Mention{{OpenID: "ou_owner"}},
+		},
+		User: UserProfile{OpenID: "ou_owner"},
+		TaskRules: taskrules.Snapshot{
+			Enabled: true,
+			Status:  taskrules.StatusOK,
+			Digest:  "sha256:prompt",
+			Body:    "Investigate every message that contains REVIEW-QUEUE.\n",
+		},
+	})
+	for _, want := range []string{
+		"Investigate every message that contains REVIEW-QUEUE.",
+		"Instruction order is: Go security",
+		"Role projection: agent",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("task process prompt missing %q:\n%s", want, prompt)

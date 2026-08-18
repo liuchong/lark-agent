@@ -14,6 +14,7 @@ Go SDK，并把 SDK HTTP 响应或 WebSocket 事件转为有类型数据。
 - `cmd/lark-agent`：进程入口。
 - `agent/cmd`：命令、daemon 组合和公开 help。
 - `agent/storage`：SQLite 接收回执、工作队列、动作和恢复。
+- `agent/taskrules`：私人任务规则快照加载、摘要和角色投影；正文不入库。
 - `internal/lark`：唯一飞书 SDK 适配层。
 - `internal/github`：唯一 GitHub HTTP、事件解析和可信通知适配层。
 - `integration_test/lark_agent`：跨包行为和隔离安装验收。

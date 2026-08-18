@@ -135,12 +135,17 @@ lark-agent memory list
 lark-agent memory add preference "优先使用中文回复"
 lark-agent memory feedback MEMORY_ID helpful "这条经验有效"
 lark-agent memory delete MEMORY_ID --confirm
+lark-agent rules check
+lark-agent rules init
 lark-agent github auth status
 ```
 
 Owner 还可以在智能助手私聊中发送 `/help` 查看控制命令，用 `/status` 查看当前会话，
 用 `/tasks` 查看需要人工处理的任务，用 `/task 工作号` 查看调查主题、状态、上下文
-证据和最近错误，并用 `/memory` 管理持久记忆。私聊中的自然语言只有在当前上下文
+证据和最近错误，用 `/memory` 管理持久记忆，并用 `/rules` 查看私人任务规则状态。
+私人任务规则写在配置目录旁的 `TASK_RULES.md`，内容不会进仓库或状态库正文。群里
+`@Owner` 只是候选；没有目标原文或当前规则快照里的义务证据时，不会创建代回复任务。
+私聊中的自然语言只有在当前上下文
 能唯一对应某个控制命令时才会执行，例如紧跟唯一审批通知发送“确认”；普通业务问题
 即使包含“确认”“状态”等词也仍按问题回答。群聊中的
 控制命令只会提示转到私聊，不会泄露队列内容；非 Owner 私聊或群聊控制命令保持静默。

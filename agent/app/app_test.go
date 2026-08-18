@@ -397,6 +397,124 @@ func TestDaemonSemanticOwnerAnswerSkipsMainReplyModel(t *testing.T) {
 	}
 }
 
+func TestDaemonSkipsMainModelWhenInformationalMentionNeedsNoReply(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_info",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_sender",
+		Content:   "@测试负责人 流程已更新，抄送相关同事。",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_info",
+		Result:          replymatch.ResultNoReplyNeeded,
+		Confidence:      0.9,
+		Reason:          "target does not contain a proven owner action obligation",
+	}}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolver.calls != 1 || decider.called || !q.done || q.deadLetter ||
+		result.Decision.Kind != domain.DecisionIgnore ||
+		result.Decision.Reason != "delegated_reply_not_needed" {
+		t.Fatalf("result=%+v queue=%+v resolver=%+v decider=%+v", result, q, resolver, decider)
+	}
+}
+
+func TestDaemonFailsClosedWhenTaskRulesAreUnavailable(t *testing.T) {
+	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_info",
+		ChatID:    "oc_group",
+		ChatType:  "group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID: "om_info",
+		Result:          replymatch.ResultAmbiguous,
+		Confidence:      1,
+		Reason:          "task_rules_unavailable:missing",
+	}}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+	_, err := daemon.RunOnce(context.Background())
+	if err != nil && !q.deadLetter {
+		t.Fatalf("err=%v queue=%+v", err, q)
+	}
+	if !q.deadLetter || decider.called || q.deferred ||
+		!strings.Contains(q.deadReason, "task_rules_unavailable") {
+		t.Fatalf("queue=%+v decider=%+v err=%v", q, decider, err)
+	}
+}
+
+func TestDaemonCancelsHeldDraftWhenTaskRulesDigestChanges(t *testing.T) {
+	item := domain.NewWorkItem(domain.NormalizedEvent{
+		MessageID: "om_held_candidate",
+		ChatID:    "oc_group",
+		SenderID:  "ou_sender",
+		Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+	})
+	item.ID = 902
+	decision := domain.Decision{
+		Kind:            domain.DecisionReply,
+		Relevance:       domain.RelevanceDirectMention,
+		Risk:            domain.RiskLow,
+		ReplyText:       "旧草稿",
+		TaskRulesDigest: "sha256:old",
+	}
+	q := &fakeQueue{
+		ok:   true,
+		item: item,
+		candidate: &domain.WorkReplyCandidate{
+			WorkItemID: item.ID,
+			Status:     domain.ReplyCandidateHeld,
+			Decision:   decision,
+		},
+	}
+	decider := &fakeDecider{decision: domain.Decision{Kind: domain.DecisionReply}}
+	resolver := &fakeReplyResolver{resolution: replymatch.Resolution{
+		TargetMessageID:          item.Event.MessageID,
+		Result:                   replymatch.ResultUnanswered,
+		Confidence:               0.99,
+		Reason:                   "still unanswered",
+		TaskRulesDigest:          "sha256:new",
+		TaskSummary:              "Investigate the request.",
+		TaskClass:                domain.TaskClassSimple,
+		ClassificationConfidence: 0.9,
+	}}
+	daemon := NewDaemon(
+		q,
+		router.New(router.Config{OwnerOpenID: "ou_owner", Mode: domain.ModeAuto}),
+		WithContextBuilder(&fakeBuilder{}),
+		WithDecider(decider),
+		WithDelegatedReplyResolver(resolver, 0.85, 30*time.Second),
+	)
+	result, err := daemon.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !q.cancelled || q.cancelReason != "task_rules_changed" || !q.deferred ||
+		decider.called || result.Decision.Reason != "task_rules_changed" {
+		t.Fatalf("result=%+v queue=%+v decider=%+v", result, q, decider)
+	}
+}
+
 func TestDaemonNoReplyNeededSkipsMainReplyModel(t *testing.T) {
 	q := &fakeQueue{ok: true, item: domain.NewWorkItem(domain.NormalizedEvent{
 		MessageID:  "om_private_answer",

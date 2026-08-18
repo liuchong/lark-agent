@@ -9,6 +9,7 @@ import (
 
 	"github.com/liuchong/lark-agent/agent/domain"
 	agentlocale "github.com/liuchong/lark-agent/agent/locale"
+	"github.com/liuchong/lark-agent/agent/taskrules"
 	"gopkg.in/yaml.v3"
 )
 
@@ -121,8 +122,8 @@ func TestDefaultHarnessConfig(t *testing.T) {
 
 func TestDefaultModelProfilesAndRoleBindings(t *testing.T) {
 	cfg := validConfigForTest(t)
-	if cfg.Version != 5 {
-		t.Fatalf("version=%d, want 5", cfg.Version)
+	if cfg.Version != 6 {
+		t.Fatalf("version=%d, want 6", cfg.Version)
 	}
 	primary, ok := cfg.Model.Profiles["primary"]
 	if !ok {
@@ -181,7 +182,7 @@ workspace:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Version != 5 {
+	if cfg.Version != 6 {
 		t.Fatalf("migrated version=%d", cfg.Version)
 	}
 	primary := cfg.Model.Profiles["primary"]
@@ -322,6 +323,9 @@ func TestGitHubConfigIsDisabledByDefaultAndBoundedWhenEnabled(t *testing.T) {
 	if cfg.GitHub.Enabled {
 		t.Fatalf("github enabled by default: %+v", cfg.GitHub)
 	}
+	if cfg.GitHub.ProactiveReview.Enabled || len(cfg.GitHub.ProactiveReview.ChatIDs) != 0 {
+		t.Fatalf("proactive github review enabled by default: %+v", cfg.GitHub.ProactiveReview)
+	}
 	if cfg.GitHub.APIBaseURL != "https://api.github.com" ||
 		cfg.GitHub.MaxFiles != 50 ||
 		cfg.GitHub.MaxPatchBytes != 64*1024 ||
@@ -340,6 +344,17 @@ func TestGitHubConfigIsDisabledByDefaultAndBoundedWhenEnabled(t *testing.T) {
 	cfg.GitHub.AllowedRepositories = []string{"invalid"}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("accepted invalid repository")
+	}
+	cfg = validConfigForTest(t)
+	cfg.GitHub.Enabled = true
+	cfg.GitHub.AllowedRepositories = []string{"example/widgets"}
+	cfg.GitHub.ProactiveReview.Enabled = true
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "proactive_review.chat_ids") {
+		t.Fatalf("enabled proactive review without chats error=%v", err)
+	}
+	cfg.GitHub.ProactiveReview.ChatIDs = []string{"oc_synthetic"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -411,6 +426,57 @@ func validConfigForTest(t *testing.T) Config {
 	cfg.Owner.Name = "测试负责人"
 	cfg.Workspace.Root = t.TempDir()
 	return cfg
+}
+
+func TestExistingInstallKeepsTaskRulesDisabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	mustWriteConfigFile(t, path, `
+version: 5
+lark:
+  app_id: cli_test
+owner:
+  open_id: ou_owner
+  name: 测试负责人
+workspace:
+  root: `+t.TempDir()+`
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Version != 6 {
+		t.Fatalf("version=%d, want 6", cfg.Version)
+	}
+	if cfg.TaskRules.Enabled {
+		t.Fatal("existing install enabled private task rules by default")
+	}
+	if cfg.TaskRules.Path != taskrules.DefaultFileName {
+		t.Fatalf("path=%q", cfg.TaskRules.Path)
+	}
+	if cfg.TaskRules.MaxBytes != taskrules.DefaultMaxBytes {
+		t.Fatalf("max_bytes=%d", cfg.TaskRules.MaxBytes)
+	}
+	if cfg.ConfigDirectory() != filepath.Dir(path) {
+		t.Fatalf("config dir=%q", cfg.ConfigDirectory())
+	}
+}
+
+func TestTaskRulesPathMustStayInsideConfigDirectory(t *testing.T) {
+	cfg := validConfigForTest(t)
+	cfg.TaskRules.Path = "../TASK_RULES.md"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "task_rules.path") {
+		t.Fatalf("escaped path error=%v", err)
+	}
+	cfg = validConfigForTest(t)
+	cfg.TaskRules.Path = "/tmp/TASK_RULES.md"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "task_rules.path") {
+		t.Fatalf("absolute path error=%v", err)
+	}
+	cfg = validConfigForTest(t)
+	cfg.TaskRules.MaxBytes = 16
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "task_rules.max_bytes") {
+		t.Fatalf("tiny max_bytes error=%v", err)
+	}
 }
 
 func mustWriteConfigFile(t *testing.T, path, content string) {

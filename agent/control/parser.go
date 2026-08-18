@@ -50,6 +50,8 @@ func Parse(raw string) (domain.OwnerControlCommand, bool, error) {
 		return noArgs(domain.OwnerControlVersion, args)
 	case domain.OwnerControlPing:
 		return noArgs(domain.OwnerControlPing, args)
+	case domain.OwnerControlRules:
+		return noArgs(domain.OwnerControlRules, args)
 	default:
 		return domain.OwnerControlCommand{}, true, fmt.Errorf("unsupported command /%s", name)
 	}

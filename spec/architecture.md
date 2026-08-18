@@ -53,8 +53,11 @@ Delegated group mentions and inbound human P2P messages are stored as
 `waiting_user` work with a durable earliest execution time. Semantic owner-reply
 resolution is a separate tool-free model boundary with strict typed output.
 Resolution audits bind one target work item to validated owner message IDs,
-confidence, a bounded context cutoff, and a result. They never grant tools or
-change sender-derived authority.
+confidence, a bounded context cutoff, obligation evidence, a task-rules digest,
+and a result. They never grant tools or change sender-derived authority. Owner
+task-rule text is loaded from private config as one snapshot shared by
+classification, the main Agent, terminal repair, and pre-send review. Schema v22
+stores only digest and obligation quotes, never the private body.
 
 Opening the database for an operator command does not create or stop a daemon
 session. On startup, unfinished work from older sessions first becomes

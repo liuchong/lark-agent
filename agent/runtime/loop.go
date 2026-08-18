@@ -1338,7 +1338,7 @@ func terminalFinalizerMessages(
 		lastFailure = "none recorded"
 	}
 	return []*schema.Message{
-		schema.SystemMessage("You are the lark-agent terminal finalizer. You have no tools. Do not request, call, or imply any tool use. Produce exactly one JSON object with the same fields accepted by submit_decision. Use only retained runtime evidence below. If evidence is insufficient, return reply_outcome=partial or clarification with evidence_status=insufficient, completed_checks, unknowns, and next_step. Never invent source_refs, code paths, deployment state, or Lark context."),
+		schema.SystemMessage("You are the lark-agent terminal finalizer. You have no tools. Do not request, call, or imply any tool use. Produce exactly one JSON object with the same fields accepted by submit_decision. Use only retained runtime evidence below. If evidence is insufficient, return reply_outcome=partial or clarification with evidence_status=insufficient, completed_checks, unknowns, and next_step. Never invent source_refs, code paths, deployment state, or Lark context.\n" + bundle.TaskRules.ReviewProjection()),
 		schema.UserMessage(fmt.Sprintf(
 			"Original message: %s\nWork kind: %s\nTask class: %s\nTerminal failure: %s\nLast runtime gate failure: %s\nReusable completed checks: %s\nKnown unknowns: %s\nRetained successful tool receipts:\n%s",
 			bundle.Event.Content,

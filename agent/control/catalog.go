@@ -42,6 +42,7 @@ var commandCatalog = []CommandSpec{
 	{Name: domain.OwnerControlMemoryFeedback, UsageZH: "/memory feedback <记忆号> confirm|reject|helpful|unhelpful [说明]", UsageEN: "/memory feedback <memory-id> confirm|reject|helpful|unhelpful [note]", PurposeZH: "确认、拒绝或评价一条记忆", PurposeEN: "confirm, reject, or rate one memory", Mutation: true, Candidate: "memory"},
 	{Name: domain.OwnerControlVersion, Aliases: []string{"version", "版本"}, UsageZH: "/version", UsageEN: "/version", PurposeZH: "查看当前版本", PurposeEN: "show current version"},
 	{Name: domain.OwnerControlPing, Aliases: []string{"ping"}, UsageZH: "/ping", UsageEN: "/ping", PurposeZH: "检查助手是否在线", PurposeEN: "check whether the assistant is online"},
+	{Name: domain.OwnerControlRules, Aliases: []string{"rules", "任务规则"}, UsageZH: "/rules", UsageEN: "/rules", PurposeZH: "查看私人任务规则状态，不含正文", PurposeEN: "show private task-rules status without the file body"},
 }
 
 // Catalog returns a defensive copy of the canonical command catalog.

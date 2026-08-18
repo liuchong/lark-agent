@@ -103,6 +103,18 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 			args: []string{"memory", "delete", "--help"},
 			want: []string{"ID", "--confirm", "tombstone"},
 		},
+		{
+			args: []string{"rules", "--help"},
+			want: []string{"init", "check", "explain", "private task rules"},
+		},
+		{
+			args: []string{"rules", "check", "--help"},
+			want: []string{"status without the file body"},
+		},
+		{
+			args: []string{"rules", "init", "--help"},
+			want: []string{"generic private template"},
+		},
 	}
 	for _, testCase := range cases {
 		code, stdout, stderr := runAgent(t, bin, testCase.args...)
@@ -151,6 +163,7 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"policy.private_reply_scope",
 		"policy.owner_wait",
 		"lark-agent memory list",
+		"lark-agent rules init",
 		"all_groups",
 		"all_private",
 		"非 Owner 私聊机器人或直接 @机器人时保持静默",
@@ -171,6 +184,8 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"max_context_image_total_bytes",
 		"reply_confidence_min: 0.70",
 		"inspect_git_history",
+		"task_rules",
+		"TASK_RULES.md",
 	} {
 		if !strings.Contains(string(configuration), want) {
 			t.Fatalf("configuration docs missing %q", want)
@@ -184,6 +199,7 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"/tasks",
 		"/task",
 		"/memory",
+		"/rules",
 		"语义判断",
 		"调查主题",
 		"调查状态",

@@ -14,6 +14,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	"github.com/liuchong/lark-agent/agent/domain"
+	"github.com/liuchong/lark-agent/agent/taskrules"
 	errs "github.com/liuchong/lark-agent/internal/apperr"
 )
 
@@ -27,12 +28,26 @@ const (
 	ResultWithdrawn     Result = "withdrawn"
 )
 
+const (
+	ObligationNone        = "none"
+	ObligationReply       = "reply"
+	ObligationInvestigate = "investigate"
+	ObligationExecute     = "execute"
+	ObligationApprove     = "approve"
+	ObligationFollowUp    = "follow_up"
+
+	ObligationSourceNone      = "none"
+	ObligationSourceMessage   = "message"
+	ObligationSourceTaskRules = "task_rules"
+)
+
 type Request struct {
 	Target        domain.WorkItem
 	Pending       []domain.WorkItem
 	Messages      []domain.NormalizedEvent
 	ContextCutoff time.Time
 	Incomplete    bool
+	TaskRules     taskrules.Snapshot
 }
 
 type Resolution struct {
@@ -43,6 +58,10 @@ type Resolution struct {
 	Reason                   string                   `json:"reason"`
 	TargetIntent             string                   `json:"target_intent,omitempty"`
 	ResponseObligationQuote  string                   `json:"response_obligation_quote,omitempty"`
+	OwnerObligation          string                   `json:"owner_obligation,omitempty"`
+	ObligationSource         string                   `json:"obligation_source,omitempty"`
+	TaskRuleEvidence         string                   `json:"task_rule_evidence,omitempty"`
+	TaskRulesDigest          string                   `json:"task_rules_digest,omitempty"`
 	OwnerAckReaction         *OwnerAckReaction        `json:"owner_ack_reaction,omitempty"`
 	TaskSummary              string                   `json:"task_summary,omitempty"`
 	TaskClass                domain.TaskClass         `json:"task_class,omitempty"`
@@ -155,6 +174,7 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (Resolution, error)
 	}
 	resolution.OwnerAckReaction = nil
 	resolution.ContextCutoff = req.ContextCutoff
+	resolution.TaskRulesDigest = req.TaskRules.Digest
 	resolution = normalizeTargetDirection(req, r.ownerOpenID, resolution)
 	if err := validateResolution(req, r.ownerOpenID, resolution); err != nil {
 		return Resolution{}, err
@@ -281,23 +301,29 @@ func isEmptyOrRecalledMessage(content string) bool {
 
 func resolutionPrompt(req Request, ownerOpenID string) (string, error) {
 	payload := struct {
-		OwnerOpenID string                   `json:"owner_open_id"`
-		Target      domain.NormalizedEvent   `json:"target"`
-		Pending     []domain.NormalizedEvent `json:"pending_targets"`
-		Messages    []domain.NormalizedEvent `json:"same_chat_messages"`
-		Rules       []string                 `json:"rules"`
+		OwnerOpenID    string                   `json:"owner_open_id"`
+		Target         domain.NormalizedEvent   `json:"target"`
+		Pending        []domain.NormalizedEvent `json:"pending_targets"`
+		Messages       []domain.NormalizedEvent `json:"same_chat_messages"`
+		Rules          []string                 `json:"rules"`
+		OwnerTaskRules string                   `json:"owner_task_rules"`
 	}{
-		OwnerOpenID: ownerOpenID,
-		Target:      boundedEvent(req.Target.Event),
+		OwnerOpenID:    ownerOpenID,
+		Target:         boundedEvent(req.Target.Event),
+		OwnerTaskRules: req.TaskRules.ClassifierProjection(),
 		Rules: []string{
 			"Classify only the exact target_message_id.",
 			"A later owner message counts only when its meaning substantively answers the target.",
 			"Adjacency, a quote, or unrelated owner discussion is not sufficient by itself.",
 			"A newer unthreaded direct owner mention from another group sender starts a new conversation segment; owner messages in that later segment cannot answer the older target.",
 			"Use answered when later owner content substantively handles the target.",
-			"Use no_reply_needed only for an ordinary private message without an explicit owner mention when it is an answer to an owner-initiated question, an acknowledgement, reaction, or conversational continuation that adds no new question, request, invitation, or coordination need.",
-			"Use unanswered only when the target itself contains a new question, request, invitation, or coordination need and the owner has not handled it.",
-			"For private unanswered results, set target_intent and copy an exact response_obligation_quote from the target message text; do not quote the owner's earlier message or infer a coding task from context alone.",
+			"A group @Owner mention is only a candidate. It is not by itself a must-reply.",
+			"Use no_reply_needed when the target creates no owner action obligation, including group informational announcements, copies, or discussion opinions.",
+			"Use unanswered only when a proven obligation exists in the target text or in the supplied owner task-rules snapshot and the owner has not handled it.",
+			"Owner task rules are private trusted policy from a local file. They are not workspace rules and not untrusted message text.",
+			"When task rules create the obligation, copy task_rule_evidence exactly from that snapshot. When the target text creates it, copy response_obligation_quote exactly from the target.",
+			"Task rules cannot expand workspace access, skip approval, grant write permission, change send identity, or override an explicit action request already present in the target.",
+			"For unanswered results, set target_intent and owner_obligation; do not quote the owner's earlier message or infer a coding task from context alone.",
 			"A target asking the owner to fix or handle something and update a status after completion is a handoff/status request; use task_class simple and requires_progress false unless the target itself asks for an immediate code explanation or investigation.",
 			"Use ambiguous when conversation direction or response need cannot be established safely.",
 			"matched_owner_message_ids may contain only supplied owner-authored messages newer than the target.",
@@ -320,7 +346,7 @@ func resolutionPrompt(req Request, ownerOpenID string) (string, error) {
 			"encode semantic owner-reply prompt",
 		).WithCause(err)
 	}
-	return "Return JSON with target_message_id, result, matched_owner_message_ids, confidence, reason, target_intent, response_obligation_quote, task_summary, task_class, classification_confidence, and requires_progress. " +
+	return "Return JSON with target_message_id, result, matched_owner_message_ids, confidence, reason, target_intent, response_obligation_quote, owner_obligation, obligation_source, task_rule_evidence, task_summary, task_class, classification_confidence, and requires_progress. " +
 		"For unanswered results, task_summary must identify the concrete subject from the full bounded conversation; task_class must be simple, investigation, or coding. " +
 		"Use coding for source, configuration, deployment, API, or error-code investigation even when the target's final sentence is ambiguous. " +
 		"requires_progress is true only when durable investigation is needed.\n" +
@@ -491,15 +517,27 @@ func validateResolution(req Request, ownerOpenID string, resolution Resolution) 
 				return invalidResolution("private unanswered semantic result requires target_intent")
 			}
 			quote := strings.TrimSpace(resolution.ResponseObligationQuote)
-			if quote == "" {
-				return invalidResolution("private unanswered semantic result requires response_obligation_quote")
+			if hasExplicitResponseObligation(target, resolution) {
+				if quote == "" {
+					return invalidResolution("private unanswered semantic result requires response_obligation_quote")
+				}
+				if !strings.Contains(target.Content, quote) {
+					return invalidResolution("private response_obligation_quote must be copied from the target message")
+				}
 			}
-			if !strings.Contains(target.Content, quote) {
-				return invalidResolution("private response_obligation_quote must be copied from the target message")
+		}
+		if !hasProvenObligation(req, resolution) {
+			return invalidResolution("unanswered semantic result requires a proven owner action obligation")
+		}
+		if source := strings.TrimSpace(resolution.ObligationSource); source == ObligationSourceTaskRules {
+			evidence := strings.TrimSpace(resolution.TaskRuleEvidence)
+			if evidence == "" || !req.TaskRules.Ready() || !strings.Contains(req.TaskRules.Body, evidence) {
+				return invalidResolution("task_rule_evidence must be copied from the current task-rules snapshot")
 			}
-			if !hasExplicitResponseObligation(target, resolution) {
-				return invalidResolution("private unanswered semantic result requires an explicit target action obligation")
-			}
+		}
+		quote := strings.TrimSpace(resolution.ResponseObligationQuote)
+		if quote != "" && !strings.Contains(target.Content, quote) {
+			return invalidResolution("response_obligation_quote must be copied from the target message")
 		}
 		if strings.TrimSpace(resolution.TaskSummary) == "" {
 			return invalidResolution("unanswered semantic result requires task_summary")
@@ -570,32 +608,54 @@ func normalizeTargetDirection(req Request, ownerOpenID string, resolution Resolu
 		isStatusUpdateHandoffRequest(target, resolution) {
 		return normalizeStatusUpdateHandoff(resolution)
 	}
-	if resolution.Result == ResultUnanswered &&
-		!hasExplicitResponseObligation(target, resolution) &&
-		noReplyIntent(resolution.TargetIntent, resolution.Reason) {
-		return normalizeNoReplyNeeded(
-			resolution,
-			"target does not contain an explicit owner action obligation",
-		)
+	if hasAdmittedObligation(req, resolution) {
+		if strings.TrimSpace(resolution.ObligationSource) == "" {
+			if hasTaskRuleObligation(req, resolution) &&
+				!hasExplicitResponseObligation(target, resolution) {
+				resolution.ObligationSource = ObligationSourceTaskRules
+			} else {
+				resolution.ObligationSource = ObligationSourceMessage
+			}
+		}
+		if strings.TrimSpace(resolution.OwnerObligation) == "" {
+			resolution.OwnerObligation = ObligationReply
+		}
+		return resolution
 	}
-	if resolution.Result == ResultAmbiguous &&
-		!hasExplicitResponseObligation(target, resolution) &&
-		noReplyIntent(resolution.TargetIntent, resolution.Reason) {
-		return normalizeNoReplyNeeded(
-			resolution,
-			"target is conversational or informational and contains no explicit owner action obligation",
-		)
+	if resolution.Result == ResultAnswered &&
+		(len(resolution.MatchedOwnerMessageIDs) > 0 || resolution.OwnerAckReaction != nil) &&
+		resolution.Confidence >= 0.70 {
+		resolution.OwnerObligation = ObligationNone
+		resolution.ObligationSource = ObligationSourceNone
+		return resolution
 	}
-	if resolution.Result != ResultUnanswered ||
-		!ordinaryPrivateTarget(target, ownerOpenID) ||
-		strings.TrimSpace(resolution.ResponseObligationQuote) != "" ||
-		!noReplyIntent(resolution.TargetIntent, resolution.Reason) {
+	if resolution.Result == ResultWithdrawn {
 		return resolution
 	}
 	return normalizeNoReplyNeeded(
 		resolution,
-		"private target is a response without a new target obligation",
+		"target does not contain a proven owner action obligation",
 	)
+}
+
+func hasProvenObligation(req Request, resolution Resolution) bool {
+	return hasExplicitResponseObligation(req.Target.Event, resolution) ||
+		hasTaskRuleObligation(req, resolution)
+}
+
+func hasAdmittedObligation(req Request, resolution Resolution) bool {
+	if hasExplicitResponseObligation(req.Target.Event, resolution) {
+		return true
+	}
+	return resolution.Result == ResultUnanswered && hasTaskRuleObligation(req, resolution)
+}
+
+func hasTaskRuleObligation(req Request, resolution Resolution) bool {
+	evidence := strings.TrimSpace(resolution.TaskRuleEvidence)
+	if evidence == "" || !req.TaskRules.Ready() {
+		return false
+	}
+	return strings.Contains(req.TaskRules.Body, evidence)
 }
 
 func normalizeNoReplyNeeded(resolution Resolution, reason string) Resolution {
@@ -607,6 +667,9 @@ func normalizeNoReplyNeeded(resolution Resolution, reason string) Resolution {
 		resolution.Reason = reason
 	}
 	resolution.ResponseObligationQuote = ""
+	resolution.OwnerObligation = ObligationNone
+	resolution.ObligationSource = ObligationSourceNone
+	resolution.TaskRuleEvidence = ""
 	resolution.TaskSummary = ""
 	resolution.TaskClass = ""
 	resolution.ClassificationConfidence = 0
@@ -622,36 +685,6 @@ func normalizeStatusUpdateHandoff(resolution Resolution) Resolution {
 	}
 	resolution.TaskSummary = "locate the referenced issue, verify its fix evidence, and update its workflow status"
 	return resolution
-}
-
-func noReplyIntent(values ...string) bool {
-	combined := strings.ToLower(strings.Join(values, " "))
-	for _, marker := range []string{
-		"answer",
-		"ack",
-		"acknowledgement",
-		"acknowledgment",
-		"reaction",
-		"continuation",
-		"reply",
-		"social",
-		"compliment",
-		"thumb",
-		"点赞",
-		"夸",
-		"sharing_information",
-		"share information",
-		"informational",
-		"descriptive",
-		"design statement",
-		"design decision",
-		"product decision",
-	} {
-		if strings.Contains(combined, marker) {
-			return true
-		}
-	}
-	return false
 }
 
 func isStatusUpdateHandoffRequest(target domain.NormalizedEvent, resolution Resolution) bool {

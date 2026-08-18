@@ -18,6 +18,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/replymatch"
 	"github.com/liuchong/lark-agent/agent/router"
 	"github.com/liuchong/lark-agent/agent/storage"
+	"github.com/liuchong/lark-agent/agent/taskrules"
 	serviceim "github.com/liuchong/lark-agent/internal/lark"
 )
 
@@ -49,9 +50,10 @@ func (m *semanticIntegrationModel) Generate(
 }
 
 type semanticIntegrationResolver struct {
-	store    *storage.Store
-	matcher  *replymatch.Resolver
-	messages []domain.NormalizedEvent
+	store     *storage.Store
+	matcher   *replymatch.Resolver
+	messages  []domain.NormalizedEvent
+	taskRules taskrules.Snapshot
 }
 
 type semanticSequenceResolver struct {
@@ -88,6 +90,7 @@ func (r semanticIntegrationResolver) Resolve(
 		Pending:       pending,
 		Messages:      r.messages,
 		ContextCutoff: time.Now().UTC(),
+		TaskRules:     r.taskRules,
 	})
 	if err != nil {
 		return replymatch.Resolution{}, err
@@ -1467,6 +1470,130 @@ func TestSemanticDelegatedReplyLifecycleAcrossGroupAndPrivateMessages(t *testing
 				semanticModel.calls,
 				builder.calls,
 				builder.item,
+				decider.calls,
+				replier.calls,
+			)
+		}
+	})
+
+	t.Run("informational group mention does not start the main agent", func(t *testing.T) {
+		store := openSemanticIntegrationStore(t)
+		base := store.CurrentSession().StartedAt.Add(time.Second)
+		item := enqueueDueDelegatedItem(t, store, domain.NormalizedEvent{
+			Source:    domain.SourcePoll,
+			EventID:   "poll:om_group_info",
+			MessageID: "om_group_info",
+			ChatID:    "oc_any_group",
+			ChatType:  "group",
+			SenderID:  "ou_teammate",
+			Content:   "@测试负责人 流程已更新，抄送相关同事。",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+			CreatedAt: base,
+		})
+		semanticModel := &semanticIntegrationModel{response: `{
+			"target_message_id":"om_group_info",
+			"result":"answered",
+			"confidence":0.62,
+			"reason":"group mention without later owner reply",
+			"target_intent":"informational_announcement"
+		}`}
+		builder := &semanticIntegrationBuilder{}
+		decider := &semanticIntegrationDecider{}
+		replier := &semanticIntegrationReplyHandler{}
+		daemon := app.NewDaemon(
+			store,
+			router.New(router.Config{
+				OwnerOpenID: "ou_owner",
+				Mode:        domain.ModeAuto,
+			}),
+			app.WithContextBuilder(builder),
+			app.WithDecider(decider),
+			app.WithReplyHandler(replier),
+			app.WithDelegatedReplyResolver(semanticIntegrationResolver{
+				store:    store,
+				matcher:  replymatch.New(semanticModel, "ou_owner"),
+				messages: []domain.NormalizedEvent{item.Event},
+			}, 0.85, 30*time.Second),
+		)
+		result, err := daemon.RunOnce(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Decision.Reason != "delegated_reply_not_needed" ||
+			builder.calls != 0 || decider.calls != 0 || replier.calls != 0 {
+			t.Fatalf(
+				"result=%+v builder=%d decider=%d replier=%d",
+				result,
+				builder.calls,
+				decider.calls,
+				replier.calls,
+			)
+		}
+	})
+
+	t.Run("private task rules can create investigation without a message ask", func(t *testing.T) {
+		store := openSemanticIntegrationStore(t)
+		base := store.CurrentSession().StartedAt.Add(time.Second)
+		item := enqueueDueDelegatedItem(t, store, domain.NormalizedEvent{
+			Source:    domain.SourcePoll,
+			EventID:   "poll:om_group_queue",
+			MessageID: "om_group_queue",
+			ChatID:    "oc_any_group",
+			ChatType:  "group",
+			SenderID:  "ou_teammate",
+			Content:   "@测试负责人 REVIEW-QUEUE item 7 is ready.",
+			Mentions:  []domain.Mention{{OpenID: "ou_owner"}},
+			CreatedAt: base,
+		})
+		semanticModel := &semanticIntegrationModel{response: `{
+			"target_message_id":"om_group_queue",
+			"result":"unanswered",
+			"confidence":0.94,
+			"reason":"private task rules require investigation",
+			"target_intent":"investigation_request",
+			"owner_obligation":"investigate",
+			"obligation_source":"task_rules",
+			"task_rule_evidence":"Investigate every message that contains REVIEW-QUEUE.",
+			"task_summary":"Investigate REVIEW-QUEUE item 7.",
+			"task_class":"investigation",
+			"classification_confidence":0.91,
+			"requires_progress":true
+		}`}
+		builder := &semanticIntegrationBuilder{}
+		decider := &semanticIntegrationDecider{}
+		replier := &semanticIntegrationReplyHandler{}
+		daemon := app.NewDaemon(
+			store,
+			router.New(router.Config{
+				OwnerOpenID: "ou_owner",
+				Mode:        domain.ModeAuto,
+			}),
+			app.WithContextBuilder(builder),
+			app.WithDecider(decider),
+			app.WithReplyHandler(replier),
+			app.WithDelegatedReplyResolver(semanticIntegrationResolver{
+				store:    store,
+				matcher:  replymatch.New(semanticModel, "ou_owner"),
+				messages: []domain.NormalizedEvent{item.Event},
+				taskRules: taskrules.Snapshot{
+					Enabled: true,
+					Status:  taskrules.StatusOK,
+					Body:    "# Rules\nInvestigate every message that contains REVIEW-QUEUE.\n",
+					Digest:  "sha256:fixture",
+				},
+			}, 0.85, 30*time.Second),
+		)
+		result, err := daemon.RunOnce(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if builder.calls != 1 || decider.calls != 1 || replier.calls != 1 ||
+			builder.item.TaskClass != domain.TaskClassInvestigation ||
+			result.Decision.Kind != domain.DecisionReply {
+			t.Fatalf(
+				"result=%+v builder=%+v decider=%d replier=%d",
+				result,
+				builder,
 				decider.calls,
 				replier.calls,
 			)
