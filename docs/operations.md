@@ -10,11 +10,11 @@ lark-agent daemon restart
 ```
 
 LaunchAgent label 是 `com.liuchong.lark-agent`。日志位于
-`~/Library/Logs/lark-agent/`。菜单栏左键打开结构化状态面板，查看服务是否在跑、
-当前模式、队列计数、待审批、任务规则公开状态、回复范围和最近工作；右键仍是
-启动、停止、暂停和打开配置/日志。面板不展示令牌、密钥、私人规则正文或原始
-命令 JSON。10 秒刷新只更新图标上的运行/待办计数，完整诊断只在打开面板或点刷新
-时加载。
+`~/Library/Logs/lark-agent/`。菜单栏左键打开结构化状态面板，打开后先显示服务是否
+在跑、待审批条目、需要关注的队列计数和最近工作；任务规则、回复范围和诊断在
+`doctor` 返回后补齐。右键仍是启动、停止、暂停和打开配置/日志。面板不展示令牌、
+密钥、私人规则正文、审批请求/响应正文或原始命令 JSON，也不拉取全量审批历史。
+10 秒刷新只更新图标上的运行/待办计数，完整诊断只在打开面板或点刷新时加载。
 
 官方 Lark SDK 中可能携带连接凭据的调试和普通信息日志会被抑制；事件分发器固定的
 无凭据 ready 提示可以保留，警告与错误会在凭据字段脱敏后保留。日志中不得出现
@@ -256,6 +256,11 @@ lark-agent approval status
 lark-agent approval approve ACTION_ID
 lark-agent approval reject ACTION_ID
 ```
+
+`approval status` 给状态栏和图标刷新使用：只返回各状态计数，以及最多 5 条待审批
+公开字段（动作号、类型、工作号、状态）。不会输出 `request_json` /
+`response_json`。查看某条拟执行内容仍用 `approval show`。`approval list` 仍是
+运维全量记录，状态栏不得调用它。
 
 批准和拒绝只作用于指定 action ID，不会重新运行模型改写草稿。
 当代回复因可信度不足或明确风险进入审批时，智能助手会主动私聊 Owner，明确说明

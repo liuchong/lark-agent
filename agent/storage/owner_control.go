@@ -153,7 +153,8 @@ func ownerTaskWhere(view domain.OwnerTaskView) (string, []any, error) {
 }
 
 // ListPendingOwnerApprovals returns only actions that still await an owner
-// decision.
+// decision. The page is public: request and response bodies are omitted so
+// local status surfaces can list pending rows without loading approval drafts.
 func (s *Store) ListPendingOwnerApprovals(
 	ctx context.Context,
 	page, pageSize int,
@@ -184,7 +185,7 @@ func (s *Store) ListPendingOwnerApprovals(
 	rows, err := s.db.QueryContext(
 		ctx,
 		`SELECT id, work_item_id, COALESCE(run_id, ''), kind, idempotency_key, status,
-		        COALESCE(request_json, ''), COALESCE(response_json, ''), COALESCE(error, ''),
+		        '', '', COALESCE(error, ''),
 		        created_at, updated_at
 		 FROM action_attempts WHERE status = ?
 		 ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`,

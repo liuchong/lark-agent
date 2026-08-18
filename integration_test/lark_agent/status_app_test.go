@@ -66,6 +66,41 @@ func TestStatusAppDoesNotUseRawJSONAsPrimaryStatus(t *testing.T) {
 	}
 }
 
+func TestStatusAppReadsCommandStdoutBeforeWaitingForExit(t *testing.T) {
+	source := functionSource(statusAppSource(t), "runAgent")
+	readAt := strings.Index(source, "readDataToEndOfFile")
+	waitAt := strings.Index(source, "waitUntilExit")
+	if readAt < 0 || waitAt < 0 || readAt > waitAt {
+		t.Fatalf("runAgent must read stdout to EOF before waitUntilExit:\n%s", source)
+	}
+}
+
+func TestStatusAppDoesNotLoadUnboundedApprovalHistory(t *testing.T) {
+	source := statusAppSource(t)
+	if strings.Contains(source, `["approval", "list"]`) {
+		t.Fatal("status popover must not invoke unbounded approval list")
+	}
+	cheap := functionSource(source, "collectCheapSnapshot")
+	if !strings.Contains(cheap, `"approval"`) || !strings.Contains(cheap, `"status"`) {
+		t.Fatal("icon refresh must keep using approval status")
+	}
+	detail := functionSource(source, "collectPanelSnapshot")
+	if strings.Contains(detail, `"list"`) {
+		t.Fatal("popover detail must not fall back to approval list")
+	}
+}
+
+func TestStatusAppShowsActionableRowsBeforeDiagnosis(t *testing.T) {
+	source := functionSource(statusAppSource(t), "rebuildContent")
+	approvalsAt := strings.Index(source, "copy.approvals")
+	recentAt := strings.Index(source, "copy.recentWork")
+	diagnosisAt := strings.Index(source, "copy.diagnosis")
+	if approvalsAt < 0 || recentAt < 0 || diagnosisAt < 0 ||
+		approvalsAt > recentAt || recentAt > diagnosisAt {
+		t.Fatalf("service panel must show approvals and recent work before diagnosis:\n%s", source)
+	}
+}
+
 func TestStatusAppOmitsSecretsFromPanelSource(t *testing.T) {
 	source := statusAppSource(t)
 	for _, forbidden := range []string{

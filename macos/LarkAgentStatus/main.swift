@@ -13,6 +13,8 @@ final class AgentMenuApp: NSObject, NSApplicationDelegate {
     private var bannerText = ""
     private var cheapSnapshot = StatusSnapshot()
     private var displayedSnapshot = StatusSnapshot()
+    private var detailLoadInFlight = false
+    private var detailLoadGeneration = 0
 
     override init() {
         super.init()
@@ -106,7 +108,7 @@ final class AgentMenuApp: NSObject, NSApplicationDelegate {
         rebuildMenu(status: status)
         overlayCheap(&displayedSnapshot, cheap: cheapSnapshot)
         if popover.isShown {
-            panel.render(displayedSnapshot, banner: bannerText, doctorLoading: false)
+            panel.render(displayedSnapshot, banner: bannerText, doctorLoading: detailLoadInFlight)
         }
     }
 
@@ -144,9 +146,13 @@ final class AgentMenuApp: NSObject, NSApplicationDelegate {
     }
 
     private func loadDetailedSnapshot() {
+        detailLoadInFlight = true
+        detailLoadGeneration += 1
+        let generation = detailLoadGeneration
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            var snapshot = self.collectPanelSnapshot()
+            var snapshot = self.cheapSnapshot
+            snapshot = self.collectPanelSnapshot(base: snapshot)
             let doctor = self.runAgent(["doctor"])
             let envelope = parseEnvelope(doctor.output)
             if envelope.ok {
@@ -155,6 +161,8 @@ final class AgentMenuApp: NSObject, NSApplicationDelegate {
                 snapshot.sectionErrors.append(envelope.errorMessage.isEmpty ? self.copy.commandFailed : envelope.errorMessage)
             }
             DispatchQueue.main.async {
+                guard generation == self.detailLoadGeneration else { return }
+                self.detailLoadInFlight = false
                 self.displayedSnapshot = snapshot
                 overlayCheap(&self.displayedSnapshot, cheap: self.cheapSnapshot)
                 self.panel.render(self.displayedSnapshot, banner: self.bannerText, doctorLoading: false)
@@ -190,13 +198,8 @@ final class AgentMenuApp: NSObject, NSApplicationDelegate {
         return snapshot
     }
 
-    private func collectPanelSnapshot() -> StatusSnapshot {
-        var snapshot = collectCheapSnapshot()
-        let approvalList = runAgent(["approval", "list"])
-        let listEnvelope = parseEnvelope(approvalList.output)
-        if listEnvelope.ok {
-            applyApprovals(&snapshot, data: listEnvelope.data)
-        }
+    private func collectPanelSnapshot(base: StatusSnapshot) -> StatusSnapshot {
+        var snapshot = base
         let rules = runAgent(["rules", "check"])
         let rulesEnvelope = parseEnvelope(rules.output)
         if rulesEnvelope.ok {
@@ -292,8 +295,8 @@ final class AgentMenuApp: NSObject, NSApplicationDelegate {
         process.standardError = FileHandle.nullDevice
         do {
             try process.run()
-            process.waitUntilExit()
             let data = stdout.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
             return CommandResult(
                 output: String(data: data, encoding: .utf8) ?? "",
                 ok: process.terminationStatus == 0

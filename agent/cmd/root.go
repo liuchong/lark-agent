@@ -4091,21 +4091,32 @@ func newApprovalCommand(out io.Writer, statePath *string) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "status",
 		Short: "Summarize action records by status",
+		Long: "Summarize action records by status and return at most five pending " +
+			"public approval rows. The preview never includes request_json or " +
+			"response_json; use approval show for one action's proposed content.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := storage.OpenInspection(resolveStatePath(*statePath))
 			if err != nil {
 				return err
 			}
 			defer store.Close() //nolint:errcheck
-			actions, err := store.ListActionAttempts()
+			counts, total, err := store.ActionAttemptCounts()
 			if err != nil {
 				return err
 			}
-			counts := map[domain.ActionStatus]int{}
-			for _, action := range actions {
-				counts[action.Status]++
+			pending, err := store.ListPendingOwnerApprovals(cmd.Context(), 1, 5)
+			if err != nil {
+				return err
 			}
-			return writeData(out, map[string]any{"counts": counts, "total": len(actions)})
+			actions := pending.Items
+			if actions == nil {
+				actions = []domain.ActionAttempt{}
+			}
+			return writeData(out, map[string]any{
+				"counts":  counts,
+				"total":   total,
+				"actions": actions,
+			})
 		},
 	})
 	cmd.AddCommand(newApprovalShowCommand(out, statePath))

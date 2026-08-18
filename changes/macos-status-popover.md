@@ -37,22 +37,32 @@ change does not add a web UI, SwiftUI, or a new daemon command.
 - Right-click: existing control menu.
 - Periodic refresh: `daemon status`, `approval status`, and `queue summary`
   only, so the icon badge stays current without Keychain/SDK doctor work.
+- `approval status` is the cheap pending-approval source: counts plus at most
+  five public pending rows. It must not serialize `request_json` /
+  `response_json` or dump the full action history.
 - Opening the popover loads those cheap commands immediately, then may load
-  `doctor` and a bounded approval list to fill remaining sections.
+  `doctor` and `rules check` to fill remaining sections.
+- Child commands must be read to EOF before `waitUntilExit`. Waiting first
+  deadlocks once stdout exceeds the pipe buffer, which is what made the panel
+  stick on “正在加载诊断…”.
 
 ### Panel sections
 
 1. Service: running/stopped/not installed, loaded, pid, mode, last error.
-2. Queue: status counts including interrupted and dead_letter, stale
-   processing, and lane counts.
-3. Approvals: awaiting count and bounded rows of id, kind, work item, status.
-4. Task rules: public view only (`enabled`, `status`, `file_name`, `bytes`,
+2. Approvals: awaiting count and bounded rows of id, kind, work item, status,
+   with approve/reject. These rows come from `approval status` on first paint.
+3. Queue: attention tiles for processing, interrupted, dead_letter, and
+   awaiting approval; historical completed/ignored/cancelled/received counts
+   are one summary line; stale processing and lane counts remain.
+4. Recent work: work item id, kind, status, duration, model turns. Message IDs
+   are omitted from this surface. This section is visible before `doctor`.
+5. Task rules: public view only (`enabled`, `status`, `file_name`, `bytes`,
    truncated digest).
-5. Reply scopes: assistant, owner, and private scopes plus owner-wait.
-6. GitHub: enabled, read-only, and whether a token is configured. Never the
+6. Reply scopes: assistant, owner, and private scopes plus owner-wait.
+7. GitHub: enabled, read-only, and whether a token is configured. Never the
    token value.
-7. Recent work: work item id, kind, status, duration, model turns. Message IDs
-   are omitted from this surface.
+8. Diagnosis: app id configured, user-token configured/missing, realtime
+   flag, and whether a workspace root is configured.
 
 Command results appear as a one-line banner in the popover when it is open,
 or as a one-line alert summary when the owner used the right-click menu.
@@ -71,6 +81,13 @@ Then a popover lists structured service, queue, approval, task-rule public,
 reply-scope, GitHub non-secret, and recent-work rows
 And the primary layout is not a raw JSON dump
 And secret and request bodies are absent from the panel source
+And the app does not invoke unbounded `approval list`
+
+Given approval history is large
+When the owner opens the popover
+Then pending public approval rows still appear
+And diagnosis sections are not left finished-but-empty because a pipe deadlock
+blocked `doctor`
 
 Given the menu bar app is running
 When the owner right-clicks the status item

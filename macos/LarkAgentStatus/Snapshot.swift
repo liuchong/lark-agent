@@ -91,6 +91,7 @@ struct PanelCopy {
     var error: String { chinese ? "错误" : "Error" }
     var checking: String { chinese ? "检查中…" : "Checking…" }
     var loadingDiagnosis: String { chinese ? "正在加载诊断…" : "Loading diagnosis…" }
+    var diagnosisUnavailable: String { chinese ? "诊断暂不可用" : "Diagnosis unavailable" }
     var none: String { chinese ? "无" : "None" }
     var enabled: String { chinese ? "已启用" : "Enabled" }
     var disabled: String { chinese ? "未启用" : "Disabled" }
@@ -104,11 +105,12 @@ struct PanelCopy {
     var lastError: String { chinese ? "最近错误" : "Last error" }
     var stale: String { chinese ? "过期处理中" : "Stale processing" }
     var lanes: String { chinese ? "工作类型" : "Work kinds" }
-    var start: String { "Start" }
-    var stop: String { "Stop" }
-    var restart: String { "Restart" }
-    var pause: String { "Pause" }
-    var auto: String { "Auto" }
+    var history: String { chinese ? "历史" : "History" }
+    var start: String { chinese ? "启动" : "Start" }
+    var stop: String { chinese ? "停止" : "Stop" }
+    var restart: String { chinese ? "重启" : "Restart" }
+    var pause: String { chinese ? "暂停" : "Pause" }
+    var auto: String { chinese ? "自动" : "Auto" }
     var refresh: String { chinese ? "刷新" : "Refresh" }
     var config: String { chinese ? "配置" : "Config" }
     var logs: String { chinese ? "日志" : "Logs" }
@@ -293,9 +295,7 @@ func overlayCheap(_ displayed: inout StatusSnapshot, cheap: StatusSnapshot) {
     displayed.laneCounts = cheap.laneCounts
     displayed.staleProcessing = cheap.staleProcessing
     displayed.pendingApprovals = cheap.pendingApprovals
-    if !cheap.approvals.isEmpty {
-        displayed.approvals = cheap.approvals
-    }
+    displayed.approvals = cheap.approvals
     displayed.recent = cheap.recent
     displayed.sectionErrors = cheap.sectionErrors
     if !cheap.taskRulesStatus.isEmpty || cheap.taskRulesEnabled {
@@ -337,6 +337,31 @@ func applyDoctor(_ snapshot: inout StatusSnapshot, data: [String: Any]) {
     snapshot.larkRealtime = jsonString(lark["realtime"])
     let workspace = asDict(data["workspace"])
     snapshot.workspaceConfigured = !jsonString(workspace["configured_root"]).isEmpty
+}
+
+func queueStatusTitle(_ key: String, copy: PanelCopy) -> String {
+    switch key {
+    case "processing":
+        return copy.chinese ? "处理中" : "processing"
+    case "interrupted":
+        return copy.chinese ? "已中断" : "interrupted"
+    case "dead_letter":
+        return copy.chinese ? "死信" : "dead letter"
+    case "awaiting_approval":
+        return copy.chinese ? "待审批" : "awaiting approval"
+    case "completed":
+        return copy.chinese ? "已完成" : "completed"
+    case "ignored":
+        return copy.chinese ? "已忽略" : "ignored"
+    case "cancelled":
+        return copy.chinese ? "已取消" : "cancelled"
+    case "received":
+        return copy.chinese ? "已接收" : "received"
+    case "ready":
+        return copy.chinese ? "就绪" : "ready"
+    default:
+        return key.replacingOccurrences(of: "_", with: " ")
+    }
 }
 
 func truncatedDigest(_ digest: String) -> String {

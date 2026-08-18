@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -407,5 +408,52 @@ func TestOwnerTaskActionViewDoesNotOrderRFC3339NanoTextAsTime(t *testing.T) {
 	}
 	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].WorkItem.ID != item.ID {
 		t.Fatalf("older resolution hid newer work epoch: %+v", page)
+	}
+}
+
+func TestListPendingOwnerApprovalsOmitsRequestBodiesAndIsBounded(t *testing.T) {
+	store := openStore(t)
+	item := enqueueOwnerControlTestItem(t, store, domain.NormalizedEvent{
+		MessageID: "om_pending_public", Content: "需要审批",
+	})
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	secret := `{"text":"SECRET_DRAFT_BODY"}`
+	for i := 0; i < 8; i++ {
+		status := domain.ActionCompleted
+		if i >= 6 {
+			status = domain.ActionAwaitingApproval
+		}
+		if _, err := store.db.Exec(
+			`INSERT INTO action_attempts(
+				work_item_id, kind, idempotency_key, status, request_json, created_at, updated_at
+			 ) VALUES (?, 'reply', ?, ?, ?, ?, ?)`,
+			item.ID, fmt.Sprintf("pending-public-%d", i), status, secret, now, now,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	counts, total, err := store.ActionAttemptCounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 8 || counts[domain.ActionCompleted] != 6 || counts[domain.ActionAwaitingApproval] != 2 {
+		t.Fatalf("counts=%v total=%d", counts, total)
+	}
+
+	page, err := store.ListPendingOwnerApprovals(context.Background(), 1, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 2 || len(page.Items) != 2 {
+		t.Fatalf("page=%+v", page)
+	}
+	for _, action := range page.Items {
+		if action.RequestJSON != "" || action.ResponseJSON != "" {
+			t.Fatalf("pending list leaked request bodies: %+v", action)
+		}
+		if action.Status != domain.ActionAwaitingApproval || action.ID <= 0 {
+			t.Fatalf("action=%+v", action)
+		}
 	}
 }

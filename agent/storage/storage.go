@@ -2718,6 +2718,32 @@ func (s *Store) ListActionAttempts() ([]domain.ActionAttempt, error) {
 	return actions, rows.Err()
 }
 
+// ActionAttemptCounts summarizes action records without loading request bodies.
+func (s *Store) ActionAttemptCounts() (map[domain.ActionStatus]int, int, error) {
+	rows, err := s.db.Query(`SELECT status, COUNT(*) FROM action_attempts GROUP BY status`)
+	if err != nil {
+		return nil, 0, errs.NewInternalError(errs.SubtypeStorage, "count action attempts").WithCause(err)
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+	counts := map[domain.ActionStatus]int{}
+	total := 0
+	for rows.Next() {
+		var status domain.ActionStatus
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, 0, errs.NewInternalError(errs.SubtypeStorage, "scan action attempt counts").WithCause(err)
+		}
+		counts[status] = count
+		total += count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, errs.NewInternalError(errs.SubtypeStorage, "iterate action attempt counts").WithCause(err)
+	}
+	return counts, total, nil
+}
+
 // GetActionAttempt returns one approval or action audit record.
 func (s *Store) GetActionAttempt(id int64) (domain.ActionAttempt, error) {
 	row := s.db.QueryRow(

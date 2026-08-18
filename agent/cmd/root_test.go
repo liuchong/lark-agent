@@ -1911,3 +1911,46 @@ func TestRecoveryNoticeExplainsCrossSessionContextReview(t *testing.T) {
 		t.Fatalf("context review was rendered as uncertain action: %s", text)
 	}
 }
+
+func TestApprovalStatusReturnsBoundedPublicPendingActions(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	store, err := storage.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := domain.NormalizedEvent{MessageID: "om_status_pending", Content: "需要审批"}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	secret := strings.Repeat("SECRET_DRAFT_BODY", 4000)
+	if _, err := store.RequestShellApproval(
+		context.Background(),
+		domain.DedupKey(event),
+		secret,
+		t.TempDir(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	if code := Execute(strings.NewReader(""), &out, &errOut, []string{
+		"--state", statePath, "approval", "status",
+	}); code != 0 {
+		t.Fatalf("approval status code=%d stderr=%s stdout=%s", code, errOut.String(), out.String())
+	}
+	text := out.String()
+	if strings.Contains(text, "SECRET_DRAFT_BODY") || strings.Contains(text, "request_json") {
+		t.Fatalf("approval status leaked request bodies: %s", text)
+	}
+	if !strings.Contains(text, `"actions"`) ||
+		!strings.Contains(text, `"awaiting_approval"`) ||
+		!strings.Contains(text, `"shell"`) {
+		t.Fatalf("approval status missing public pending preview: %s", text)
+	}
+	if len(text) > 16*1024 {
+		t.Fatalf("approval status output too large: %d", len(text))
+	}
+}

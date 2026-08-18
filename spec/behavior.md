@@ -633,7 +633,14 @@ popover is the primary status surface; raw command JSON is not the primary
 layout. Tokens, app secrets, private task-rule bodies, owner open IDs, and
 approval `request_json` / `response_json` are never shown. The 10-second icon
 refresh uses only `daemon status`, `approval status`, and `queue summary`.
-Opening the popover may additionally load `doctor` and a bounded approval list.
+`approval status` returns status counts plus a bounded public pending-action
+preview (id, kind, work item, status) and never includes request or response
+bodies. Opening the popover may additionally load `doctor` and `rules check`.
+The controller reads child-command stdout while the process runs so a large
+envelope cannot deadlock the pipe. The first visible rows are service,
+attention queue counts, pending approval actions, and recent work; historical
+completed/ignored/cancelled totals are a summary line, not the primary tiles.
+Diagnosis sections may show a loading state only while `doctor` is in flight.
 Right-click keeps Start/Stop/Restart, Pause/Resume Auto, Open Config, Open
 Logs, and Quit. The App bundle carries the repository's branded macOS icon
 through `CFBundleIconFile`. The menu bar uses the matching monochrome template
@@ -655,10 +662,23 @@ Given the menu bar app is running, when the owner left-clicks the status item,
 then a popover lists structured service, queue, approval, task-rule public,
 reply-scope, GitHub non-secret, and recent-work rows, and the layout is not a
 raw JSON dump.
+Given the menu bar app is running and approval history contains many records
+with request bodies, when the owner left-clicks the status item, then the
+popover still completes, pending approval rows appear without request or
+response bodies, and the app does not invoke unbounded `approval list`.
+Given the menu bar app is running, when the owner left-clicks the status item
+before `doctor` returns, then service, attention queue counts, pending
+approvals, and recent work are already visible.
+Given a status-app child command writes more stdout than a pipe buffer, when
+the controller runs that command, then it reads stdout before waiting for
+exit and the command completes.
 Given the menu bar app is running, when the owner right-clicks the status item,
 then the existing Start/Stop/Restart control menu remains available.
 Given the periodic status refresh, when the popover is closed, then the
 controller does not invoke `doctor`.
+Given the periodic status refresh, when the popover is open and `doctor` is
+still in flight, then diagnosis sections remain in a loading state instead of
+appearing finished.
 
 The user-level installation may write files only under the current user's
 `~/.config/lark-agent`, `~/Applications`,

@@ -13,6 +13,7 @@ final class StatusPanelController: NSViewController {
     private let footer = NSStackView()
     private var snapshot = StatusSnapshot()
     private var bannerText = ""
+    private var doctorLoading = false
 
     override func loadView() {
         effect.material = .popover
@@ -75,6 +76,7 @@ final class StatusPanelController: NSViewController {
     func render(_ snapshot: StatusSnapshot, banner: String, doctorLoading: Bool) {
         self.snapshot = snapshot
         bannerText = banner
+        self.doctorLoading = doctorLoading
         if spinner.superview == nil {
             _ = view
         }
@@ -84,6 +86,7 @@ final class StatusPanelController: NSViewController {
             spinner.stopAnimation(nil)
         }
         rebuildContent()
+        scrollToTop()
     }
 
     private func rebuildContent() {
@@ -104,14 +107,20 @@ final class StatusPanelController: NSViewController {
             stack.addArrangedSubview(errorLine(message))
         }
         stack.addArrangedSubview(card(title: copy.service, views: serviceRows()))
-        stack.addArrangedSubview(card(title: copy.queue, views: queueViews()))
         stack.addArrangedSubview(card(title: copy.approvals, views: approvalViews()))
+        stack.addArrangedSubview(card(title: copy.queue, views: queueViews()))
+        stack.addArrangedSubview(card(title: copy.recentWork, views: recentViews()))
         stack.addArrangedSubview(card(title: copy.taskRules, views: taskRuleRows()))
         stack.addArrangedSubview(card(title: copy.replyScopes, views: scopeRows()))
         stack.addArrangedSubview(card(title: copy.github, views: githubRows()))
         stack.addArrangedSubview(card(title: copy.diagnosis, views: diagnosisRows()))
-        stack.addArrangedSubview(card(title: copy.recentWork, views: recentViews()))
         view.layoutSubtreeIfNeeded()
+    }
+
+    private func scrollToTop() {
+        view.layoutSubtreeIfNeeded()
+        scroll.contentView.scroll(to: .zero)
+        scroll.reflectScrolledClipView(scroll.contentView)
     }
 
     private func rebuildFooter() {
@@ -229,24 +238,28 @@ final class StatusPanelController: NSViewController {
     }
 
     private func queueViews() -> [NSView] {
-        let keys = [
-            "ready", "processing", "interrupted", "dead_letter",
-            "awaiting_approval", "completed", "ignored", "cancelled",
-        ]
-        var tiles: [NSView] = keys.compactMap { key in
+        let attention = ["processing", "interrupted", "dead_letter", "awaiting_approval"]
+        let historical = ["received", "ready", "completed", "ignored", "cancelled"]
+        var tiles: [NSView] = attention.map { key in
             let count = snapshot.queueCounts[key] ?? 0
-            if count == 0 && key != "processing" && key != "interrupted" && key != "dead_letter" {
-                return nil
-            }
-            return metricTile(title: key.replacingOccurrences(of: "_", with: " "), value: "\(count)", emphasize: count > 0 && (key == "interrupted" || key == "dead_letter"))
+            return metricTile(
+                title: queueStatusTitle(key, copy: copy),
+                value: "\(count)",
+                emphasize: count > 0 && (key == "interrupted" || key == "dead_letter" || key == "awaiting_approval")
+            )
         }
         if snapshot.staleProcessing > 0 {
             tiles.append(metricTile(title: copy.stale, value: "\(snapshot.staleProcessing)", emphasize: true))
         }
-        if tiles.isEmpty {
-            return [muted(copy.none)]
-        }
         var views: [NSView] = [wrapTiles(tiles)]
+        let historyParts = historical.compactMap { key -> String? in
+            let count = snapshot.queueCounts[key] ?? 0
+            guard count > 0 else { return nil }
+            return "\(queueStatusTitle(key, copy: copy)) \(count)"
+        }
+        if !historyParts.isEmpty {
+            views.append(labeled(copy.history, historyParts.joined(separator: " · ")))
+        }
         let lanes = snapshot.laneCounts.filter { $0.value > 0 }.sorted { $0.key < $1.key }
         if !lanes.isEmpty {
             let text = lanes.map { "\($0.key) \($0.value)" }.joined(separator: " · ")
@@ -282,9 +295,13 @@ final class StatusPanelController: NSViewController {
         return line
     }
 
+    private func pendingDetail() -> [NSView] {
+        [muted(doctorLoading ? copy.loadingDiagnosis : copy.diagnosisUnavailable)]
+    }
+
     private func taskRuleRows() -> [NSView] {
         if !snapshot.doctorLoaded && snapshot.taskRulesStatus.isEmpty {
-            return [muted(copy.loadingDiagnosis)]
+            return pendingDetail()
         }
         var rows = [
             labeled(copy.status, snapshot.taskRulesEnabled ? "\(copy.enabled) · \(snapshot.taskRulesStatus)" : copy.disabled),
@@ -303,7 +320,7 @@ final class StatusPanelController: NSViewController {
 
     private func scopeRows() -> [NSView] {
         if !snapshot.doctorLoaded {
-            return [muted(copy.loadingDiagnosis)]
+            return pendingDetail()
         }
         return [
             labeled(copy.assistantMentions, blank(snapshot.assistantScope)),
@@ -315,7 +332,7 @@ final class StatusPanelController: NSViewController {
 
     private func githubRows() -> [NSView] {
         if !snapshot.doctorLoaded {
-            return [muted(copy.loadingDiagnosis)]
+            return pendingDetail()
         }
         return [
             labeled(copy.enabled, snapshot.githubEnabled ? copy.yes : copy.no),
@@ -326,7 +343,7 @@ final class StatusPanelController: NSViewController {
 
     private func diagnosisRows() -> [NSView] {
         if !snapshot.doctorLoaded {
-            return [muted(copy.loadingDiagnosis)]
+            return pendingDetail()
         }
         return [
             labeled(copy.appID, snapshot.larkAppIDConfigured ? copy.configured : copy.missing),

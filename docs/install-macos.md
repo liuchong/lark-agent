@@ -11,7 +11,7 @@
 - 状态和已安装二进制：`~/Library/Application Support/lark-agent/`
 - 日志：`~/Library/Logs/lark-agent/`
 - 服务：`~/Library/LaunchAgents/com.liuchong.lark-agent.plist`
-- 状态栏：`~/Applications/Lark Agent.app`。左键图标打开结构化运行状态面板；右键保留启动、停止和模式菜单。面板展示服务、队列、待审批、任务规则公开状态、回复范围和最近工作，不展示令牌、密钥或原始 JSON。
+- 状态栏：`~/Applications/Lark Agent.app`。左键图标打开结构化运行状态面板；右键保留启动、停止和模式菜单。面板先展示服务、待审批条目、需关注的队列和最近工作，再补齐任务规则与诊断；不展示令牌、密钥、审批请求正文或原始 JSON。
 
 Agent 通过官方公开 Go SDK 访问 Lark。配置只保存 app id 和 Keychain 引用；app secret
 必须在 macOS Keychain 中。用户 token 可选，只用于用户身份轮询、读取消息确认表情和

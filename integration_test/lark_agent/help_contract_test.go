@@ -115,6 +115,10 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 			args: []string{"rules", "init", "--help"},
 			want: []string{"generic private template"},
 		},
+		{
+			args: []string{"approval", "status", "--help"},
+			want: []string{"pending", "request_json"},
+		},
 	}
 	for _, testCase := range cases {
 		code, stdout, stderr := runAgent(t, bin, testCase.args...)
