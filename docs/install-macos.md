@@ -1,5 +1,16 @@
 # macOS 安装
 
+安装只处理本机常驻助手。配置字段见 [配置说明](configuration.md)；装好之后的队列和恢复见
+[运行、恢复与故障处理](operations.md)；GitHub Actions 见
+[智能命令与 GitHub](smart-command.md)。
+
+## 目录
+
+- [安装边界](#安装边界)
+- [新安装](#新安装)
+- [安装参数](#安装参数)
+- [GitHub Environment](#github-environment)
+
 ## 安装边界
 
 安装只写当前用户目录，不需要管理员权限：
@@ -152,12 +163,14 @@ policy:
 仓库工作流使用名为 `lark-production` 的受保护 GitHub Environment：
 
 - secret `LARK_APP_SECRET`：与本地 daemon 相同的 Lark 应用 secret；
+- secret `OPENAI_API_KEY`：仅 `mode: run` 的智能命令需要；普通通知不用；
 - variable `LARK_APP_ID`：同一个 Lark 应用 ID；
 - variable `LARK_CHAT_ID`：通知目标的精确 chat ID。
 - variable `LARK_BASE_URL`：显式 OpenAPI 根地址；国际版 Lark 使用
   `https://open.larksuite.com`，飞书中国站使用 `https://open.feishu.cn`。
 
-这不会创建第二个实时监听实例。Action 只执行
-`lark-agent github notify --chat-id ...` 并通过 Lark HTTP API 发送一次消息；本地
-LaunchAgent 继续独占 WebSocket 事件消费。Environment 应只允许默认分支部署，避免
-不可信分支取得 Lark secret。
+这不会创建第二个实时监听实例。Action 默认执行 `github notify`；`mode: run` 才走
+智能命令。两种形态都只通过 Lark HTTP API 发消息，本地 LaunchAgent 继续独占
+WebSocket 事件消费。Environment 应只允许默认分支部署，避免不可信分支取得 Lark
+secret。工作流列表、评论语法和允许写入的工具见
+[智能命令与 GitHub](smart-command.md)。

@@ -1,19 +1,20 @@
-# 智能命令与内建 GitHub 支持
+# 智能命令与 GitHub
 
-智能命令是一次跑完就退出的 Agent 主循环：不启动飞书长连接，只有在允许名单里的工具真正需要时才发飞书 HTTP，结束后进程退出。
+智能命令是一次跑完就退出的 Agent 主循环：不启动飞书长连接，只有允许名单里的工具真正需要时才发飞书 HTTP，结束后进程退出。
 
-两条入口：
+常驻助手怎么安装、怎么在聊天里追问已验证的 GitHub 引用，见 [macOS 安装](install-macos.md) 和 [运行、恢复与故障处理](operations.md)。这份文档只写一次性命令和 GitHub Actions。
 
-- `lark-agent run`：本地或任意环境里跑一条智能命令。可以读当前工作区文件，不能开 shell，也不能改文件。
-- `lark-agent github run`：先读 GitHub 事件 JSON 和仓库引用，再跑同一套智能命令。代码只通过 GitHub HTTP 按事件提交 SHA 读取，不打开工作区 shell，也不执行 PR 头上的代码。
+## 选哪条命令
 
-`lark-agent github notify` 仍是普通命令：不跑模型，只把可信工作流事实用 HTTP 发到指定飞书群。现有 `.github/workflows/lark-notify.yml` 不用加 `mode`。
+| 场景 | 命令 | 会不会跑模型 |
+| --- | --- | --- |
+| 把 CI / 工作流结果发到飞书 | `lark-agent github notify` | 否 |
+| 根据 GitHub 事件做一次判断，并可能发评论、改标题、写检查、发飞书或写 job output | `lark-agent github run` | 是 |
+| 不在 GitHub 上，但要用同一套主循环跑完一条任务 | `lark-agent run` | 是 |
 
-## 何时用哪条命令
+`github run` 先读事件 JSON 和仓库引用。代码只通过 GitHub HTTP 按事件提交 SHA 读取，不打开工作区 shell，也不执行 PR 头上的代码。
 
-- 只要把 CI / 工作流结果发到飞书：用 `github notify`。
-- 要根据评论、PR、Issue、push 或 release 做一次有模型的判断，并可能发评论、改标题、写检查、发飞书或写 job output：用 `github run`。
-- 不在 GitHub 上、但要用同一套主循环跑完一条任务：用 `run`。
+`github notify` 只把可信工作流事实用 HTTP 发到指定飞书群。现有 `.github/workflows/lark-notify.yml` 不用加 `mode`。
 
 ## GitHub 评论怎么唤醒
 
@@ -25,11 +26,39 @@
 
 ## GitHub Actions
 
-仓库根目录 `action.yml` 的 `mode` 默认是 `notify`，会继续走 `github notify`。`mode: run` 才走 `github run`。
+仓库根目录 `action.yml` 的 `mode` 默认是 `notify`，继续走 `github notify`。`mode: run` 才走 `github run`。
 
-示范工作流在 `.github/workflows/lark-agent-*.yml`，同样的文件也放在 `examples/github-agent/workflows/`。它们都检出仓库默认分支上的 Action 实现，不检出 PR 头，不下载产物，需要飞书或模型密钥的 job 使用 Environment `lark-production`。
+两种形态都可以和已安装 daemon 使用同一个 Lark 应用，但都不会启动 WebSocket；本机 LaunchAgent 始终是唯一实时事件监听者。
 
-模型密钥从进程环境读取 `OPENAI_API_KEY`（可选 `OPENAI_BASE_URL`、`OPENAI_MODEL`），不会去调 GitHub 的 secrets HTTP API。
+需要飞书或模型密钥的 job 使用受保护 Environment `lark-production`：
+
+| 名称 | 类型 | 用途 |
+| --- | --- | --- |
+| `LARK_APP_SECRET` | secret | 与本机 daemon 相同的应用 secret |
+| `OPENAI_API_KEY` | secret | 仅 `mode: run` 需要 |
+| `LARK_APP_ID` | variable | 同一个应用 ID |
+| `LARK_CHAT_ID` | variable | 精确 chat ID，不能按群名猜测 |
+| `LARK_BASE_URL` | variable | 必须显式设置。国际版 `https://open.larksuite.com`，飞书中国站 `https://open.feishu.cn` |
+
+模型密钥只从进程环境读取，不会调用 GitHub 的 secrets HTTP API。工作流只检出仓库默认分支上的 Action 实现，不检出 PR 头，不下载产物，不执行外部贡献代码。
+
+可复用的 YAML 和 prompt 在 [examples/github-agent](../examples/github-agent/README.md)。本仓库正在跑的是 `.github/workflows/lark-agent-*.yml` 里同一套文件。
+
+| 工作流 | 做什么 |
+| --- | --- |
+| `lark-notify.yml` | CI 完成后普通通知，不加 `mode` |
+| `lark-agent-comment.yml` | 评论里 `@lark-agent` 后回答 |
+| `lark-agent-review-dispatch.yml` | 手动触发 PR 审查 |
+| `lark-agent-pr-review.yml` | 新开或打标签的 PR 审查 |
+| `lark-agent-event-summary.yml` | Issue / PR / 非 CI 工作流摘要 |
+| `lark-agent-master-changelog.yml` | 默认分支 changelog |
+| `lark-agent-release.yml` | 发布说明，验证后再建草稿 release |
+| `lark-agent-pr-summary.yml` | PR 摘要 |
+| `lark-agent-merge-check.yml` | 合并门禁检查 `lark-agent-gate` |
+| `lark-agent-notify-style.yml` | 通知口吻的事件摘要 |
+| `lark-agent-title.yml` | 标题改写 |
+
+Fork 来的 PR 会跳过。名为 `CI` 的 `workflow_run` 不进事件摘要和通知口吻工作流，避免和 `lark-notify.yml` 抢同一条 CI 完成事件。
 
 ## 写操作允许名单
 
@@ -42,3 +71,5 @@
 ## 结束方式
 
 工作类型是 `smart_command`。模型必须调用 `submit_decision`，且 `decision` 只能是 `record`。这个工具本身不发飞书、不写 GitHub。真正的评论、检查、标题、飞书消息和 job output 只能通过上面的具名写入工具，每种进程最多成功一次。
+
+场景编号、事件 JSON 样例和退出码见 [智能命令规格](../spec/smart-command.md)。

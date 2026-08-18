@@ -1,6 +1,20 @@
 # 配置说明
 
-配置默认位于 `~/.config/lark-agent/config.yaml`。建议先运行：
+配置默认位于 `~/.config/lark-agent/config.yaml`。字段含义写在这里；安装步骤见
+[macOS 安装](install-macos.md)，GitHub Actions 见 [智能命令与 GitHub](smart-command.md)。
+
+## 目录
+
+- [关键字段](#关键字段)
+- [GitHub 只读证据桥](#github-只读证据桥)
+- [模式](#模式)
+- [强制保护](#强制保护)
+- [群回复范围](#群回复范围)
+- [私人任务规则](#私人任务规则)
+- [Workspace](#workspace)
+- [持久记忆](#持久记忆)
+
+建议先运行：
 
 ```bash
 lark-agent init \
@@ -162,6 +176,10 @@ github:
 Lark app secret 只来自受保护的 GitHub Environment。智能命令还从进程环境读取
 `OPENAI_API_KEY`（可选 `OPENAI_BASE_URL`、`OPENAI_MODEL`）。这些值都不会写入
 YAML、消息、日志或命令参数，也不会通过 `/actions/secrets` HTTP 去拉。
+
+GitHub Actions 的 `mode`、Environment 变量和评论唤醒词见
+[智能命令与 GitHub](smart-command.md)。常驻助手引用已发送通知后再读 GitHub，见
+[运行、恢复与故障处理](operations.md)。
 
 普通文本中的仓库名、PR 号或 run ID 不是权限来源。可信范围有两个代码验证入口：
 当前 Lark 应用发送且同群引用关系和 HMAC 签名均有效的通知；或 Owner/智能助手明确

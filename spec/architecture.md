@@ -100,3 +100,10 @@ The supported integration contract is the official public Go SDK and documented
 Lark OpenAPI behavior. Official CLI internal packages, hidden commands, config
 file formats, stdout envelopes, and process lifecycle are not compatibility
 surfaces.
+
+## Documentation
+
+User-facing guides live in `docs/` and are indexed by `docs/README.md`.
+`spec/` is the long-lived behavior contract after merge.
+`changes/` records why a change was made; if it conflicts with `spec/`, `spec/`
+wins. GitHub Action copy-paste files live in `examples/github-agent/`.

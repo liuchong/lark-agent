@@ -33,6 +33,10 @@ GitHub reference from the quoted current-app message and may expose fresh,
 bounded, read-only GitHub evidence to the model. It never treats a human or
 another app's marker as trusted control data.
 
+User-facing guides are indexed in `docs/README.md`. Operator steps for smart
+commands and GitHub Actions are in `docs/smart-command.md`. This file plus
+`spec/smart-command.md` remain the behavior contract.
+
 The runtime also supports smart commands: the same agent main loop started for
 one process, without a Lark WebSocket, using on-demand HTTP for Lark when a
 tool needs it, then exiting. Ordinary commands compose primitive capabilities

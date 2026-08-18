@@ -148,6 +148,8 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"docs/operations.md",
 		"docs/development.md",
 		"docs/smart-command.md",
+		"docs/README.md",
+		"examples/github-agent/README.md",
 		"spec/behavior.md",
 		"spec/architecture.md",
 	} {
@@ -181,6 +183,8 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"all_private",
 		"非 Owner 私聊机器人或直接 @机器人时保持静默",
 		"/.local/owner-config/",
+		"docs/README.md",
+		"docs/smart-command.md",
 	} {
 		if !strings.Contains(string(readme), want) {
 			t.Fatalf("README missing %q", want)

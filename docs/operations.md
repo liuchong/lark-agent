@@ -1,5 +1,23 @@
 # 运行、恢复与故障处理
 
+这份文档写常驻助手：服务、队列、审批、恢复、云文档监控和代码调查。一次性 GitHub 命令和工作流见 [智能命令与 GitHub](smart-command.md)。文档分层见 [文档地图](README.md)。
+
+## 目录
+
+- [服务状态](#服务状态)
+- [队列检查](#队列检查)
+- [智能助手私聊控制](#智能助手私聊控制)
+- [自动收敛与显式恢复](#自动收敛与显式恢复)
+- [审核后取消](#审核后取消)
+- [授权缺失后的显式补录](#授权缺失后的显式补录)
+- [审批](#审批)
+- [云文档、Wiki 与 Base 监控](#云文档wiki-与-base-监控)
+- [诊断](#诊断)
+- [GitHub 证据追问](#github-证据追问)
+- [权限与回复质量](#权限与回复质量)
+- [代码调查](#代码调查)
+- [故障回退](#故障回退)
+
 ## 服务状态
 
 ```bash
@@ -288,7 +306,7 @@ Owner 自己向智能助手发出的请求显示“助手答复草稿”。审�
 是发给机器人还是发给 Owner 的事实。升级前创建的旧审批会从工作项原始决策恢复该
 身份并消费旧审批键；如果两处都没有合法身份，恢复会明确失败而不是猜测发送者。
 
-## 文档、Wiki 与 Base 监控
+## 云文档、Wiki 与 Base 监控
 
 先登记要监控的资源，再按资源类型激活监控并执行首次对账：
 
@@ -389,28 +407,23 @@ Owner 是否已处理，以及该消息本身是否合理期待回复。真人�
 时，智能助手应说明已完成的有限核对和准确的未知项或拒绝原因，不能编造，也不能静默
 吞掉消息。
 
-## GitHub 通知、智能命令与追问
+## GitHub 证据追问
 
-本地令牌状态：
+常驻助手可以核对已验证的 GitHub 引用，再只读读取摘要、检查、文件或审查。
+`github notify`、`github run`、评论语法和工作流不在这里展开，见
+[智能命令与 GitHub](smart-command.md)。
 
 ```bash
 lark-agent github auth status
 lark-agent doctor
-lark-agent run --help
-lark-agent github run --help
 ```
-
-`lark-agent run` 和 `lark-agent github run` 跑一条智能命令后退出，不启动飞书长连接。
-`github notify` 仍是不跑模型的 HTTP 通知。详细入口、评论语法和工作流见
-[智能命令与 GitHub](smart-command.md)。
 
 `doctor.github` 会显示是否启用、精确仓库 allowlist、令牌是否可读、`read_only` 和
 `single_lark_listener`。GitHub 未启用或令牌缺失都不阻止普通 Lark 消息链路；如果
 当前请求明确要求审查远程 PR，系统会直接返回对应配置阻塞，不会转而搜索本地 Git
 历史。
 
-GitHub Action 可以是一次性 HTTP 通知，也可以是 `mode: run` 的智能命令。两种形态
-都可以与已安装 daemon 使用同一个 Lark app ID 和 app secret，但都不会启动
+GitHub Action 与已安装 daemon 可以共用同一个 Lark 应用，但 Action 不会启动
 WebSocket；已安装 daemon 始终是唯一实时事件监听者。
 Action 消息带有机器可验证的引用标记。用户在 Lark 中回复或引用该消息后，daemon
 只在以下条件全部成立时开放 `get_github_context`：
@@ -439,11 +452,10 @@ PR 摘要会绑定远程 head SHA；读取文件、审查或检查后会再次�
 路径只调用 GitHub API，不创建 checkout，不修改当前仓库的 HEAD、索引、文件、
 remote 或 hook，也不执行 PR 代码。
 
-生产工作流使用受保护的 GitHub Environment `lark-production`。其中
-`LARK_APP_SECRET` 是 secret，`LARK_APP_ID`、`LARK_CHAT_ID` 和 `LARK_BASE_URL`
-是部署变量。`LARK_BASE_URL` 必须显式设置，国际版使用
-`https://open.larksuite.com`。仓库工作流只检出默认分支的 Action 实现，不检出触发
-run 的 PR 头，不下载 artifacts，不执行外部贡献代码。
+Environment 名称、密钥变量和 Action `mode` 写在 [智能命令与 GitHub](smart-command.md)
+和 [macOS 安装](install-macos.md)。
+
+## 权限与回复质量
 
 非 Owner 只有群内直接 `@Owner` 或发给 Owner 的真人私聊代回复请求会进入运行，
 并且只按只读权限执行：只能读取来源会话的有界上下文和配置 Workspace 内的业务代码，
@@ -466,6 +478,8 @@ Workspace 项目规则不能覆盖或替代这组当前配置事实。
 `owner_reply_confidence_min`；`answered`、`no_reply_needed`、`withdrawn` 不会替
 Owner 发送任何内容，且 `answered` 必须引用有效的 Owner 后续消息或 Owner reaction，
 因此达到较低的安全收口阈值即可完成，避免把已处理对话反复重试成死信。
+
+## 代码调查
 
 明确要求检查源码、生产入口、代码入口、API、处理函数或数据库依据的消息会进入
 `coding_question` 代码调查链路，而不是简单问答链路。单独提到 Workspace 或业务

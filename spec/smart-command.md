@@ -1,8 +1,10 @@
 # Smart Command And Built-In GitHub Support
 
 This file is the long-lived, testable contract. Scene ids `SC-*` and `GW-*`
-must appear in test names. `changes/smart-command-and-github.md` records why
-this round exists; if it conflicts with this file after merge, this file wins.
+must appear in test names. Operator steps are in `docs/smart-command.md`; the
+documentation map is `docs/README.md`. `changes/smart-command-and-github.md`
+records why this round exists; if it conflicts with this file after merge, this
+file wins.
 
 Tests must not invent product behavior. If a field, error substring, HTTP path,
 JSON key, or YAML `if` is not in this file, it is out of scope.
