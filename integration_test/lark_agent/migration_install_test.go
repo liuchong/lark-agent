@@ -17,12 +17,7 @@ import (
 )
 
 func TestStatusAppUsesMacOSTemplateIcon(t *testing.T) {
-	sourcePath := filepath.Join(repoRoot(t), "macos", "LarkAgentStatus", "main.swift")
-	source, err := os.ReadFile(sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(source)
+	text := statusAppSource(t)
 	for _, expected := range []string{
 		`forResource: "StatusIconTemplate"`,
 		"image.isTemplate = true",

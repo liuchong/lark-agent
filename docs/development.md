@@ -35,7 +35,7 @@ make integration-test
 make harness-eval
 make verify
 bash -n scripts/macos/install-lark-agent.sh
-swiftc macos/LarkAgentStatus/main.swift -framework AppKit -o /tmp/LarkAgentStatus
+swiftc macos/LarkAgentStatus/*.swift -framework AppKit -o /tmp/LarkAgentStatus
 ```
 
 ## Prompt 与收敛评测

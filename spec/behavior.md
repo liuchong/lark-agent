@@ -623,13 +623,23 @@ the live bot callback adapter is configured.
 On macOS, the agent can be installed as a current-user LaunchAgent with a menu
 bar controller. The installed service uses label `com.liuchong.lark-agent` and
 runs the installed `lark-agent daemon run` binary with explicit `--config` and
-`--state` paths. The menu bar App is a thin controller: it shows LaunchAgent
-status and invokes `daemon status/start/stop/restart` and `mode paused|auto`.
-The App bundle carries the repository's branded macOS icon through
-`CFBundleIconFile`. The menu bar uses the matching monochrome template mark,
-not a fixed-color or fixed-white bitmap: AppKit tints the template white or
-black to match the active macOS menu bar. Status counts may appear beside the
-mark, but the legacy `LA` text is not the primary status item.
+`--state` paths. The menu bar App is a thin controller: it does not interpret
+Lark events or change policy itself. It shows LaunchAgent status and invokes
+`daemon status/start/stop/restart` and `mode paused|auto`. Left-clicking the
+status item opens a structured popover of service runtime, mode, queue counts,
+pending approvals, task-rule public status, reply scopes, GitHub
+enabled/token-configured flags, and recent work kind/status/duration. That
+popover is the primary status surface; raw command JSON is not the primary
+layout. Tokens, app secrets, private task-rule bodies, owner open IDs, and
+approval `request_json` / `response_json` are never shown. The 10-second icon
+refresh uses only `daemon status`, `approval status`, and `queue summary`.
+Opening the popover may additionally load `doctor` and a bounded approval list.
+Right-click keeps Start/Stop/Restart, Pause/Resume Auto, Open Config, Open
+Logs, and Quit. The App bundle carries the repository's branded macOS icon
+through `CFBundleIconFile`. The menu bar uses the matching monochrome template
+mark, not a fixed-color or fixed-white bitmap: AppKit tints the template white
+or black to match the active macOS menu bar. Status counts may appear beside
+the mark, but the legacy `LA` text is not the primary status item.
 Across the README mark, App icon, and menu bar template, the bird/chat shape
 retains a connected intelligence-spark antenna and a two-node tool loop. These
 elements make the Agent role explicit without introducing text or details that
@@ -641,6 +651,14 @@ then its branded `.icns` and monochrome template resource are installed,
 template resource with template rendering enabled.
 Given any shipped brand variant, when its vector source is inspected, then the
 connected Agent antenna and tool-loop groups are present in that variant.
+Given the menu bar app is running, when the owner left-clicks the status item,
+then a popover lists structured service, queue, approval, task-rule public,
+reply-scope, GitHub non-secret, and recent-work rows, and the layout is not a
+raw JSON dump.
+Given the menu bar app is running, when the owner right-clicks the status item,
+then the existing Start/Stop/Restart control menu remains available.
+Given the periodic status refresh, when the popover is closed, then the
+controller does not invoke `doctor`.
 
 The user-level installation may write files only under the current user's
 `~/.config/lark-agent`, `~/Applications`,

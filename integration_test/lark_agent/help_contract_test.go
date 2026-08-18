@@ -204,6 +204,7 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"调查主题",
 		"调查状态",
 		"上下文证据",
+		"结构化状态面板",
 	} {
 		if !strings.Contains(string(operations), want) {
 			t.Fatalf("operations docs missing %q", want)

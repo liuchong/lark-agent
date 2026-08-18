@@ -10,7 +10,11 @@ lark-agent daemon restart
 ```
 
 LaunchAgent label 是 `com.liuchong.lark-agent`。日志位于
-`~/Library/Logs/lark-agent/`。
+`~/Library/Logs/lark-agent/`。菜单栏左键打开结构化状态面板，查看服务是否在跑、
+当前模式、队列计数、待审批、任务规则公开状态、回复范围和最近工作；右键仍是
+启动、停止、暂停和打开配置/日志。面板不展示令牌、密钥、私人规则正文或原始
+命令 JSON。10 秒刷新只更新图标上的运行/待办计数，完整诊断只在打开面板或点刷新
+时加载。
 
 官方 Lark SDK 中可能携带连接凭据的调试和普通信息日志会被抑制；事件分发器固定的
 无凭据 ready 提示可以保留，警告与错误会在凭据字段脱敏后保留。日志中不得出现

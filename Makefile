@@ -17,7 +17,7 @@ test:
 
 install-test:
 	bash -n scripts/macos/install-lark-agent.sh
-	set -e; tmp="$$(mktemp "$${TMPDIR:-/tmp}/lark-agent-status.XXXXXX")"; trap 'rm -f "$$tmp"' EXIT; swiftc macos/LarkAgentStatus/main.swift -framework AppKit -o "$$tmp"
+	set -e; tmp="$$(mktemp "$${TMPDIR:-/tmp}/lark-agent-status.XXXXXX")"; trap 'rm -f "$$tmp"' EXIT; swiftc macos/LarkAgentStatus/*.swift -framework AppKit -o "$$tmp"
 	go test -race ./integration_test/lark_agent -run 'TestMacOSInstallerInstallsCleanHomeWithoutLoading'
 
 lint:

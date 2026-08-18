@@ -250,7 +250,7 @@ if [ ! -f "$CONFIG_PATH" ]; then
 fi
 
 echo "Building menu bar status app candidate..."
-swiftc "$ROOT/macos/LarkAgentStatus/main.swift" -framework AppKit -o "$STATUS_CANDIDATE"
+swiftc "$ROOT"/macos/LarkAgentStatus/*.swift -framework AppKit -o "$STATUS_CANDIDATE"
 for asset in \
   "$ROOT/assets/brand/LarkAgent.icns" \
   "$ROOT/assets/brand/lark-agent-status-template.png"; do
