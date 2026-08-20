@@ -131,7 +131,6 @@ type Capabilities struct {
 	Thinking         bool
 	ParallelToolCall bool
 	ImageInput       bool
-	MaxContextTokens int
 	MaxOutputTokens  int
 }
 
@@ -213,7 +212,6 @@ type Budgets struct {
 	MaxAttemptsPerStep int
 	FirstByteTimeout   time.Duration
 	StreamIdleTimeout  time.Duration
-	MaxContextTokens   int
 	MaxOutputTokens    int
 	MaxContextBytes    int
 	OutputReserveBytes int

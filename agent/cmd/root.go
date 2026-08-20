@@ -1137,6 +1137,9 @@ func newDaemonCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 				return err
 			}
 			defer store.Close() //nolint:errcheck // foreground daemon shutdown
+			if err := store.ApplyRetention(cmd.Context(), time.Now().AddDate(0, 0, -cfg.Retention.Days)); err != nil {
+				return err
+			}
 			store.ConfigureScheduler(cfg.Scheduler.DuplicateWindow, cfg.Goal.MaxActive)
 			agentRouter := newAgentRouter(cfg, store)
 			options, realtimeSource, liveMessenger, liveInfo, err := buildLiveOptions(
@@ -2106,6 +2109,8 @@ func buildLiveOptions(
 			MaxRepeatedCalls:  cfg.Agent.MaxRepeatedCalls,
 			MaxToolCalls:      cfg.ToolPolicy.CodingMaxToolCalls,
 			MaxNoProgress:     cfg.ToolPolicy.MaxNoProgress,
+			MaxEvidenceFiles:  cfg.Coding.MaxEvidenceFiles,
+			MaxLarkContext:    cfg.Coding.MaxLarkContextCalls,
 			SimpleMaxTurns:    cfg.FastPath.SimpleMaxTurns,
 			CodingMaxTurns:    cfg.FastPath.CodingMaxTurns,
 			GoalMaxTurns:      cfg.Goal.MaxInvestigationTurns,
@@ -2384,6 +2389,7 @@ func newAgentRouter(cfg config.Config, store *storage.Store) *router.Router {
 		BlockUsers:          cfg.Policy.BlockUsers,
 		Sensitivity:         cfg.Policy.Sensitivity,
 		DisableFastPath:     !cfg.FastPath.Enabled,
+		DisableCoding:       !cfg.Coding.Enabled,
 		DisableCodingGoal:   !cfg.Goal.Enabled,
 		StatusText:          func() string { return queueText() },
 		DoctorText:          func() string { return queueText() },
@@ -4709,13 +4715,13 @@ func newDoctorCommand(out io.Writer, configPath, statePath *string) *cobra.Comma
 					"open_ids_configured":  len(cfg.Assistant.OpenIDs),
 				},
 				"coding": map[string]any{
-					"enabled":             cfg.Coding.Enabled,
-					"code_index":          "fallback",
-					"max_evidence_files":  cfg.Coding.MaxEvidenceFiles,
-					"require_source_refs": cfg.Coding.RequireSourceRefs,
-					"plan_tool":           "submit_investigation_plan",
-					"verify_gate":         true,
-					"transcript_export":   "queue export --run-id",
+					"enabled":                cfg.Coding.Enabled,
+					"code_index":             "fallback",
+					"max_evidence_files":     cfg.Coding.MaxEvidenceFiles,
+					"max_lark_context_calls": cfg.Coding.MaxLarkContextCalls,
+					"plan_tool":              "submit_investigation_plan",
+					"verify_gate":            true,
+					"transcript_export":      "queue export --run-id",
 				},
 			})
 		},

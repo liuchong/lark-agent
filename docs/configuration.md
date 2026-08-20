@@ -54,10 +54,6 @@ lark-agent config show
   令牌的 Keychain 引用。
 - `github.max_files`、`max_patch_bytes`、`max_annotations`、`max_reviews`：
   单次模型读取的硬上限。
-- `github.proactive_review.enabled`：是否允许处理没有 `@Owner` 或 `@智能助手` 的
-  群内 PR 审查请求。默认 `false`。
-- `github.proactive_review.chat_ids`：主动审查开启时必填的精确群 ID 列表。主动审查
-  只能把结果私聊通知 Owner，不能在原群回复请求者。
 - `output.language`：全产品对外语言，`auto`、`zh-CN` 或 `en-US`，默认 `auto`。
   所有对外消息都遵守它，包括没有人类会话可参考的智能命令。
 - `output.fallback_language`：`zh-CN` 或 `en-US`，默认 `zh-CN`。`auto` 判断不
@@ -110,7 +106,9 @@ lark-agent config show
   循环预算，所以这两个值要留在这个预算里。
 - `model.profiles.<名字>.reasoning`、`capabilities`：档案声明的推理模式、推理强度和
   能力上限。这些声明会真正出现在请求里，常驻助手和 GitHub Actions 里的一次性智能命令
-  用同一套档案语义，不存在“某个字段只在其中一边生效”。
+  用同一套档案语义，不存在“某个字段只在其中一边生效”。当前会落到请求线上的能力包括：
+  `tool_use=false` 时不发送工具，`parallel_tool_call=false` 时声明禁止并行工具调用，
+  `image_input=false` 时不发送图片内容，`max_output_tokens` 控制 `max_tokens`。
 - `model.roles`：角色绑定。`agent`、`semantic`、`finalizer`、`compactor`、`vision`
   默认都绑定 `primary`，也可以显式绑定到不同档案；运行时不会在未授权时自动跨供应商
   故障切换。
@@ -136,6 +134,10 @@ lark-agent config show
 额度，并要求证据足够时尽早提交完整、部分或澄清结论。
 `tool_policy.coding_max_tool_calls` 默认为 `16`，只有成功执行的调查工具才消耗这项
 额度；参数或策略校验失败仍受模型轮次和无进展上限约束，但不会挤掉后续生产代码读取。
+`coding.enabled=false` 会把代码类请求留在简单问答通道，不进入代码调查 lane。
+`coding.max_evidence_files` 限制一次代码调查中 `read_workspace` 的成功执行次数，默认
+`12`；`coding.max_lark_context_calls` 限制一次代码调查中同会话上下文读取次数，默认
+`2`。代码事实仍始终要求当前运行里的来源引用；该规则不是可配置开关。
 一旦工具额度、无进展或证据充分条件要求提交结论，后续只允许
 `submit_decision`，最多给模型 3 次强制收尾机会；如果模型仍调用旧工具，运行时会再发起
 一次无工具的终端收尾请求，只能根据已保留工具回执生成同形结构化结论。该结论仍走来源、
@@ -186,9 +188,6 @@ github:
   max_patch_bytes: 65536
   max_annotations: 50
   max_reviews: 50
-  proactive_review:
-    enabled: false
-    chat_ids: []
 ```
 
 本地令牌用 `lark-agent github auth login` 从标准输入写入 Keychain，输入格式为
@@ -212,6 +211,16 @@ PR 审查直接读取远程 GitHub API，并在一次取证前后核对相同的
 它不依赖 `gh` 登录状态，不向当前仓库执行 fetch/pull/checkout，不运行 PR 代码。
 GitHub 未启用或只读凭据缺失时会直接说明配置阻塞，不会把“本地仓库里没找到”当作
 远程 PR 不存在。
+
+## 本地审计保留
+
+```yaml
+retention:
+  days: 30
+```
+
+`retention.days` 必须大于 0。daemon 启动时会删除超过保留期且已经终止的运行轨迹、
+外部引用和临时审计行；仍在处理、等待用户、等待审批或被中断的工作不会被删除。
 
 ## 模式
 

@@ -33,6 +33,8 @@ type AgentLoop struct {
 	MaxRepeatedCalls  int
 	MaxToolCalls      int
 	MaxNoProgress     int
+	MaxEvidenceFiles  int
+	MaxLarkContext    int
 	SimpleMaxTurns    int
 	CodingMaxTurns    int
 	GoalMaxTurns      int
@@ -139,6 +141,12 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 		WorkKind:              bundle.WorkKind,
 		GitHubReference:       bundle.GitHubReference,
 		ResourceURLs:          bundleResourceURLs(bundle),
+	}
+	if bundle.WorkKind == domain.WorkKindCodingQuestion || bundle.WorkKind == domain.WorkKindCodingGoal {
+		invocationScope.CodingLimits = &agenttools.CodingToolLimits{
+			MaxWorkspaceReads:   l.MaxEvidenceFiles,
+			MaxLarkContextCalls: l.MaxLarkContext,
+		}
 	}
 	requestedWorkspaceScope := requestedCodingWorkspaceScope(bundle)
 	visibleToolInfos := l.Tools.InfosFor(invocationScope)

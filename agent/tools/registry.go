@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudwego/eino/schema"
@@ -84,6 +85,17 @@ type InvocationScope struct {
 	WorkKind              domain.WorkKind
 	GitHubReference       *domain.GitHubReference
 	ResourceURLs          []string
+	CodingLimits          *CodingToolLimits
+}
+
+// CodingToolLimits tracks per-run coding evidence budgets. The registry owns
+// enforcement so hidden or denied calls fail before any tool side effect.
+type CodingToolLimits struct {
+	MaxWorkspaceReads   int
+	MaxLarkContextCalls int
+	mu                  sync.Mutex
+	workspaceReads      int
+	larkContextCalls    int
 }
 
 // WithWorkItemDedup makes the current durable work identity available to tools.
@@ -214,6 +226,9 @@ func (r *Registry) Execute(ctx context.Context, name string, arguments json.RawM
 				).WithParam(definition.SameChatArgument)
 			}
 		}
+		if err := checkCodingToolLimit(scope, name); err != nil {
+			return Execution{}, err
+		}
 	}
 	execution, err := definition.Execute(ctx, arguments)
 	if err != nil {
@@ -223,6 +238,36 @@ func (r *Registry) Execute(ctx context.Context, name string, arguments json.RawM
 		execution.Receipt = newToolReceipt(definition, arguments, execution)
 	}
 	return execution, nil
+}
+
+func checkCodingToolLimit(scope InvocationScope, name string) error {
+	if scope.CodingLimits == nil ||
+		(scope.WorkKind != domain.WorkKindCodingQuestion && scope.WorkKind != domain.WorkKindCodingGoal) {
+		return nil
+	}
+	scope.CodingLimits.mu.Lock()
+	defer scope.CodingLimits.mu.Unlock()
+	switch name {
+	case "read_workspace":
+		if scope.CodingLimits.MaxWorkspaceReads > 0 &&
+			scope.CodingLimits.workspaceReads >= scope.CodingLimits.MaxWorkspaceReads {
+			return errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"coding workspace read budget exhausted",
+			).WithParam("read_workspace")
+		}
+		scope.CodingLimits.workspaceReads++
+	case "get_lark_context", "search_lark_messages":
+		if scope.CodingLimits.MaxLarkContextCalls > 0 &&
+			scope.CodingLimits.larkContextCalls >= scope.CodingLimits.MaxLarkContextCalls {
+			return errs.NewValidationError(
+				errs.SubtypeFailedPrecondition,
+				"coding Lark context budget exhausted",
+			).WithParam(name)
+		}
+		scope.CodingLimits.larkContextCalls++
+	}
+	return nil
 }
 
 func toolAllowedForScope(definition Definition, scope InvocationScope) bool {

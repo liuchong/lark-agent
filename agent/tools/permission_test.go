@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/cloudwego/eino/schema"
+
+	"github.com/liuchong/lark-agent/agent/domain"
 )
 
 func TestRegistryDeniesToolPermissionBeforeExecute(t *testing.T) {
@@ -139,5 +141,56 @@ func TestRegistryNonOwnerScopeConfinesSameChatTool(t *testing.T) {
 	}
 	if !executed {
 		t.Fatal("same-chat read was not executed")
+	}
+}
+
+func TestRegistryEnforcesCodingEvidenceBudgets(t *testing.T) {
+	readCount := 0
+	larkCount := 0
+	registry, err := NewRegistry(
+		Definition{
+			Info:       &schema.ToolInfo{Name: "read_workspace"},
+			Permission: ToolPermissionAllow,
+			Execute: func(context.Context, json.RawMessage) (Execution, error) {
+				readCount++
+				return Execution{Content: `{"ok":true}`}, nil
+			},
+		},
+		Definition{
+			Info:       &schema.ToolInfo{Name: "get_lark_context"},
+			Permission: ToolPermissionAllow,
+			Execute: func(context.Context, json.RawMessage) (Execution, error) {
+				larkCount++
+				return Execution{Content: `{"ok":true}`}, nil
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithInvocationScope(context.Background(), InvocationScope{
+		Owner:    true,
+		WorkKind: domain.WorkKindCodingQuestion,
+		CodingLimits: &CodingToolLimits{
+			MaxWorkspaceReads:   1,
+			MaxLarkContextCalls: 1,
+		},
+	})
+	if _, err := registry.Execute(ctx, "read_workspace", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Execute(ctx, "read_workspace", []byte(`{}`)); err == nil ||
+		!strings.Contains(err.Error(), "workspace read budget exhausted") {
+		t.Fatalf("second read error=%v", err)
+	}
+	if _, err := registry.Execute(ctx, "get_lark_context", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Execute(ctx, "get_lark_context", []byte(`{}`)); err == nil ||
+		!strings.Contains(err.Error(), "Lark context budget exhausted") {
+		t.Fatalf("second lark context error=%v", err)
+	}
+	if readCount != 1 || larkCount != 1 {
+		t.Fatalf("read_count=%d lark_count=%d", readCount, larkCount)
 	}
 }

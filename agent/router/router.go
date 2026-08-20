@@ -26,6 +26,7 @@ type Config struct {
 	Sensitivity         domain.Sensitivity
 	Now                 func() time.Time
 	DisableFastPath     bool
+	DisableCoding       bool
 	DisableCodingGoal   bool
 	StatusText          func() string
 	DoctorText          func() string
@@ -125,10 +126,10 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 				return fast, nil
 			}
 		}
-		if !r.cfg.DisableCodingGoal && isCodingGoal(item.Event.Content) {
+		if !r.cfg.DisableCoding && !r.cfg.DisableCodingGoal && isCodingGoal(item.Event.Content) {
 			decision.WorkKind = domain.WorkKindCodingGoal
 			decision.Priority = domain.PriorityBackground
-		} else if domain.IsCodingQuestion(item.Event.Content) {
+		} else if !r.cfg.DisableCoding && domain.IsCodingQuestion(item.Event.Content) {
 			decision.WorkKind = domain.WorkKindCodingQuestion
 			decision.Priority = domain.PriorityCodingQuestion
 		}
@@ -183,10 +184,10 @@ func (r *Router) Route(_ context.Context, item domain.WorkItem) (domain.Decision
 				return fast, nil
 			}
 		}
-		if !r.cfg.DisableCodingGoal && isCodingGoal(item.Event.Content) {
+		if !r.cfg.DisableCoding && !r.cfg.DisableCodingGoal && isCodingGoal(item.Event.Content) {
 			decision.WorkKind = domain.WorkKindCodingGoal
 			decision.Priority = domain.PriorityBackground
-		} else if domain.IsCodingQuestion(item.Event.Content) {
+		} else if !r.cfg.DisableCoding && domain.IsCodingQuestion(item.Event.Content) {
 			decision.WorkKind = domain.WorkKindCodingQuestion
 			decision.Priority = domain.PriorityCodingQuestion
 		}

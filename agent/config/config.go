@@ -35,7 +35,6 @@ type Config struct {
 	Coding     CodingConfig     `json:"coding" yaml:"coding"`
 	ToolPolicy ToolPolicyConfig `json:"tool_policy" yaml:"tool_policy"`
 	Goal       GoalConfig       `json:"goal" yaml:"goal"`
-	State      StateConfig      `json:"state" yaml:"state"`
 	Policy     PolicyConfig     `json:"policy" yaml:"policy"`
 	Workspace  WorkspaceConfig  `json:"workspace" yaml:"workspace"`
 	Retention  RetentionConfig  `json:"retention" yaml:"retention"`
@@ -63,11 +62,9 @@ type AgentConfig struct {
 
 // CodingConfig controls read-only coding investigations.
 type CodingConfig struct {
-	Enabled             bool              `json:"enabled" yaml:"enabled"`
-	MaxEvidenceFiles    int               `json:"max_evidence_files" yaml:"max_evidence_files"`
-	MaxLarkContextCalls int               `json:"max_lark_context_calls" yaml:"max_lark_context_calls"`
-	RequireSourceRefs   bool              `json:"require_source_refs" yaml:"require_source_refs"`
-	ToolPermission      map[string]string `json:"tool_permission,omitempty" yaml:"tool_permission,omitempty"`
+	Enabled             bool `json:"enabled" yaml:"enabled"`
+	MaxEvidenceFiles    int  `json:"max_evidence_files" yaml:"max_evidence_files"`
+	MaxLarkContextCalls int  `json:"max_lark_context_calls" yaml:"max_lark_context_calls"`
 }
 
 // FastPathConfig controls deterministic local answers for direct requests.
@@ -103,45 +100,30 @@ type GoalConfig struct {
 	MaxInvestigationTurns int  `json:"max_investigation_turns" yaml:"max_investigation_turns"`
 }
 
-// StateConfig controls local state lifecycle during live installs.
-type StateConfig struct {
-	AllowReset bool `json:"allow_reset" yaml:"allow_reset"`
-}
-
 // LarkConfig stores public SDK settings and references to Keychain-held
 // credentials. Secrets and tokens are never serialized into this struct.
 type LarkConfig struct {
 	AppID                   string                 `json:"app_id" yaml:"app_id"`
-	Brand                   string                 `json:"brand" yaml:"brand"`
 	BaseURL                 string                 `json:"base_url,omitempty" yaml:"base_url,omitempty"`
 	KeychainService         string                 `json:"keychain_service" yaml:"keychain_service"`
 	AppSecretKeychainKey    string                 `json:"app_secret_keychain_key" yaml:"app_secret_keychain_key"`
 	UserTokenKeychainKey    string                 `json:"user_token_keychain_key" yaml:"user_token_keychain_key"`
 	RefreshTokenKeychainKey string                 `json:"refresh_token_keychain_key" yaml:"refresh_token_keychain_key"`
-	OAuthCallback           string                 `json:"oauth_callback,omitempty" yaml:"oauth_callback,omitempty"`
 	Subscriptions           []ResourceSubscription `json:"subscriptions,omitempty" yaml:"subscriptions,omitempty"`
 }
 
 // GitHubConfig controls the optional trusted GitHub evidence bridge. Tokens are
 // referenced by Keychain account and never serialized here.
 type GitHubConfig struct {
-	Enabled              bool                        `json:"enabled" yaml:"enabled"`
-	APIBaseURL           string                      `json:"api_base_url" yaml:"api_base_url"`
-	TokenKeychainService string                      `json:"token_keychain_service" yaml:"token_keychain_service"`
-	TokenKeychainKey     string                      `json:"token_keychain_key" yaml:"token_keychain_key"`
-	AllowedRepositories  []string                    `json:"allowed_repositories,omitempty" yaml:"allowed_repositories,omitempty"`
-	MaxFiles             int                         `json:"max_files" yaml:"max_files"`
-	MaxPatchBytes        int                         `json:"max_patch_bytes" yaml:"max_patch_bytes"`
-	MaxAnnotations       int                         `json:"max_annotations" yaml:"max_annotations"`
-	MaxReviews           int                         `json:"max_reviews" yaml:"max_reviews"`
-	ProactiveReview      GitHubProactiveReviewConfig `json:"proactive_review" yaml:"proactive_review"`
-}
-
-// GitHubProactiveReviewConfig controls optional private Owner review of
-// unmentioned pull-request requests in exact allowlisted chats.
-type GitHubProactiveReviewConfig struct {
-	Enabled bool     `json:"enabled" yaml:"enabled"`
-	ChatIDs []string `json:"chat_ids,omitempty" yaml:"chat_ids,omitempty"`
+	Enabled              bool     `json:"enabled" yaml:"enabled"`
+	APIBaseURL           string   `json:"api_base_url" yaml:"api_base_url"`
+	TokenKeychainService string   `json:"token_keychain_service" yaml:"token_keychain_service"`
+	TokenKeychainKey     string   `json:"token_keychain_key" yaml:"token_keychain_key"`
+	AllowedRepositories  []string `json:"allowed_repositories,omitempty" yaml:"allowed_repositories,omitempty"`
+	MaxFiles             int      `json:"max_files" yaml:"max_files"`
+	MaxPatchBytes        int      `json:"max_patch_bytes" yaml:"max_patch_bytes"`
+	MaxAnnotations       int      `json:"max_annotations" yaml:"max_annotations"`
+	MaxReviews           int      `json:"max_reviews" yaml:"max_reviews"`
 }
 
 // ResourceSubscription is the config-level projection used before the durable
@@ -308,7 +290,6 @@ func (p ModelProfileConfig) RuntimeProfile(name string) modelruntime.Profile {
 			Thinking:         p.Capabilities.Thinking,
 			ParallelToolCall: p.Capabilities.ParallelToolCall,
 			ImageInput:       p.Capabilities.ImageInput,
-			MaxContextTokens: p.Capabilities.MaxContextTokens,
 			MaxOutputTokens:  p.Capabilities.MaxOutputTokens,
 		},
 	}
@@ -324,7 +305,6 @@ type ModelCapabilitiesConfig struct {
 	Thinking         bool `json:"thinking,omitempty" yaml:"thinking,omitempty"`
 	ParallelToolCall bool `json:"parallel_tool_call,omitempty" yaml:"parallel_tool_call,omitempty"`
 	ImageInput       bool `json:"image_input,omitempty" yaml:"image_input,omitempty"`
-	MaxContextTokens int  `json:"max_context_tokens,omitempty" yaml:"max_context_tokens,omitempty"`
 	MaxOutputTokens  int  `json:"max_output_tokens,omitempty" yaml:"max_output_tokens,omitempty"`
 }
 
@@ -346,7 +326,6 @@ type PolicyConfig struct {
 	OwnerReplyConfidenceMin float64                  `json:"owner_reply_confidence_min" yaml:"owner_reply_confidence_min"`
 	OwnerReplyRetry         time.Duration            `json:"owner_reply_retry" yaml:"owner_reply_retry"`
 	OwnerReplyMaxRetries    int                      `json:"owner_reply_max_retries" yaml:"owner_reply_max_retries"`
-	MentionPoll             time.Duration            `json:"mention_poll" yaml:"mention_poll"`
 	ReplyConfidenceMin      float64                  `json:"reply_confidence_min" yaml:"reply_confidence_min"`
 	InvestigationProgress   string                   `json:"investigation_progress" yaml:"investigation_progress"`
 	AllowChats              []string                 `json:"allow_chats,omitempty" yaml:"allow_chats,omitempty"`
@@ -399,7 +378,6 @@ func Default() Config {
 	return Config{
 		Version: currentVersion,
 		Lark: LarkConfig{
-			Brand:                   "feishu",
 			KeychainService:         "lark-agent",
 			AppSecretKeychainKey:    "app_secret",
 			UserTokenKeychainKey:    "user_access_token",
@@ -489,26 +467,13 @@ func Default() Config {
 			Enabled:             true,
 			MaxEvidenceFiles:    12,
 			MaxLarkContextCalls: 2,
-			RequireSourceRefs:   true,
-			ToolPermission: map[string]string{
-				"read_workspace":        "allow",
-				"search_code_symbols":   "allow",
-				"trace_code_path":       "allow",
-				"explore_workspace":     "allow",
-				"edit_workspace":        "allow",
-				"write_workspace":       "allow",
-				"shell":                 "allow",
-				"direct_lark_im_send":   "deny",
-				"production_file_write": "deny",
-			},
 		},
 		ToolPolicy: ToolPolicyConfig{
 			DenyUnboundedShellSearch: true,
 			CodingMaxToolCalls:       16,
 			MaxNoProgress:            3,
 		},
-		Goal:  GoalConfig{Enabled: true, MaxActive: 3, MaxInvestigationTurns: 150},
-		State: StateConfig{AllowReset: false},
+		Goal: GoalConfig{Enabled: true, MaxActive: 3, MaxInvestigationTurns: 150},
 		Policy: PolicyConfig{
 			Mode:                    domain.ModeAuto,
 			ReplyScope:              domain.ReplyScopeAllGroups,
@@ -518,7 +483,6 @@ func Default() Config {
 			OwnerReplyConfidenceMin: 0.85,
 			OwnerReplyRetry:         30 * time.Second,
 			OwnerReplyMaxRetries:    3,
-			MentionPoll:             30 * time.Second,
 			ReplyConfidenceMin:      0.70,
 			InvestigationProgress:   "enabled",
 		},
@@ -702,9 +666,6 @@ func (c Config) Validate() error {
 			"policy.owner_reply_max_retries must be positive",
 		).WithField("policy.owner_reply_max_retries")
 	}
-	if c.Policy.MentionPoll <= 0 {
-		return errs.NewConfigError(errs.SubtypeInvalidConfig, "policy.mention_poll must be positive").WithField("policy.mention_poll")
-	}
 	if c.Policy.ReplyConfidenceMin < 0 || c.Policy.ReplyConfidenceMin > 1 {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "policy.reply_confidence_min must be between 0 and 1").WithField("policy.reply_confidence_min")
 	}
@@ -748,6 +709,9 @@ func (c Config) Validate() error {
 			errs.SubtypeInvalidConfig,
 			"agent.max_context_image_total_bytes must cover one image and be at most 2097152",
 		).WithField("agent.max_context_image_total_bytes")
+	}
+	if c.Retention.Days <= 0 {
+		return errs.NewConfigError(errs.SubtypeInvalidConfig, "retention.days must be positive").WithField("retention.days")
 	}
 	if c.Agent.ContextCompaction < 0.5 || c.Agent.ContextCompaction > 0.95 {
 		return errs.NewConfigError(
@@ -1059,18 +1023,6 @@ func validateGitHubConfig(cfg GitHubConfig) error {
 			"github.allowed_repositories is required when github is enabled",
 		).WithField("github.allowed_repositories")
 	}
-	if cfg.ProactiveReview.Enabled && !cfg.Enabled {
-		return errs.NewConfigError(
-			errs.SubtypeInvalidConfig,
-			"github.proactive_review requires github.enabled",
-		).WithField("github.proactive_review.enabled")
-	}
-	if cfg.ProactiveReview.Enabled && len(cfg.ProactiveReview.ChatIDs) == 0 {
-		return errs.NewConfigError(
-			errs.SubtypeInvalidConfig,
-			"github.proactive_review.chat_ids is required when proactive review is enabled",
-		).WithField("github.proactive_review.chat_ids")
-	}
 	seen := map[string]bool{}
 	for _, repository := range cfg.AllowedRepositories {
 		parts := strings.Split(repository, "/")
@@ -1084,17 +1036,6 @@ func validateGitHubConfig(cfg GitHubConfig) error {
 				WithField("github.allowed_repositories")
 		}
 		seen[canonical] = true
-	}
-	seenChats := map[string]bool{}
-	for _, chatID := range cfg.ProactiveReview.ChatIDs {
-		chatID = strings.TrimSpace(chatID)
-		if chatID == "" || seenChats[chatID] {
-			return errs.NewConfigError(
-				errs.SubtypeInvalidConfig,
-				"github.proactive_review.chat_ids must contain unique non-empty chat ids",
-			).WithField("github.proactive_review.chat_ids")
-		}
-		seenChats[chatID] = true
 	}
 	return nil
 }

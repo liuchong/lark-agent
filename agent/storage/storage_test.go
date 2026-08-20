@@ -2697,6 +2697,75 @@ func openStore(t *testing.T) *Store {
 	return store
 }
 
+func TestApplyRetentionRemovesOnlyOldTerminalWork(t *testing.T) {
+	store := openStore(t)
+	for _, messageID := range []string{"om_old_done", "om_old_interrupted", "om_fresh_done"} {
+		accepted, err := store.EnqueueEvent(domain.NormalizedEvent{
+			Source:    domain.SourceRealtime,
+			EventID:   "evt_" + messageID,
+			MessageID: messageID,
+			ChatID:    "oc_retention",
+			Content:   messageID,
+		})
+		if err != nil || !accepted {
+			t.Fatalf("enqueue %s accepted=%v err=%v", messageID, accepted, err)
+		}
+	}
+	items, err := store.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byMessage := map[string]domain.WorkItem{}
+	for _, item := range items {
+		byMessage[item.Event.MessageID] = item
+	}
+	old := time.Now().AddDate(0, 0, -45).UTC().Format(time.RFC3339Nano)
+	fresh := time.Now().AddDate(0, 0, -1).UTC().Format(time.RFC3339Nano)
+	for messageID, update := range map[string]struct {
+		status domain.WorkItemStatus
+		when   string
+	}{
+		"om_old_done":        {status: domain.StatusCompleted, when: old},
+		"om_old_interrupted": {status: domain.StatusInterrupted, when: old},
+		"om_fresh_done":      {status: domain.StatusCompleted, when: fresh},
+	} {
+		item, ok := byMessage[messageID]
+		if !ok {
+			t.Fatalf("missing %s in %+v", messageID, byMessage)
+		}
+		if _, err := store.db.ExecContext(
+			context.Background(),
+			`UPDATE work_items SET status = ?, updated_at = ? WHERE id = ?`,
+			update.status,
+			update.when,
+			item.ID,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := store.ApplyRetention(context.Background(), time.Now().AddDate(0, 0, -30)); err != nil {
+		t.Fatal(err)
+	}
+	items, err = store.ListWorkItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := map[string]domain.WorkItem{}
+	for _, item := range items {
+		remaining[item.Event.MessageID] = item
+	}
+	if _, ok := remaining["om_old_done"]; ok {
+		t.Fatalf("old terminal work survived retention: %+v", remaining["om_old_done"])
+	}
+	if remaining["om_old_interrupted"].Status != domain.StatusInterrupted {
+		t.Fatalf("old interrupted work should remain: %+v", remaining["om_old_interrupted"])
+	}
+	if remaining["om_fresh_done"].Status != domain.StatusCompleted {
+		t.Fatalf("fresh terminal work should remain: %+v", remaining["om_fresh_done"])
+	}
+}
+
 func TestCheckpointStoreRoundTrip(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

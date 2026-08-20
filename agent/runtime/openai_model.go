@@ -91,14 +91,17 @@ func (m *OpenAICompatibleModel) encodeRequest(input []*schema.Message, opts ...e
 	}
 	body := map[string]any{
 		"model":    modelName,
-		"messages": toOpenAIMessages(input),
+		"messages": toOpenAIMessages(input, m.allowsImageInput()),
 	}
-	if len(cfg.Tools) > 0 {
+	if len(cfg.Tools) > 0 && m.allowsToolUse() {
 		tools, err := toOpenAITools(cfg.Tools)
 		if err != nil {
 			return nil, err
 		}
 		body["tools"] = tools
+		if m.hasProfile() && !m.Profile.Capabilities.ParallelToolCall {
+			body["parallel_tool_calls"] = false
+		}
 		if choice, ok := openAIToolChoice(cfg.ToolChoice); ok {
 			body["tool_choice"] = choice
 		}
@@ -270,7 +273,23 @@ func (m *OpenAICompatibleModel) baseURL() string {
 	return "https://api.openai.com/v1"
 }
 
-func toOpenAIMessages(input []*schema.Message) []map[string]any {
+func (m *OpenAICompatibleModel) hasProfile() bool {
+	return m.Profile.Name != "" ||
+		m.Profile.Provider != "" ||
+		m.Profile.Protocol != "" ||
+		m.Profile.Model != "" ||
+		m.Profile.BaseURL != ""
+}
+
+func (m *OpenAICompatibleModel) allowsToolUse() bool {
+	return !m.hasProfile() || m.Profile.Capabilities.ToolUse
+}
+
+func (m *OpenAICompatibleModel) allowsImageInput() bool {
+	return !m.hasProfile() || m.Profile.Capabilities.ImageInput
+}
+
+func toOpenAIMessages(input []*schema.Message, allowImages bool) []map[string]any {
 	out := make([]map[string]any, 0, len(input))
 	for _, msg := range input {
 		if msg == nil {
@@ -287,6 +306,9 @@ func toOpenAIMessages(input []*schema.Message) []map[string]any {
 						"text": part.Text,
 					})
 				case schema.ChatMessagePartTypeImageURL:
+					if !allowImages {
+						continue
+					}
 					if part.Image == nil || part.Image.URL == nil {
 						continue
 					}

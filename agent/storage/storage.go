@@ -87,6 +87,89 @@ func open(path string, createSession bool) (*Store, error) {
 	return store, nil
 }
 
+// ApplyRetention removes terminal audit state older than the configured
+// retention horizon. It intentionally leaves active, retrying, waiting, and
+// interrupted work intact even when their timestamps are old.
+func (s *Store) ApplyRetention(ctx context.Context, cutoff time.Time) error {
+	if s == nil || s.db == nil || cutoff.IsZero() {
+		return nil
+	}
+	cutoffRaw := cutoff.UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errs.NewInternalError(errs.SubtypeStorage, "begin retention cleanup").WithCause(err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	terminalStatuses := []any{
+		domain.StatusCompleted,
+		domain.StatusIgnored,
+		domain.StatusCancelled,
+		domain.StatusDeadLetter,
+	}
+	workWhere := `work_item_id IN (
+		SELECT id FROM work_items
+		WHERE updated_at < ?
+		  AND status IN (?, ?, ?, ?)
+	)`
+	for _, stmt := range []string{
+		`DELETE FROM agent_steps WHERE run_id IN (
+			SELECT id FROM agent_runs WHERE ` + workWhere + `
+		)`,
+		`DELETE FROM tool_calls WHERE run_id IN (
+			SELECT id FROM agent_runs WHERE ` + workWhere + `
+		)`,
+		`DELETE FROM owner_work_resolutions WHERE ` + workWhere,
+		`DELETE FROM owner_reply_resolutions WHERE ` + workWhere,
+		`DELETE FROM work_reply_candidates WHERE ` + workWhere,
+		`DELETE FROM work_interruptions WHERE ` + workWhere,
+		`DELETE FROM delegated_investigations WHERE ` + workWhere,
+		`DELETE FROM delegated_investigation_history WHERE ` + workWhere,
+		`DELETE FROM coding_goals WHERE ` + workWhere,
+		`DELETE FROM dead_letters WHERE ` + workWhere,
+		`DELETE FROM action_attempts WHERE ` + workWhere,
+		`DELETE FROM agent_runs WHERE ` + workWhere,
+		`DELETE FROM intake_receipts WHERE ` + workWhere,
+		`DELETE FROM memory_feedback WHERE memory_entry_id IN (
+			SELECT id FROM memory_entries WHERE source_work_item_id IN (
+				SELECT id FROM work_items
+				WHERE updated_at < ?
+				  AND status IN (?, ?, ?, ?)
+			)
+		)`,
+		`DELETE FROM memory_entries WHERE source_work_item_id IN (
+			SELECT id FROM work_items
+			WHERE updated_at < ?
+			  AND status IN (?, ?, ?, ?)
+		)`,
+		`DELETE FROM work_items
+		  WHERE updated_at < ?
+		    AND status IN (?, ?, ?, ?)`,
+	} {
+		args := append([]any{cutoffRaw}, terminalStatuses...)
+		if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+			return errs.NewInternalError(errs.SubtypeStorage, "apply retention cleanup").WithCause(err)
+		}
+	}
+
+	for _, stmt := range []string{
+		`DELETE FROM checkpoints WHERE updated_at < ?`,
+		`DELETE FROM external_references WHERE updated_at < ?`,
+		`DELETE FROM lifecycle_actions WHERE updated_at < ? AND status IN ('completed', 'failed')`,
+		`DELETE FROM owner_control_commands WHERE updated_at < ? AND status IN ('completed', 'failed', 'cancelled')`,
+		`DELETE FROM resource_evidence WHERE observed_at < ?`,
+		`DELETE FROM resource_subscriptions WHERE updated_at < ? AND status IN ('deleted', 'disabled')`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt, cutoffRaw); err != nil {
+			return errs.NewInternalError(errs.SubtypeStorage, "apply retention cleanup").WithCause(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return errs.NewInternalError(errs.SubtypeStorage, "commit retention cleanup").WithCause(err)
+	}
+	return nil
+}
+
 // ConfigureRecovery sets the bounded poison-item retry limit.
 func (s *Store) ConfigureRecovery(maxRetries int) {
 	if maxRetries > 0 {

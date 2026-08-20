@@ -49,7 +49,7 @@ func TestAgentTurnBudgetSupportsDeepInvestigation(t *testing.T) {
 
 func TestDefaultCodingConfig(t *testing.T) {
 	cfg := validConfigForTest(t)
-	if !cfg.Coding.Enabled || !cfg.Coding.RequireSourceRefs {
+	if !cfg.Coding.Enabled {
 		t.Fatalf("coding defaults=%+v", cfg.Coding)
 	}
 	if cfg.Coding.MaxEvidenceFiles <= 0 || cfg.Coding.MaxLarkContextCalls <= 0 {
@@ -58,6 +58,14 @@ func TestDefaultCodingConfig(t *testing.T) {
 	cfg.Coding.MaxEvidenceFiles = 0
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("Validate accepted invalid coding max evidence files")
+	}
+}
+
+func TestRetentionDaysMustBePositive(t *testing.T) {
+	cfg := validConfigForTest(t)
+	cfg.Retention.Days = 0
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "retention.days") {
+		t.Fatalf("retention validation error=%v", err)
 	}
 }
 
@@ -384,9 +392,6 @@ func TestGitHubConfigIsDisabledByDefaultAndBoundedWhenEnabled(t *testing.T) {
 	if cfg.GitHub.Enabled {
 		t.Fatalf("github enabled by default: %+v", cfg.GitHub)
 	}
-	if cfg.GitHub.ProactiveReview.Enabled || len(cfg.GitHub.ProactiveReview.ChatIDs) != 0 {
-		t.Fatalf("proactive github review enabled by default: %+v", cfg.GitHub.ProactiveReview)
-	}
 	if cfg.GitHub.APIBaseURL != "https://api.github.com" ||
 		cfg.GitHub.MaxFiles != 50 ||
 		cfg.GitHub.MaxPatchBytes != 64*1024 ||
@@ -405,17 +410,6 @@ func TestGitHubConfigIsDisabledByDefaultAndBoundedWhenEnabled(t *testing.T) {
 	cfg.GitHub.AllowedRepositories = []string{"invalid"}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("accepted invalid repository")
-	}
-	cfg = validConfigForTest(t)
-	cfg.GitHub.Enabled = true
-	cfg.GitHub.AllowedRepositories = []string{"example/widgets"}
-	cfg.GitHub.ProactiveReview.Enabled = true
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "proactive_review.chat_ids") {
-		t.Fatalf("enabled proactive review without chats error=%v", err)
-	}
-	cfg.GitHub.ProactiveReview.ChatIDs = []string{"oc_synthetic"}
-	if err := cfg.Validate(); err != nil {
-		t.Fatal(err)
 	}
 }
 

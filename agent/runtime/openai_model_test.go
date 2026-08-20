@@ -216,6 +216,120 @@ func TestOpenAICompatibleModelAllowedToolChoiceOmitsWireField(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatibleModelHonorsToolUseCapability(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	model := &OpenAICompatibleModel{
+		APIKey: "key", BaseURL: server.URL, Model: "test-model", Client: server.Client(),
+		Profile: modelruntime.Profile{
+			Name:         "primary",
+			Provider:     modelruntime.ProviderKimi,
+			Protocol:     modelruntime.ProtocolOpenAIChat,
+			Capabilities: modelruntime.Capabilities{ToolUse: false},
+		},
+	}
+	_, err := model.Generate(
+		context.Background(),
+		[]*schema.Message{schema.UserMessage("find router")},
+		einomodel.WithTools([]*schema.ToolInfo{{Name: "search_workspace"}}),
+		einomodel.WithToolChoice(schema.ToolChoiceForced),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["tools"]; ok {
+		t.Fatalf("tool_use=false must omit tools: %+v", body)
+	}
+	if _, ok := body["tool_choice"]; ok {
+		t.Fatalf("tool_use=false must omit tool_choice: %+v", body)
+	}
+	if format, ok := body["response_format"].(map[string]any); !ok || format["type"] != "json_object" {
+		t.Fatalf("response_format=%+v body=%+v", body["response_format"], body)
+	}
+}
+
+func TestOpenAICompatibleModelHonorsParallelToolCapability(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	model := &OpenAICompatibleModel{
+		APIKey: "key", BaseURL: server.URL, Model: "test-model", Client: server.Client(),
+		Profile: modelruntime.Profile{
+			Name: "primary", Provider: modelruntime.ProviderKimi, Protocol: modelruntime.ProtocolOpenAIChat,
+			Capabilities: modelruntime.Capabilities{ToolUse: true, ParallelToolCall: false},
+		},
+	}
+	_, err := model.Generate(
+		context.Background(),
+		[]*schema.Message{schema.UserMessage("find router")},
+		einomodel.WithTools([]*schema.ToolInfo{{Name: "search_workspace"}}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := body["parallel_tool_calls"].(bool); !ok || got {
+		t.Fatalf("parallel_tool_calls=%+v body=%+v", body["parallel_tool_calls"], body)
+	}
+}
+
+func TestOpenAICompatibleModelHonorsImageInputCapability(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	imageURL := "data:image/png;base64,AAAA"
+	model := &OpenAICompatibleModel{
+		APIKey: "key", BaseURL: server.URL, Model: "test-model", Client: server.Client(),
+		Profile: modelruntime.Profile{
+			Name:         "primary",
+			Provider:     modelruntime.ProviderKimi,
+			Protocol:     modelruntime.ProtocolOpenAIChat,
+			Capabilities: modelruntime.Capabilities{ImageInput: false},
+		},
+	}
+	_, err := model.Generate(context.Background(), []*schema.Message{{
+		Role: schema.User,
+		UserInputMultiContent: []schema.MessageInputPart{
+			{Type: schema.ChatMessagePartTypeText, Text: "Inspect this evidence."},
+			{Type: schema.ChatMessagePartTypeImageURL, Image: &schema.MessageInputImage{
+				MessagePartCommon: schema.MessagePartCommon{URL: &imageURL},
+				Detail:            schema.ImageURLDetailHigh,
+			}},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := body["messages"].([]any)
+	message := messages[0].(map[string]any)
+	parts := message["content"].([]any)
+	if len(parts) != 1 {
+		t.Fatalf("image_input=false must strip image parts: %+v", parts)
+	}
+	textPart := parts[0].(map[string]any)
+	if textPart["type"] != "text" || textPart["text"] != "Inspect this evidence." {
+		t.Fatalf("text part=%+v", textPart)
+	}
+}
+
 func TestOpenAICompatibleModelWithToolsReturnsIndependentModel(t *testing.T) {
 	base := &OpenAICompatibleModel{APIKey: "key", Model: "test-model"}
 	tool := &schema.ToolInfo{Name: "search_workspace"}

@@ -202,6 +202,32 @@ func TestOwnerCodingQuestionClassifiesWorkKind(t *testing.T) {
 	}
 }
 
+func TestDisabledCodingKeepsOwnerRequestInSimpleLane(t *testing.T) {
+	r := New(Config{
+		OwnerOpenID:      "ou_owner",
+		AssistantOpenIDs: []string{"ou_bot"},
+		AssistantNames:   []string{"Assistant Bot"},
+		Mode:             domain.ModeAuto,
+		DisableCoding:    true,
+	})
+	decision, err := r.Route(context.Background(), domain.WorkItem{
+		Event: domain.NormalizedEvent{
+			MessageID: "om_code_disabled",
+			ChatID:    "oc_group",
+			SenderID:  "ou_owner",
+			Mentions:  []domain.Mention{{OpenID: "ou_bot", Name: "Assistant Bot"}},
+			Content:   "@Assistant Bot 帮我看一下 POST /api/sample/items 为什么每次都访问 SampleDB，请基于代码证据回答。",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.WorkKind != domain.WorkKindSimpleQuestion ||
+		decision.Priority != domain.PrioritySimpleQuestion {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
 func TestOwnerFastPathCoversDateStatusDoctorQueueAndHelp(t *testing.T) {
 	now := time.Date(2026, 7, 24, 4, 30, 0, 0, time.Local)
 	r := New(Config{
