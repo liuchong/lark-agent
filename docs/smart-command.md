@@ -68,6 +68,20 @@ Fork 来的 PR 会跳过。名为 `CI` 的 `workflow_run` 不进事件摘要和�
 
 `/review` 和 `/check` 在有 PR 号时会额外允许检查写入。`--dry-run` 会清空全部写入。检查名固定为 `lark-agent-gate`，不会调用 merge API。
 
+## 输出语言
+
+对外语言由配置决定，不看提示词是什么语言写的。提示词、规则文件和 `--message` 是给模型的指令，不是语言样本；早期版本靠数汉字和拉丁词猜语言，结果所有英文提示词都产出英文内容。
+
+优先级是 `--output-language` > `LARK_AGENT_OUTPUT_LANGUAGE` > `output.language`（具体值）> `output.fallback_language`。取值只有 `auto`、`zh-CN`、`en-US`，其他值在跑模型和发任何 HTTP 之前以退出码 2 失败。Actions 里用 `action.yml` 的 `output_language` 输入。
+
+解析结果会出现在 stdout 的 `data.output_language`，也会作为“必须使用的对外语言”进入每一轮模型上下文。
+
+真正拦住语言不符的是写入门禁，不是提示词：`post_github_comment` 的 `body`、`send_lark_message` 的 `text`、`upsert_github_check` 的 `summary` 和 `text`、`write_job_output` 的 `value` 语言不符时返回有类型的工具错误，不发 HTTP，一次性写入额度也不消耗，模型可以改写后重试。
+
+标题不受语言约束。Issue、PR 和检查的标题是仓库产物，遵守仓库自己的英文 Conventional Commits 约定。
+
+未知斜杠命令和 `/review`、`/check` 用在非 PR 上的帮助评论也跟随这个语言。
+
 ## 结束方式
 
 工作类型是 `smart_command`。模型必须调用 `submit_decision`，且 `decision` 只能是 `record`。这个工具本身不发飞书、不写 GitHub。真正的评论、检查、标题、飞书消息和 job output 只能通过上面的具名写入工具，每种进程最多成功一次。

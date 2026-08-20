@@ -11,6 +11,7 @@ import (
 
 	"github.com/cloudwego/eino/schema"
 
+	agentlocale "github.com/liuchong/lark-agent/agent/locale"
 	"github.com/liuchong/lark-agent/internal/apperr"
 	internalgithub "github.com/liuchong/lark-agent/internal/github"
 )
@@ -31,6 +32,7 @@ type WriteGate struct {
 
 	Allow          map[string]bool
 	Secrets        []string
+	Language       agentlocale.Language
 	JobOutputPath  string
 	ChatID         string
 	AppSecret      string
@@ -72,6 +74,26 @@ func (g *WriteGate) rejectSecrets(body string) error {
 	return nil
 }
 
+// rejectLanguage keeps outward prose in the language the run resolved. Titles
+// are repository artifacts, not outward prose, so callers do not pass them here.
+func (g *WriteGate) rejectLanguage(text string) error {
+	if g == nil {
+		return nil
+	}
+	language, err := agentlocale.ParseConcrete(string(g.Language))
+	if err != nil {
+		return nil
+	}
+	if err := agentlocale.ValidateProse(text, language); err != nil {
+		return errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"outward text must be written in %s; rewrite it in that language and call again",
+			language,
+		).WithCause(err)
+	}
+	return nil
+}
+
 func denyWrite(name string) error {
 	return errs.NewValidationError(
 		errs.SubtypeFailedPrecondition,
@@ -109,6 +131,9 @@ func PostGitHubCommentDefinition(writer GitHubWriter, gate *WriteGate) Definitio
 				return Execution{}, errs.NewValidationError(errs.SubtypeInvalidArgument, "comment body exceeds 65536 bytes")
 			}
 			if err := gate.rejectSecrets(body); err != nil {
+				return Execution{}, err
+			}
+			if err := gate.rejectLanguage(body); err != nil {
 				return Execution{}, err
 			}
 			scope, ok := invocationScope(ctx)
@@ -228,6 +253,9 @@ func UpsertGitHubCheckDefinition(writer GitHubWriter, gate *WriteGate) Definitio
 			if err := gate.rejectSecrets(args.Title + args.Summary + args.Text); err != nil {
 				return Execution{}, err
 			}
+			if err := gate.rejectLanguage(args.Summary + "\n" + args.Text); err != nil {
+				return Execution{}, err
+			}
 			scope, ok := invocationScope(ctx)
 			if !ok || scope.GitHubReference == nil {
 				return Execution{}, errs.NewValidationError(errs.SubtypeFailedPrecondition, "verified GitHub reference is required")
@@ -280,6 +308,9 @@ func SendLarkMessageDefinition(sender BotMessageSender, gate *WriteGate) Definit
 				return Execution{}, errs.NewValidationError(errs.SubtypeInvalidArgument, "text exceeds 4000 runes")
 			}
 			if err := gate.rejectSecrets(text); err != nil {
+				return Execution{}, err
+			}
+			if err := gate.rejectLanguage(text); err != nil {
 				return Execution{}, err
 			}
 			if strings.TrimSpace(gate.ChatID) == "" {
@@ -353,6 +384,9 @@ func WriteJobOutputDefinition(gate *WriteGate) Definition {
 				}
 			}
 			if err := gate.rejectSecrets(args.Value); err != nil {
+				return Execution{}, err
+			}
+			if err := gate.rejectLanguage(args.Value); err != nil {
 				return Execution{}, err
 			}
 			gate.mu.Lock()

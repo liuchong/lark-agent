@@ -33,6 +33,7 @@ type smartCommandData struct {
 	CheckID        string            `json:"check_id"`
 	MessageID      string            `json:"message_id"`
 	Title          string            `json:"title"`
+	OutputLanguage string            `json:"output_language"`
 	Outputs        map[string]string `json:"outputs"`
 	Reference      json.RawMessage   `json:"reference"`
 }

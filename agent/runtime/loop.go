@@ -1408,6 +1408,12 @@ func consumesInvestigationToolBudget(toolName string) bool {
 }
 
 func resolvedBundleLanguage(bundle agentcontext.Bundle) agentlocale.Language {
+	// Work with no human conversation carries its outward language explicitly;
+	// its own instruction text must never be treated as a language sample.
+	if language := agentlocale.Language(bundle.OutputLanguage); language == agentlocale.LanguageChinese ||
+		language == agentlocale.LanguageEnglish {
+		return language
+	}
 	language := agentlocale.Language(bundle.User.Language)
 	if language == agentlocale.LanguageChinese || language == agentlocale.LanguageEnglish {
 		return language

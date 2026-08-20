@@ -58,12 +58,19 @@ lark-agent config show
   群内 PR 审查请求。默认 `false`。
 - `github.proactive_review.chat_ids`：主动审查开启时必填的精确群 ID 列表。主动审查
   只能把结果私聊通知 Owner，不能在原群回复请求者。
+- `output.language`：全产品对外语言，`auto`、`zh-CN` 或 `en-US`，默认 `auto`。
+  所有对外消息都遵守它，包括没有人类会话可参考的智能命令。
+- `output.fallback_language`：`zh-CN` 或 `en-US`，默认 `zh-CN`。`auto` 判断不
+  明确时使用；智能命令在 `output.language` 为 `auto` 时直接使用它，不会拿提示词
+  文本当语言样本。
 - `owner.open_id`：唯一 Owner 的 open ID。
 - `owner.name`：必填。智能助手代回复和私聊通知中使用的具体姓名。缺失时配置校验
   直接失败，代回复不会用“用户”或“负责人”代替。
-- `owner.preferred_language`：`auto`、`zh-CN` 或 `en-US`。配置为具体语言时优先
-  使用；`auto` 按当前消息和有界同会话上下文判断。
-- `owner.fallback_language`：自动判断不明确时使用的 `zh-CN` 或 `en-US`。
+- `owner.preferred_language`：`auto`、`zh-CN` 或 `en-US`。仅覆盖面向 Owner 的会话
+  工作。配置为具体语言时优先于 `output.language`；`auto` 时按当前消息和有界同会话
+  上下文判断。
+- `owner.fallback_language`：自动判断不明确时使用的 `zh-CN` 或 `en-US`。未配置时
+  回落到 `output.fallback_language`。
 - `assistant.open_ids`、`assistant.names`：Owner 私聊和群 @机器人的识别身份。
 - `assistant.owner_direct.enabled`：是否接受 Owner 直接发给机器人的请求。
 - `assistant.reply_scope`：Owner 群内 @机器人范围。`all_groups` 是默认值，允许
@@ -230,6 +237,10 @@ lark-agent mode paused
 ```yaml
 assistant:
   reply_scope: all_groups
+
+output:
+  language: zh-CN
+  fallback_language: zh-CN
 
 owner:
   name: 姓名

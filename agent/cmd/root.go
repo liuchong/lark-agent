@@ -1890,6 +1890,7 @@ func buildLiveOptions(
 	} else {
 		info["github_context"] = false
 	}
+	ownerPreferred, ownerFallback := cfg.OwnerLanguagePolicy()
 	builder := &conversationBuilder{
 		svc:                 imSvc,
 		store:               store,
@@ -1905,8 +1906,8 @@ func buildLiveOptions(
 			User: agentcontext.UserProfile{
 				OpenID:            cfg.Owner.OpenID,
 				Name:              cfg.Owner.Name,
-				PreferredLanguage: string(cfg.Owner.PreferredLanguage),
-				FallbackLanguage:  string(cfg.Owner.FallbackLanguage),
+				PreferredLanguage: string(ownerPreferred),
+				FallbackLanguage:  string(ownerFallback),
 			},
 		},
 		includeLarkContext: userContextEnabled,

@@ -24,6 +24,7 @@ type Config struct {
 	Version    int              `json:"version" yaml:"version"`
 	Lark       LarkConfig       `json:"lark" yaml:"lark"`
 	GitHub     GitHubConfig     `json:"github" yaml:"github"`
+	Output     OutputConfig     `json:"output" yaml:"output"`
 	Owner      OwnerConfig      `json:"owner" yaml:"owner"`
 	Assistant  AssistantConfig  `json:"assistant" yaml:"assistant"`
 	Model      ModelConfig      `json:"model" yaml:"model"`
@@ -176,12 +177,65 @@ func DefaultPaths(home string) Paths {
 	}
 }
 
-// OwnerConfig identifies the human owner.
+// OutputConfig is the product-wide outward language policy. It applies to every
+// message this agent sends, including work that has no human conversation to
+// infer a language from.
+type OutputConfig struct {
+	Language         agentlocale.Language `json:"language" yaml:"language"`
+	FallbackLanguage agentlocale.Language `json:"fallback_language" yaml:"fallback_language"`
+}
+
+// OwnerConfig identifies the human owner. Its language fields override
+// OutputConfig for owner-facing conversational work only.
 type OwnerConfig struct {
 	OpenID            string               `json:"open_id" yaml:"open_id"`
 	Name              string               `json:"name,omitempty" yaml:"name,omitempty"`
 	PreferredLanguage agentlocale.Language `json:"preferred_language" yaml:"preferred_language"`
 	FallbackLanguage  agentlocale.Language `json:"fallback_language" yaml:"fallback_language"`
+}
+
+// OwnerLanguagePolicy returns the preferred and fallback languages for
+// owner-facing conversational work. A concrete owner preference wins over
+// output.language; `auto` defers to it.
+func (c Config) OwnerLanguagePolicy() (preferred, fallback agentlocale.Language) {
+	preferred = concreteLanguage(c.Owner.PreferredLanguage)
+	if preferred == "" {
+		preferred = concreteLanguage(c.Output.Language)
+	}
+	if preferred == "" {
+		preferred = agentlocale.LanguageAuto
+	}
+	fallback = concreteLanguage(c.Owner.FallbackLanguage)
+	if fallback == "" {
+		fallback = c.OutwardFallbackLanguage()
+	}
+	return preferred, fallback
+}
+
+// OutwardLanguage returns the concrete language for outward work that has no
+// human conversation to infer from, such as a smart command. Instruction text
+// is never a language sample, so inference does not apply here.
+func (c Config) OutwardLanguage() agentlocale.Language {
+	if language := concreteLanguage(c.Output.Language); language != "" {
+		return language
+	}
+	return c.OutwardFallbackLanguage()
+}
+
+// OutwardFallbackLanguage returns the configured concrete fallback.
+func (c Config) OutwardFallbackLanguage() agentlocale.Language {
+	if language := concreteLanguage(c.Output.FallbackLanguage); language != "" {
+		return language
+	}
+	return agentlocale.LanguageChinese
+}
+
+func concreteLanguage(value agentlocale.Language) agentlocale.Language {
+	language, err := agentlocale.ParseConcrete(string(value))
+	if err != nil {
+		return ""
+	}
+	return language
 }
 
 // AssistantConfig identifies bot-facing request entry points.
@@ -321,6 +375,10 @@ func Default() Config {
 			MaxPatchBytes:        64 * 1024,
 			MaxAnnotations:       50,
 			MaxReviews:           50,
+		},
+		Output: OutputConfig{
+			Language:         agentlocale.LanguageAuto,
+			FallbackLanguage: agentlocale.LanguageChinese,
 		},
 		Owner: OwnerConfig{
 			PreferredLanguage: agentlocale.LanguageAuto,
@@ -486,6 +544,14 @@ func (c *Config) Normalize() {
 		c.Version = currentVersion
 	}
 	c.Model.normalize(legacyVersion)
+	// An absent and an explicitly blank language are indistinguishable in YAML,
+	// so both take the documented default instead of failing validation.
+	if strings.TrimSpace(string(c.Output.Language)) == "" {
+		c.Output.Language = agentlocale.LanguageAuto
+	}
+	if strings.TrimSpace(string(c.Output.FallbackLanguage)) == "" {
+		c.Output.FallbackLanguage = agentlocale.LanguageChinese
+	}
 	if strings.TrimSpace(c.TaskRules.Path) == "" {
 		c.TaskRules.Path = taskrules.DefaultFileName
 	}
@@ -527,6 +593,20 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.Owner.Name) == "" {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "owner.name is required").WithField("owner.name")
+	}
+	if _, err := agentlocale.ParsePreferred(string(c.Output.Language)); err != nil {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"invalid output.language: %s",
+			c.Output.Language,
+		).WithField("output.language").WithCause(err)
+	}
+	if _, err := agentlocale.ParseConcrete(string(c.Output.FallbackLanguage)); err != nil {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"invalid output.fallback_language: %s",
+			c.Output.FallbackLanguage,
+		).WithField("output.fallback_language").WithCause(err)
 	}
 	if _, err := agentlocale.ParsePreferred(string(c.Owner.PreferredLanguage)); err != nil {
 		return errs.NewConfigError(

@@ -40,6 +40,10 @@ inputs:
     description: Inline smart-command message
     required: false
     default: ""
+  output_language:
+    description: Outward language for generated content, auto, zh-CN or en-US
+    required: false
+    default: ""
 outputs:
   changelog:
     description: Changelog text written by the write_job_output smart-command tool
@@ -58,3 +62,4 @@ runs:
     LARK_AGENT_ALLOWED_ACTIONS: ${{ inputs.allowed_actions }}
     LARK_AGENT_DRY_RUN: ${{ inputs.dry_run }}
     LARK_AGENT_MESSAGE: ${{ inputs.message }}
+    LARK_AGENT_OUTPUT_LANGUAGE: ${{ inputs.output_language }}

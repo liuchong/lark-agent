@@ -127,6 +127,7 @@ Global flags already on the root command (`--config`, `--state`) apply.
 | `--allowed-actions` | no | empty = no write tools | comma-separated; trim space; empty tokens ignored; duplicates keep first-seen order; unknown name `SC-21` |
 | `--chat-id` | if `send_lark_message` effectively allowed and not dry-run | `LARK_CHAT_ID` | non-empty |
 | `--dry-run` | no | false | boolean flag; `--dry-run=true`/`false` as cobra bool is allowed on **CLI**; comment parser rejects `=` form (`SC-23`) |
+| `--output-language` | no | `LARK_AGENT_OUTPUT_LANGUAGE`, else config | `auto`, `zh-CN`, `en-US`; unsupported value exits 2 before the model (`SC-86`) |
 | `--state` | no | temp sqlite | tests must not point this at the daemon live DB |
 
 ### `lark-agent github run`
@@ -166,7 +167,7 @@ Keychain fallback and env overrides the daemon uses. Optional:
 `OPENAI_BASE_URL`, `OPENAI_MODEL`, `LARK_CHAT_ID`,
 `GITHUB_OUTPUT`, `GITHUB_WORKSPACE`, `GITHUB_RUN_ID`, `GITHUB_SHA`,
 `GITHUB_API_URL` (GitHub Enterprise API base; default `https://api.github.com`
-when unset).
+when unset), `LARK_AGENT_OUTPUT_LANGUAGE`.
 
 Workspace root is `GITHUB_WORKSPACE` when set, else process cwd.
 
@@ -190,6 +191,7 @@ or `GITHUB_TOKEN`.
 | `allowed_actions` | no | empty | `LARK_AGENT_ALLOWED_ACTIONS` |
 | `dry_run` | no | `false` | `LARK_AGENT_DRY_RUN` (`true`/`false`) |
 | `message` | no | empty | `LARK_AGENT_MESSAGE` |
+| `output_language` | no | empty | `LARK_AGENT_OUTPUT_LANGUAGE` |
 
 `runs.using` remains `docker`. `runs.image` remains `Dockerfile`.
 
@@ -202,7 +204,8 @@ or `GITHUB_TOKEN`.
 - `LARK_AGENT_MODE=run`: `github run` plus `--prompt-file`, `--rules-file`,
   `--allowed-actions`, `--message`, `--chat-id`, `--dry-run` when the
   corresponding env is non-empty. `--dry-run` is passed only when
-  `LARK_AGENT_DRY_RUN` is the string `true`.
+  `LARK_AGENT_DRY_RUN` is the string `true`. `LARK_AGENT_OUTPUT_LANGUAGE` is
+  read by the command itself and needs no flag.
 - any other mode: exit 2, stderr contains `unknown mode`, no model (`SC-34`).
 
 Existing `.github/workflows/lark-notify.yml` does not set `mode` and must keep
@@ -228,6 +231,7 @@ Success (`SC-03`, `SC-35`):
     "check_id": "",
     "message_id": "",
     "title": "",
+    "output_language": "zh-CN",
     "outputs": {},
     "reference": {}
   }
@@ -248,6 +252,7 @@ Success (`SC-03`, `SC-35`):
 | `check_id` | string | decimal check-run id after upsert; else `""` |
 | `message_id` | string | Lark message id after send; else `""` |
 | `title` | string | new title after PATCH; else `""` |
+| `output_language` | string | resolved outward language, `zh-CN` or `en-US`; never empty or `auto` |
 | `outputs` | object | `{"changelog":"<text>"}` after `write_job_output`; else `{}` |
 | `reference` | object | validated `GitHubReference`; omitted/empty object on `lark-agent run` |
 
@@ -644,6 +649,37 @@ LARK_AGENT_EOF
 
 If `value` contains the exact line `LARK_AGENT_EOF`, the tool fails, no write.
 
+### Outward language enforcement (`SC-85` … `SC-88`)
+
+A smart command resolves exactly one outward language before the first model
+call: `--output-language` when non-empty, else `LARK_AGENT_OUTPUT_LANGUAGE`,
+else `output.language` when concrete, else `output.fallback_language`. Prompt
+text, rules text, and message text are never language samples (`SC-85`). An
+unsupported value fails closed with exit 2 before any model or HTTP call
+(`SC-86`).
+
+The resolved language reaches the model as the required outward language in the
+per-turn budget note, and is enforced by the write gate on the fields that
+carry outward prose (`SC-87`):
+
+| Tool | Enforced field | Exempt |
+|---|---|---|
+| `post_github_comment` | `body` | |
+| `send_lark_message` | `text` | HMAC marker appended by Go |
+| `upsert_github_check` | `summary`, `text` | `title` |
+| `update_github_issue_title` | | `title` |
+| `write_job_output` | `value` | |
+
+A mismatch is a typed validation error naming the required language, with zero
+HTTP and no gate state change, so the model can rewrite and call again. Title
+fields are exempt because an issue, pull-request, or check title is a
+repository artifact under the English Conventional Commits rule, not outward
+prose.
+
+Deterministic outward help text renders in the resolved language (`SC-88`):
+the unknown-slash-command help and the `/review` or `/check` outside a pull
+request help.
+
 ### Forbidden registry names on `github run` (`SC-50`)
 
 `shell`, `edit_workspace`, `write_workspace`, `read_workspace`,
@@ -878,8 +914,9 @@ success path; verify failure YAML `if: success()` on release job.
 |---|---|---|
 | ParseEvent + fixtures | `internal/github/*_test.go` | SC-02, SC-13, SC-29, SC-30, SC-48, SC-55–SC-57, SC-72 |
 | Mention parser | package next to GitHub support | SC-06–SC-09, SC-17, SC-23–SC-27, SC-43–SC-47, SC-74–SC-76 |
-| CLI / no WebSocket / envelope | `agent/cmd` + `integration_test/lark_agent` | SC-01, SC-03, SC-11, SC-14, SC-15, SC-18, SC-19, SC-35, SC-54, SC-81, SC-82 |
-| Tools + fake HTTP | `agent/tools` + `internal/github` | SC-04, SC-05, SC-10, SC-12, SC-21, SC-22, SC-31–SC-33, SC-39–SC-42, SC-49, SC-50, SC-58, SC-62, SC-63 |
+| CLI / no WebSocket / envelope | `agent/cmd` + `integration_test/lark_agent` | SC-01, SC-03, SC-11, SC-14, SC-15, SC-18, SC-19, SC-35, SC-54, SC-81, SC-82, SC-85, SC-86 |
+| Tools + fake HTTP | `agent/tools` + `internal/github` | SC-04, SC-05, SC-10, SC-12, SC-21, SC-22, SC-31–SC-33, SC-39–SC-42, SC-49, SC-50, SC-58, SC-62, SC-63, SC-87 |
+| Outward language + prompt contract | `integration_test/lark_agent` | SC-85–SC-89 |
 | Workflow YAML | `integration_test/lark_agent` | GW-03.2, SC-38, SC-65–SC-69, SC-83 |
 | Help | `help_contract_test.go` | SC-51 |
 | Action dispatcher | unit test of mode switch / Dockerfile assertion | SC-34, SC-52, SC-53 |
@@ -1024,6 +1061,29 @@ Tests use only synthetic identifiers (`example/widgets`, `oc_synthetic`,
   question markers (`repository`, `api`, `代码`, …), when the model submits
   `record`, then the decision is accepted; smart command work is never
   reclassified as a coding question and never requires a `reply`.
+- **SC-85.** Given `output.language: auto`, `output.fallback_language: zh-CN`,
+  and an English prompt file, when a smart command runs, then the required
+  outward language given to the model is `zh-CN`; prompt text never changes the
+  resolved language.
+- **SC-86.** Given `--output-language ja-JP`, when the smart command starts,
+  then exit 2 before any model or HTTP call and the message names the
+  unsupported language. Given `--output-language en-US` with
+  `output.language: zh-CN`, the run resolves `en-US`; given only
+  `LARK_AGENT_OUTPUT_LANGUAGE=en-US`, the run also resolves `en-US`, and the
+  flag wins over the environment.
+- **SC-87.** Given resolved language `zh-CN`, when the model calls
+  `send_lark_message`, `post_github_comment`, `upsert_github_check`, or
+  `write_job_output` with an English prose body, then a typed validation error
+  names `zh-CN`, zero HTTP happens, the one-shot gate stays unused, and a
+  following call in `zh-CN` succeeds. A title argument in either language is
+  never rejected for language.
+- **SC-88.** Given resolved language `zh-CN` and `@lark-agent /nope`, when the
+  help comment is posted, then its body is Chinese and still names `/review`,
+  `/title`, `/check`, and `--dry-run`. The same holds for `/review` outside a
+  pull request.
+- **SC-89.** Given the smart-command system prompt, then it requires the
+  conclusion before detail and forbids repository-internal scene ids and code
+  identifiers in outward text.
 
 `SC-36` is unused (reserved). `SC-37` is covered by the comment `if` Bot
 clause in YAML tests.

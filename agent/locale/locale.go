@@ -121,6 +121,30 @@ func ValidateProse(text string, target Language) error {
 	return nil
 }
 
+// UnknownSlashCommandHelp is the deterministic help posted when a mention names
+// a slash command this agent does not implement.
+func UnknownSlashCommandHelp(language Language, command string) string {
+	if language == LanguageEnglish {
+		return fmt.Sprintf(
+			"Unknown slash command /%s. Allowed: /review, /title, /check, and --dry-run.",
+			command,
+		)
+	}
+	return fmt.Sprintf(
+		"未知命令 /%s。可用命令：/review、/title、/check，以及 --dry-run。",
+		command,
+	)
+}
+
+// NonPullRequestCommandHelp is the deterministic help posted when a
+// pull-request-only slash command is used outside a pull request.
+func NonPullRequestCommandHelp(language Language) string {
+	if language == LanguageEnglish {
+		return "/review and /check only apply to a pull request."
+	}
+	return "/review 和 /check 只能用于 Pull Request。"
+}
+
 // RenderDelegatedReply gives sender-facing delegated replies an explicit
 // assistant identity and owner-notification disclosure.
 func RenderDelegatedReply(language Language, ownerName, content string) (string, error) {

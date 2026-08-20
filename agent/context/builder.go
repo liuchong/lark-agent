@@ -27,7 +27,12 @@ func SmartCommandSystemPrompt() string {
 Use only the registered tools. Finish exactly once by calling submit_decision with decision=record.
 Do not merge pull requests. Do not invent repository, commit, or conversation facts.
 GitHub comments, checks, titles, Lark posts, and job outputs happen only through named write tools.
-submit_decision never sends Lark or GitHub.`
+submit_decision never sends Lark or GitHub.
+Outward text is read by people who cannot see this run, the diff, or this repository's internal conventions.
+State the conclusion first, then the supporting detail; never send a restatement of the diff as the conclusion.
+Write outward text in the required outward language given in the budget note. A write tool rejects a language mismatch.
+Outward text may name files, commands, and public identifiers. It must not contain any identifier that only means something inside this repository: specification or scene ids such as AB-12, internal ticket ids, test names, or source code symbol names. If a change is only explainable through such an identifier, describe the observable behavior instead and drop the identifier.
+Titles keep the repository's own convention and are exempt from the outward language requirement.`
 }
 
 func AgentSystemPrompt() string {
@@ -300,6 +305,7 @@ type Bundle struct {
 	ContextDigest      string                   `json:"context_digest,omitempty" yaml:"context_digest,omitempty"`
 	Priority           int                      `json:"priority,omitempty" yaml:"priority,omitempty"`
 	MaxTurns           int                      `json:"max_turns,omitempty" yaml:"max_turns,omitempty"`
+	OutputLanguage     string                   `json:"output_language,omitempty" yaml:"output_language,omitempty"`
 	User               UserProfile              `json:"user" yaml:"user"`
 	Environment        EnvironmentSnapshot      `json:"environment" yaml:"environment"`
 	RuntimePolicy      RuntimePolicySnapshot    `json:"runtime_policy" yaml:"runtime_policy"`

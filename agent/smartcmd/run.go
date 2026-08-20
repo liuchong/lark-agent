@@ -2,7 +2,6 @@ package smartcmd
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,6 +13,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/config"
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
+	agentlocale "github.com/liuchong/lark-agent/agent/locale"
 	agentruntime "github.com/liuchong/lark-agent/agent/runtime"
 	"github.com/liuchong/lark-agent/agent/storage"
 	agenttools "github.com/liuchong/lark-agent/agent/tools"
@@ -24,11 +24,7 @@ import (
 	"github.com/liuchong/lark-agent/internal/secretstore"
 )
 
-const (
-	smartCommandIdentity = "smart-command"
-	unknownSlashHelpTmpl = "Unknown slash command /%s. Allowed: /review, /title, /check, and --dry-run."
-	nonPRReviewHelp      = "/review and /check only apply to a pull request."
-)
+const smartCommandIdentity = "smart-command"
 
 type Options struct {
 	Config         config.Config
@@ -43,6 +39,7 @@ type Options struct {
 	EventPath      string
 	EventName      string
 	WorkspaceRoot  string
+	OutputLanguage string
 
 	Model             einomodel.BaseChatModel
 	TerminalFinalizer einomodel.BaseChatModel
@@ -64,6 +61,7 @@ type Result struct {
 	CheckID        string            `json:"check_id"`
 	MessageID      string            `json:"message_id"`
 	Title          string            `json:"title"`
+	OutputLanguage string            `json:"output_language"`
 	Outputs        map[string]string `json:"outputs"`
 	Reference      any               `json:"reference"`
 }
@@ -76,6 +74,12 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		Outputs:        map[string]string{},
 		Reference:      map[string]any{},
 	}
+	language, err := resolveOutputLanguage(opts)
+	if err != nil {
+		return Result{}, err
+	}
+	result.OutputLanguage = string(language)
+
 	workspaceRoot := strings.TrimSpace(opts.WorkspaceRoot)
 	if workspaceRoot == "" {
 		workspaceRoot = firstNonEmpty(os.Getenv("GITHUB_WORKSPACE"), opts.Config.Workspace.Root)
@@ -176,7 +180,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	result.AllowedActions = append([]string{}, effective...)
 
 	if mention.UnknownCommand {
-		help := fmt.Sprintf(unknownSlashHelpTmpl, mention.Command)
+		help := agentlocale.UnknownSlashCommandHelp(language, mention.Command)
 		if internalgithub.AllowlistContains(effective, internalgithub.ActionPostGitHubComment) {
 			commentID, err := postHelpComment(ctx, opts, snapshot.Reference, help)
 			if err != nil {
@@ -189,7 +193,12 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	}
 	if (mention.Command == "review" || mention.Command == "check") && !hasPR {
 		if internalgithub.AllowlistContains(effective, internalgithub.ActionPostGitHubComment) {
-			commentID, err := postHelpComment(ctx, opts, snapshot.Reference, nonPRReviewHelp)
+			commentID, err := postHelpComment(
+				ctx,
+				opts,
+				snapshot.Reference,
+				agentlocale.NonPullRequestCommandHelp(language),
+			)
 			if err != nil {
 				return Result{}, err
 			}
@@ -283,6 +292,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	gate := &agenttools.WriteGate{
 		Allow:          allowMap(effective),
 		Secrets:        secretValues(),
+		Language:       language,
 		JobOutputPath:  os.Getenv("GITHUB_OUTPUT"),
 		ChatID:         strings.TrimSpace(opts.ChatID),
 		AppSecret:      opts.AppSecret,
@@ -365,6 +375,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		},
 		WorkKind:           domain.WorkKindSmartCommand,
 		MaxTurns:           20,
+		OutputLanguage:     string(language),
 		User:               agentcontext.UserProfile{OpenID: smartCommandIdentity, Name: smartCommandIdentity},
 		Environment:        agentcontext.EnvironmentSnapshot{WorkspaceRoot: workspaceRoot, Tools: tools},
 		GitHubReference:    githubRef,
@@ -540,6 +551,28 @@ func readWorkspaceFile(root, rel, kind string) (string, error) {
 		return "", errs.NewValidationError(errs.SubtypeInvalidArgument, "%s file is missing", kind).WithCause(err)
 	}
 	return string(data), nil
+}
+
+// resolveOutputLanguage fixes one concrete outward language before any model or
+// HTTP call. Flag beats environment beats configuration; prompt, rules, and
+// message text are instructions and never language samples.
+func resolveOutputLanguage(opts Options) (agentlocale.Language, error) {
+	requested := firstNonEmpty(opts.OutputLanguage, os.Getenv("LARK_AGENT_OUTPUT_LANGUAGE"))
+	if strings.TrimSpace(requested) == "" {
+		return opts.Config.OutwardLanguage(), nil
+	}
+	language, err := agentlocale.ParsePreferred(requested)
+	if err != nil {
+		return "", errs.NewValidationError(
+			errs.SubtypeInvalidArgument,
+			"unsupported output language: %s",
+			strings.TrimSpace(requested),
+		).WithParam("--output-language")
+	}
+	if language == agentlocale.LanguageAuto {
+		return opts.Config.OutwardLanguage(), nil
+	}
+	return language, nil
 }
 
 func resolveRoleModel(ctx context.Context, cfg config.Config, role string) (*agentruntime.OpenAICompatibleModel, error) {

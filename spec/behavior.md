@@ -1695,6 +1695,13 @@ as other commands. Restart preserves accepted entries and feedback.
 
 ## Reply Policy
 
+Outward language is product-wide configuration. `output.language` is the
+preferred outward language and `output.fallback_language` is the concrete
+language used when inference is inconclusive. `owner.preferred_language` and
+`owner.fallback_language` override them for owner-facing conversational work
+only; a concrete owner preference wins over `output.language`, and `auto` defers
+to it.
+
 The owner profile contains a concrete display name and language policy.
 Configured language takes priority; `auto` infers Chinese or English from the
 bounded current conversation and then uses the configured fallback. All
@@ -1703,6 +1710,11 @@ model reasoning is never pasted into owner notices. Sender-facing replies,
 their owner notices, and terminal summaries for the same work item use the
 same resolved language. Lifecycle messages with no bounded conversation use
 the configured fallback.
+
+Work with no bounded human conversation never infers language from its own
+instruction text. Prompt files, rule files, and command templates are
+instructions, not language samples. Such work uses `output.language` when
+concrete and `output.fallback_language` otherwise.
 
 For delegated direct mentions and human private messages, the sent body is
 deterministically wrapped as an intelligent-assistant response and states that

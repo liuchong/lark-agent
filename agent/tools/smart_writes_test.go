@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/liuchong/lark-agent/agent/domain"
+	agentlocale "github.com/liuchong/lark-agent/agent/locale"
 	internalgithub "github.com/liuchong/lark-agent/internal/github"
 )
 
@@ -206,6 +207,81 @@ func TestSendLarkMessageAppendsMarkerAndRejectsSecrets(t *testing.T) {
 	if sender.sends != 1 || !strings.Contains(sender.text, "[lark-agent-github-ref:v1:") ||
 		!strings.HasPrefix(sender.key, "ghs-") {
 		t.Fatalf("SC-39 sender=%+v", sender)
+	}
+}
+
+// TestWriteGateEnforcesOutwardLanguage covers SC-87. Outward prose must match
+// the resolved language; titles are repository artifacts and stay exempt.
+func TestWriteGateEnforcesOutwardLanguage(t *testing.T) {
+	const english = "This pull request updates the notification pipeline and adds regression coverage."
+	const chinese = "已确认通知链路更新，并补齐了回归覆盖。"
+
+	writer := &recordingGitHubWriter{}
+	sender := &recordingSender{}
+	outputPath := t.TempDir() + "/github-output"
+	gate := &WriteGate{
+		Allow: map[string]bool{
+			internalgithub.ActionPostGitHubComment:      true,
+			internalgithub.ActionUpdateGitHubIssueTitle: true,
+			internalgithub.ActionUpsertGitHubCheck:      true,
+			internalgithub.ActionSendLarkMessage:        true,
+			internalgithub.ActionWriteJobOutput:         true,
+		},
+		ChatID:        "oc_synthetic",
+		JobOutputPath: outputPath,
+		Language:      agentlocale.LanguageChinese,
+	}
+	registry, err := NewRegistry(
+		PostGitHubCommentDefinition(writer, gate),
+		UpdateGitHubIssueTitleDefinition(writer, gate),
+		UpsertGitHubCheckDefinition(writer, gate),
+		SendLarkMessageDefinition(sender, gate),
+		WriteJobOutputDefinition(gate),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := smartWriteScope()
+
+	for _, testCase := range []struct {
+		tool string
+		args string
+	}{
+		{internalgithub.ActionPostGitHubComment, `{"body":"` + english + `"}`},
+		{internalgithub.ActionSendLarkMessage, `{"text":"` + english + `"}`},
+		{
+			internalgithub.ActionUpsertGitHubCheck,
+			`{"conclusion":"success","title":"lark-agent gate","summary":"` + english + `"}`,
+		},
+		{internalgithub.ActionWriteJobOutput, `{"name":"changelog","value":"` + english + `"}`},
+	} {
+		_, err := registry.Execute(ctx, testCase.tool, json.RawMessage(testCase.args))
+		if err == nil || !strings.Contains(err.Error(), "zh-CN") {
+			t.Fatalf("SC-87 %s err=%v", testCase.tool, err)
+		}
+	}
+	if writer.comments != 0 || writer.checks != 0 || sender.sends != 0 {
+		t.Fatalf("SC-87 a rejected write reached its transport: %+v %+v", writer, sender)
+	}
+	if _, statErr := os.Stat(outputPath); !os.IsNotExist(statErr) {
+		t.Fatalf("SC-87 rejected job output was written: %v", statErr)
+	}
+
+	// An English Conventional Commits title stays legal under zh-CN.
+	if _, err := registry.Execute(ctx, internalgithub.ActionUpdateGitHubIssueTitle, json.RawMessage(
+		`{"title":"fix: keep the notification pipeline gate deterministic for every workflow run"}`,
+	)); err != nil {
+		t.Fatalf("SC-87 title must be exempt from language enforcement: %v", err)
+	}
+
+	// The gate stayed unused, so the model can rewrite and call again.
+	if _, err := registry.Execute(ctx, internalgithub.ActionPostGitHubComment, json.RawMessage(
+		`{"body":"`+chinese+`"}`,
+	)); err != nil {
+		t.Fatalf("SC-87 rewrite rejected: %v", err)
+	}
+	if writer.comments != 1 || writer.lastBody != chinese {
+		t.Fatalf("SC-87 writer=%+v", writer)
 	}
 }
 

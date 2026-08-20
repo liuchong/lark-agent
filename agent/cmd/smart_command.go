@@ -11,7 +11,7 @@ import (
 )
 
 func newRunCommand(out io.Writer, configPath, statePath *string) *cobra.Command {
-	var promptFile, message, rulesFile, allowedActions, chatID string
+	var promptFile, message, rulesFile, allowedActions, chatID, outputLanguage string
 	var dryRun bool
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -35,6 +35,7 @@ func newRunCommand(out io.Writer, configPath, statePath *string) *cobra.Command 
 				ChatID:         firstNonEmpty(chatID, os.Getenv("LARK_CHAT_ID")),
 				DryRun:         dryRun,
 				WorkspaceRoot:  firstNonEmpty(os.Getenv("GITHUB_WORKSPACE"), cfg.Workspace.Root),
+				OutputLanguage: outputLanguage,
 			})
 			if err != nil {
 				return err
@@ -42,12 +43,13 @@ func newRunCommand(out io.Writer, configPath, statePath *string) *cobra.Command 
 			return writeData(out, result)
 		},
 	}
-	bindSmartCommandFlags(cmd, &promptFile, &message, &rulesFile, &allowedActions, &chatID, &dryRun)
+	bindSmartCommandFlags(cmd, &promptFile, &message, &rulesFile, &allowedActions, &chatID, &outputLanguage, &dryRun)
 	return cmd
 }
 
 func newGitHubRunCommand(out io.Writer, configPath, statePath *string) *cobra.Command {
-	var promptFile, message, rulesFile, allowedActions, chatID, eventPath, eventName string
+	var promptFile, message, rulesFile, allowedActions, chatID, outputLanguage string
+	var eventPath, eventName string
 	var dryRun bool
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -74,6 +76,7 @@ func newGitHubRunCommand(out io.Writer, configPath, statePath *string) *cobra.Co
 				EventPath:      eventPath,
 				EventName:      eventName,
 				WorkspaceRoot:  firstNonEmpty(os.Getenv("GITHUB_WORKSPACE"), cfg.Workspace.Root),
+				OutputLanguage: outputLanguage,
 			})
 			if err != nil {
 				return err
@@ -81,7 +84,7 @@ func newGitHubRunCommand(out io.Writer, configPath, statePath *string) *cobra.Co
 			return writeData(out, result)
 		},
 	}
-	bindSmartCommandFlags(cmd, &promptFile, &message, &rulesFile, &allowedActions, &chatID, &dryRun)
+	bindSmartCommandFlags(cmd, &promptFile, &message, &rulesFile, &allowedActions, &chatID, &outputLanguage, &dryRun)
 	cmd.Flags().StringVar(&eventPath, "event-path", "", "typed GitHub event JSON path (default: GITHUB_EVENT_PATH)")
 	cmd.Flags().StringVar(&eventName, "event-name", "", "GitHub event name (default: GITHUB_EVENT_NAME)")
 	return cmd
@@ -89,7 +92,7 @@ func newGitHubRunCommand(out io.Writer, configPath, statePath *string) *cobra.Co
 
 func bindSmartCommandFlags(
 	cmd *cobra.Command,
-	promptFile, message, rulesFile, allowedActions, chatID *string,
+	promptFile, message, rulesFile, allowedActions, chatID, outputLanguage *string,
 	dryRun *bool,
 ) {
 	cmd.Flags().StringVar(promptFile, "prompt-file", "", "workspace-relative prompt file")
@@ -97,5 +100,7 @@ func bindSmartCommandFlags(
 	cmd.Flags().StringVar(rulesFile, "rules-file", "", "workspace-relative extra rules file")
 	cmd.Flags().StringVar(allowedActions, "allowed-actions", "", "comma-separated write tools")
 	cmd.Flags().StringVar(chatID, "chat-id", "", "exact destination Lark chat ID (default: LARK_CHAT_ID)")
+	cmd.Flags().StringVar(outputLanguage, "output-language", "",
+		"outward language auto|zh-CN|en-US (default: LARK_AGENT_OUTPUT_LANGUAGE, then output.language)")
 	cmd.Flags().BoolVar(dryRun, "dry-run", false, "deny every write tool")
 }
