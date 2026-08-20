@@ -337,6 +337,115 @@ func TestSmartCommandActionDispatcherAndPrompts(t *testing.T) {
 	}
 }
 
+// TestSmartCommandTerminalFinalizerConverges covers SC-81: a loop model that
+// answers in prose without ever calling submit_decision must still converge
+// through the terminal finalizer instead of failing the command.
+func TestSmartCommandTerminalFinalizerConverges(t *testing.T) {
+	bin := buildAgentBinary(t)
+	workspace := t.TempDir()
+
+	var loopTurns, finalizerTurns atomic.Int32
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(string(raw), `"tools"`) {
+			loopTurns.Add(1)
+			_, _ = w.Write([]byte(`{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"submit_decision","arguments":"{\"decision\":\"reply\",\"relevance_confidence\":0.9,\"risk\":\"low\",\"reason\":\"tried to answer without recording\"}"}}]}}]}`))
+			return
+		}
+		finalizerTurns.Add(1)
+		_, _ = w.Write([]byte(`{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"{\"decision\":\"record\",\"relevance_confidence\":0.9,\"risk\":\"low\",\"reason\":\"finalizer recorded the event without writes\",\"reply_outcome\":\"complete\"}"}}]}`))
+	}))
+	t.Cleanup(model.Close)
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("SC-81 mutating github HTTP %s %s", r.Method, r.URL.Path)
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(github.Close)
+
+	eventPath := filepath.Join(t.TempDir(), "event.json")
+	if err := os.WriteFile(eventPath, []byte(`{
+	  "repository":{"full_name":"example/widgets"},
+	  "workflow_run":{
+	    "id":981,"run_attempt":1,"name":"verify","status":"completed","conclusion":"failure",
+	    "head_sha":"`+smartHeadSHA+`",
+	    "html_url":"https://github.example/example/widgets/actions/runs/981"
+	  }
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	env := []string{
+		"GITHUB_ACTIONS=true",
+		"GITHUB_WORKSPACE=" + workspace,
+		"GITHUB_REPOSITORY=example/widgets",
+		"GITHUB_API_URL=" + github.URL,
+		"GITHUB_EVENT_NAME=workflow_run",
+		"GITHUB_EVENT_PATH=" + eventPath,
+		"GITHUB_TOKEN=must-not-appear",
+		"LARK_AGENT_APP_ID=cli_synthetic",
+		"LARK_AGENT_APP_SECRET=must-not-appear",
+		"LARK_AGENT_LARK_BASE_URL=https://open.larksuite.com",
+		"OPENAI_API_KEY=test-key",
+		"OPENAI_BASE_URL=" + model.URL,
+		"OPENAI_MODEL=test-model",
+	}
+	missingConfig := filepath.Join(t.TempDir(), "missing.yaml")
+	code, stdout, stderr := runAgentWithEnv(t, env, bin, "--config", missingConfig,
+		"github", "run", "--dry-run", "--allowed-actions", "send_lark_message",
+		"--message", "Summarize the event and send it to Lark using send_lark_message.")
+	if code != 0 {
+		t.Fatalf("SC-81 exit=%d stderr=%s", code, stderr)
+	}
+	if finalizerTurns.Load() != 1 {
+		t.Fatalf("SC-81 finalizer turns=%d loop turns=%d", finalizerTurns.Load(), loopTurns.Load())
+	}
+	if strings.Contains(stdout, "must-not-appear") || strings.Contains(stderr, "must-not-appear") {
+		t.Fatalf("SC-22 secret leaked stdout=%s stderr=%s", stdout, stderr)
+	}
+	data := decodeSmartCommandData(t, stdout)
+	if !data.DryRun || len(data.AllowedActions) != 0 {
+		t.Fatalf("SC-81 dry run must stay a dry run: %+v", data)
+	}
+}
+
+// TestSmartCommandRejectsMissingFinalizerProfile covers SC-82.
+func TestSmartCommandRejectsMissingFinalizerProfile(t *testing.T) {
+	bin := buildAgentBinary(t)
+	cfg := config.Default()
+	cfg.Lark.AppID = "cli_test"
+	cfg.Owner.OpenID = "ou_owner"
+	cfg.Owner.Name = "测试负责人"
+	cfg.Workspace.Root = t.TempDir()
+	cfg.GitHub.Enabled = true
+	cfg.GitHub.AllowedRepositories = []string{"example/widgets"}
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	// config.Save validates role bindings, so break the binding in the file.
+	saved, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken := strings.Replace(string(saved), "finalizer: primary", "finalizer: absent-profile", 1)
+	if broken == string(saved) {
+		t.Fatal("SC-82 could not rebind model.roles.finalizer")
+	}
+	if err := os.WriteFile(configPath, []byte(broken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := runAgentWithEnv(t, []string{"OPENAI_API_KEY=test-key"}, bin,
+		"--config", configPath, "run", "--message", "x")
+	if code != 2 || stdout != "" ||
+		!strings.Contains(stderr, "model role finalizer references missing profile") {
+		t.Fatalf("SC-82 code=%d stdout=%q stderr=%s", code, stdout, stderr)
+	}
+}
+
 func TestSmartCommandWorkflowYAMLContracts(t *testing.T) {
 	root := repoRoot(t)
 	var files []string
@@ -375,6 +484,7 @@ func TestSmartCommandWorkflowYAMLContracts(t *testing.T) {
 		jobs, _ := parsed["jobs"].(map[string]any)
 		onValue := parsed["on"]
 		hasPullRequest := yamlHasPullRequest(onValue)
+		assertWorkflowRunTrigger(t, path, onValue)
 		base := filepath.Base(path)
 		larkWorkflow := strings.HasPrefix(base, "lark-") || strings.Contains(path, "examples/github-agent")
 		for jobName, rawJob := range jobs {
@@ -458,6 +568,33 @@ func decodeSmartCommandData(t *testing.T, stdout string) smartCommandData {
 		t.Fatalf("ok=false %s", stdout)
 	}
 	return envelope.Data
+}
+
+// assertWorkflowRunTrigger enforces SC-83. GitHub rejects the whole workflow
+// file when `on.workflow_run` omits `workflows`, so the job never starts.
+func assertWorkflowRunTrigger(t *testing.T, path string, onValue any) {
+	t.Helper()
+	triggers, ok := onValue.(map[string]any)
+	if !ok {
+		return
+	}
+	raw, ok := triggers["workflow_run"]
+	if !ok {
+		return
+	}
+	trigger, ok := raw.(map[string]any)
+	if !ok {
+		t.Fatalf("SC-83 %s workflow_run trigger is not a mapping: %T", path, raw)
+	}
+	workflows, _ := trigger["workflows"].([]any)
+	if len(workflows) == 0 {
+		t.Fatalf("SC-83 %s workflow_run must declare a non-empty workflows list", path)
+	}
+	for _, name := range workflows {
+		if strings.TrimSpace(stringify(name)) == "" {
+			t.Fatalf("SC-83 %s workflow_run workflows contains an empty name", path)
+		}
+	}
 }
 
 func yamlHasPullRequest(onValue any) bool {

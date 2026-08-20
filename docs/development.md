@@ -90,8 +90,13 @@ go test -race ./...
 go vet ./...
 go mod tidy
 go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.1.6 run
-actionlint .github/workflows/*.yml
+make workflow-lint
 ```
+
+`make verify` 已包含 `make workflow-lint`，它对 `.github/workflows/` 和
+`examples/github-agent/workflows/` 一起跑 actionlint。GitHub 会整份拒收无效的
+工作流文件，这类错误在 Actions 里表现为 0 秒失败、一个 job 都不建，所以必须在
+本地门禁里拦住。
 
 并确认：
 

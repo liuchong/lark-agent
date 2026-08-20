@@ -43,10 +43,12 @@ type Options struct {
 	EventPath      string
 	EventName      string
 	WorkspaceRoot  string
-	Model          einomodel.BaseChatModel
-	GitHubClient   *internalgithub.Client
-	LarkService    *serviceim.Service
-	AppSecret      string
+
+	Model             einomodel.BaseChatModel
+	TerminalFinalizer einomodel.BaseChatModel
+	GitHubClient      *internalgithub.Client
+	LarkService       *serviceim.Service
+	AppSecret         string
 }
 
 type Result struct {
@@ -95,11 +97,19 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 
 	model := opts.Model
 	if model == nil {
-		adapter, err := resolveModel(ctx, opts.Config)
+		adapter, err := resolveRoleModel(ctx, opts.Config, opts.Config.Model.Roles.Agent)
 		if err != nil {
 			return Result{}, err
 		}
 		model = adapter
+	}
+	finalizer := opts.TerminalFinalizer
+	if finalizer == nil {
+		adapter, err := resolveRoleModel(ctx, opts.Config, opts.Config.Model.Roles.Finalizer)
+		if err != nil {
+			return Result{}, err
+		}
+		finalizer = adapter
 	}
 
 	cliActions, err := internalgithub.ParseAllowedActions(opts.AllowedActions)
@@ -362,12 +372,13 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	}
 
 	loop := agentruntime.AgentLoop{
-		Model:        model,
-		Tools:        registry,
-		MaxTurns:     20,
-		MaxToolCalls: 12,
-		MaxElapsed:   8 * time.Minute,
-		SystemPrompt: agentcontext.SmartCommandSystemPrompt(),
+		Model:             model,
+		TerminalFinalizer: finalizer,
+		Tools:             registry,
+		MaxTurns:          20,
+		MaxToolCalls:      12,
+		MaxElapsed:        8 * time.Minute,
+		SystemPrompt:      agentcontext.SmartCommandSystemPrompt(),
 	}
 	decision, _, loopErr := loop.Decide(ctx, bundle)
 	if loopErr != nil {
@@ -531,8 +542,8 @@ func readWorkspaceFile(root, rel, kind string) (string, error) {
 	return string(data), nil
 }
 
-func resolveModel(ctx context.Context, cfg config.Config) (*agentruntime.OpenAICompatibleModel, error) {
-	profileName := strings.TrimSpace(cfg.Model.Roles.Agent)
+func resolveRoleModel(ctx context.Context, cfg config.Config, role string) (*agentruntime.OpenAICompatibleModel, error) {
+	profileName := strings.TrimSpace(role)
 	if profileName == "" {
 		profileName = "primary"
 	}

@@ -107,7 +107,7 @@ model HTTP client is never invoked.
 | 15 | Construct Lark HTTP client only if a Lark tool is in the catalog. Must not construct WebSocket (`SC-01`). | Client error → exit 1. |
 | 16 | If PR number is set and `head_sha` is empty, GET the pull request to fill `head_sha` / `html_url`. Failure: `partial=true` unless the slash command is `review` or `check` or the workflow allowlist contains `upsert_github_check`, in which case exit 2 before model. | |
 | 17 | Inject typed event summary into agent context (`SC-20`). Always inject. | |
-| 18 | Run the agent loop until `submit_decision` `record`, turn limit, or failure. | Turn limit / invalid terminal → exit 1, no further writes (`SC-61`). |
+| 18 | Run the agent loop until `submit_decision` `record`, turn limit, or failure. When the loop exhausts its terminal-only attempts, hand the trajectory to the terminal finalizer once. | Finalizer converges → exit 0, `record`, no further writes (`SC-81`). Finalizer unavailable or failing, or turn limit reached → exit 1, no further writes (`SC-61`). |
 | 19 | Print success envelope. Exit 0. | After model start, still no secrets in stdout/stderr. |
 
 `lark-agent run` without GitHub: skip steps 5–8, 9–10, 16–17 GitHub injection;
@@ -160,7 +160,10 @@ Required for any `github run` that may send Lark:
 - `GITHUB_EVENT_NAME`
 
 Required for the model: `OPENAI_API_KEY` (or the daemon’s existing equivalent
-model env). Optional: `OPENAI_BASE_URL`, `OPENAI_MODEL`, `LARK_CHAT_ID`,
+model env). The loop model resolves `model.roles.agent` and the terminal
+finalizer resolves `model.roles.finalizer`; both use the same profile lookup,
+Keychain fallback and env overrides the daemon uses. Optional:
+`OPENAI_BASE_URL`, `OPENAI_MODEL`, `LARK_CHAT_ID`,
 `GITHUB_OUTPUT`, `GITHUB_WORKSPACE`, `GITHUB_RUN_ID`, `GITHUB_SHA`,
 `GITHUB_API_URL` (GitHub Enterprise API base; default `https://api.github.com`
 when unset).
@@ -691,9 +694,14 @@ Required args:
 `reply_text` if present is **ignored** (not sent). Tests assert no Lark IM and
 no GitHub HTTP from this tool.
 
-If the loop ends without a successful `record`, exit 1 (`SC-61`). Max turns:
-20. Max tool calls: 12. Loop timeout: 8 minutes (YAML `timeout-minutes: 10`
-gives the job slack).
+When the loop exhausts its terminal-only attempts, the terminal finalizer runs
+once with the same trajectory and no tools, exactly as in the daemon. A
+finalizer `record` ends the command successfully (`SC-81`). If the finalizer
+errors or still returns no valid `record`, exit 1 (`SC-61`). Exhausting the turn
+limit stays a hard exit 1 and does not reach the finalizer, matching the daemon.
+The finalizer never widens the write allowlist, so a dry run stays a dry run.
+Max turns: 20. Max tool calls: 12. Loop timeout: 8 minutes (YAML
+`timeout-minutes: 10` gives the job slack).
 
 ## Prompt and contract files
 
@@ -865,9 +873,9 @@ success path; verify failure YAML `if: success()` on release job.
 |---|---|---|
 | ParseEvent + fixtures | `internal/github/*_test.go` | SC-02, SC-13, SC-29, SC-30, SC-48, SC-55–SC-57, SC-72 |
 | Mention parser | package next to GitHub support | SC-06–SC-09, SC-17, SC-23–SC-27, SC-43–SC-47, SC-74–SC-76 |
-| CLI / no WebSocket / envelope | `agent/cmd` + `integration_test/lark_agent` | SC-01, SC-03, SC-11, SC-14, SC-15, SC-18, SC-19, SC-35, SC-54 |
+| CLI / no WebSocket / envelope | `agent/cmd` + `integration_test/lark_agent` | SC-01, SC-03, SC-11, SC-14, SC-15, SC-18, SC-19, SC-35, SC-54, SC-81, SC-82 |
 | Tools + fake HTTP | `agent/tools` + `internal/github` | SC-04, SC-05, SC-10, SC-12, SC-21, SC-22, SC-31–SC-33, SC-39–SC-42, SC-49, SC-50, SC-58, SC-62, SC-63 |
-| Workflow YAML | `integration_test/lark_agent` | GW-03.2, SC-38, SC-65–SC-69 |
+| Workflow YAML | `integration_test/lark_agent` | GW-03.2, SC-38, SC-65–SC-69, SC-83 |
 | Help | `help_contract_test.go` | SC-51 |
 | Action dispatcher | unit test of mode switch / Dockerfile assertion | SC-34, SC-52, SC-53 |
 
@@ -968,8 +976,9 @@ Tests use only synthetic identifiers (`example/widgets`, `oc_synthetic`,
   dry-run, then exit 2, message contains `--chat-id is required`.
 - **SC-60.** Given `get_lark_context` `chat_id` other than configured, then
   `SC-05` denial.
-- **SC-61.** Given a model that never calls valid `submit_decision` `record`,
-  when max turns exhausted, then exit 1, empty stdout.
+- **SC-61.** Given a model that never calls valid `submit_decision` `record` and
+  a terminal finalizer that also returns no valid `record`, when max turns
+  exhausted, then exit 1, empty stdout.
 - **SC-62.** Given check `title` of 256 `a` characters, then no HTTP.
 - **SC-63.** Given comment `body` of 65537 bytes, then no HTTP.
 - **SC-65.** Given each live workflow, when `permissions` is parsed, then it
@@ -996,6 +1005,16 @@ Tests use only synthetic identifiers (`example/widgets`, `oc_synthetic`,
   but event repo `other/other`, then `SC-16`.
 - **SC-80.** Given `get_github_context` `sections=["nope"]`, then tool error
   containing `unsupported github section`, no HTTP.
+- **SC-81.** Given a loop model that keeps returning an invalid terminal
+  `submit_decision` until terminal-only attempts are exhausted, when the
+  terminal finalizer returns `record`, then exit 0, envelope `ok`, zero writes,
+  and a dry run stays a dry run.
+- **SC-82.** Given `model.roles.finalizer` naming a profile that does not exist,
+  when the smart command starts, then exit 2 before any model call, message
+  contains `model role finalizer references missing profile`.
+- **SC-83.** Given every workflow file under `.github/workflows/` and
+  `examples/github-agent/` that triggers on `workflow_run`, then it declares a
+  non-empty `workflows` list.
 
 `SC-36` is unused (reserved). `SC-37` is covered by the comment `if` Bot
 clause in YAML tests.

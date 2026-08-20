@@ -72,4 +72,6 @@ Fork 来的 PR 会跳过。名为 `CI` 的 `workflow_run` 不进事件摘要和�
 
 工作类型是 `smart_command`。模型必须调用 `submit_decision`，且 `decision` 只能是 `record`。这个工具本身不发飞书、不写 GitHub。真正的评论、检查、标题、飞书消息和 job output 只能通过上面的具名写入工具，每种进程最多成功一次。
 
+如果模型反复给出无效的终结决定，用完限定的几次终结尝试后，会像常驻助手那样交给收尾模型再收一次；收尾模型拿不到任何工具，所以 `--dry-run` 仍然是干跑。收尾也收不住，或者用尽轮数上限，进程以 1 退出并且不再写入。收尾模型取 `model.roles.finalizer` 绑定的 profile。
+
 场景编号、事件 JSON 样例和退出码见 [智能命令规格](../spec/smart-command.md)。

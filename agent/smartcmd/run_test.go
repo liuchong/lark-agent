@@ -76,6 +76,12 @@ func writeEvent(t *testing.T, name, body string) (string, string) {
 	return path, filepath.Dir(path)
 }
 
+// unusedFinalizer errors if the terminal finalizer is consulted, so tests that
+// expect the loop model to converge on its own stay honest.
+func unusedFinalizer() *recordingModel {
+	return &recordingModel{}
+}
+
 func recordDecision() *schema.Message {
 	return schema.AssistantMessage("", []schema.ToolCall{{
 		ID:   "record",
@@ -101,13 +107,14 @@ func TestGitHubRunSkipsWithoutMention(t *testing.T) {
 	  "comment":{"id":1001,"body":"please look","user":{"login":"example-user","type":"User"}}
 	}`)
 	result, err := Run(context.Background(), Options{
-		Config:    testConfig(t),
-		GitHub:    true,
-		Message:   "unused",
-		EventPath: eventPath,
-		EventName: "issue_comment",
-		Model:     model,
-		DryRun:    true,
+		Config:            testConfig(t),
+		GitHub:            true,
+		Message:           "unused",
+		EventPath:         eventPath,
+		EventName:         "issue_comment",
+		Model:             model,
+		TerminalFinalizer: unusedFinalizer(),
+		DryRun:            true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -149,14 +156,15 @@ func TestGitHubRunUnknownSlashPostsHelp(t *testing.T) {
 	  "comment":{"id":1001,"body":"@lark-agent /nope","user":{"login":"example-user","type":"User"}}
 	}`)
 	result, err := Run(context.Background(), Options{
-		Config:         testConfig(t),
-		GitHub:         true,
-		Message:        "unused",
-		AllowedActions: "post_github_comment",
-		EventPath:      eventPath,
-		EventName:      "issue_comment",
-		Model:          model,
-		GitHubClient:   client,
+		Config:            testConfig(t),
+		GitHub:            true,
+		Message:           "unused",
+		AllowedActions:    "post_github_comment",
+		EventPath:         eventPath,
+		EventName:         "issue_comment",
+		Model:             model,
+		TerminalFinalizer: unusedFinalizer(),
+		GitHubClient:      client,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -195,14 +203,15 @@ func TestGitHubRunReviewOnIssuePostsPullRequestHelp(t *testing.T) {
 	  "comment":{"id":1001,"body":"@lark-agent /review","user":{"login":"example-user","type":"User"}}
 	}`)
 	result, err := Run(context.Background(), Options{
-		Config:         testConfig(t),
-		GitHub:         true,
-		Message:        "unused",
-		AllowedActions: "post_github_comment",
-		EventPath:      eventPath,
-		EventName:      "issue_comment",
-		Model:          model,
-		GitHubClient:   client,
+		Config:            testConfig(t),
+		GitHub:            true,
+		Message:           "unused",
+		AllowedActions:    "post_github_comment",
+		EventPath:         eventPath,
+		EventName:         "issue_comment",
+		Model:             model,
+		TerminalFinalizer: unusedFinalizer(),
+		GitHubClient:      client,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -224,13 +233,14 @@ func TestGitHubRunDryRunEnvelopeAndNoWrites(t *testing.T) {
 	  }
 	}`)
 	result, err := Run(context.Background(), Options{
-		Config:    testConfig(t),
-		GitHub:    true,
-		Message:   "summarize",
-		DryRun:    true,
-		EventPath: eventPath,
-		EventName: "workflow_run",
-		Model:     model,
+		Config:            testConfig(t),
+		GitHub:            true,
+		Message:           "summarize",
+		DryRun:            true,
+		EventPath:         eventPath,
+		EventName:         "workflow_run",
+		Model:             model,
+		TerminalFinalizer: unusedFinalizer(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -253,7 +263,8 @@ func TestGitHubRunDryRunEnvelopeAndNoWrites(t *testing.T) {
 func TestGitHubRunRejectsUnknownActionAndRequiresChat(t *testing.T) {
 	cfg := testConfig(t)
 	if _, err := Run(context.Background(), Options{
-		Config: cfg, GitHub: true, AllowedActions: "merge", Model: &recordingModel{},
+		Config: cfg, GitHub: true, AllowedActions: "merge",
+		Model: &recordingModel{}, TerminalFinalizer: unusedFinalizer(),
 	}); err == nil || !strings.Contains(err.Error(), "unknown allowed action") {
 		t.Fatalf("SC-21 err=%v", err)
 	}
@@ -263,13 +274,14 @@ func TestGitHubRunRejectsUnknownActionAndRequiresChat(t *testing.T) {
 	  "issue":{"number":7,"title":"printer smoke","html_url":"https://github.example/example/widgets/issues/7"}
 	}`)
 	if _, err := Run(context.Background(), Options{
-		Config:         cfg,
-		GitHub:         true,
-		AllowedActions: "send_lark_message",
-		Message:        "summarize",
-		EventPath:      eventPath,
-		EventName:      "issues",
-		Model:          &recordingModel{responses: []*schema.Message{recordDecision()}},
+		Config:            cfg,
+		GitHub:            true,
+		AllowedActions:    "send_lark_message",
+		Message:           "summarize",
+		EventPath:         eventPath,
+		EventName:         "issues",
+		Model:             &recordingModel{responses: []*schema.Message{recordDecision()}},
+		TerminalFinalizer: unusedFinalizer(),
 	}); err == nil || !strings.Contains(err.Error(), "--chat-id is required") {
 		t.Fatalf("SC-59 err=%v", err)
 	}
@@ -279,10 +291,11 @@ func TestBareRunRegistersWorkspaceReadsOnly(t *testing.T) {
 	model := &recordingModel{responses: []*schema.Message{recordDecision()}}
 	cfg := testConfig(t)
 	result, err := Run(context.Background(), Options{
-		Config:        cfg,
-		Message:       "list files",
-		WorkspaceRoot: cfg.Workspace.Root,
-		Model:         model,
+		Config:            cfg,
+		Message:           "list files",
+		WorkspaceRoot:     cfg.Workspace.Root,
+		Model:             model,
+		TerminalFinalizer: unusedFinalizer(),
 	})
 	if err != nil {
 		t.Fatal(err)

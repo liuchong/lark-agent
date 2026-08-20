@@ -40,6 +40,9 @@ inputs:
     description: Inline smart-command message
     required: false
     default: ""
+outputs:
+  changelog:
+    description: Changelog text written by the write_job_output smart-command tool
 runs:
   using: docker
   image: Dockerfile
