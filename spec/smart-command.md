@@ -694,6 +694,11 @@ Required args:
 `reply_text` if present is **ignored** (not sent). Tests assert no Lark IM and
 no GitHub HTTP from this tool.
 
+`record` is the only legal terminal decision for this work kind. Content-based
+coding-question classification must not apply to smart commands (`SC-84`);
+otherwise a prompt that merely says `repository` would make every terminal
+decision invalid.
+
 When the loop exhausts its terminal-only attempts, the terminal finalizer runs
 once with the same trajectory and no tools, exactly as in the daemon. A
 finalizer `record` ends the command successfully (`SC-81`). If the finalizer
@@ -1015,6 +1020,10 @@ Tests use only synthetic identifiers (`example/widgets`, `oc_synthetic`,
 - **SC-83.** Given every workflow file under `.github/workflows/` and
   `examples/github-agent/` that triggers on `workflow_run`, then it declares a
   non-empty `workflows` list.
+- **SC-84.** Given any live prompt or message whose wording matches the coding
+  question markers (`repository`, `api`, `代码`, …), when the model submits
+  `record`, then the decision is accepted; smart command work is never
+  reclassified as a coding question and never requires a `reply`.
 
 `SC-36` is unused (reserved). `SC-37` is covered by the comment `if` Bot
 clause in YAML tests.

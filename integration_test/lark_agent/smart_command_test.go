@@ -412,6 +412,87 @@ func TestSmartCommandTerminalFinalizerConverges(t *testing.T) {
 	}
 }
 
+// TestSmartCommandLivePromptsAcceptRecord covers SC-84. The shipped prompts say
+// "repository", which matches the coding-question markers, so a content-based
+// reclassification would reject the only terminal decision this work kind may
+// use. Every live prompt runs against a fake model that submits record once.
+func TestSmartCommandLivePromptsAcceptRecord(t *testing.T) {
+	bin := buildAgentBinary(t)
+	root := repoRoot(t)
+
+	promptDir := filepath.Join(root, ".github", "lark-agent", "prompts")
+	entries, err := os.ReadDir(promptDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prompts []string
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".md") {
+			prompts = append(prompts, entry.Name())
+		}
+	}
+	if len(prompts) < 8 {
+		t.Fatalf("expected the live prompt set, got %v", prompts)
+	}
+
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(raw), `"tools"`) {
+			t.Errorf("SC-84 terminal finalizer was consulted for a valid record")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"submit_decision","arguments":"{\"decision\":\"record\",\"relevance_confidence\":0.9,\"risk\":\"low\",\"reason\":\"recorded the event\",\"reply_outcome\":\"complete\"}"}}]}}]}`))
+	}))
+	t.Cleanup(model.Close)
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.NotFound(w, nil)
+	}))
+	t.Cleanup(github.Close)
+
+	eventPath := filepath.Join(t.TempDir(), "event.json")
+	if err := os.WriteFile(eventPath, []byte(`{
+	  "repository":{"full_name":"example/widgets"},
+	  "workflow_run":{
+	    "id":981,"run_attempt":1,"name":"verify","status":"completed","conclusion":"failure",
+	    "head_sha":"`+smartHeadSHA+`",
+	    "html_url":"https://github.example/example/widgets/actions/runs/981"
+	  }
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	env := []string{
+		"GITHUB_ACTIONS=true",
+		"GITHUB_WORKSPACE=" + root,
+		"GITHUB_REPOSITORY=example/widgets",
+		"GITHUB_API_URL=" + github.URL,
+		"GITHUB_EVENT_NAME=workflow_run",
+		"GITHUB_EVENT_PATH=" + eventPath,
+		"GITHUB_TOKEN=synthetic-token",
+		"LARK_AGENT_APP_ID=cli_synthetic",
+		"LARK_AGENT_APP_SECRET=synthetic-secret",
+		"LARK_AGENT_LARK_BASE_URL=https://open.larksuite.com",
+		"OPENAI_API_KEY=test-key",
+		"OPENAI_BASE_URL=" + model.URL,
+		"OPENAI_MODEL=test-model",
+	}
+	missingConfig := filepath.Join(t.TempDir(), "missing.yaml")
+	for _, prompt := range prompts {
+		t.Run(prompt, func(t *testing.T) {
+			code, stdout, stderr := runAgentWithEnv(t, env, bin, "--config", missingConfig,
+				"github", "run", "--dry-run",
+				"--prompt-file", filepath.Join(".github", "lark-agent", "prompts", prompt))
+			if code != 0 {
+				t.Fatalf("SC-84 %s exit=%d stderr=%s", prompt, code, stderr)
+			}
+			if !decodeSmartCommandData(t, stdout).DryRun {
+				t.Fatalf("SC-84 %s lost dry run: %s", prompt, stdout)
+			}
+		})
+	}
+}
+
 // TestSmartCommandRejectsMissingFinalizerProfile covers SC-82.
 func TestSmartCommandRejectsMissingFinalizerProfile(t *testing.T) {
 	bin := buildAgentBinary(t)

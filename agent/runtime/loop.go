@@ -2462,6 +2462,11 @@ func normalizeCodingDecisionWithSearchEvidence(
 }
 
 func isCodingBundle(bundle agentcontext.Bundle) bool {
+	// Smart commands may only finish as record, so content markers must never
+	// reclassify them; their prompts routinely mention repositories and APIs.
+	if bundle.WorkKind == domain.WorkKindSmartCommand {
+		return false
+	}
 	return bundle.WorkKind == domain.WorkKindCodingQuestion ||
 		domain.IsCodingQuestion(bundle.Event.Content)
 }
