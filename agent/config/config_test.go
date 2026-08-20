@@ -9,6 +9,7 @@ import (
 
 	"github.com/liuchong/lark-agent/agent/domain"
 	agentlocale "github.com/liuchong/lark-agent/agent/locale"
+	modelruntime "github.com/liuchong/lark-agent/agent/runtime/model"
 	"github.com/liuchong/lark-agent/agent/taskrules"
 	"gopkg.in/yaml.v3"
 )
@@ -155,6 +156,66 @@ func TestDefaultModelProfilesAndRoleBindings(t *testing.T) {
 	if strings.Contains(strings.ToLower(string(data)), "api_key") ||
 		strings.Contains(string(data), "sk-test") {
 		t.Fatalf("model config serialized a secret-shaped field:\n%s", data)
+	}
+}
+
+// TestDefaultModelProfileCarriesItsOwnCallBudget pins the shipped per-call
+// budget: one attempt is long enough for a reasoning model to answer a long
+// prompt, and a single provider blip does not fail the run.
+func TestDefaultModelProfileCarriesItsOwnCallBudget(t *testing.T) {
+	cfg := validConfigForTest(t)
+	primary := cfg.Model.Profiles["primary"]
+	if primary.Timeout != 120*time.Second {
+		t.Fatalf("primary timeout=%s, want 120s", primary.Timeout)
+	}
+	if primary.MaxAttempts != 3 {
+		t.Fatalf("primary max_attempts=%d, want 3", primary.MaxAttempts)
+	}
+	if cfg.Model.Timeout != 120*time.Second {
+		t.Fatalf("model timeout=%s, want 120s", cfg.Model.Timeout)
+	}
+}
+
+func TestValidateRejectsUnusableModelAttemptBudget(t *testing.T) {
+	for _, attempts := range []int{-1, 0, 11} {
+		cfg := validConfigForTest(t)
+		primary := cfg.Model.Profiles["primary"]
+		primary.MaxAttempts = attempts
+		cfg.Model.Profiles["primary"] = primary
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "max_attempts") {
+			t.Fatalf("max_attempts=%d error=%v", attempts, err)
+		}
+	}
+}
+
+// TestRuntimeProfileCarriesDeclaredProviderTraits proves the declared reasoning
+// and capability fields survive the trip to the model runtime, so no calling
+// path can build a request from part of a profile.
+func TestRuntimeProfileCarriesDeclaredProviderTraits(t *testing.T) {
+	cfg := validConfigForTest(t)
+	primary := cfg.Model.Profiles["primary"]
+	primary.Reasoning = ModelReasoningConfig{Mode: "enabled", Effort: "high"}
+	primary.Capabilities.MaxOutputTokens = 4096
+
+	runtime := primary.RuntimeProfile("primary")
+	if runtime.Name != "primary" || runtime.Model != "k3-256k" {
+		t.Fatalf("runtime profile identity=%+v", runtime)
+	}
+	if runtime.Provider != modelruntime.ProviderKimi ||
+		runtime.Protocol != modelruntime.ProtocolOpenAIChat ||
+		runtime.Stream != modelruntime.StreamAuto {
+		t.Fatalf("runtime profile transport=%+v", runtime)
+	}
+	if runtime.Reasoning.Mode != modelruntime.ReasoningEnabled || runtime.Reasoning.Effort != "high" {
+		t.Fatalf("runtime reasoning=%+v", runtime.Reasoning)
+	}
+	if !runtime.Capabilities.Thinking || !runtime.Capabilities.ToolUse ||
+		runtime.Capabilities.MaxOutputTokens != 4096 {
+		t.Fatalf("runtime capabilities=%+v", runtime.Capabilities)
+	}
+	if runtime.Timeout != primary.Timeout {
+		t.Fatalf("runtime timeout=%s want %s", runtime.Timeout, primary.Timeout)
 	}
 }
 

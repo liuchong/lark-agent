@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	einomodel "github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
+
+	modelruntime "github.com/liuchong/lark-agent/agent/runtime/model"
 )
 
 func TestOpenAICompatibleModelGenerate(t *testing.T) {
@@ -235,7 +238,10 @@ func TestOpenAICompatibleModelExposesProviderRetryAfter(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":"rate limited"}`))
 	}))
 	t.Cleanup(server.Close)
-	model := &OpenAICompatibleModel{APIKey: "key", BaseURL: server.URL, Model: "test", Client: server.Client()}
+	model := &OpenAICompatibleModel{
+		APIKey: "key", BaseURL: server.URL, Model: "test",
+		MaxAttempts: 1, Client: server.Client(),
+	}
 	_, err := model.Generate(context.Background(), []*schema.Message{schema.UserMessage("test")})
 	if err == nil {
 		t.Fatal("expected rate limit error")
@@ -243,5 +249,173 @@ func TestOpenAICompatibleModelExposesProviderRetryAfter(t *testing.T) {
 	retryable, ok := err.(interface{ RetryAfter() time.Duration })
 	if !ok || retryable.RetryAfter() != 90*time.Second {
 		t.Fatalf("err=%T %v", err, err)
+	}
+}
+
+// TestOpenAICompatibleModelRetriesTransportFailure covers the spec scene where a
+// call fails before any response arrives: a dropped connection or an elapsed
+// per-attempt timeout is retried, and the caller sees one successful call.
+func TestOpenAICompatibleModelRetriesTransportFailure(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			hijacked, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = hijacked.Close()
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"second"}}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	model := &OpenAICompatibleModel{
+		APIKey: "key", BaseURL: server.URL, Model: "test",
+		MaxAttempts: 3, RetryBackoff: time.Millisecond, Client: server.Client(),
+	}
+	msg, err := model.Generate(context.Background(), []*schema.Message{schema.UserMessage("hello")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Content != "second" || atomic.LoadInt32(&attempts) != 2 {
+		t.Fatalf("content=%q attempts=%d", msg.Content, atomic.LoadInt32(&attempts))
+	}
+}
+
+// TestOpenAICompatibleModelStopsAtAttemptBudget keeps the retry bounded: a
+// provider that stays broken costs the declared attempts and no more.
+func TestOpenAICompatibleModelStopsAtAttemptBudget(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"overloaded"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	model := &OpenAICompatibleModel{
+		APIKey: "key", BaseURL: server.URL, Model: "test",
+		MaxAttempts: 3, RetryBackoff: time.Millisecond, Client: server.Client(),
+	}
+	if _, err := model.Generate(context.Background(), []*schema.Message{schema.UserMessage("hello")}); err == nil {
+		t.Fatal("expected the exhausted attempt budget to fail the call")
+	}
+	if got := atomic.LoadInt32(&attempts); got != 3 {
+		t.Fatalf("attempts=%d, want the declared 3", got)
+	}
+}
+
+// TestOpenAICompatibleModelDoesNotRetryDeterministicFailure covers the spec
+// scene where a wrong key or a malformed request costs one round trip.
+func TestOpenAICompatibleModelDoesNotRetryDeterministicFailure(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound} {
+		var attempts int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&attempts, 1)
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":"refused"}`))
+		}))
+		model := &OpenAICompatibleModel{
+			APIKey: "key", BaseURL: server.URL, Model: "test",
+			MaxAttempts: 3, RetryBackoff: time.Millisecond, Client: server.Client(),
+		}
+		_, err := model.Generate(context.Background(), []*schema.Message{schema.UserMessage("hello")})
+		server.Close()
+		if err == nil {
+			t.Fatalf("HTTP %d must fail the call", status)
+		}
+		if got := atomic.LoadInt32(&attempts); got != 1 {
+			t.Fatalf("HTTP %d attempts=%d, want 1", status, got)
+		}
+	}
+}
+
+// TestOpenAICompatibleModelStopsWaitingWhenCallerDeadlinePasses covers the spec
+// scene where `Retry-After` outlives the caller: the wait ends with the caller's
+// deadline instead of holding the run open, and no further request is sent.
+func TestOpenAICompatibleModelStopsWaitingWhenCallerDeadlinePasses(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.Header().Set("Retry-After", "90")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	t.Cleanup(cancel)
+	model := &OpenAICompatibleModel{
+		APIKey: "key", BaseURL: server.URL, Model: "test",
+		MaxAttempts: 3, RetryBackoff: time.Millisecond, Client: server.Client(),
+	}
+	started := time.Now()
+	if _, err := model.Generate(ctx, []*schema.Message{schema.UserMessage("hello")}); err == nil {
+		t.Fatal("expected the rate limit to fail the call")
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("call waited %s, it must not outlive the caller deadline", elapsed)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Fatalf("attempts=%d, want 1", got)
+	}
+}
+
+// TestOpenAICompatibleModelBoundsEachAttemptByProfileTimeout proves the profile
+// timeout bounds an attempt even when the caller injects its own HTTP client.
+func TestOpenAICompatibleModelBoundsEachAttemptByProfileTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	model := &OpenAICompatibleModel{
+		APIKey: "key", BaseURL: server.URL, Model: "test",
+		Timeout: 30 * time.Millisecond, MaxAttempts: 1,
+		Client: &http.Client{Transport: server.Client().Transport},
+	}
+	started := time.Now()
+	if _, err := model.Generate(context.Background(), []*schema.Message{schema.UserMessage("hello")}); err == nil {
+		t.Fatal("expected the elapsed attempt timeout to fail the call")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("attempt took %s, the profile timeout did not bound it", elapsed)
+	}
+}
+
+// TestOpenAICompatibleModelSendsProfileReasoning covers the spec scene where a
+// declared reasoning effort must reach the wire on every calling path.
+func TestOpenAICompatibleModelSendsProfileReasoning(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	model := &OpenAICompatibleModel{
+		APIKey: "key", BaseURL: server.URL, Model: "k3-256k", Client: server.Client(),
+		Profile: modelruntime.Profile{
+			Provider:     modelruntime.ProviderKimi,
+			Protocol:     modelruntime.ProtocolOpenAIChat,
+			Reasoning:    modelruntime.ReasoningConfig{Mode: modelruntime.ReasoningProviderDefault, Effort: "high"},
+			Capabilities: modelruntime.Capabilities{ToolUse: true, Thinking: true},
+		},
+	}
+	if _, err := model.Generate(context.Background(), []*schema.Message{schema.UserMessage("hello")}); err != nil {
+		t.Fatal(err)
+	}
+	thinking, ok := body["thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("body=%+v, want the profile thinking field on the wire", body)
+	}
+	if thinking["type"] != "enabled" || thinking["effort"] != "high" {
+		t.Fatalf("thinking=%+v", thinking)
 	}
 }

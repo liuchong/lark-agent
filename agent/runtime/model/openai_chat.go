@@ -296,6 +296,14 @@ func openAIChatToolChoice(req Request) (string, bool) {
 	}
 }
 
+// ThinkingPayload maps a profile's declared reasoning behavior onto the
+// provider fields that carry it. Every path that builds an `openai_chat`
+// request uses this, so a declared reasoning mode or effort cannot reach one
+// caller and silently skip another.
+func ThinkingPayload(profile Profile) (map[string]any, bool) {
+	return kimiThinking(profile)
+}
+
 func kimiThinking(profile Profile) (map[string]any, bool) {
 	if profile.Provider != ProviderKimi || !profile.Capabilities.Thinking {
 		return nil, false

@@ -506,10 +506,39 @@ func loadGitHubNotifyConfig(path string) (config.Config, error) {
 	cfg.GitHub.Enabled = true
 	cfg.GitHub.APIBaseURL = firstNonEmpty(os.Getenv("GITHUB_API_URL"), cfg.GitHub.APIBaseURL)
 	cfg.GitHub.AllowedRepositories = []string{strings.TrimSpace(os.Getenv("GITHUB_REPOSITORY"))}
+	if err := applyGitHubModelEnv(&cfg); err != nil {
+		return config.Config{}, err
+	}
 	if err := cfg.Validate(); err != nil {
 		return config.Config{}, err
 	}
 	return cfg, nil
+}
+
+// applyGitHubModelEnv lets an Actions run tune the primary profile it never gets
+// to edit, so the same reasoning effort and per-attempt timeout are available in
+// CI as in a local config file.
+func applyGitHubModelEnv(cfg *config.Config) error {
+	profile, ok := cfg.Model.Profiles["primary"]
+	if !ok {
+		return nil
+	}
+	if effort := strings.TrimSpace(os.Getenv("LARK_AGENT_MODEL_REASONING_EFFORT")); effort != "" {
+		profile.Reasoning.Effort = effort
+	}
+	if raw := strings.TrimSpace(os.Getenv("LARK_AGENT_MODEL_TIMEOUT")); raw != "" {
+		timeout, err := time.ParseDuration(raw)
+		if err != nil || timeout <= 0 {
+			return errs.NewValidationError(
+				errs.SubtypeInvalidArgument,
+				"LARK_AGENT_MODEL_TIMEOUT must be a positive duration such as 180s",
+			)
+		}
+		profile.Timeout = timeout
+		cfg.Model.Timeout = timeout
+	}
+	cfg.Model.Profiles["primary"] = profile
+	return nil
 }
 
 func repositoryAllowed(repository string, allowed []string) bool {
@@ -1026,8 +1055,12 @@ func modelAdapterForProfile(
 		timeout = cfg.Model.Timeout
 	}
 	if timeout <= 0 {
-		timeout = 60 * time.Second
+		timeout = config.DefaultModelTimeout
 	}
+	runtimeProfile := profile.RuntimeProfile(profileName)
+	runtimeProfile.BaseURL = baseURL
+	runtimeProfile.Model = modelName
+	runtimeProfile.Timeout = timeout
 	fingerprint := fmt.Sprintf(
 		"%s:%s/%s/%s@%s",
 		profileName,
@@ -1037,10 +1070,12 @@ func modelAdapterForProfile(
 		baseURL,
 	)
 	return &agentruntime.OpenAICompatibleModel{
-		APIKey:  apiKey,
-		BaseURL: baseURL,
-		Model:   modelName,
-		Timeout: timeout,
+		APIKey:      apiKey,
+		BaseURL:     baseURL,
+		Model:       modelName,
+		Timeout:     timeout,
+		MaxAttempts: profile.MaxAttempts,
+		Profile:     runtimeProfile,
 	}, profile, fingerprint, nil
 }
 

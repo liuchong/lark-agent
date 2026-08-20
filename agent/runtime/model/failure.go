@@ -1,6 +1,9 @@
 package model
 
 import (
+	"context"
+	"errors"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -81,6 +84,46 @@ func ClassifyHTTPFailure(status int, body string, retryAfter string, now time.Ti
 		}
 	}
 	return failure
+}
+
+// ClassifyTransportError classifies a failure that happened before any provider
+// response arrived: a dropped connection, a refused dial, an elapsed per-attempt
+// timeout, or a cancelled caller. Only the first three are worth another
+// attempt; a cancelled caller wants the call to stop.
+func ClassifyTransportError(err error) Failure {
+	if err == nil {
+		return Failure{}
+	}
+	if errors.Is(err, context.Canceled) {
+		return Failure{
+			Category:       FailureCancelled,
+			RecoveryAction: RecoveryStopDeterministic,
+			Diagnostic:     redactDiagnostic(err.Error()),
+		}
+	}
+	failure := Failure{
+		Category:       FailureNetwork,
+		Retryable:      true,
+		RecoveryAction: RecoveryRetryStep,
+		Diagnostic:     redactDiagnostic(err.Error()),
+	}
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+		failure.Category = FailureTimeout
+	}
+	return failure
+}
+
+// ClassifyEmptyProviderOutput classifies a response that decoded but carried no
+// turn. A provider that answers with nothing may answer on the next attempt, so
+// this is retryable while a malformed body is not.
+func ClassifyEmptyProviderOutput(diagnostic string) Failure {
+	return Failure{
+		Category:       FailureInvalidProviderOutput,
+		Retryable:      true,
+		RecoveryAction: RecoveryRetryStep,
+		Diagnostic:     redactDiagnostic(strings.TrimSpace(diagnostic)),
+	}
 }
 
 func parseRetryAfter(raw string, now time.Time) time.Duration {

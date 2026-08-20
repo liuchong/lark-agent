@@ -837,12 +837,12 @@ contains(github.event.comment.body, '@lark-agent')
 | GW-02.1 | same | same | slash via parser | union check if PR | `review.md` appended by slash |
 | GW-02.2 | `lark-agent-review-dispatch.yml` | `workflow_dispatch` input `pr_number` (string, required) | | `post_github_comment,upsert_github_check` | `review.md` |
 | GW-03 | `lark-agent-pr-review.yml` | `pull_request` types `[opened, labeled]` | not draft; same-repo; skip `synchronize`; labeled `lark-agent-review` may run | `post_github_comment,upsert_github_check` | `review.md` |
-| GW-04 | `lark-agent-event-summary.yml` | `issues` types `[opened]`; `pull_request` types `[opened]`; `workflow_run` types `[completed]` | workflow_run: `github.event.workflow_run.name != 'CI'` (`SC-69`) | `send_lark_message` | `event-summary.md` |
+| GW-04 | `lark-agent-event-summary.yml` | `issues` types `[opened]`; `pull_request` types `[opened]` | not draft; same-repo | `send_lark_message` | `event-summary.md` |
 | GW-05 | `lark-agent-master-changelog.yml` | `push` branches `[master]` | | `send_lark_message` | `changelog.md` |
 | GW-06 | `lark-agent-release.yml` | `workflow_dispatch` | jobs chained | `write_job_output` then ordinary notify | `release-notes.md` |
 | GW-07 | `lark-agent-pr-summary.yml` | `pull_request` types `[opened]` | not draft; same-repo | `post_github_comment` | `pr-summary.md` |
 | GW-08 | `lark-agent-merge-check.yml` | `pull_request` types `[opened]` | not draft; same-repo | `upsert_github_check` | `merge-check.md` |
-| GW-09 | `lark-agent-notify-style.yml` | same as GW-04 including CI exclusion | | `send_lark_message` | `notify-style.md` |
+| GW-09 | `lark-agent-notify-style.yml` | `workflow_run` workflows `[CI]` types `[completed]` | `github.event.workflow_run.conclusion != 'success'` (`SC-69`) | `send_lark_message` | `notify-style.md` |
 | GW-10 | `lark-agent-title.yml` | `issues` `[opened]`, `pull_request` `[opened]` | not draft for PRs | `update_github_issue_title` | `title-rules.md` |
 
 GW-03.2: `on.pull_request.types` must **not** include `synchronize`. The
@@ -1041,8 +1041,12 @@ Tests use only synthetic identifiers (`example/widgets`, `oc_synthetic`,
   `ref` is `github.event.repository.default_branch`.
 - **SC-68.** Given jobs that pass Lark/model secrets, then
   `environment: lark-production`.
-- **SC-69.** Given GW-04/GW-09 YAML, then a `workflow_run` job `if` contains
-  `!= 'CI'` or `!= \"CI\"`.
+- **SC-69.** Given the Lark-sending smart-command workflows, then no two of them
+  react to the same event, so one repository event never produces two
+  model-written chat messages. GW-04 owns newly opened issues and pull requests
+  and declares no `workflow_run` trigger; GW-09 owns a completed `CI` run and
+  runs only when the conclusion is not `success`, because the deterministic
+  notifier already reports every completion once.
 - **SC-70.** Given `github notify --dry-run` regression, then envelope still
   has `ok` and `data.message_type=post`.
 - **SC-71.** Given event name `check_suite`, then `SC-02`.

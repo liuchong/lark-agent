@@ -69,8 +69,21 @@ cannot hold the whole Lark assistant hostage:
 - The model runtime resolves an explicit role binding (`agent`, `semantic`,
   `finalizer`, `compactor`, or `vision`) to a named model profile. Profiles
   declare provider, protocol, endpoint, model name, credential reference,
-  reasoning behavior, streaming behavior, timeout, and capability limits. The
-  runtime never guesses a protocol from a URL or model name.
+  reasoning behavior, streaming behavior, timeout, per-call attempt budget, and
+  capability limits. The runtime never guesses a protocol from a URL or model
+  name.
+- Every execution path that calls a model resolves the profile the same way and
+  sends a request built from the whole profile. The resident daemon and the
+  one-shot smart command differ in how they are triggered and where they write,
+  never in which provider traits reach the wire: a profile that declares
+  reasoning behavior, a thinking capability, or a per-call timeout takes effect
+  in both. A path that builds a request from part of a profile is a defect, not
+  a smaller feature set.
+- A model profile carries its own per-call budget: `timeout` bounds one attempt
+  and `max_attempts` bounds how many attempts one model call may spend on
+  retryable failures. Both have defaults sized for the shipped reasoning
+  profile, so an unconfigured install survives a single provider blip without
+  the operator having to discover a timeout knob.
 - Tool policy is centralized. Shell, workspace reads, code search, Lark context,
   and exploration tools all return bounded receipts and structured denial
   results when a call is outside the current work kind or permission policy.
@@ -1964,6 +1977,24 @@ The multi-step loop is accepted by these executable BDD scenarios:
   current model step is retried with exponential backoff and `Retry-After`
   handling; if the per-step attempt budget is exhausted, only then may the work
   enter the existing transient retry state.
+- Given a model call fails before any response arrives, because the connection
+  dropped or the per-attempt timeout elapsed, when the profile still has
+  attempts left, then the runtime issues the same request again after a bounded
+  backoff and the caller observes one successful call; when the attempts are
+  spent, the caller observes one retryable transport failure naming the model
+  call, not a generic error.
+- Given a model call fails with a status the runtime classifies as
+  deterministic, such as 400, 401, 403, or 404, when the failure is returned,
+  then no further attempt is sent, so a wrong key or a malformed request costs
+  one round trip instead of the whole attempt budget.
+- Given a retryable failure carries `Retry-After`, when the runtime waits before
+  the next attempt, then it waits at least that long, and if the caller's
+  deadline or cancellation arrives first, the wait ends immediately and the call
+  fails without sending another request.
+- Given a profile declares a reasoning mode, a reasoning effort, or a thinking
+  capability, when any path calls that model, including a one-shot smart command
+  in CI, then the outbound request carries the provider fields those
+  declarations map to; a profile field that never reaches the wire is a defect.
 - Given the stable prompt core, task process, and tool schema are rendered
   twice with the same configuration, when dynamic time, budgets, run phase, or
   failure state changes, then the stable prefix hash remains unchanged and only

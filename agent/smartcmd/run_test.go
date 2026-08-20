@@ -11,11 +11,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	einomodel "github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 
 	"github.com/liuchong/lark-agent/agent/config"
+	modelruntime "github.com/liuchong/lark-agent/agent/runtime/model"
 	agenttools "github.com/liuchong/lark-agent/agent/tools"
 	internalgithub "github.com/liuchong/lark-agent/internal/github"
 )
@@ -65,6 +67,37 @@ func testConfig(t *testing.T) config.Config {
 	cfg.GitHub.AllowedRepositories = []string{"example/widgets"}
 	cfg.GitHub.APIBaseURL = "https://github.example"
 	return cfg
+}
+
+// TestSmartCommandModelCarriesWholeProfile covers the spec rule that a one-shot
+// smart command sends the same provider traits as the resident daemon: the
+// declared reasoning effort, the per-attempt timeout, and the attempt budget.
+func TestSmartCommandModelCarriesWholeProfile(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "synthetic-key")
+	t.Setenv("OPENAI_BASE_URL", "")
+	t.Setenv("OPENAI_MODEL", "")
+	cfg := testConfig(t)
+	primary := cfg.Model.Profiles["primary"]
+	primary.Reasoning = config.ModelReasoningConfig{Mode: "enabled", Effort: "high"}
+	primary.Timeout = 90 * time.Second
+	primary.MaxAttempts = 4
+	cfg.Model.Profiles["primary"] = primary
+
+	model, err := resolveRoleModel(context.Background(), cfg, "primary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.Timeout != 90*time.Second || model.MaxAttempts != 4 {
+		t.Fatalf("timeout=%s attempts=%d", model.Timeout, model.MaxAttempts)
+	}
+	if model.Profile.Reasoning.Effort != "high" ||
+		model.Profile.Reasoning.Mode != modelruntime.ReasoningEnabled ||
+		!model.Profile.Capabilities.Thinking {
+		t.Fatalf("profile=%+v", model.Profile)
+	}
+	if model.Profile.Model != primary.Name || model.Profile.BaseURL != primary.BaseURL {
+		t.Fatalf("profile identity=%+v", model.Profile)
+	}
 }
 
 func writeEvent(t *testing.T, name, body string) (string, string) {

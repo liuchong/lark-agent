@@ -605,9 +605,17 @@ func TestSmartCommandWorkflowYAMLContracts(t *testing.T) {
 				t.Fatalf("GW-03.3 %s missing labeled", path)
 			}
 		}
-		if strings.Contains(base, "event-summary") || strings.Contains(base, "notify-style") {
-			if !strings.Contains(text, `!= 'CI'`) && !strings.Contains(text, `!= "CI"`) {
-				t.Fatalf("SC-69 %s missing CI exclusion", path)
+		if strings.Contains(base, "event-summary") {
+			if yamlHasWorkflowRun(onValue) {
+				t.Fatalf("SC-69 %s must leave completed runs to the notify-style workflow", path)
+			}
+		}
+		if strings.Contains(base, "notify-style") {
+			if !yamlHasWorkflowRun(onValue) || yamlHasPullRequest(onValue) {
+				t.Fatalf("SC-69 %s must react to a completed run and nothing else", path)
+			}
+			if !strings.Contains(text, "github.event.workflow_run.conclusion != 'success'") {
+				t.Fatalf("SC-69 %s must skip a successful run the notifier already reported", path)
 			}
 		}
 		if strings.Contains(base, "comment.yml") {
@@ -724,6 +732,18 @@ func yamlHasPullRequest(onValue any) bool {
 		return typed == "pull_request"
 	case map[string]any:
 		_, ok := typed["pull_request"]
+		return ok
+	default:
+		return false
+	}
+}
+
+func yamlHasWorkflowRun(onValue any) bool {
+	switch typed := onValue.(type) {
+	case string:
+		return typed == "workflow_run"
+	case map[string]any:
+		_, ok := typed["workflow_run"]
 		return ok
 	default:
 		return false

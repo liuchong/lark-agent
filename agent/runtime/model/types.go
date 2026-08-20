@@ -5,6 +5,23 @@ import (
 	"time"
 )
 
+// The per-call budget defaults live here because both the configuration layer
+// and the transport need the same numbers; a second copy would let them drift.
+const (
+	// DefaultTimeout bounds one model attempt. It is sized for a reasoning model
+	// answering a long prompt, such as a changelog built from a whole push,
+	// rather than for a short completion.
+	DefaultTimeout = 120 * time.Second
+	// DefaultMaxAttempts lets one model call survive a single provider blip
+	// without the operator having to discover a retry knob.
+	DefaultMaxAttempts = 3
+	// DefaultRetryBackoff is the wait before a second attempt; it doubles.
+	DefaultRetryBackoff = 2 * time.Second
+	// MaxAttemptsLimit keeps a configured retry budget from turning a broken
+	// provider into a call that never ends.
+	MaxAttemptsLimit = 10
+)
+
 type Provider string
 
 const (

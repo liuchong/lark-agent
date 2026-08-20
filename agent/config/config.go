@@ -12,6 +12,7 @@ import (
 
 	"github.com/liuchong/lark-agent/agent/domain"
 	agentlocale "github.com/liuchong/lark-agent/agent/locale"
+	modelruntime "github.com/liuchong/lark-agent/agent/runtime/model"
 	"github.com/liuchong/lark-agent/agent/taskrules"
 	errs "github.com/liuchong/lark-agent/internal/apperr"
 	"github.com/liuchong/lark-agent/internal/fsx"
@@ -251,6 +252,13 @@ type OwnerDirectRequestConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
 }
 
+const (
+	// DefaultModelTimeout and DefaultModelMaxAttempts are the shipped per-call
+	// budget. The model runtime owns the numbers because it enforces them.
+	DefaultModelTimeout     = modelruntime.DefaultTimeout
+	DefaultModelMaxAttempts = modelruntime.DefaultMaxAttempts
+)
+
 // ModelConfig configures role-bound model profiles. Provider/BaseURL/Name are
 // retained as legacy v4 fields and as a temporary mirror for code paths not yet
 // switched to role-bound profiles. They are not credential fields.
@@ -271,9 +279,39 @@ type ModelProfileConfig struct {
 	KeychainService       string                  `json:"keychain_service,omitempty" yaml:"keychain_service,omitempty"`
 	CredentialKeychainKey string                  `json:"credential_keychain_key" yaml:"credential_keychain_key"`
 	Timeout               time.Duration           `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+	MaxAttempts           int                     `json:"max_attempts,omitempty" yaml:"max_attempts,omitempty"`
 	Stream                string                  `json:"stream,omitempty" yaml:"stream,omitempty"`
 	Reasoning             ModelReasoningConfig    `json:"reasoning,omitempty" yaml:"reasoning,omitempty"`
 	Capabilities          ModelCapabilitiesConfig `json:"capabilities,omitempty" yaml:"capabilities,omitempty"`
+}
+
+// RuntimeProfile maps a configured profile onto the provider-semantics profile
+// the model runtime puts on the wire. Every path that calls a model goes through
+// this, so a declared reasoning mode, effort, or output limit cannot reach one
+// caller and silently skip another.
+func (p ModelProfileConfig) RuntimeProfile(name string) modelruntime.Profile {
+	return modelruntime.Profile{
+		Name:          strings.TrimSpace(name),
+		Provider:      modelruntime.Provider(strings.TrimSpace(p.Provider)),
+		Protocol:      modelruntime.Protocol(strings.TrimSpace(p.Protocol)),
+		BaseURL:       strings.TrimSpace(p.BaseURL),
+		Model:         strings.TrimSpace(p.Name),
+		CredentialRef: strings.TrimSpace(p.CredentialKeychainKey),
+		Timeout:       p.Timeout,
+		Stream:        modelruntime.StreamMode(strings.TrimSpace(p.Stream)),
+		Reasoning: modelruntime.ReasoningConfig{
+			Mode:   modelruntime.ReasoningMode(strings.TrimSpace(p.Reasoning.Mode)),
+			Effort: strings.TrimSpace(p.Reasoning.Effort),
+		},
+		Capabilities: modelruntime.Capabilities{
+			ToolUse:          p.Capabilities.ToolUse,
+			Thinking:         p.Capabilities.Thinking,
+			ParallelToolCall: p.Capabilities.ParallelToolCall,
+			ImageInput:       p.Capabilities.ImageInput,
+			MaxContextTokens: p.Capabilities.MaxContextTokens,
+			MaxOutputTokens:  p.Capabilities.MaxOutputTokens,
+		},
+	}
 }
 
 type ModelReasoningConfig struct {
@@ -393,7 +431,7 @@ func Default() Config {
 			Provider: "kimi",
 			BaseURL:  "https://api.kimi.com/coding/v1",
 			Name:     "k3-256k",
-			Timeout:  60 * time.Second,
+			Timeout:  DefaultModelTimeout,
 			Profiles: map[string]ModelProfileConfig{
 				"primary": {
 					Provider:              "kimi",
@@ -402,7 +440,8 @@ func Default() Config {
 					Name:                  "k3-256k",
 					KeychainService:       "lark-agent",
 					CredentialKeychainKey: "model/primary/api-key",
-					Timeout:               60 * time.Second,
+					Timeout:               DefaultModelTimeout,
+					MaxAttempts:           DefaultModelMaxAttempts,
 					Stream:                "auto",
 					Reasoning:             ModelReasoningConfig{Mode: "provider_default"},
 					Capabilities: ModelCapabilitiesConfig{
@@ -825,10 +864,19 @@ func (m *ModelConfig) normalize(forceLegacyPrimary bool) {
 				ParallelToolCall: true,
 			},
 		}
-		if profile.Timeout <= 0 {
-			profile.Timeout = 60 * time.Second
-		}
 		m.Profiles = map[string]ModelProfileConfig{"primary": profile}
+	}
+	if m.Timeout <= 0 {
+		m.Timeout = DefaultModelTimeout
+	}
+	for name, profile := range m.Profiles {
+		if profile.Timeout <= 0 {
+			profile.Timeout = m.Timeout
+		}
+		if profile.MaxAttempts <= 0 {
+			profile.MaxAttempts = DefaultModelMaxAttempts
+		}
+		m.Profiles[name] = profile
 	}
 	if m.Roles.Agent == "" {
 		m.Roles.Agent = "primary"
@@ -938,6 +986,13 @@ func validateModelProfile(field string, profile ModelProfileConfig) error {
 	if profile.Timeout <= 0 {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "model profile timeout must be positive").
 			WithField(field + ".timeout")
+	}
+	if profile.MaxAttempts < 1 || profile.MaxAttempts > modelruntime.MaxAttemptsLimit {
+		return errs.NewConfigError(
+			errs.SubtypeInvalidConfig,
+			"model profile max_attempts must be between 1 and %d",
+			modelruntime.MaxAttemptsLimit,
+		).WithField(field + ".max_attempts")
 	}
 	if profile.Stream != "" && profile.Stream != "auto" && profile.Stream != "disabled" && profile.Stream != "required" {
 		return errs.NewConfigError(errs.SubtypeInvalidConfig, "model profile stream must be auto, disabled, or required").

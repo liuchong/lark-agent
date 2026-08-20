@@ -98,6 +98,19 @@ lark-agent config show
 - `model.profiles`：模型档案。每个档案明确写出供应商、协议、API URL、模型名、
   Keychain 凭据引用、流式和思考配置。默认 `primary` 使用 Kimi `k3-256k` 与
   `openai_chat` 协议。配置只保存 Keychain 引用，不保存 API key。
+- `model.profiles.<名字>.timeout`：单次模型尝试的超时，默认 `120s`。这是一次尝试的
+  上限，不是一次调用的上限。默认值按“推理模型读长提示词后作答”来定，例如从整个 diff
+  生成 changelog；把它调到很短会让重的提示词稳定超时。
+- `model.profiles.<名字>.max_attempts`：一次模型调用最多用几次尝试，默认 `3`，允许
+  `1` 到 `10`。只有被判为可重试的失败才会再发一次：连接中断、单次尝试超时、429、5xx、
+  529，以及解出来没有内容的应答。400、401、403、404 和额度耗尽是确定性失败，只花一次
+  往返就返回。重试之间按 2 秒起指数退避，供应商给了 `Retry-After` 就至少等那么久；调用方
+  取消或到期时立刻停止，不会再发下一次。
+  一次调用的最坏耗时是 `timeout × max_attempts` 加退避，智能命令的整体上限仍是 8 分钟
+  循环预算，所以这两个值要留在这个预算里。
+- `model.profiles.<名字>.reasoning`、`capabilities`：档案声明的推理模式、推理强度和
+  能力上限。这些声明会真正出现在请求里，常驻助手和 GitHub Actions 里的一次性智能命令
+  用同一套档案语义，不存在“某个字段只在其中一边生效”。
 - `model.roles`：角色绑定。`agent`、`semantic`、`finalizer`、`compactor`、`vision`
   默认都绑定 `primary`，也可以显式绑定到不同档案；运行时不会在未授权时自动跨供应商
   故障切换。

@@ -1,12 +1,11 @@
 name: Lark Agent notify style
 
+# A failed CI run, which is the one CI outcome worth explaining in prose. Every
+# completion, including green ones, is already reported once by the deterministic
+# notifier.
 on:
-  issues:
-    types: [opened]
-  pull_request:
-    types: [opened]
   workflow_run:
-    workflows: [Notify Lark after CI]
+    workflows: [CI]
     types: [completed]
 
 permissions:
@@ -14,7 +13,7 @@ permissions:
 
 jobs:
   notify:
-    if: (github.event_name != 'pull_request' || (github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository)) && (github.event_name != 'workflow_run' || github.event.workflow_run.name != 'CI')
+    if: github.event.workflow_run.conclusion != 'success'
     runs-on: ubuntu-latest
     environment: lark-production
     timeout-minutes: 10

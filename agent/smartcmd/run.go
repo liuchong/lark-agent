@@ -603,13 +603,24 @@ func resolveRoleModel(ctx context.Context, cfg config.Config, role string) (*age
 	}
 	timeout := profile.Timeout
 	if timeout <= 0 {
-		timeout = 60 * time.Second
+		timeout = cfg.Model.Timeout
 	}
+	if timeout <= 0 {
+		timeout = config.DefaultModelTimeout
+	}
+	// A smart command differs from the resident daemon in what triggers it and
+	// where it writes, never in which provider traits reach the wire.
+	runtimeProfile := profile.RuntimeProfile(profileName)
+	runtimeProfile.BaseURL = baseURL
+	runtimeProfile.Model = modelName
+	runtimeProfile.Timeout = timeout
 	return &agentruntime.OpenAICompatibleModel{
-		APIKey:  apiKey,
-		BaseURL: baseURL,
-		Model:   modelName,
-		Timeout: timeout,
+		APIKey:      apiKey,
+		BaseURL:     baseURL,
+		Model:       modelName,
+		Timeout:     timeout,
+		MaxAttempts: profile.MaxAttempts,
+		Profile:     runtimeProfile,
 	}, nil
 }
 

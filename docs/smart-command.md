@@ -41,7 +41,11 @@
 | `rules_file` | 否 | 追加的规则文件 |
 | `allowed_actions` | 否 | 逗号分隔的写入工具白名单；不给则没有写入能力 |
 | `output_language` | 否 | `auto`、`zh-CN` 或 `en-US` |
+| `model_reasoning_effort` | 否 | 主模型档案的推理强度，例如 `high` |
+| `model_timeout` | 否 | 单次模型尝试超时，Go duration，例如 `180s` |
 | `dry_run` | 否 | `true` 时清空全部写入 |
+
+Actions 里没有配置文件，配置由默认档案加环境变量组成，所以 `model_reasoning_effort` 和 `model_timeout` 是在 CI 里调整档案的唯一入口。留空就用默认：单次尝试 120 秒，一次调用最多 3 次尝试。这两个值一起决定一次调用的最坏耗时，要留在 8 分钟循环预算里。
 
 唯一的输出是 `changelog`，来自 `write_job_output` 工具。
 
@@ -71,11 +75,11 @@
 | `lark-agent-merge-check.yml` | 合并门禁检查 `lark-agent-gate` | GitHub 检查，`en-US` |
 | `lark-agent-release.yml` | 发布说明，验证后再建草稿 release | release 正文，`en-US` |
 | `lark-agent-title.yml` | 标题改写 | GitHub 标题，标题不受语言约束 |
-| `lark-agent-event-summary.yml` | Issue / PR / 非 CI 工作流摘要 | 飞书，沿用配置语言 |
+| `lark-agent-event-summary.yml` | 新开 Issue / PR 摘要 | 飞书，沿用配置语言 |
 | `lark-agent-master-changelog.yml` | 默认分支 changelog | 飞书，沿用配置语言 |
-| `lark-agent-notify-style.yml` | 通知口吻的事件摘要，例行成功事件直接跳过 | 飞书，沿用配置语言 |
+| `lark-agent-notify-style.yml` | CI 失败时用通知口吻解释一次 | 飞书，沿用配置语言 |
 
-Fork 来的 PR 会跳过。名为 `CI` 的 `workflow_run` 不进事件摘要和通知口吻工作流，避免和 `lark-notify.yml` 抢同一条 CI 完成事件。
+Fork 来的 PR 会跳过。发飞书的智能命令工作流之间不共用触发事件：新开的 Issue 和 PR 归事件摘要，CI 完成归 `lark-notify.yml` 的确定性通知，只有 CI 失败才额外由通知口吻工作流写一段解释。所以一次仓库事件不会产生两条模型写的消息。
 
 ## 写操作允许名单
 
@@ -110,6 +114,14 @@ Fork 来的 PR 会跳过。名为 `CI` 的 `workflow_run` 不进事件摘要和�
 - 工作流名、分支名、标签名、release 名、文件名和命令名是专名，照抄事件或仓库给的原文。即使整句是中文也不许翻译，更不许替换成自己对它用途的描述。
 
 飞书消息是纯文本类型，Markdown 链接语法会原样显示，所以 `send_lark_message` 的工具描述要求写裸 URL。
+
+## 模型调用预算
+
+智能命令和常驻助手用同一套模型档案语义。档案声明的推理模式、推理强度、能力上限、单次尝试超时和尝试次数都会真正生效，不存在“某个字段只在常驻助手里管用”。
+
+一次调用的预算来自档案：单次尝试默认 120 秒，一次调用最多 3 次尝试。连接中断、单次尝试超时、429、5xx、529 和解出来没有内容的应答会按 2 秒起的指数退避再试；供应商给了 `Retry-After` 就至少等那么久。400、401、403、404 和额度耗尽是确定性失败，只花一次往返，不会把尝试预算耗在同一个错误上。进程被取消或到期时立刻停止，不会再发一次请求。
+
+一次调用的最坏耗时是超时乘尝试次数加退避，而整个智能命令仍有 8 分钟循环预算和 YAML 的 `timeout-minutes`。调大 `model_timeout` 时要一起算这三个上限，否则重的提示词会从“模型超时”变成“循环超时”。
 
 ## 跑完之后看什么
 
