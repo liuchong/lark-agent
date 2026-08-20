@@ -324,6 +324,12 @@ func TestSmartCommandActionDispatcherAndPrompts(t *testing.T) {
 			t.Fatalf("notify-style.md missing %s heading", heading)
 		}
 	}
+	notifyText := strings.ToLower(string(notifyStyle))
+	for _, stale := range []string{"routine ci completions", "empty drafts", "releases", "pull-request openings"} {
+		if strings.Contains(notifyText, stale) {
+			t.Fatalf("notify-style.md mentions unreachable event class %q", stale)
+		}
+	}
 	titleRules, err := os.ReadFile(filepath.Join(promptDir, "title-rules.md"))
 	if err != nil {
 		t.Fatal(err)

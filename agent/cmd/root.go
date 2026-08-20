@@ -479,6 +479,15 @@ func newGitHubClient(cfg config.Config, token string) (*internalgithub.Client, e
 func loadGitHubNotifyConfig(path string) (config.Config, error) {
 	cfg, err := config.Load(path)
 	if err == nil {
+		// The model inputs tune the profile wherever the config came from; a
+		// container that happens to ship a config file must not silently ignore
+		// them.
+		if envErr := applyGitHubModelEnv(&cfg); envErr != nil {
+			return config.Config{}, envErr
+		}
+		if validateErr := cfg.Validate(); validateErr != nil {
+			return config.Config{}, validateErr
+		}
 		return cfg, nil
 	}
 	if os.Getenv("GITHUB_ACTIONS") != "true" {
@@ -965,11 +974,15 @@ func newModelDoctorCommand(out io.Writer, configPath *string) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				// The doctor must send what the daemon sends, profile traits and
+				// attempt budget included, or it can pass while a real run fails.
 				result, err := agentruntime.DoctorNativeTools(cmd.Context(), &agentruntime.OpenAICompatibleModel{
-					APIKey:  apiKey,
-					BaseURL: profile.BaseURL,
-					Model:   profile.Name,
-					Timeout: profile.Timeout,
+					APIKey:      apiKey,
+					BaseURL:     profile.BaseURL,
+					Model:       profile.Name,
+					Timeout:     profile.Timeout,
+					MaxAttempts: profile.MaxAttempts,
+					Profile:     profile.RuntimeProfile(name),
 				})
 				if err != nil {
 					return err
@@ -2036,13 +2049,23 @@ func buildLiveOptions(
 		))
 		loopModelAdapter := modelAdapter
 		if visionModel := strings.TrimSpace(cfg.Agent.VisionModel); visionModel != "" {
-			loopModelAdapter = &agentruntime.OpenAICompatibleModel{
-				APIKey:  modelAdapter.APIKey,
-				BaseURL: modelAdapter.BaseURL,
-				Model:   visionModel,
-				Timeout: modelAdapter.Timeout,
+			// Image turns run on the profile bound to the `vision` role, with
+			// `agent.vision_model` overriding only the model name. Building the
+			// adapter by hand here used to drop the profile's reasoning
+			// behavior, output limits, and attempt budget.
+			visionAdapter, _, _, visionErr := modelAdapterForProfile(ctx, cfg, cfg.Model.Roles.Vision)
+			if visionErr != nil {
+				return nil, nil, nil, info, visionErr
 			}
+			if visionAdapter == nil {
+				visionAdapter = modelAdapter
+			}
+			withVisionModel := *visionAdapter
+			withVisionModel.Model = visionModel
+			withVisionModel.Profile.Model = visionModel
+			loopModelAdapter = &withVisionModel
 			info["vision_model"] = visionModel
+			info["vision_profile"] = cfg.Model.Roles.Vision
 		}
 		finalizerModelAdapter, _, _, err := modelAdapterForProfile(ctx, cfg, cfg.Model.Roles.Finalizer)
 		if err != nil {

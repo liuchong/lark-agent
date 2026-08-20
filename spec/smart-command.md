@@ -66,8 +66,11 @@ CLI envelopes, fail-closed security, and the already confirmed product.
 8. Unknown slash command with comments allowed: one help comment, no model,
    exit 0 (`SC-09`). Unknown slash command without comments: exit 2, no model.
 9. Unknown comment `--flag`: exit 2, **no** GitHub comment, no model.
-10. GW-04 must not summarize the workflow named `CI` (`github.event.workflow_run.name != 'CI'`),
-    so it does not double-post with `.github/workflows/lark-notify.yml`.
+10. The Lark-sending smart-command workflows do not share a trigger, so one
+    repository event never produces two model-written chat messages. GW-04 owns
+    newly opened issues and pull requests; every CI completion is reported once
+    by `.github/workflows/lark-notify.yml`, and only a non-success run reaches
+    GW-09 for an explanation (`SC-69`).
 11. Jobs that need Lark or model secrets use GitHub Environment `lark-production`
     and skip when `github.event.pull_request.head.repo.full_name` (if present)
     is not `github.repository`.
@@ -192,6 +195,14 @@ or `GITHUB_TOKEN`.
 | `dry_run` | no | `false` | `LARK_AGENT_DRY_RUN` (`true`/`false`) |
 | `message` | no | empty | `LARK_AGENT_MESSAGE` |
 | `output_language` | no | empty | `LARK_AGENT_OUTPUT_LANGUAGE` |
+| `model_reasoning_effort` | no | empty | `LARK_AGENT_MODEL_REASONING_EFFORT` |
+| `model_timeout` | no | empty | `LARK_AGENT_MODEL_TIMEOUT` (Go duration) |
+
+An Actions run has no config file to edit, so `model_reasoning_effort` and
+`model_timeout` are the only way to tune the primary profile there. They apply
+to the profile whether the config came from a file or from the Actions
+bootstrap, and an unparsable or non-positive timeout fails with exit 2 before
+any model call.
 
 `runs.using` remains `docker`. `runs.image` remains `Dockerfile`.
 

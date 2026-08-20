@@ -140,6 +140,50 @@ func TestRuntimeModelProtocolRejectsProfilesNotYetConnectedToAgentLoop(t *testin
 	}
 }
 
+func TestGitHubActionModelInputsApplyToLoadedConfig(t *testing.T) {
+	t.Setenv("LARK_AGENT_MODEL_REASONING_EFFORT", "high")
+	t.Setenv("LARK_AGENT_MODEL_TIMEOUT", "150s")
+	cfg := config.Default()
+	cfg.Lark.AppID = "cli_test"
+	cfg.Owner.OpenID = "ou_owner"
+	cfg.Owner.Name = "测试负责人"
+	cfg.Workspace.Root = t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadGitHubNotifyConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := loaded.Model.Profiles["primary"]
+	if primary.Reasoning.Effort != "high" || primary.Timeout != 150*time.Second ||
+		loaded.Model.Timeout != 150*time.Second {
+		t.Fatalf("primary=%+v model_timeout=%s", primary, loaded.Model.Timeout)
+	}
+}
+
+func TestModelAdapterForProfileCarriesWholeProfile(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "synthetic-key")
+	cfg := config.Default()
+	primary := cfg.Model.Profiles["primary"]
+	primary.Reasoning = config.ModelReasoningConfig{Mode: "enabled", Effort: "high"}
+	primary.MaxAttempts = 4
+	primary.Capabilities.MaxOutputTokens = 4096
+	cfg.Model.Profiles["primary"] = primary
+
+	model, _, _, err := modelAdapterForProfile(context.Background(), cfg, "primary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.MaxAttempts != 4 ||
+		model.Profile.Reasoning.Effort != "high" ||
+		model.Profile.Capabilities.MaxOutputTokens != 4096 {
+		t.Fatalf("model=%+v profile=%+v", model, model.Profile)
+	}
+}
+
 type fakeSemanticContextReader struct {
 	result    serviceim.SemanticReplyContext
 	err       error
