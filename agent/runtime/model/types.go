@@ -162,12 +162,13 @@ type Message struct {
 }
 
 type Block struct {
-	Type       BlockType
-	Text       string
-	ImageURL   string
-	ToolCall   *ToolCall
-	ToolResult *ToolResult
-	Thinking   *ThinkingBlock
+	Type        BlockType
+	Text        string
+	ImageURL    string
+	ImageDetail string
+	ToolCall    *ToolCall
+	ToolResult  *ToolResult
+	Thinking    *ThinkingBlock
 }
 
 type Tool struct {

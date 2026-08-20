@@ -71,6 +71,50 @@ func TestOpenAIChatKimiThinkingOmitsForcedToolChoice(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatEncodesToolHistory(t *testing.T) {
+	codec := OpenAIChatCodec{}
+	req := Request{
+		Profile: Profile{Model: "k3-256k", Capabilities: Capabilities{ToolUse: true, ParallelToolCall: false}},
+		Messages: []Message{
+			{Role: RoleUser, Blocks: []Block{{Type: BlockText, Text: "find router"}}},
+			{Role: RoleAssistant, Blocks: []Block{
+				{Type: BlockToolCall, ToolCall: &ToolCall{
+					ID:        "call_1",
+					Name:      "search_workspace",
+					Arguments: json.RawMessage(`{"query":"router"}`),
+				}},
+			}},
+			{Role: RoleTool, Name: "search_workspace", ToolCallID: "call_1", Blocks: []Block{
+				{Type: BlockToolResult, ToolResult: &ToolResult{ID: "call_1", Name: "search_workspace", Content: `{"matches":[]}`}},
+			}},
+		},
+		Tools: []Tool{{Name: "search_workspace"}},
+	}
+
+	httpReq, err := codec.Encode(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := httpReq.Body["messages"].([]map[string]any)
+	assistant := messages[1]
+	toolCalls, ok := assistant["tool_calls"].([]map[string]any)
+	if !ok || len(toolCalls) != 1 {
+		t.Fatalf("assistant tool calls=%+v", assistant["tool_calls"])
+	}
+	function := toolCalls[0]["function"].(map[string]any)
+	if function["name"] != "search_workspace" || function["arguments"] != `{"query":"router"}` {
+		t.Fatalf("function=%+v", function)
+	}
+	toolMessage := messages[2]
+	if toolMessage["role"] != "tool" || toolMessage["tool_call_id"] != "call_1" ||
+		toolMessage["content"] != `{"matches":[]}` {
+		t.Fatalf("tool message=%+v", toolMessage)
+	}
+	if got := httpReq.Body["parallel_tool_calls"]; got != false {
+		t.Fatalf("parallel_tool_calls=%+v", got)
+	}
+}
+
 func TestOpenAIChatSSEAssemblesParallelToolCalls(t *testing.T) {
 	codec := OpenAIChatCodec{}
 	stream := strings.Join([]string{

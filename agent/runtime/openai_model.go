@@ -89,39 +89,38 @@ func (m *OpenAICompatibleModel) encodeRequest(input []*schema.Message, opts ...e
 	if cfg.Model != nil && *cfg.Model != "" {
 		modelName = *cfg.Model
 	}
-	body := map[string]any{
-		"model":    modelName,
-		"messages": toOpenAIMessages(input, m.allowsImageInput()),
-	}
+	profile := m.runtimeProfile(modelName)
+	var tools []modelruntime.Tool
 	if len(cfg.Tools) > 0 && m.allowsToolUse() {
-		tools, err := toOpenAITools(cfg.Tools)
+		var err error
+		tools, err = toModelTools(cfg.Tools)
 		if err != nil {
 			return nil, err
 		}
-		body["tools"] = tools
-		if m.hasProfile() && !m.Profile.Capabilities.ParallelToolCall {
-			body["parallel_tool_calls"] = false
-		}
-		if choice, ok := openAIToolChoice(cfg.ToolChoice); ok {
-			body["tool_choice"] = choice
-		}
-	} else {
-		body["response_format"] = map[string]string{"type": "json_object"}
 	}
+	var structured json.RawMessage
+	if len(tools) == 0 {
+		structured = json.RawMessage(`{"type":"json_object"}`)
+	}
+	req, err := (modelruntime.OpenAIChatCodec{}).Encode(modelruntime.Request{
+		Profile:          profile,
+		Messages:         toModelMessages(input, m.allowsImageInput()),
+		Tools:            tools,
+		ToolChoice:       toModelToolChoice(cfg.ToolChoice),
+		StructuredOutput: structured,
+		Budgets: modelruntime.Budgets{
+			MaxOutputTokens: valueOrZero(cfg.MaxTokens),
+		},
+	})
+	if err != nil {
+		return nil, errs.NewInternalError(errs.SubtypeUnknown, "encode OpenAI-compatible request").WithCause(err)
+	}
+	body := req.Body
 	if cfg.Temperature != nil {
 		body["temperature"] = *cfg.Temperature
 	}
-	switch {
-	case cfg.MaxTokens != nil:
-		body["max_tokens"] = *cfg.MaxTokens
-	case m.Profile.Capabilities.MaxOutputTokens > 0:
-		body["max_tokens"] = m.Profile.Capabilities.MaxOutputTokens
-	}
 	if len(cfg.Stop) > 0 {
 		body["stop"] = cfg.Stop
-	}
-	if thinking, ok := modelruntime.ThinkingPayload(m.Profile); ok {
-		body["thinking"] = thinking
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -170,43 +169,27 @@ func (m *OpenAICompatibleModel) attempt(ctx context.Context, payload []byte) (*s
 		}
 		return nil, failure, apiErr
 	}
-	var decoded struct {
-		ID      string `json:"id"`
-		Choices []struct {
-			Message struct {
-				Role      string            `json:"role"`
-				Content   string            `json:"content"`
-				ToolCalls []schema.ToolCall `json:"tool_calls"`
-			} `json:"message"`
-			FinishReason string `json:"finish_reason"`
-		} `json:"choices"`
-		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
-		} `json:"usage"`
-	}
-	if err := json.Unmarshal(respBody, &decoded); err != nil {
+	turn, err := (modelruntime.OpenAIChatCodec{}).Decode(respBody)
+	if err != nil {
+		if strings.Contains(err.Error(), "no choices") {
+			return nil, modelruntime.ClassifyEmptyProviderOutput(err.Error()),
+				errs.NewInternalError(errs.SubtypeInvalidResponse, "OpenAI-compatible response contained no choices")
+		}
 		return nil, modelruntime.Failure{}, errs.NewInternalError(errs.SubtypeInvalidResponse, "decode OpenAI-compatible response").WithCause(err)
 	}
-	if len(decoded.Choices) == 0 {
-		return nil, modelruntime.ClassifyEmptyProviderOutput("response contained no choices"),
-			errs.NewInternalError(errs.SubtypeInvalidResponse, "OpenAI-compatible response contained no choices")
-	}
-	choice := decoded.Choices[0]
 	msg := &schema.Message{
 		Role:      schema.Assistant,
-		Content:   choice.Message.Content,
-		ToolCalls: choice.Message.ToolCalls,
+		Content:   turn.Text,
+		ToolCalls: schemaToolCalls(turn.ToolCalls),
 		ResponseMeta: &schema.ResponseMeta{
-			FinishReason: choice.FinishReason,
+			FinishReason: string(turn.FinishReason),
 			Usage: &schema.TokenUsage{
-				PromptTokens:     decoded.Usage.PromptTokens,
-				CompletionTokens: decoded.Usage.CompletionTokens,
-				TotalTokens:      decoded.Usage.TotalTokens,
+				PromptTokens:     turn.Usage.PromptTokens,
+				CompletionTokens: turn.Usage.CompletionTokens,
+				TotalTokens:      turn.Usage.TotalTokens,
 			},
 		},
-		Extra: map[string]any{"request_id": decoded.ID},
+		Extra: map[string]any{"request_id": turn.RequestID},
 	}
 	return msg, modelruntime.Failure{}, nil
 }
@@ -289,21 +272,54 @@ func (m *OpenAICompatibleModel) allowsImageInput() bool {
 	return !m.hasProfile() || m.Profile.Capabilities.ImageInput
 }
 
-func toOpenAIMessages(input []*schema.Message, allowImages bool) []map[string]any {
-	out := make([]map[string]any, 0, len(input))
+func (m *OpenAICompatibleModel) runtimeProfile(modelName string) modelruntime.Profile {
+	profile := m.Profile
+	if !m.hasProfile() {
+		profile = modelruntime.Profile{
+			Protocol: modelruntime.ProtocolOpenAIChat,
+			Model:    modelName,
+			Capabilities: modelruntime.Capabilities{
+				ToolUse:          true,
+				ParallelToolCall: true,
+				ImageInput:       true,
+			},
+		}
+	}
+	if profile.Model == "" {
+		profile.Model = modelName
+	} else {
+		profile.Model = modelName
+	}
+	return profile
+}
+
+func toModelMessages(input []*schema.Message, allowImages bool) []modelruntime.Message {
+	out := make([]modelruntime.Message, 0, len(input))
 	for _, msg := range input {
 		if msg == nil {
 			continue
 		}
-		content := any(msg.Content)
+		message := modelruntime.Message{
+			Role:       modelruntime.Role(msg.Role),
+			Name:       msg.Name,
+			ToolCallID: msg.ToolCallID,
+		}
+		if msg.ToolName != "" {
+			message.Name = msg.ToolName
+		}
+		if msg.Content != "" {
+			message.Blocks = append(message.Blocks, modelruntime.Block{
+				Type: modelruntime.BlockText,
+				Text: msg.Content,
+			})
+		}
 		if len(msg.UserInputMultiContent) > 0 {
-			parts := make([]map[string]any, 0, len(msg.UserInputMultiContent))
 			for _, part := range msg.UserInputMultiContent {
 				switch part.Type {
 				case schema.ChatMessagePartTypeText:
-					parts = append(parts, map[string]any{
-						"type": "text",
-						"text": part.Text,
+					message.Blocks = append(message.Blocks, modelruntime.Block{
+						Type: modelruntime.BlockText,
+						Text: part.Text,
 					})
 				case schema.ChatMessagePartTypeImageURL:
 					if !allowImages {
@@ -312,74 +328,100 @@ func toOpenAIMessages(input []*schema.Message, allowImages bool) []map[string]an
 					if part.Image == nil || part.Image.URL == nil {
 						continue
 					}
-					parts = append(parts, map[string]any{
-						"type": "image_url",
-						"image_url": map[string]any{
-							"url":    *part.Image.URL,
-							"detail": string(part.Image.Detail),
-						},
+					message.Blocks = append(message.Blocks, modelruntime.Block{
+						Type:        modelruntime.BlockImage,
+						ImageURL:    *part.Image.URL,
+						ImageDetail: string(part.Image.Detail),
 					})
 				}
 			}
-			content = parts
-		}
-		wire := map[string]any{
-			"role":    string(msg.Role),
-			"content": content,
-		}
-		if msg.Name != "" {
-			wire["name"] = msg.Name
 		}
 		if len(msg.ToolCalls) > 0 {
-			wire["tool_calls"] = msg.ToolCalls
+			for _, call := range msg.ToolCalls {
+				message.Blocks = append(message.Blocks, modelruntime.Block{
+					Type: modelruntime.BlockToolCall,
+					ToolCall: &modelruntime.ToolCall{
+						ID:        call.ID,
+						Name:      call.Function.Name,
+						Arguments: json.RawMessage(call.Function.Arguments),
+					},
+				})
+			}
 		}
-		if msg.ToolCallID != "" {
-			wire["tool_call_id"] = msg.ToolCallID
+		if msg.Role == schema.Tool && msg.Content != "" {
+			message.Blocks = []modelruntime.Block{{
+				Type: modelruntime.BlockToolResult,
+				ToolResult: &modelruntime.ToolResult{
+					ID:      msg.ToolCallID,
+					Name:    msg.ToolName,
+					Content: msg.Content,
+				},
+			}}
 		}
-		if msg.ToolName != "" {
-			wire["name"] = msg.ToolName
-		}
-		out = append(out, wire)
+		out = append(out, message)
 	}
 	return out
 }
 
-func toOpenAITools(tools []*schema.ToolInfo) ([]map[string]any, error) {
-	out := make([]map[string]any, 0, len(tools))
+func toModelTools(tools []*schema.ToolInfo) ([]modelruntime.Tool, error) {
+	out := make([]modelruntime.Tool, 0, len(tools))
 	for _, tool := range tools {
 		if tool == nil || strings.TrimSpace(tool.Name) == "" {
 			return nil, errs.NewValidationError(errs.SubtypeInvalidArgument, "model tool name is required")
 		}
-		parameters := any(map[string]any{"type": "object", "properties": map[string]any{}})
+		parameters := json.RawMessage(`{"type":"object","properties":{}}`)
 		if tool.ParamsOneOf != nil {
 			jsonSchema, err := tool.ToJSONSchema()
 			if err != nil {
 				return nil, errs.NewInternalError(errs.SubtypeUnknown, "encode model tool schema: %s", tool.Name).WithCause(err)
 			}
-			parameters = jsonSchema
+			data, err := json.Marshal(jsonSchema)
+			if err != nil {
+				return nil, errs.NewInternalError(errs.SubtypeUnknown, "encode model tool schema: %s", tool.Name).WithCause(err)
+			}
+			parameters = data
 		}
-		out = append(out, map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name":        tool.Name,
-				"description": tool.Desc,
-				"parameters":  parameters,
-			},
+		out = append(out, modelruntime.Tool{
+			Name:        tool.Name,
+			Description: tool.Desc,
+			Schema:      parameters,
 		})
 	}
 	return out, nil
 }
 
-func openAIToolChoice(choice *schema.ToolChoice) (string, bool) {
+func toModelToolChoice(choice *schema.ToolChoice) modelruntime.ToolChoiceIntent {
 	if choice == nil {
-		return "", false
+		return modelruntime.ToolChoiceAuto
 	}
 	switch *choice {
 	case schema.ToolChoiceForbidden:
-		return "none", true
+		return modelruntime.ToolChoiceNone
 	case schema.ToolChoiceForced:
-		return "required", true
+		return modelruntime.ToolChoiceRequired
 	default:
-		return "", false
+		return modelruntime.ToolChoiceAuto
 	}
+}
+
+func schemaToolCalls(calls []modelruntime.ToolCall) []schema.ToolCall {
+	out := make([]schema.ToolCall, 0, len(calls))
+	for _, call := range calls {
+		out = append(out, schema.ToolCall{
+			ID:   call.ID,
+			Type: "function",
+			Function: schema.FunctionCall{
+				Name:      call.Name,
+				Arguments: string(call.Arguments),
+			},
+		})
+	}
+	return out
+}
+
+func valueOrZero(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
 }

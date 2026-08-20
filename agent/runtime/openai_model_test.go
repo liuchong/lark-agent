@@ -320,13 +320,8 @@ func TestOpenAICompatibleModelHonorsImageInputCapability(t *testing.T) {
 	}
 	messages := body["messages"].([]any)
 	message := messages[0].(map[string]any)
-	parts := message["content"].([]any)
-	if len(parts) != 1 {
-		t.Fatalf("image_input=false must strip image parts: %+v", parts)
-	}
-	textPart := parts[0].(map[string]any)
-	if textPart["type"] != "text" || textPart["text"] != "Inspect this evidence." {
-		t.Fatalf("text part=%+v", textPart)
+	if message["content"] != "Inspect this evidence." {
+		t.Fatalf("image_input=false must strip image parts: %+v", message["content"])
 	}
 }
 

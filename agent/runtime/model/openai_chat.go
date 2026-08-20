@@ -22,12 +22,26 @@ func (OpenAIChatCodec) Encode(req Request) (HTTPRequest, error) {
 			return HTTPRequest{}, err
 		}
 		body["tools"] = tools
+		if !req.Profile.Capabilities.ParallelToolCall {
+			body["parallel_tool_calls"] = false
+		}
 		if choice, ok := openAIChatToolChoice(req); ok {
 			body["tool_choice"] = choice
 		}
+	} else if len(req.StructuredOutput) > 0 {
+		var responseFormat any
+		if err := json.Unmarshal(req.StructuredOutput, &responseFormat); err != nil {
+			return HTTPRequest{}, fmt.Errorf("decode structured output: %w", err)
+		}
+		body["response_format"] = responseFormat
 	}
 	if req.CacheKey != "" {
 		body["prompt_cache_key"] = req.CacheKey
+	}
+	if req.Budgets.MaxOutputTokens > 0 {
+		body["max_tokens"] = req.Budgets.MaxOutputTokens
+	} else if req.Profile.Capabilities.MaxOutputTokens > 0 {
+		body["max_tokens"] = req.Profile.Capabilities.MaxOutputTokens
 	}
 	if thinking, ok := kimiThinking(req.Profile); ok {
 		body["thinking"] = thinking
@@ -224,14 +238,48 @@ func encodeOpenAIChatMessages(messages []Message) []map[string]any {
 		if message.ToolCallID != "" {
 			wire["tool_call_id"] = message.ToolCallID
 		}
-		if len(message.Blocks) == 1 && message.Blocks[0].Type == BlockText {
+		toolCalls := openAIChatMessageToolCalls(message.Blocks)
+		toolResult := openAIChatToolResult(message.Blocks)
+		if toolResult != "" {
+			wire["content"] = toolResult
+		} else if len(message.Blocks) == 1 && message.Blocks[0].Type == BlockText {
 			wire["content"] = message.Blocks[0].Text
 		} else {
 			wire["content"] = encodeOpenAIContentParts(message.Blocks)
 		}
+		if len(toolCalls) > 0 {
+			wire["tool_calls"] = toolCalls
+		}
 		out = append(out, wire)
 	}
 	return out
+}
+
+func openAIChatMessageToolCalls(blocks []Block) []map[string]any {
+	out := make([]map[string]any, 0)
+	for _, block := range blocks {
+		if block.Type != BlockToolCall || block.ToolCall == nil {
+			continue
+		}
+		out = append(out, map[string]any{
+			"id":   block.ToolCall.ID,
+			"type": "function",
+			"function": map[string]any{
+				"name":      block.ToolCall.Name,
+				"arguments": string(block.ToolCall.Arguments),
+			},
+		})
+	}
+	return out
+}
+
+func openAIChatToolResult(blocks []Block) string {
+	for _, block := range blocks {
+		if block.Type == BlockToolResult && block.ToolResult != nil {
+			return block.ToolResult.Content
+		}
+	}
+	return ""
 }
 
 func encodeOpenAIContentParts(blocks []Block) []map[string]any {
@@ -241,9 +289,13 @@ func encodeOpenAIContentParts(blocks []Block) []map[string]any {
 		case BlockText:
 			parts = append(parts, map[string]any{"type": "text", "text": block.Text})
 		case BlockImage:
+			image := map[string]any{"url": block.ImageURL}
+			if block.ImageDetail != "" {
+				image["detail"] = block.ImageDetail
+			}
 			parts = append(parts, map[string]any{
 				"type":      "image_url",
-				"image_url": map[string]any{"url": block.ImageURL},
+				"image_url": image,
 			})
 		}
 	}
