@@ -266,10 +266,7 @@ func TestSmartCommandActionDispatcherAndPrompts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(action)
-	if !strings.Contains(text, "default: notify") || !strings.Contains(text, "LARK_AGENT_MODE") {
-		t.Fatalf("SC-53 action.yml=%s", text)
-	}
+	assertActionYAMLContract(t, action)
 	docker, err := os.ReadFile(filepath.Join(root, "Dockerfile"))
 	if err != nil {
 		t.Fatal(err)
@@ -604,11 +601,12 @@ func TestSmartCommandWorkflowYAMLContracts(t *testing.T) {
 			}
 		}
 		if strings.Contains(base, "pr-review") {
-			if strings.Contains(text, "synchronize") {
+			actions := yamlEventActions(onValue, "pull_request")
+			if containsString(actions, "synchronize") {
 				t.Fatalf("GW-03.2 %s lists synchronize", path)
 			}
-			if !strings.Contains(text, "labeled") {
-				t.Fatalf("GW-03.3 %s missing labeled", path)
+			if !containsString(actions, "labeled") {
+				t.Fatalf("GW-03.3 %s pull_request actions=%v", path, actions)
 			}
 		}
 		if strings.Contains(base, "event-summary") {
@@ -619,6 +617,9 @@ func TestSmartCommandWorkflowYAMLContracts(t *testing.T) {
 		if strings.Contains(base, "notify-style") {
 			if !yamlHasWorkflowRun(onValue) || yamlHasPullRequest(onValue) {
 				t.Fatalf("SC-69 %s must react to a completed run and nothing else", path)
+			}
+			if !yamlWorkflowRunOnlyCIFailures(onValue) {
+				t.Fatalf("SC-69 %s workflow_run trigger must be CI completed", path)
 			}
 			if !strings.Contains(text, "github.event.workflow_run.conclusion != 'success'") {
 				t.Fatalf("SC-69 %s must skip a successful run the notifier already reported", path)
@@ -705,6 +706,37 @@ func decodeSmartCommandData(t *testing.T, stdout string) smartCommandData {
 	return envelope.Data
 }
 
+func assertActionYAMLContract(t *testing.T, raw []byte) {
+	t.Helper()
+	var parsed map[string]any
+	if err := yaml.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("SC-53 action.yml parse: %v", err)
+	}
+	inputs, _ := parsed["inputs"].(map[string]any)
+	mode, _ := inputs["mode"].(map[string]any)
+	if stringify(mode["default"]) != "notify" {
+		t.Fatalf("SC-53 mode default=%v", mode["default"])
+	}
+	runs, _ := parsed["runs"].(map[string]any)
+	if stringify(runs["using"]) != "docker" || stringify(runs["image"]) != "Dockerfile" {
+		t.Fatalf("SC-53 runs=%+v", runs)
+	}
+	env, _ := runs["env"].(map[string]any)
+	for input, envName := range map[string]string{
+		"mode":                   "LARK_AGENT_MODE",
+		"model_reasoning_effort": "LARK_AGENT_MODEL_REASONING_EFFORT",
+		"model_timeout":          "LARK_AGENT_MODEL_TIMEOUT",
+		"output_language":        "LARK_AGENT_OUTPUT_LANGUAGE",
+	} {
+		if _, ok := inputs[input]; !ok {
+			t.Fatalf("SC-53 action.yml missing input %s", input)
+		}
+		if stringify(env[envName]) != "${{ inputs."+input+" }}" {
+			t.Fatalf("SC-53 %s env=%v", envName, env[envName])
+		}
+	}
+}
+
 // assertWorkflowRunTrigger enforces SC-83. GitHub rejects the whole workflow
 // file when `on.workflow_run` omits `workflows`, so the job never starts.
 func assertWorkflowRunTrigger(t *testing.T, path string, onValue any) {
@@ -754,6 +786,52 @@ func yamlHasWorkflowRun(onValue any) bool {
 	default:
 		return false
 	}
+}
+
+func yamlEventActions(onValue any, eventName string) []string {
+	triggers, ok := onValue.(map[string]any)
+	if !ok {
+		if stringify(onValue) == eventName {
+			return nil
+		}
+		return nil
+	}
+	trigger, ok := triggers[eventName].(map[string]any)
+	if !ok {
+		return nil
+	}
+	rawTypes, _ := trigger["types"].([]any)
+	out := make([]string, 0, len(rawTypes))
+	for _, raw := range rawTypes {
+		out = append(out, stringify(raw))
+	}
+	return out
+}
+
+func yamlWorkflowRunOnlyCIFailures(onValue any) bool {
+	triggers, ok := onValue.(map[string]any)
+	if !ok {
+		return false
+	}
+	trigger, ok := triggers["workflow_run"].(map[string]any)
+	if !ok {
+		return false
+	}
+	workflowsRaw, _ := trigger["workflows"].([]any)
+	typesRaw, _ := trigger["types"].([]any)
+	return len(workflowsRaw) == 1 &&
+		stringify(workflowsRaw[0]) == "CI" &&
+		len(typesRaw) == 1 &&
+		stringify(typesRaw[0]) == "completed"
+}
+
+func containsString(items []string, needle string) bool {
+	for _, item := range items {
+		if item == needle {
+			return true
+		}
+	}
+	return false
 }
 
 func jobNeedsAction(job map[string]any) bool {
