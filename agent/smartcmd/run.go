@@ -398,15 +398,18 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	if decision.Kind != domain.DecisionRecord {
 		return Result{}, errs.NewInternalError(errs.SubtypeInvalidResponse, "smart command must finish with decision=record")
 	}
-	result.Skipped = result.Skipped || decision.Skipped
-	if decision.ReplyOutcome == domain.ReplyOutcomePartial || decision.ReplyOutcome == domain.ReplyOutcomeClarification {
-		result.Partial = true
-	}
 	result.Partial = result.Partial || gate.Partial
 	result.CommentID = gate.CommentID
 	result.CheckID = gate.CheckID
 	result.MessageID = gate.MessageID
 	result.Title = gate.Title
+	// A run that wrote nothing skipped, whether or not the model said so: the
+	// gate is the only witness of what actually left the process. A dry run
+	// writes nothing by construction, so `dry_run` already reports it.
+	result.Skipped = result.Skipped || decision.Skipped || (!opts.DryRun && !gate.Wrote())
+	if decision.ReplyOutcome == domain.ReplyOutcomePartial || decision.ReplyOutcome == domain.ReplyOutcomeClarification {
+		result.Partial = true
+	}
 	if len(gate.Outputs) > 0 {
 		result.Outputs = gate.Outputs
 	}

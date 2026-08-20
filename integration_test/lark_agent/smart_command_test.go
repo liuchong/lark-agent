@@ -319,8 +319,10 @@ func TestSmartCommandActionDispatcherAndPrompts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(notifyStyle), "Skip") || !strings.Contains(string(notifyStyle), "Send") {
-		t.Fatal("notify-style.md missing Skip/Send headings")
+	for _, heading := range []string{"## Scope", "## Skip", "## Send"} {
+		if !strings.Contains(string(notifyStyle), heading) {
+			t.Fatalf("notify-style.md missing %s heading", heading)
+		}
 	}
 	titleRules, err := os.ReadFile(filepath.Join(promptDir, "title-rules.md"))
 	if err != nil {
@@ -592,6 +594,7 @@ func TestSmartCommandWorkflowYAMLContracts(t *testing.T) {
 			if larkWorkflow {
 				assertCheckoutSteps(t, path, job)
 				assertPermissions(t, path, jobName, parsed, job)
+				assertPublicSurfaceLanguage(t, path, jobName, job)
 			}
 		}
 		if strings.Contains(base, "pr-review") {
@@ -631,6 +634,42 @@ func TestSmartCommandWorkflowYAMLContracts(t *testing.T) {
 			if stringify(perms["contents"]) != "write" {
 				t.Fatalf("SC-65 release contents=%v", perms["contents"])
 			}
+		}
+	}
+}
+
+// assertPublicSurfaceLanguage covers SC-90. A GitHub comment, check summary, or
+// release body is public repository content, so those workflows pin the outward
+// language instead of inheriting the chat-facing default.
+func assertPublicSurfaceLanguage(t *testing.T, path, jobName string, job map[string]any) {
+	t.Helper()
+	steps, _ := job["steps"].([]any)
+	for _, rawStep := range steps {
+		step, _ := rawStep.(map[string]any)
+		with, _ := step["with"].(map[string]any)
+		if with == nil || stringify(with["mode"]) != "run" {
+			continue
+		}
+		actions := stringify(with["allowed_actions"])
+		public := false
+		for _, action := range []string{
+			"post_github_comment",
+			"upsert_github_check",
+			"write_job_output",
+		} {
+			if strings.Contains(actions, action) {
+				public = true
+				break
+			}
+		}
+		language := strings.TrimSpace(stringify(with["output_language"]))
+		if public && language != "en-US" {
+			t.Fatalf("SC-90 %s job %s writes public GitHub content with output_language=%q",
+				path, jobName, language)
+		}
+		if !public && language != "" {
+			t.Fatalf("SC-90 %s job %s is chat-only and must inherit the configured language, got %q",
+				path, jobName, language)
 		}
 	}
 }

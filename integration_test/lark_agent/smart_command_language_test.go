@@ -131,6 +131,7 @@ func TestSmartCommandResolvesConfiguredOutputLanguage(t *testing.T) {
 			for _, rule := range []string{
 				"State the conclusion first",
 				"only means something inside this repository",
+				"Copy it exactly as the event or repository gives it",
 			} {
 				if !strings.Contains(body, rule) {
 					t.Fatalf("SC-89 system prompt is missing %q: %s", rule, body)

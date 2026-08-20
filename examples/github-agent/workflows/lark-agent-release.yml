@@ -27,6 +27,7 @@ jobs:
           github_token: ${{ github.token }}
           prompt_file: .github/lark-agent/prompts/release-notes.md
           allowed_actions: write_job_output
+          output_language: en-US
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
   verify:

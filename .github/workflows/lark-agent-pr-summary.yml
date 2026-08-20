@@ -30,5 +30,6 @@ jobs:
           github_token: ${{ github.token }}
           prompt_file: .github/lark-agent/prompts/pr-summary.md
           allowed_actions: post_github_comment
+          output_language: en-US
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

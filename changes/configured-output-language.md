@@ -54,6 +54,24 @@ Go identifiers appeared in a Lark message, where no reader can resolve them.
    per-repository prompt file should not have to repeat: conclusion before
    detail, and no repository-internal scene ids or code identifiers in text
    addressed to a chat.
+8. Example workflows choose language by destination, not by repository
+   preference. A GitHub comment, a check summary, and a release body are public
+   repository content and pin `en-US`; a Lark-only workflow inherits the
+   configured language. A YAML contract test keeps the two sets from drifting.
+9. Three defects observed in acceptance are fixed at the layer they belong to.
+   A `workflow_run` notification described the CI run reachable from the event
+   instead of the event itself, so `notify-style.md` gained an explicit scope
+   rule. Markdown link syntax rendered literally in Lark, which is a property of
+   the `text` message type rather than of one prompt, so the
+   `send_lark_message` tool description now states it. A Chinese notification
+   translated the workflow name `Lark Agent master changelog` into a description
+   of a different workflow, so the system prompt now requires proper names to be
+   copied verbatim regardless of the outward language.
+10. `data.skipped` stops depending on the model's own claim. A non-dry run that
+    called no write tool reports `skipped=true`, because the write gate is the
+    only witness of what left the process. Acceptance produced exactly this
+    case: the model correctly stayed silent on a routine success and still
+    reported `skipped=false`.
 
 ## Not in this round
 

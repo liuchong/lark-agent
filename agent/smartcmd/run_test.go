@@ -222,6 +222,78 @@ func TestGitHubRunReviewOnIssuePostsPullRequestHelp(t *testing.T) {
 	}
 }
 
+// TestGitHubRunDerivesSkipFromWrites covers SC-91. The write gate, not the
+// model's own claim, decides whether a non-dry run had any outward effect.
+func TestGitHubRunDerivesSkipFromWrites(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":3003}`))
+	}))
+	t.Cleanup(server.Close)
+	client, err := internalgithub.NewClient(internalgithub.ClientConfig{
+		BaseURL: server.URL, Token: "synthetic-token",
+		Limits: internalgithub.DefaultLimits(), HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := `{
+	  "action":"opened",
+	  "repository":{"full_name":"example/widgets"},
+	  "issue":{"number":7,"title":"printer smoke","html_url":"https://github.example/example/widgets/issues/7"}
+	}`
+
+	silent := &recordingModel{responses: []*schema.Message{recordDecision()}}
+	eventPath, _ := writeEvent(t, "silent.json", event)
+	result, err := Run(context.Background(), Options{
+		Config:            testConfig(t),
+		GitHub:            true,
+		Message:           "summarize",
+		AllowedActions:    "post_github_comment",
+		EventPath:         eventPath,
+		EventName:         "issues",
+		Model:             silent,
+		TerminalFinalizer: unusedFinalizer(),
+		GitHubClient:      client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Skipped || result.CommentID != "" {
+		t.Fatalf("SC-91 a run without writes must report skipped: %+v", result)
+	}
+
+	writing := &recordingModel{responses: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{{
+			ID:   "comment",
+			Type: "function",
+			Function: schema.FunctionCall{
+				Name:      internalgithub.ActionPostGitHubComment,
+				Arguments: `{"body":"构建已通过，无需处理。"}`,
+			},
+		}}),
+		recordDecision(),
+	}}
+	writingEventPath, _ := writeEvent(t, "writing.json", event)
+	written, err := Run(context.Background(), Options{
+		Config:            testConfig(t),
+		GitHub:            true,
+		Message:           "summarize",
+		AllowedActions:    "post_github_comment",
+		EventPath:         writingEventPath,
+		EventName:         "issues",
+		Model:             writing,
+		TerminalFinalizer: unusedFinalizer(),
+		GitHubClient:      client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written.Skipped || written.CommentID != "3003" {
+		t.Fatalf("SC-91 a run that wrote must not report skipped: %+v", written)
+	}
+}
+
 func TestGitHubRunDryRunEnvelopeAndNoWrites(t *testing.T) {
 	model := &recordingModel{responses: []*schema.Message{recordDecision()}}
 	eventPath, _ := writeEvent(t, "event.json", `{

@@ -242,7 +242,7 @@ Success (`SC-03`, `SC-35`):
 |---|---|---|
 | `mode` | string | always `run` for this command (`notify` stays on `github notify`) |
 | `dry_run` | bool | CLI or comment `--dry-run` |
-| `skipped` | bool | true when `SC-17` or GW-09.1 skip; still exit 0 |
+| `skipped` | bool | true when `SC-17` or GW-09.1 skip, and true for any non-dry run where no write tool succeeded (`SC-91`); still exit 0 |
 | `partial` | bool | enrichment/compare/file read failed or `submit_decision` evidence insufficient |
 | `event_name` | string | `GITHUB_EVENT_NAME`; empty on `lark-agent run` |
 | `command` | string | slash name without `/`; empty string not `null` |
@@ -627,7 +627,9 @@ title. GW-10.2: if the model never calls the tool, no PATCH.
 
 Args: `{ "text": string }` required, trim empty → error, max 4000 runes.
 Go sends existing bot `SendMessageAsBot` as `text` (not `post`) to the
-configured chat only. After the model text, Go appends `\n` and the HMAC
+configured chat only. Because the message type is `text`, the tool description
+tells the model that Markdown link syntax is displayed literally and that URLs
+belong in the text bare. After the model text, Go appends `\n` and the HMAC
 marker (`SC-39`). Idempotency key:
 `ghs-` + first 32 hex chars of SHA-256(`chat_id + "\x00" + ExternalKey() + "\x00v1"`),
 total length ≤ 50. At most one successful send.
@@ -679,6 +681,12 @@ prose.
 Deterministic outward help text renders in the resolved language (`SC-88`):
 the unknown-slash-command help and the `/review` or `/check` outside a pull
 request help.
+
+A GitHub comment, a check summary, and a release body are public repository
+content, so every example workflow whose `allowed_actions` include
+`post_github_comment`, `upsert_github_check`, or `write_job_output` pins
+`output_language: en-US`. A workflow that only sends Lark inherits the
+configured chat-facing language and must not pin one (`SC-90`).
 
 ### Forbidden registry names on `github run` (`SC-50`)
 
@@ -773,7 +781,9 @@ corresponding file after the workflow `--prompt-file`. Missing contract file
 is `SC-18`.
 
 `notify-style.md` must contain a heading `Skip` and a heading `Send` so tests
-can pin skip vs send with a fake model plus the file bytes.
+can pin skip vs send with a fake model plus the file bytes. It must also contain
+a heading `Scope`, because a `workflow_run` event reaches the model together with
+the runs around it and the notification describes only the triggering event.
 
 `title-rules.md` must contain `max 72` so GW-10 can be judged.
 
@@ -1082,8 +1092,18 @@ Tests use only synthetic identifiers (`example/widgets`, `oc_synthetic`,
   `/title`, `/check`, and `--dry-run`. The same holds for `/review` outside a
   pull request.
 - **SC-89.** Given the smart-command system prompt, then it requires the
-  conclusion before detail and forbids repository-internal scene ids and code
-  identifiers in outward text.
+  conclusion before detail, forbids repository-internal scene ids and code
+  identifiers in outward text, and requires a workflow, branch, tag, release,
+  file, or command name to be copied verbatim rather than translated or
+  paraphrased into a description.
+- **SC-90.** Given every live and GW example workflow, when a `mode: run` step
+  allows `post_github_comment`, `upsert_github_check`, or `write_job_output`,
+  then that step declares `output_language: en-US`; when a step allows only
+  Lark or title writes, then it declares no `output_language`.
+- **SC-91.** Given a non-dry `github run` whose model finishes `record` with
+  `skipped` absent and calls no write tool, then `data.skipped=true`, exit 0.
+  Given the same run where one write tool succeeded, then `data.skipped=false`.
+  A dry run keeps the model's own `skipped` value.
 
 `SC-36` is unused (reserved). `SC-37` is covered by the comment `if` Bot
 clause in YAML tests.

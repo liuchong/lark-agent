@@ -52,6 +52,18 @@ type WriteGate struct {
 	Outputs       map[string]string
 }
 
+// Wrote reports whether any write tool succeeded, so a caller can describe a
+// run that produced no outward effect without trusting the model to say so.
+func (g *WriteGate) Wrote() bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.CommentPosted || g.TitleUpdated || g.LarkSent || g.OutputWritten ||
+		strings.TrimSpace(g.CheckID) != ""
+}
+
 func (g *WriteGate) allowed(name string) bool {
 	if g == nil || g.Allow == nil {
 		return false
@@ -283,7 +295,7 @@ func UpsertGitHubCheckDefinition(writer GitHubWriter, gate *WriteGate) Definitio
 func SendLarkMessageDefinition(sender BotMessageSender, gate *WriteGate) Definition {
 	const name = internalgithub.ActionSendLarkMessage
 	return Definition{
-		Info: toolInfo(name, "Send one text message to the configured Lark chat. The runtime appends a GitHub reference footer.", map[string]*schema.ParameterInfo{
+		Info: toolInfo(name, "Send one plain-text message to the configured Lark chat. The runtime appends a GitHub reference footer. Markdown link syntax is displayed literally in the chat, so write bare URLs.", map[string]*schema.ParameterInfo{
 			"text": {Type: schema.String, Required: true},
 		}),
 		Permission:       ToolPermissionAllow,

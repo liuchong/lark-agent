@@ -82,6 +82,8 @@ Fork 来的 PR 会跳过。名为 `CI` 的 `workflow_run` 不进事件摘要和�
 
 未知斜杠命令和 `/review`、`/check` 用在非 PR 上的帮助评论也跟随这个语言。
 
+示例工作流按落地面选语言：写 GitHub 评论、检查结论或 release 正文的是公开仓库内容，固定 `output_language: en-US`；只发飞书的沿用配置里的语言，不写这个输入。
+
 ## 结束方式
 
 工作类型是 `smart_command`。模型必须调用 `submit_decision`，且 `decision` 只能是 `record`。这个工具本身不发飞书、不写 GitHub。真正的评论、检查、标题、飞书消息和 job output 只能通过上面的具名写入工具，每种进程最多成功一次。

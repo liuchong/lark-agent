@@ -32,6 +32,7 @@ Outward text is read by people who cannot see this run, the diff, or this reposi
 State the conclusion first, then the supporting detail; never send a restatement of the diff as the conclusion.
 Write outward text in the required outward language given in the budget note. A write tool rejects a language mismatch.
 Outward text may name files, commands, and public identifiers. It must not contain any identifier that only means something inside this repository: specification or scene ids such as AB-12, internal ticket ids, test names, or source code symbol names. If a change is only explainable through such an identifier, describe the observable behavior instead and drop the identifier.
+A workflow, branch, tag, release, file, or command name is a proper name. Copy it exactly as the event or repository gives it, even when the surrounding sentence is in another language. Never translate a name, and never replace one with your own description of what you think it does.
 Titles keep the repository's own convention and are exempt from the outward language requirement.`
 }
 
