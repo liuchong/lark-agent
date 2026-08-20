@@ -15,6 +15,7 @@ import (
 	"github.com/liuchong/lark-agent/agent/domain"
 	agentlocale "github.com/liuchong/lark-agent/agent/locale"
 	agentruntime "github.com/liuchong/lark-agent/agent/runtime"
+	modelruntime "github.com/liuchong/lark-agent/agent/runtime/model"
 	"github.com/liuchong/lark-agent/agent/storage"
 	agenttools "github.com/liuchong/lark-agent/agent/tools"
 	"github.com/liuchong/lark-agent/agent/workspace"
@@ -25,6 +26,12 @@ import (
 )
 
 const smartCommandIdentity = "smart-command"
+
+const (
+	defaultSmartCommandTurns     = 20
+	defaultSmartCommandToolCalls = 12
+	defaultSmartCommandElapsed   = 8 * time.Minute
+)
 
 type Options struct {
 	Config         config.Config
@@ -374,7 +381,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 			Content:   userMessage,
 		},
 		WorkKind:           domain.WorkKindSmartCommand,
-		MaxTurns:           20,
+		MaxTurns:           defaultSmartCommandTurns,
 		OutputLanguage:     string(language),
 		User:               agentcontext.UserProfile{OpenID: smartCommandIdentity, Name: smartCommandIdentity},
 		Environment:        agentcontext.EnvironmentSnapshot{WorkspaceRoot: workspaceRoot, Tools: tools},
@@ -386,9 +393,9 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		Model:             model,
 		TerminalFinalizer: finalizer,
 		Tools:             registry,
-		MaxTurns:          20,
-		MaxToolCalls:      12,
-		MaxElapsed:        8 * time.Minute,
+		MaxTurns:          defaultSmartCommandTurns,
+		MaxToolCalls:      defaultSmartCommandToolCalls,
+		MaxElapsed:        defaultSmartCommandElapsed,
 		SystemPrompt:      agentcontext.SmartCommandSystemPrompt(),
 	}
 	decision, _, loopErr := loop.Decide(ctx, bundle)
@@ -472,7 +479,7 @@ func catalog(
 		)
 	}
 	if !opts.GitHub {
-		scope, err := workspace.NewScope(workspaceRoot)
+		scope, err := workspace.NewScopeWithExcludes(workspaceRoot, opts.Config.Workspace.Excludes)
 		if err != nil {
 			return nil, err
 		}
@@ -587,6 +594,9 @@ func resolveRoleModel(ctx context.Context, cfg config.Config, role string) (*age
 	if !ok {
 		return nil, errs.NewConfigError(errs.SubtypeInvalidConfig, "model profile does not exist: %s", profileName)
 	}
+	if err := ensureSmartCommandModelProtocol(profile); err != nil {
+		return nil, err
+	}
 	envName := ""
 	if profileName == "primary" {
 		envName = "OPENAI_API_KEY"
@@ -622,6 +632,19 @@ func resolveRoleModel(ctx context.Context, cfg config.Config, role string) (*age
 		MaxAttempts: profile.MaxAttempts,
 		Profile:     runtimeProfile,
 	}, nil
+}
+
+func ensureSmartCommandModelProtocol(profile config.ModelProfileConfig) error {
+	protocol := strings.TrimSpace(profile.Protocol)
+	if protocol == "" || protocol == string(modelruntime.ProtocolOpenAIChat) {
+		return nil
+	}
+	return errs.NewConfigError(
+		errs.SubtypeInvalidConfig,
+		"smart command model profile protocol %q is not connected to the current agent loop; use %q",
+		protocol,
+		modelruntime.ProtocolOpenAIChat,
+	).WithField("model.profiles.protocol")
 }
 
 func repositoryAllowed(repository string, allowed []string) bool {

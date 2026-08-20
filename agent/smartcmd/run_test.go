@@ -100,6 +100,42 @@ func TestSmartCommandModelCarriesWholeProfile(t *testing.T) {
 	}
 }
 
+func TestSmartCommandRejectsUnsupportedModelProtocol(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "synthetic-key")
+	cfg := testConfig(t)
+	primary := cfg.Model.Profiles["primary"]
+	primary.Protocol = string(modelruntime.ProtocolOpenAIResponses)
+	cfg.Model.Profiles["primary"] = primary
+
+	_, err := resolveRoleModel(context.Background(), cfg, "primary")
+	if err == nil || !strings.Contains(err.Error(), "openai_chat") {
+		t.Fatalf("protocol error=%v", err)
+	}
+}
+
+func TestSmartCommandWorkspaceToolsHonorConfiguredExcludes(t *testing.T) {
+	cfg := testConfig(t)
+	root := t.TempDir()
+	cfg.Workspace.Root = root
+	cfg.Workspace.Excludes = []string{"secret.txt"}
+	if err := os.WriteFile(filepath.Join(root, "secret.txt"), []byte("do not read"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	definitions, err := catalog(Options{Config: cfg}, nil, nil, &agenttools.WriteGate{}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agenttools.NewRegistry(definitions...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := agenttools.WithInvocationScope(context.Background(), agenttools.InvocationScope{Owner: true})
+	if _, err := registry.Execute(ctx, "read_workspace", []byte(`{"path":"secret.txt"}`)); err == nil ||
+		!strings.Contains(err.Error(), "excluded") {
+		t.Fatalf("read excluded file error=%v", err)
+	}
+}
+
 func writeEvent(t *testing.T, name, body string) (string, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), name)
