@@ -12,7 +12,9 @@ import (
 	"github.com/liuchong/lark-agent/agent/domain"
 )
 
-const ReferenceMarkerPrefix = "[lark-agent-github-ref:v1:"
+const ReferenceMarkerPrefix = "[lark-agent-github-ref:v2:"
+const legacyReferenceMarkerPrefix = "[lark-agent-github-ref:v1:"
+const referenceMarkerSignatureBytes = 16
 
 type Reference = domain.GitHubReference
 type ReferenceKind = domain.GitHubReferenceKind
@@ -35,11 +37,11 @@ func EncodeReferenceMarker(ref Reference, signingKey string) (string, error) {
 	if strings.TrimSpace(signingKey) == "" {
 		return "", fmt.Errorf("github reference signing key is required")
 	}
-	data, err := json.Marshal(ref)
+	data, err := json.Marshal(compactReferenceFrom(ref))
 	if err != nil {
 		return "", fmt.Errorf("encode github reference: %w", err)
 	}
-	signature := referenceSignature(data, signingKey)
+	signature := referenceSignature(data, signingKey)[:referenceMarkerSignatureBytes]
 	return ReferenceMarkerPrefix +
 		base64.RawURLEncoding.EncodeToString(data) + "." +
 		base64.RawURLEncoding.EncodeToString(signature) + "]", nil
@@ -50,17 +52,17 @@ func ParseReferenceMarker(content, signingKey string) (Reference, bool, error) {
 	if strings.TrimSpace(signingKey) == "" {
 		return Reference{}, false, fmt.Errorf("github reference signing key is required")
 	}
-	start := strings.Index(content, ReferenceMarkerPrefix)
-	if start < 0 {
+	prefix, start, compact, found := locateReferenceMarker(content)
+	if !found {
 		return Reference{}, false, nil
 	}
-	encodedStart := start + len(ReferenceMarkerPrefix)
+	encodedStart := start + len(prefix)
 	endOffset := strings.IndexByte(content[encodedStart:], ']')
 	if endOffset < 0 {
 		return Reference{}, false, fmt.Errorf("github reference marker is not terminated")
 	}
 	end := encodedStart + endOffset
-	if strings.Contains(content[end+1:], ReferenceMarkerPrefix) {
+	if _, _, _, found := locateReferenceMarker(content[end+1:]); found {
 		return Reference{}, false, fmt.Errorf("multiple github reference markers are not allowed")
 	}
 	encodedPayload, encodedSignature, found := strings.Cut(content[encodedStart:end], ".")
@@ -75,17 +77,86 @@ func ParseReferenceMarker(content, signingKey string) (Reference, bool, error) {
 	if err != nil {
 		return Reference{}, false, fmt.Errorf("decode github reference signature: %w", err)
 	}
-	if !hmac.Equal(signature, referenceSignature(data, signingKey)) {
+	expected := referenceSignature(data, signingKey)
+	if compact {
+		expected = expected[:referenceMarkerSignatureBytes]
+	}
+	if !hmac.Equal(signature, expected) {
 		return Reference{}, false, fmt.Errorf("github reference marker signature is invalid")
 	}
 	var ref Reference
-	if err := json.Unmarshal(data, &ref); err != nil {
-		return Reference{}, false, fmt.Errorf("parse github reference marker: %w", err)
+	if compact {
+		var compactRef compactReference
+		if err := json.Unmarshal(data, &compactRef); err != nil {
+			return Reference{}, false, fmt.Errorf("parse github reference marker: %w", err)
+		}
+		ref = compactRef.Reference()
+	} else {
+		if err := json.Unmarshal(data, &ref); err != nil {
+			return Reference{}, false, fmt.Errorf("parse github reference marker: %w", err)
+		}
 	}
 	if err := ref.Validate(); err != nil {
 		return Reference{}, false, err
 	}
 	return ref, true, nil
+}
+
+type compactReference struct {
+	Repository         string        `json:"r"`
+	Kind               ReferenceKind `json:"k"`
+	WorkflowRunID      int64         `json:"w,omitempty"`
+	WorkflowRunAttempt int           `json:"a,omitempty"`
+	PullRequestNumber  int           `json:"p,omitempty"`
+	IssueNumber        int           `json:"i,omitempty"`
+	CommentID          int64         `json:"c,omitempty"`
+	HeadSHA            string        `json:"h,omitempty"`
+	Ref                string        `json:"f,omitempty"`
+	TagName            string        `json:"t,omitempty"`
+}
+
+func compactReferenceFrom(ref Reference) compactReference {
+	return compactReference{
+		Repository:         ref.Repository,
+		Kind:               ref.Kind,
+		WorkflowRunID:      ref.WorkflowRunID,
+		WorkflowRunAttempt: ref.WorkflowRunAttempt,
+		PullRequestNumber:  ref.PullRequestNumber,
+		IssueNumber:        ref.IssueNumber,
+		CommentID:          ref.CommentID,
+		HeadSHA:            ref.HeadSHA,
+		Ref:                ref.Ref,
+		TagName:            ref.TagName,
+	}
+}
+
+func (r compactReference) Reference() Reference {
+	return Reference{
+		SchemaVersion:      1,
+		Repository:         r.Repository,
+		Kind:               r.Kind,
+		WorkflowRunID:      r.WorkflowRunID,
+		WorkflowRunAttempt: r.WorkflowRunAttempt,
+		PullRequestNumber:  r.PullRequestNumber,
+		IssueNumber:        r.IssueNumber,
+		CommentID:          r.CommentID,
+		HeadSHA:            r.HeadSHA,
+		Ref:                r.Ref,
+		TagName:            r.TagName,
+	}
+}
+
+func locateReferenceMarker(content string) (string, int, bool, bool) {
+	v2 := strings.Index(content, ReferenceMarkerPrefix)
+	v1 := strings.Index(content, legacyReferenceMarkerPrefix)
+	switch {
+	case v2 < 0 && v1 < 0:
+		return "", -1, false, false
+	case v1 < 0 || (v2 >= 0 && v2 < v1):
+		return ReferenceMarkerPrefix, v2, true, true
+	default:
+		return legacyReferenceMarkerPrefix, v1, false, true
+	}
 }
 
 func referenceSignature(data []byte, signingKey string) []byte {

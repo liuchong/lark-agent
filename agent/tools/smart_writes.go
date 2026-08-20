@@ -316,7 +316,8 @@ func SendLarkMessageDefinition(sender BotMessageSender, gate *WriteGate) Definit
 			if text == "" {
 				return Execution{}, errs.NewValidationError(errs.SubtypeInvalidArgument, "text is required")
 			}
-			if utf8.RuneCountInString(text) > 4000 {
+			const maxLarkTextRunes = 4000
+			if utf8.RuneCountInString(text) > maxLarkTextRunes {
 				return Execution{}, errs.NewValidationError(errs.SubtypeInvalidArgument, "text exceeds 4000 runes")
 			}
 			if err := gate.rejectSecrets(text); err != nil {
@@ -339,7 +340,7 @@ func SendLarkMessageDefinition(sender BotMessageSender, gate *WriteGate) Definit
 				if err != nil {
 					return Execution{}, err
 				}
-				text = text + "\n" + marker
+				text = appendMarkerWithinLimit(text, marker, maxLarkTextRunes)
 			}
 			if err := gate.rejectSecrets(text); err != nil {
 				return Execution{}, err
@@ -431,6 +432,41 @@ func WriteJobOutputDefinition(gate *WriteGate) Definition {
 			return jsonExecution(map[string]string{"name": "changelog"}, nil, nil)
 		},
 	}
+}
+
+func appendMarkerWithinLimit(text, marker string, maxRunes int) string {
+	text = strings.TrimSpace(text)
+	marker = strings.TrimSpace(marker)
+	if marker == "" {
+		return text
+	}
+	footerRunes := utf8.RuneCountInString("\n" + marker)
+	if maxRunes <= footerRunes {
+		return marker
+	}
+	if utf8.RuneCountInString(text)+footerRunes <= maxRunes {
+		return text + "\n" + marker
+	}
+	ellipsis := "\n... [truncated]"
+	allowed := maxRunes - footerRunes - utf8.RuneCountInString(ellipsis)
+	if allowed <= 0 {
+		return marker
+	}
+	return firstRunes(text, allowed) + ellipsis + "\n" + marker
+}
+
+func firstRunes(text string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	count := 0
+	for index := range text {
+		if count == limit {
+			return strings.TrimSpace(text[:index])
+		}
+		count++
+	}
+	return strings.TrimSpace(text)
 }
 
 func formatInt64(value int64) string {

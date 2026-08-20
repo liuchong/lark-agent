@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/liuchong/lark-agent/agent/domain"
 	agentlocale "github.com/liuchong/lark-agent/agent/locale"
@@ -204,9 +205,49 @@ func TestSendLarkMessageAppendsMarkerAndRejectsSecrets(t *testing.T) {
 	)); err != nil {
 		t.Fatal(err)
 	}
-	if sender.sends != 1 || !strings.Contains(sender.text, "[lark-agent-github-ref:v1:") ||
+	if sender.sends != 1 || !strings.Contains(sender.text, internalgithub.ReferenceMarkerPrefix) ||
 		!strings.HasPrefix(sender.key, "ghs-") {
 		t.Fatalf("SC-39 sender=%+v", sender)
+	}
+}
+
+func TestSendLarkMessageBoundsFinalTextAfterMarker(t *testing.T) {
+	sender := &recordingSender{}
+	ref := internalgithub.Reference{
+		SchemaVersion: 1,
+		Repository:    "example/widgets",
+		Kind:          internalgithub.ReferenceIssue,
+		IssueNumber:   7,
+	}
+	gate := &WriteGate{
+		Allow:        map[string]bool{internalgithub.ActionSendLarkMessage: true},
+		ChatID:       "oc_synthetic",
+		AppSecret:    "synthetic-lark-app-secret",
+		Reference:    &ref,
+		EncodeMarker: internalgithub.EncodeReferenceMarker,
+	}
+	registry, err := NewRegistry(SendLarkMessageDefinition(sender, gate))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(map[string]string{"text": strings.Repeat("长", 4000)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Execute(context.Background(), internalgithub.ActionSendLarkMessage, payload); err != nil {
+		t.Fatal(err)
+	}
+	var content map[string]string
+	if err := json.Unmarshal([]byte(sender.text), &content); err != nil {
+		t.Fatal(err)
+	}
+	text := content["text"]
+	if utf8.RuneCountInString(text) > 4000 {
+		t.Fatalf("final text exceeds Lark limit: %d", utf8.RuneCountInString(text))
+	}
+	if !strings.Contains(text, internalgithub.ReferenceMarkerPrefix) ||
+		!strings.Contains(text, "... [truncated]") {
+		t.Fatalf("text=%q", text)
 	}
 }
 
