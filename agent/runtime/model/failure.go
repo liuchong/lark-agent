@@ -62,6 +62,9 @@ func ClassifyHTTPFailure(status int, body string, retryAfter string, now time.Ti
 	case http.StatusNotFound:
 		failure.Category = FailureNotFound
 		failure.RecoveryAction = RecoveryStopDeterministic
+	case http.StatusRequestEntityTooLarge:
+		failure.Category = FailureRequestTooLarge
+		failure.RecoveryAction = RecoveryChangeInput
 	case http.StatusRequestTimeout, http.StatusConflict, http.StatusTooManyRequests:
 		failure.Category = FailureRateLimit
 		failure.Retryable = true

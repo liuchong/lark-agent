@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	einomodel "github.com/cloudwego/eino/components/model"
@@ -16,6 +17,8 @@ import (
 
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
+	modelruntime "github.com/liuchong/lark-agent/agent/runtime/model"
+	"github.com/liuchong/lark-agent/agent/storage"
 	agenttools "github.com/liuchong/lark-agent/agent/tools"
 	"github.com/liuchong/lark-agent/agent/workspace"
 	errs "github.com/liuchong/lark-agent/internal/apperr"
@@ -53,6 +56,18 @@ func (m *scriptedModel) Generate(_ context.Context, input []*schema.Message, opt
 }
 
 func (m *scriptedModel) Stream(context.Context, []*schema.Message, ...einomodel.Option) (*schema.StreamReader[*schema.Message], error) {
+	return nil, errors.New("not implemented")
+}
+
+type failingModel struct {
+	err error
+}
+
+func (m failingModel) Generate(context.Context, []*schema.Message, ...einomodel.Option) (*schema.Message, error) {
+	return nil, m.err
+}
+
+func (m failingModel) Stream(context.Context, []*schema.Message, ...einomodel.Option) (*schema.StreamReader[*schema.Message], error) {
 	return nil, errors.New("not implemented")
 }
 
@@ -140,6 +155,63 @@ func TestAgentLoopSearchesReadsAndSubmitsDecision(t *testing.T) {
 	}
 	if lastInput[len(lastInput)-2].Role != schema.Tool || lastInput[len(lastInput)-2].ToolCallID != "call_read" {
 		t.Fatalf("last input=%+v", lastInput)
+	}
+}
+
+func TestAgentLoopRecordsClassifiedModelFailure(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	event := domain.NormalizedEvent{MessageID: "om_model_failure", ChatID: "oc_test", SenderID: "ou_owner", Content: "check"}
+	if _, err := store.EnqueueEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agenttools.NewRegistry(SubmitDecisionDefinition())
+	if err != nil {
+		t.Fatal(err)
+	}
+	modelErr := &classifiedModelError{
+		err: errs.NewAPIError(errs.SubtypeServerError, "model returned 413").WithCode(413),
+		failure: modelruntime.Failure{
+			Category:       modelruntime.FailureRequestTooLarge,
+			HTTPStatus:     413,
+			RecoveryAction: modelruntime.RecoveryChangeInput,
+		},
+	}
+	loop := AgentLoop{
+		Model:           failingModel{err: modelErr},
+		Tools:           registry,
+		Recorder:        store,
+		MaxTurns:        1,
+		MaxElapsed:      time.Second,
+		MaxContextBytes: 64 * 1024,
+	}
+	_, _, err = loop.Decide(context.Background(), agentcontext.Bundle{
+		Event:    event,
+		WorkKind: domain.WorkKindSimpleQuestion,
+		User:     agentcontext.UserProfile{OpenID: "ou_owner"},
+	})
+	if err == nil {
+		t.Fatal("expected model failure")
+	}
+	runs, err := store.ListAgentRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("runs=%+v", runs)
+	}
+	steps, err := store.ListAgentSteps(runs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 ||
+		steps[0].HTTPStatus != 413 ||
+		steps[0].FailureCategory != string(modelruntime.FailureRequestTooLarge) ||
+		steps[0].RecoveryAction != string(modelruntime.RecoveryChangeInput) {
+		t.Fatalf("steps=%+v", steps)
 	}
 }
 

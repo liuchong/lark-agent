@@ -244,6 +244,13 @@ func TestProviderFailureClassification(t *testing.T) {
 			retryable: false,
 		},
 		{
+			name:      "request too large",
+			status:    413,
+			body:      `{"error":{"message":"context length exceeded"}}`,
+			category:  FailureRequestTooLarge,
+			retryable: false,
+		},
+		{
 			name:      "server overload",
 			status:    529,
 			body:      `overloaded`,

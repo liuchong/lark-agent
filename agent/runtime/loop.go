@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -15,6 +16,7 @@ import (
 	agentcontext "github.com/liuchong/lark-agent/agent/context"
 	"github.com/liuchong/lark-agent/agent/domain"
 	agentlocale "github.com/liuchong/lark-agent/agent/locale"
+	modelruntime "github.com/liuchong/lark-agent/agent/runtime/model"
 	agenttools "github.com/liuchong/lark-agent/agent/tools"
 	"github.com/liuchong/lark-agent/internal/apperr"
 )
@@ -454,6 +456,10 @@ func (l AgentLoop) Decide(ctx context.Context, bundle agentcontext.Bundle) (deci
 			einomodel.WithTools(turnToolInfos),
 			einomodel.WithToolChoice(l.ToolChoice))
 		if err != nil {
+			sequence++
+			if recordErr := l.recordModelFailureStep(ctx, runID, sequence, err); recordErr != nil {
+				return domain.Decision{}, trajectory, recordErr
+			}
 			return domain.Decision{}, trajectory, err
 		}
 		if assistant == nil {
@@ -1908,6 +1914,33 @@ func (l AgentLoop) recordModelStep(ctx context.Context, runID string, sequence i
 		if requestID, ok := assistant.Extra["request_id"].(string); ok {
 			step.RequestID = requestID
 		}
+	}
+	return l.Recorder.AppendAgentStep(ctx, step)
+}
+
+type classifiedFailure interface {
+	Failure() modelruntime.Failure
+}
+
+func (l AgentLoop) recordModelFailureStep(ctx context.Context, runID string, sequence int, modelErr error) error {
+	if l.Recorder == nil || runID == "" {
+		return nil
+	}
+	step := domain.AgentStep{
+		RunID:     runID,
+		Sequence:  sequence,
+		Kind:      "model",
+		Phase:     string(PhaseGenerate),
+		Attempt:   1,
+		Error:     modelErr.Error(),
+		CreatedAt: time.Now().UTC(),
+	}
+	var classified classifiedFailure
+	if errors.As(modelErr, &classified) {
+		failure := classified.Failure()
+		step.HTTPStatus = failure.HTTPStatus
+		step.FailureCategory = string(failure.Category)
+		step.RecoveryAction = string(failure.RecoveryAction)
 	}
 	return l.Recorder.AppendAgentStep(ctx, step)
 }

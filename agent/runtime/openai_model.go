@@ -47,6 +47,15 @@ func (e *retryAfterError) Error() string             { return e.err.Error() }
 func (e *retryAfterError) Unwrap() error             { return e.err }
 func (e *retryAfterError) RetryAfter() time.Duration { return e.delay }
 
+type classifiedModelError struct {
+	err     error
+	failure modelruntime.Failure
+}
+
+func (e *classifiedModelError) Error() string                 { return e.err.Error() }
+func (e *classifiedModelError) Unwrap() error                 { return e.err }
+func (e *classifiedModelError) Failure() modelruntime.Failure { return e.failure }
+
 // WithTools returns an immutable model view with the supplied tools bound.
 func (m *OpenAICompatibleModel) WithTools(tools []*schema.ToolInfo) (einomodel.ToolCallingChatModel, error) {
 	if m == nil {
@@ -73,12 +82,12 @@ func (m *OpenAICompatibleModel) Generate(ctx context.Context, input []*schema.Me
 			return msg, nil
 		}
 		if attempt >= attempts || !failure.Retryable {
-			return nil, err
+			return nil, &classifiedModelError{err: err, failure: failure}
 		}
 		if waitErr := waitBeforeRetry(ctx, failure.RetryAfter, m.backoffFor(attempt)); waitErr != nil {
 			// The caller went away while waiting. Report why the call failed,
 			// not that the wait was cut short.
-			return nil, err
+			return nil, &classifiedModelError{err: err, failure: failure}
 		}
 	}
 }

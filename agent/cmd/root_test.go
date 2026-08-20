@@ -138,6 +138,15 @@ func TestRuntimeModelProtocolRejectsProfilesNotYetConnectedToAgentLoop(t *testin
 	if err == nil || !strings.Contains(err.Error(), "openai_chat") {
 		t.Fatalf("protocol error=%v", err)
 	}
+	err = ensureRuntimeModelProtocol(config.ModelProfileConfig{
+		Provider: "kimi",
+		Protocol: "openai_chat",
+		Name:     "k3-256k",
+		Stream:   "required",
+	})
+	if err == nil || !strings.Contains(err.Error(), "streaming") {
+		t.Fatalf("stream error=%v", err)
+	}
 }
 
 func TestGitHubActionModelInputsApplyToLoadedConfig(t *testing.T) {

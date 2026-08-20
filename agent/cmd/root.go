@@ -1094,6 +1094,13 @@ func modelAdapterForProfile(
 
 func ensureRuntimeModelProtocol(profile config.ModelProfileConfig) error {
 	if strings.TrimSpace(profile.Protocol) == "openai_chat" {
+		if strings.TrimSpace(profile.Stream) == "required" {
+			return errs.NewConfigError(
+				errs.SubtypeInvalidConfig,
+				"model profile %s requires streaming, but daemon model execution is non-streaming in V1",
+				strings.TrimSpace(profile.Name),
+			).WithField("model.profiles.stream")
+		}
 		return nil
 	}
 	return errs.NewConfigError(

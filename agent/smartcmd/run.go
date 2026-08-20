@@ -637,6 +637,12 @@ func resolveRoleModel(ctx context.Context, cfg config.Config, role string) (*age
 func ensureSmartCommandModelProtocol(profile config.ModelProfileConfig) error {
 	protocol := strings.TrimSpace(profile.Protocol)
 	if protocol == "" || protocol == string(modelruntime.ProtocolOpenAIChat) {
+		if strings.TrimSpace(profile.Stream) == string(modelruntime.StreamRequired) {
+			return errs.NewConfigError(
+				errs.SubtypeInvalidConfig,
+				"smart command model profile requires streaming, but smart command execution is non-streaming in V1",
+			).WithField("model.profiles.stream")
+		}
 		return nil
 	}
 	return errs.NewConfigError(

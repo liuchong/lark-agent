@@ -111,6 +111,13 @@ func TestSmartCommandRejectsUnsupportedModelProtocol(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "openai_chat") {
 		t.Fatalf("protocol error=%v", err)
 	}
+	primary.Protocol = string(modelruntime.ProtocolOpenAIChat)
+	primary.Stream = string(modelruntime.StreamRequired)
+	cfg.Model.Profiles["primary"] = primary
+	_, err = resolveRoleModel(context.Background(), cfg, "primary")
+	if err == nil || !strings.Contains(err.Error(), "streaming") {
+		t.Fatalf("stream error=%v", err)
+	}
 }
 
 func TestSmartCommandWorkspaceToolsHonorConfiguredExcludes(t *testing.T) {

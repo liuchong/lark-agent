@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -355,8 +356,8 @@ func TestOpenAICompatibleModelExposesProviderRetryAfter(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected rate limit error")
 	}
-	retryable, ok := err.(interface{ RetryAfter() time.Duration })
-	if !ok || retryable.RetryAfter() != 90*time.Second {
+	var retryable interface{ RetryAfter() time.Duration }
+	if !errors.As(err, &retryable) || retryable.RetryAfter() != 90*time.Second {
 		t.Fatalf("err=%T %v", err, err)
 	}
 }

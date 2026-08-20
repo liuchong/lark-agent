@@ -94,6 +94,8 @@ lark-agent config show
 - `model.profiles`：模型档案。每个档案明确写出供应商、协议、API URL、模型名、
   Keychain 凭据引用、流式和思考配置。默认 `primary` 使用 Kimi `k3-256k` 与
   `openai_chat` 协议。配置只保存 Keychain 引用，不保存 API key。
+- `model.profiles.<名字>.stream`：`auto` 或 `disabled` 都使用 V1 的完整非流式调用。
+  `required` 会在运行前失败，因为当前策略门禁需要看到完整 assistant turn 后再验收。
 - `model.profiles.<名字>.timeout`：单次模型尝试的超时，默认 `120s`。这是一次尝试的
   上限，不是一次调用的上限。默认值按“推理模型读长提示词后作答”来定，例如从整个 diff
   生成 changelog；把它调到很短会让重的提示词稳定超时。
