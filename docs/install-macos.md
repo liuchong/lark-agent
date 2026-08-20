@@ -89,6 +89,9 @@ go build -o ./lark-agent ./cmd/lark-agent
 ```yaml
 assistant:
   reply_scope: all_groups
+output:
+  language: zh-CN
+  fallback_language: zh-CN
 owner:
   name: 姓名
   preferred_language: zh-CN
@@ -103,7 +106,10 @@ policy:
   reply_confidence_min: 0.70
 ```
 
-前者控制 Owner 可在哪些群里 `@机器人`，后者控制其他人可在哪些群里 `@Owner`
+`output.language` 是全产品对外语言，本机常驻助手和 GitHub Actions 里的智能命令都遵守它；
+`owner.*` 的语言只覆盖面向 Owner 的对话。
+
+`assistant.reply_scope` 控制 Owner 可在哪些群里 `@机器人`，`policy.reply_scope` 控制其他人可在哪些群里 `@Owner`
 后触发智能代回复。用户身份可见的真人私聊由 `private_reply_scope` 单独控制。
 `all_private` 表示所有对方发来的真人私聊都进入语义判断，不表示每条消息都要回复；
 对方只是在回答 Owner 主动发起的话题、确认或继续闲聊且没有新增请求时会静默结束。

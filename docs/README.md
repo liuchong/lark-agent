@@ -15,7 +15,7 @@
 1. [macOS 安装](install-macos.md)：本机配置、LaunchAgent、状态栏、GitHub Environment。
 2. [配置说明](configuration.md)：`config.yaml` 字段、范围、Workspace、记忆、GitHub 只读桥。
 3. [运行、恢复与故障处理](operations.md)：常驻助手的队列、审批、恢复、云文档监控、代码调查。
-4. [智能命令与 GitHub](smart-command.md)：`run` / `github run` / `github notify`、评论语法、本仓库工作流。
+4. [智能命令与 GitHub](smart-command.md)：`run` / `github run` / `github notify`、评论语法、Action 输入、输出语言、内容质量约束、本仓库工作流。
 
 根目录 [README](../README.md) 只保留产品入口和最短上手步骤。
 

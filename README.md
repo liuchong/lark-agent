@@ -31,7 +31,9 @@
 - 编程问题可在配置的 Workspace 内做有界读取和搜索；非 Owner 始终只读。
 - GitHub Actions 可把可信工作流结果发到指定群，也可跑一条智能命令。默认仍是普通通知；`mode: run` 才读事件并调用具名写入工具。细节见 [智能命令与 GitHub](docs/smart-command.md)。
 - 所有消息和外部动作写入 SQLite。无状态只读工作可以安全重算；对话调查和未发送回复候选保持中断；结果不确定的外部动作绝不重放。
-- 对外语言优先使用 `owner.preferred_language`。Owner 可保存记忆；私人任务规则写在配置旁的 `TASK_RULES.md`。
+- 对外语言由 `output.language` 决定，覆盖所有对外消息，包括没有人类会话可参考的智能命令；`owner.preferred_language` 只覆盖面向 Owner 的对话。生成内容的语言由写入门禁强制，不靠提示词自觉。
+- 对外内容有统一质量约束：先结论后细节，不出现只在仓库内部有意义的编号和符号，工作流和分支这类专名照抄原文。
+- Owner 可保存记忆；私人任务规则写在配置旁的 `TASK_RULES.md`。
 
 ## 要求
 
@@ -120,6 +122,7 @@ Owner 还可以在智能助手私聊中发送 `/help`、`/status`、`/tasks`、`
 - 只要把 CI 结果发到飞书：用 `github notify`。本仓库 `.github/workflows/lark-notify.yml` 不用加 `mode`。
 - 要根据评论、PR、Issue、push 或 release 做一次有模型的判断：用 `github run`。
 - 评论唤醒词是 `@lark-agent`。斜杠命令只有 `/review`、`/title`、`/check`。
+- 写 GitHub 评论、检查结论或 release 正文的工作流固定 `output_language: en-US`；只发飞书的沿用配置语言。
 
 本地常驻助手的 GitHub 读取令牌单独放在 macOS Keychain：
 

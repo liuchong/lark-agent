@@ -172,6 +172,7 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 		"无状态只读",
 		"对话调查和未发送回复候选保持中断",
 		"结果不确定的外部动作绝不重放",
+		"output.language",
 		"owner.preferred_language",
 		"assistant.reply_scope",
 		"policy.reply_scope",
@@ -208,6 +209,23 @@ func TestStandaloneDocsAndDetailedHelpStaySynchronized(t *testing.T) {
 	} {
 		if !strings.Contains(string(configuration), want) {
 			t.Fatalf("configuration docs missing %q", want)
+		}
+	}
+	smartCommand, err := os.ReadFile(filepath.Join(root, "docs/smart-command.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"output_language",
+		"LARK_AGENT_OUTPUT_LANGUAGE",
+		"data.output_language",
+		"内容质量约束",
+		"lark-agent-gate",
+		"post_github_comment",
+		"write_job_output",
+	} {
+		if !strings.Contains(string(smartCommand), want) {
+			t.Fatalf("smart-command docs missing %q", want)
 		}
 	}
 	operations, err := os.ReadFile(filepath.Join(root, "docs/operations.md"))

@@ -28,6 +28,23 @@
 
 仓库根目录 `action.yml` 的 `mode` 默认是 `notify`，继续走 `github notify`。`mode: run` 才走 `github run`。
 
+| 输入 | 必填 | 说明 |
+| --- | --- | --- |
+| `mode` | 否 | 默认 `notify`；`run` 才跑模型 |
+| `lark_app_id` | 是 | 与本机 daemon 同一个应用 ID |
+| `lark_app_secret` | 是 | 来自受保护 Environment |
+| `lark_base_url` | 是 | 必须显式给出，不猜站点 |
+| `github_token` | 是 | 一般是 `github.token` |
+| `lark_chat_id` | 视情况 | 需要发飞书时必填，必须是精确 chat ID |
+| `prompt_file` | 视情况 | `mode: run` 的提示词，仓库相对路径 |
+| `message` | 视情况 | 行内消息，可替代 `prompt_file` |
+| `rules_file` | 否 | 追加的规则文件 |
+| `allowed_actions` | 否 | 逗号分隔的写入工具白名单；不给则没有写入能力 |
+| `output_language` | 否 | `auto`、`zh-CN` 或 `en-US` |
+| `dry_run` | 否 | `true` 时清空全部写入 |
+
+唯一的输出是 `changelog`，来自 `write_job_output` 工具。
+
 两种形态都可以和已安装 daemon 使用同一个 Lark 应用，但都不会启动 WebSocket；本机 LaunchAgent 始终是唯一实时事件监听者。
 
 需要飞书或模型密钥的 job 使用受保护 Environment `lark-production`：
@@ -44,19 +61,19 @@
 
 可复用的 YAML 和 prompt 在 [examples/github-agent](../examples/github-agent/README.md)。本仓库正在跑的是 `.github/workflows/lark-agent-*.yml` 里同一套文件。
 
-| 工作流 | 做什么 |
-| --- | --- |
-| `lark-notify.yml` | CI 完成后普通通知，不加 `mode` |
-| `lark-agent-comment.yml` | 评论里 `@lark-agent` 后回答 |
-| `lark-agent-review-dispatch.yml` | 手动触发 PR 审查 |
-| `lark-agent-pr-review.yml` | 新开或打标签的 PR 审查 |
-| `lark-agent-event-summary.yml` | Issue / PR / 非 CI 工作流摘要 |
-| `lark-agent-master-changelog.yml` | 默认分支 changelog |
-| `lark-agent-release.yml` | 发布说明，验证后再建草稿 release |
-| `lark-agent-pr-summary.yml` | PR 摘要 |
-| `lark-agent-merge-check.yml` | 合并门禁检查 `lark-agent-gate` |
-| `lark-agent-notify-style.yml` | 通知口吻的事件摘要 |
-| `lark-agent-title.yml` | 标题改写 |
+| 工作流 | 做什么 | 落地面与语言 |
+| --- | --- | --- |
+| `lark-notify.yml` | CI 完成后普通通知，不加 `mode` | 飞书，不跑模型 |
+| `lark-agent-comment.yml` | 评论里 `@lark-agent` 后回答 | GitHub 评论，`en-US` |
+| `lark-agent-review-dispatch.yml` | 手动触发 PR 审查 | GitHub 评论与检查，`en-US` |
+| `lark-agent-pr-review.yml` | 新开或打标签的 PR 审查 | GitHub 评论与检查，`en-US` |
+| `lark-agent-pr-summary.yml` | PR 摘要 | GitHub 评论，`en-US` |
+| `lark-agent-merge-check.yml` | 合并门禁检查 `lark-agent-gate` | GitHub 检查，`en-US` |
+| `lark-agent-release.yml` | 发布说明，验证后再建草稿 release | release 正文，`en-US` |
+| `lark-agent-title.yml` | 标题改写 | GitHub 标题，标题不受语言约束 |
+| `lark-agent-event-summary.yml` | Issue / PR / 非 CI 工作流摘要 | 飞书，沿用配置语言 |
+| `lark-agent-master-changelog.yml` | 默认分支 changelog | 飞书，沿用配置语言 |
+| `lark-agent-notify-style.yml` | 通知口吻的事件摘要，例行成功事件直接跳过 | 飞书，沿用配置语言 |
 
 Fork 来的 PR 会跳过。名为 `CI` 的 `workflow_run` 不进事件摘要和通知口吻工作流，避免和 `lark-notify.yml` 抢同一条 CI 完成事件。
 
@@ -84,10 +101,35 @@ Fork 来的 PR 会跳过。名为 `CI` 的 `workflow_run` 不进事件摘要和�
 
 示例工作流按落地面选语言：写 GitHub 评论、检查结论或 release 正文的是公开仓库内容，固定 `output_language: en-US`；只发飞书的沿用配置里的语言，不写这个输入。
 
+## 内容质量约束
+
+下面这些要求写在智能命令的系统提示里，对所有仓库生效。自己的 `prompt_file` 不需要重复它们，只写这次要做什么。
+
+- 先给结论再给细节。不允许把 diff 的复述当成结论。
+- 不许出现只在本仓库内部有意义的编号和符号：规格场景号、内部工单号、测试名、源码标识符。只能通过这类编号解释的改动，改写成可观察行为。
+- 工作流名、分支名、标签名、release 名、文件名和命令名是专名，照抄事件或仓库给的原文。即使整句是中文也不许翻译，更不许替换成自己对它用途的描述。
+
+飞书消息是纯文本类型，Markdown 链接语法会原样显示，所以 `send_lark_message` 的工具描述要求写裸 URL。
+
+## 跑完之后看什么
+
+进程在 stdout 输出一个 JSON 信封，Actions 日志里可以直接读：
+
+| 字段 | 含义 |
+| --- | --- |
+| `skipped` | 这次没有任何对外写入。非干跑时由写入门禁推导，不取决于模型自己怎么说 |
+| `partial` | 富化、比较或文件读取失败，或者证据不足 |
+| `output_language` | 本次解析出的对外语言 |
+| `comment_id`、`check_id`、`message_id`、`title` | 各类写入成功后的标识，没写就是空 |
+| `outputs` | `write_job_output` 写出的 job output |
+| `reference` | 已验证的 GitHub 引用 |
+
+退出码 0 是成功，包含“该跳过所以什么都没发”。2 是参数或配置不合法，此时不跑模型也不发 HTTP。1 是跑到一半失败，例如飞书 HTTP 失败或模型收不住。
+
 ## 结束方式
 
 工作类型是 `smart_command`。模型必须调用 `submit_decision`，且 `decision` 只能是 `record`。这个工具本身不发飞书、不写 GitHub。真正的评论、检查、标题、飞书消息和 job output 只能通过上面的具名写入工具，每种进程最多成功一次。
 
 如果模型反复给出无效的终结决定，用完限定的几次终结尝试后，会像常驻助手那样交给收尾模型再收一次；收尾模型拿不到任何工具，所以 `--dry-run` 仍然是干跑。收尾也收不住，或者用尽轮数上限，进程以 1 退出并且不再写入。收尾模型取 `model.roles.finalizer` 绑定的 profile。
 
-场景编号、事件 JSON 样例和退出码见 [智能命令规格](../spec/smart-command.md)。
+场景编号、事件 JSON 样例和逐条退出码规则见 [智能命令规格](../spec/smart-command.md)。
